@@ -28,6 +28,9 @@ mod privacy;
 mod private_server;
 mod reshade;
 mod self_update;
+mod server_admin;
+mod server_admin_page;
+mod server_manifest;
 mod services;
 mod session_worker;
 mod settings_page;
@@ -757,6 +760,7 @@ pub(crate) enum Message {
     LaunchTools(launch_tools::Msg),
     Dgvoodoo(dgvoodoo::Msg),
     Reshade(reshade::Msg),
+    ServerAdmin(server_admin_page::Msg),
 }
 /// A path field that has a native Browse dialog.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -897,6 +901,7 @@ pub(crate) struct App {
     friends_checked: Instant,
     pub dgvoodoo: dgvoodoo::State,
     pub reshade: reshade::State,
+    pub server_admin: server_admin_page::State,
     pub self_update: self_update::State,
     pub controller_nav: controller_nav::State,
 }
@@ -1023,6 +1028,7 @@ impl App {
             friends_checked: Instant::now(),
             dgvoodoo,
             reshade: reshade::State::default(),
+            server_admin: server_admin_page::State::load(&config),
             self_update: self_update::initial(&config),
             controller_nav: controller_nav::State::default(),
         };
@@ -1259,6 +1265,8 @@ impl App {
         );
         let checks = app.refresh();
         let installation = app.find_installation(true);
+        // Update holds set on private servers since the last launch
+        let manifests = server_admin_page::refresh_manifests(&app.config);
         let viewer = app.start_viewer_check();
         let launcher = if app.settings.launcher_auto_updates
             && !matches!(app.self_update, self_update::State::Error(_))
@@ -1269,7 +1277,7 @@ impl App {
         };
         (
             app,
-            Task::batch([accounts, checks, viewer, launcher, installation]),
+            Task::batch([accounts, checks, viewer, launcher, installation, manifests]),
         )
     }
 
@@ -1297,6 +1305,7 @@ impl App {
             prereqs::subscription(&self.prereqs).map(Message::Prereqs),
             gamepad::subscription(&self.gamepad).map(Message::Gamepad),
             dgvoodoo::subscription(&self.dgvoodoo),
+            server_admin_page::subscription(&self.server_admin),
             iced::event::listen_with(user_input),
             if self.account_drag.source.is_some() {
                 iced::event::listen_raw(account_order::input)
@@ -1695,6 +1704,15 @@ impl App {
             return Task::none();
         }
         let account_folder = self.update_account_folder(kind);
+        // A private server that hasn't approved the new client holds updates to the folder its
+        // accounts play from (Settings → Server on the server's side lifts it)
+        if kind == MaintenanceKind::Update {
+            let target = account_folder.clone().unwrap_or_else(|| PathBuf::from(&self.settings.install_path));
+            if let Some(hold) = self.update_hold(&target) {
+                self.status = hold;
+                return Task::none();
+            }
+        }
         if !game_operation {
             // Pressing an installer step selects its current folder. The old
             // extra confirmation left all three buttons disabled on first use.
@@ -2428,6 +2446,23 @@ impl App {
 
     /// The game folder an operation of `kind` changes when it is not the Settings one: an
     /// Update the W20 of an account with its own folder asked for updates that folder.
+    /// Why updating the FFXI folder `target` is on hold: a private-server account plays from it
+    /// and its server's last manifest says the new client isn't approved yet.
+    fn update_hold(&self, target: &Path) -> Option<String> {
+        let plain = |path: &Path| {
+            backend::plain_windows_path(path)
+                .to_string_lossy()
+                .trim_end_matches(['\\', '/'])
+                .to_ascii_lowercase()
+        };
+        let target = plain(target);
+        self.accounts
+            .iter()
+            .filter(|row| row.account.mode == AccountMode::Private)
+            .filter(|row| plain(&self.settings.config_for(&self.config, &row.account).game_directory()) == target)
+            .find_map(|row| server_manifest::update_hold(&self.config, &row.account.server))
+    }
+
     fn update_account_folder(&self, kind: MaintenanceKind) -> Option<PathBuf> {
         self.patch_folder
             .clone()
@@ -5297,6 +5332,7 @@ impl App {
             }
             Message::Dgvoodoo(m) => return dgvoodoo::update(self, m),
             Message::Reshade(m) => return reshade::update(self, m),
+            Message::ServerAdmin(m) => return server_admin_page::update(self, m),
             Message::Gamepad(m) => {
                 let captured = self.gamepad.capturing();
                 let task =
@@ -8000,6 +8036,7 @@ mod tests {
             friends_checked: Instant::now(),
             dgvoodoo: dgvoodoo::State::new(false),
             reshade: reshade::State::default(),
+            server_admin: server_admin_page::State::default(),
             self_update: self_update::State::default(),
             controller_nav: controller_nav::State::default(),
         };

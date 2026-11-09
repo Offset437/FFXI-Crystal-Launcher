@@ -633,7 +633,7 @@ pub fn save_accounts(config: &Config, accounts: &[Account]) -> Result<(), String
 }
 
 #[cfg(windows)]
-fn protect(input: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn protect(input: &[u8]) -> Result<Vec<u8>, String> {
     use windows_sys::Win32::{
         Foundation::LocalFree,
         Security::Cryptography::{CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB},
@@ -669,7 +669,7 @@ fn protect(input: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 #[cfg(windows)]
-fn unprotect(input: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+pub(crate) fn unprotect(input: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     use windows_sys::Win32::{
         Foundation::LocalFree,
         Security::Cryptography::{
@@ -709,11 +709,11 @@ fn unprotect(input: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     }
 }
 #[cfg(not(windows))]
-fn protect(_: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn protect(_: &[u8]) -> Result<Vec<u8>, String> {
     Err(t("Saved accounts require Windows DPAPI.").into())
 }
 #[cfg(not(windows))]
-fn unprotect(_: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+pub(crate) fn unprotect(_: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     Err(t("Saved accounts require Windows DPAPI.").into())
 }
 

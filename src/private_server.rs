@@ -9,6 +9,7 @@ use crate::{
     launch_log::{self, LoaderEnd},
     launch_timing::{Milestone, Timeline},
     pol_less::{self, Plan, Tool},
+    server_manifest::{self, LoaderOptions},
 };
 use std::{
     collections::HashSet,
@@ -23,16 +24,30 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
 fn xiloader_command(loader: &Path, game: &Path, account: &Account, otp: &str) -> Command {
     xiloader_command_with_hairpin(loader, game, account, otp, true)
 }
 
+#[cfg(test)]
 fn xiloader_command_with_hairpin(
     loader: &Path,
     game: &Path,
     account: &Account,
     otp: &str,
     hairpin: bool,
+) -> Command {
+    xiloader_command_with_options(loader, game, account, otp, hairpin, &LoaderOptions::default())
+}
+
+/// `options` are the fingerprint and ports from the server's launcher manifest, if it has one.
+fn xiloader_command_with_options(
+    loader: &Path,
+    game: &Path,
+    account: &Account,
+    otp: &str,
+    hairpin: bool,
+    options: &LoaderOptions,
 ) -> Command {
     let mut command = Command::new(loader);
 
@@ -53,6 +68,8 @@ fn xiloader_command_with_hairpin(
         command.arg("--hairpin");
     }
 
+    command.args(options.arguments());
+
     command
 }
 
@@ -63,8 +80,9 @@ fn xiloader_argument_string(
     account: &Account,
     otp: &str,
     hairpin: bool,
+    options: &LoaderOptions,
 ) -> String {
-    let command = xiloader_command_with_hairpin(loader, game, account, otp, hairpin);
+    let command = xiloader_command_with_options(loader, game, account, otp, hairpin, options);
     pol_less::command_arguments(&command)
 }
 
@@ -112,13 +130,14 @@ pub(crate) fn launch_with_plan(
             game.display()
         ));
     }
-    let loader = game.join("xiloader.exe");
-    if !loader.is_file() {
-        return Err(format!(
-            "xiloader.exe was not found in the selected FINAL FANTASY XI folder: {}",
-            game.display()
-        ));
+    // The server's own xiloader, fingerprint and ports when it publishes a launcher manifest;
+    // otherwise xiloader.exe from the game folder, as before.
+    let prepared = server_manifest::prepare(config, &account.server, &game, &mut progress)?;
+    for note in &prepared.notes {
+        progress(note);
     }
+    let loader = prepared.loader.clone();
+    let options = prepared.options.clone();
 
     let launcher = via
         .as_ref()
@@ -133,6 +152,17 @@ pub(crate) fn launch_with_plan(
     writeln!(
         stdout,
         "[launcher] Starting private-server client through {launcher}."
+    )
+    .map_err(|e| format!("Could not write the private-server launch log: {e}"))?;
+    for line in prepared.details.iter().chain(&prepared.notes) {
+        writeln!(stdout, "[manifest] {line}")
+            .map_err(|e| format!("Could not write the private-server launch log: {e}"))?;
+    }
+    writeln!(
+        stdout,
+        "[launcher] xiloader: {}{}",
+        loader.display(),
+        if options.fingerprint.is_some() { " (server key pinned)" } else { "" }
     )
     .map_err(|e| format!("Could not write the private-server launch log: {e}"))?;
     stdout
@@ -178,7 +208,7 @@ pub(crate) fn launch_with_plan(
     #[cfg(windows)]
     let (pid, monitor) = if let Some(plan) = via.as_ref() {
         let arguments =
-            xiloader_argument_string(&loader, &game, &account, otp.as_str(), hairpin);
+            xiloader_argument_string(&loader, &game, &account, otp.as_str(), hairpin, &options);
         let mut frontend = private_frontend(plan, &loader, &arguments)?;
         frontend
             .command
@@ -198,7 +228,7 @@ pub(crate) fn launch_with_plan(
         (pid, PrivateMonitor::Pid(pid))
     } else {
         let mut command =
-            xiloader_command_with_hairpin(&loader, &game, &account, otp.as_str(), hairpin);
+            xiloader_command_with_options(&loader, &game, &account, otp.as_str(), hairpin, &options);
         command
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
@@ -228,7 +258,7 @@ pub(crate) fn launch_with_plan(
             );
         }
         let mut command =
-            xiloader_command_with_hairpin(&loader, &game, &account, otp.as_str(), hairpin);
+            xiloader_command_with_options(&loader, &game, &account, otp.as_str(), hairpin, &options);
         command
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
@@ -651,6 +681,37 @@ mod tests {
 
         assert!(!args.iter().any(|arg| arg == "--otp"));
         assert!(!args.iter().any(|arg| arg == "123456"));
+    }
+
+    #[test]
+    fn manifest_fingerprint_and_ports_follow_the_login_arguments() {
+        let account = private_account();
+        let options = LoaderOptions {
+            fingerprint: Some("SHA256:eQmR2ar3Lq/CHlKETW+sZ8JqMDS48h/M/RIH8UmR0E4".into()),
+            ports: Some(server_manifest::Ports { data: 54230, view: 54001, auth: 54231, profile: 51220 }),
+        };
+        let command = xiloader_command_with_options(
+            Path::new(r"C:\FFXI\xiloader.exe"),
+            Path::new(r"C:\FFXI"),
+            &account,
+            "",
+            true,
+            &options,
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(&args[..6], ["--server", "play.example.test", "--user", "fixture-user", "--password", "fixture-secret"]);
+        assert_eq!(
+            &args[6..],
+            [
+                "--hairpin",
+                "--dataport", "54230", "--viewport", "54001", "--authport", "54231", "--profileport", "51220",
+                "--fingerprint", "SHA256:eQmR2ar3Lq/CHlKETW+sZ8JqMDS48h/M/RIH8UmR0E4",
+            ]
+        );
     }
 
     #[cfg(windows)]

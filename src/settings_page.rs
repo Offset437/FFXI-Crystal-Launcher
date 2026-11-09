@@ -14,16 +14,19 @@ pub(crate) enum Tab {
     Sound,
     Controller,
     System,
+    Server,
 }
 
 impl Tab {
-    const ALL: [Tab; 4] = [Tab::Graphics, Tab::Sound, Tab::Controller, Tab::System];
+    const ALL: [Tab; 5] = [Tab::Graphics, Tab::Sound, Tab::Controller, Tab::System, Tab::Server];
     fn label(self) -> &'static str {
         match self {
             Tab::Graphics => t("Graphics"),
             Tab::Sound => t("Sound & interface"),
             Tab::Controller => t("Controller"),
             Tab::System => t("System"),
+            // English only, like the private-server text it belongs with
+            Tab::Server => "Server",
         }
     }
     /// The suffix used by `--preview-settings-<flag>` and the preview filename.
@@ -33,6 +36,7 @@ impl Tab {
             Tab::Sound => "sound",
             Tab::Controller => "controller",
             Tab::System => "system",
+            Tab::Server => "server",
         }
     }
     pub(crate) fn from_flag(flag: &str) -> Option<Tab> {
@@ -84,6 +88,7 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
             sign_in_switch(app), crate::launch_tools::view(app), crate::prereqs::view(app), ownership_notice(app)]
             .spacing(14.0 * s)
             .into(),
+        Tab::Server => crate::server_admin_page::view(app),
     };
     let header = row![
         column![
