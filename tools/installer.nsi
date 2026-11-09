@@ -18,6 +18,9 @@ Unicode true
 !ifndef UNINSTALL_KEY
   !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\CrystalLauncher"
 !endif
+!ifndef PROJECT_URL
+  !define PROJECT_URL "https://github.com/porisius/FFXI-Crystal-Launcher"
+!endif
 !ifndef SHORTCUT_NAME
   !define SHORTCUT_NAME "Crystal Launcher"
 !endif
@@ -453,7 +456,7 @@ Section "Crystal Launcher"
   !insertmacro StageReg Str "DisplayIcon" "$INSTDIR\Crystal-Launcher.exe"
   !insertmacro StageReg Str "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
   !insertmacro StageReg Str "QuietUninstallString" '$\"$INSTDIR\Uninstall.exe$\" /S'
-  !insertmacro StageReg Str "URLInfoAbout" "https://github.com/Offset437/Crystal-Launcher"
+  !insertmacro StageReg Str "URLInfoAbout" "${PROJECT_URL}"
   !insertmacro StageReg DWORD "NoModify" 1
   !insertmacro StageReg DWORD "NoRepair" 1
 

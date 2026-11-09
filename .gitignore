@@ -12,3 +12,5 @@ directories.json
 __pycache__/
 *.pyc
 /THIRD_PARTY_LICENSES.txt
+# Release signing keys never go in the repository
+*.pk8

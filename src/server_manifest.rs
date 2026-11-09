@@ -54,10 +54,62 @@ pub(crate) struct ClientInfo {
     /// False while the server holds players back from a new FFXI client it doesn't support yet.
     #[serde(default = "approved")]
     pub update_approved: bool,
+    /// "lsb-month" (LandSandBoat's own rule: the first 6 characters) or "exact".
+    #[serde(default)]
+    pub comparison_mode: String,
+    /// The server's login.VER_LOCK: 0 no check, 1 must match, 2 this version or newer.
+    #[serde(default = "newer_allowed")]
+    pub ver_lock: u8,
 }
 
 fn approved() -> bool {
     true
+}
+
+fn newer_allowed() -> u8 {
+    2
+}
+
+/// What the installed client means for logging in, judged the way the server's login does.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ClientVerdict {
+    Fine,
+    /// The server will refuse this client: don't launch.
+    Refused(String),
+    /// Likely fine, but worth a line in the launch status.
+    Note(String),
+}
+
+pub(crate) fn client_verdict(installed: &str, client: &ClientInfo, host: &str) -> ClientVerdict {
+    let required = client.required_version.trim();
+    if required.is_empty() || installed.is_empty() || client.ver_lock == 0 {
+        return ClientVerdict::Fine;
+    }
+    // LandSandBoat compares the first 6 characters (year and month of the patch)
+    let key = |version: &str| -> String {
+        if client.comparison_mode.eq_ignore_ascii_case("exact") {
+            version.to_owned()
+        } else {
+            version.chars().take(6).collect()
+        }
+    };
+    let (have, want) = (key(installed), key(required));
+    if have == want {
+        return ClientVerdict::Fine;
+    }
+    if have < want {
+        return ClientVerdict::Refused(format!(
+            "Your FINAL FANTASY XI client is {installed}, older than {host} accepts ({required}). Update FFXI first (Maintenance → Update), then launch again."
+        ));
+    }
+    if client.ver_lock == 1 {
+        return ClientVerdict::Refused(format!(
+            "Your FINAL FANTASY XI client is {installed}, newer than {host} supports ({required}). The server has to be updated before this client can log in there."
+        ));
+    }
+    ClientVerdict::Note(format!(
+        "Your FFXI client ({installed}) is newer than {host} expects ({required}). It's allowed in, but if something misbehaves the server may not support this patch yet."
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -357,6 +409,20 @@ pub(crate) fn prepare(
     };
     notes.extend(notes_for(&manifest));
 
+    // The same version rule the server's login applies, so a client it would refuse is caught
+    // here with a clear reason instead of a failed login
+    if let Some(client) = &manifest.client {
+        let installed = fs::read(game.join("patch.cfg"))
+            .ok()
+            .and_then(|bytes| crate::server_admin::client_version(&String::from_utf8_lossy(&bytes)))
+            .unwrap_or_default();
+        match client_verdict(&installed, client, &host) {
+            ClientVerdict::Fine => {}
+            ClientVerdict::Refused(reason) => return Err(reason),
+            ClientVerdict::Note(note) => notes.push(note),
+        }
+    }
+
     let ports = manifest.ports;
     // A blank hash is a server that couldn't hash its xiloader (older LSB manifests send one
     // when the file is missing): the same as naming none
@@ -562,6 +628,33 @@ mod tests {
         ] {
             assert!(loader_url(&entry(address), &manifest).is_err(), "{address} should be refused");
         }
+    }
+
+    #[test]
+    fn client_versions_are_judged_like_lsb_login() {
+        let client = |required: &str, mode: &str, ver_lock: u8| ClientInfo {
+            required_version: required.into(),
+            update_approved: true,
+            comparison_mode: mode.into(),
+            ver_lock,
+        };
+        let lsb = client("30261006_0", "lsb-month", 2);
+        // Same month, any build: LSB only looks at the first 6 characters
+        assert_eq!(client_verdict("30261006_0", &lsb, "h"), ClientVerdict::Fine);
+        assert_eq!(client_verdict("30261015_2", &lsb, "h"), ClientVerdict::Fine);
+        assert!(matches!(client_verdict("30260910_0", &lsb, "h"), ClientVerdict::Refused(r) if r.contains("older")));
+        assert!(matches!(client_verdict("30261106_0", &lsb, "h"), ClientVerdict::Note(_)));
+        // VER_LOCK 1: newer is refused too; VER_LOCK 0: nothing is
+        assert!(matches!(client_verdict("30261106_0", &client("30261006_0", "lsb-month", 1), "h"), ClientVerdict::Refused(r) if r.contains("newer")));
+        assert_eq!(client_verdict("30200101_0", &client("30261006_0", "lsb-month", 0), "h"), ClientVerdict::Fine);
+        // Exact mode compares the whole string
+        assert!(matches!(client_verdict("30261006_0", &client("30261006_1", "exact", 2), "h"), ClientVerdict::Refused(_)));
+        // Unknown installed version or no requirement: don't get in the way
+        assert_eq!(client_verdict("", &lsb, "h"), ClientVerdict::Fine);
+        assert_eq!(client_verdict("30200101_0", &client("", "lsb-month", 2), "h"), ClientVerdict::Fine);
+        // An LSB manifest without verLock (older server build) means the default, 2
+        let parsed = parse(br#"{"schemaVersion":1,"client":{"requiredVersion":"30261006_0","comparisonMode":"lsb-month"}}"#).unwrap();
+        assert_eq!(parsed.client.unwrap().ver_lock, 2);
     }
 
     #[test]

@@ -19,8 +19,21 @@ use std::{
     time::Duration,
 };
 
-const INDEX: &str = "https://api.github.com/repos/Offset437/Crystal-Launcher/releases?per_page=10";
-const RELEASE_PATH: &str = "/Offset437/Crystal-Launcher/releases/download/";
+/// The GitHub repository (`owner/name`) Crystal updates itself from. Its releases must be signed
+/// with the private key matching assets/update-public-key.hex (see docs/RELEASING.md). Set
+/// CRYSTAL_RELEASE_REPO when building to publish from another repository.
+const REPO: &str = match option_env!("CRYSTAL_RELEASE_REPO") {
+    Some(repo) => repo,
+    None => "porisius/FFXI-Crystal-Launcher",
+};
+
+fn index_url() -> String {
+    format!("https://api.github.com/repos/{REPO}/releases?per_page=10")
+}
+
+fn release_path() -> String {
+    format!("/{REPO}/releases/download/")
+}
 const PUBLIC_KEY: &str = include_str!("../assets/update-public-key.hex");
 const MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
 const MAX_METADATA: usize = 512 * 1024;
@@ -138,6 +151,13 @@ fn trusted_key() -> Result<[u8; 32], String> {
 }
 
 fn asset_url(url: &Url, extension: &str) -> bool {
+    // GitHub may spell the owner or name with other capitals than REPO
+    let prefix = release_path();
+    let path = url.path();
+    let rest = (path.len() > prefix.len()
+        && path.is_char_boundary(prefix.len())
+        && path[..prefix.len()].eq_ignore_ascii_case(&prefix))
+    .then(|| &path[prefix.len()..]);
     url.scheme() == "https"
         && url.host_str() == Some("github.com")
         && url.port_or_known_default() == Some(443)
@@ -145,8 +165,8 @@ fn asset_url(url: &Url, extension: &str) -> bool {
         && url.password().is_none()
         && url.query().is_none()
         && url.fragment().is_none()
-        && !url.path().contains('%')
-        && url.path().strip_prefix(RELEASE_PATH).is_some_and(|rest| {
+        && !path.contains('%')
+        && rest.is_some_and(|rest| {
             let parts: Vec<_> = rest.split('/').collect();
             parts.len() == 2
                 && !parts[0].is_empty()
@@ -253,7 +273,7 @@ async fn check() -> Result<Option<Release>, String> {
     let key = trusted_key()?;
     let client = client()?;
     let index = client
-        .get(INDEX)
+        .get(index_url())
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
@@ -767,7 +787,7 @@ mod tests {
     fn signed(version: &str) -> (Vec<u8>, [u8; 32]) {
         let key = signature::Ed25519KeyPair::from_seed_unchecked(&[17; 32]).unwrap();
         let payload = Payload { format: 1, platform: "windows-x86_64".into(), version: version.into(),
-            url: "https://github.com/Offset437/Crystal-Launcher/releases/download/v0.2.0/Crystal-Launcher.zip".into(),
+            url: format!("https://github.com/{REPO}/releases/download/v0.2.0/Crystal-Launcher.zip"),
             size: 400, sha256: "ab".repeat(32) };
         let payload = serde_json::to_string(&payload).unwrap();
         let envelope = Envelope {
@@ -792,11 +812,14 @@ mod tests {
 
     #[test]
     fn only_crystals_https_release_assets_are_accepted() {
-        let good = "https://github.com/Offset437/Crystal-Launcher/releases/download/v1/Crystal-Launcher.zip";
+        let good = format!("https://github.com/{REPO}/releases/download/v1/Crystal-Launcher.zip");
+        let good = good.as_str();
         assert!(asset_url(&Url::parse(good).unwrap(), ".zip"));
+        assert!(asset_url(&Url::parse(&good.to_ascii_lowercase()).unwrap(), ".zip"), "GitHub may change the capitals");
         for bad in [
             good.replace("https:", "http:"),
-            good.replace("Offset437", "someone"),
+            good.replace(REPO, "someone/Crystal-Launcher"),
+            good.replace(REPO, "Offset437/Crystal-Launcher"),
             format!("{good}?target=other"),
             good.replace("github.com", "github.com.evil.example"),
             good.replace("/v1/", "/%2e%2e/"),
