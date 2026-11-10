@@ -370,6 +370,16 @@ fn poll(slot: &mut Slot, engine: &mut Engine, now: u64, settings: &Settings) {
 
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(Some(0)).collect() }
 
+/// A one-off balloon outside the friends notices (the launcher-update restart notice), shown
+/// off the calling thread; a failure only loses the balloon.
+pub(crate) fn balloon(title: &str, body: &str) {
+    let (title, body) = (title.to_owned(), body.to_owned());
+    let _ = std::thread::Builder::new().name("notify-balloon".into()).spawn(move || {
+        let (done, _) = std::sync::mpsc::channel();
+        balloon_thread(&title, &body, done);
+    });
+}
+
 /// A tray balloon (Shell_NotifyIconW), which Windows 10/11 shows as a notification under
 /// Crystal's name. No WinRT, no AppUserModelID registration, nothing written to the registry.
 fn deliver(notice: &Notice) -> Delivery {

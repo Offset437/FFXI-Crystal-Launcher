@@ -201,6 +201,7 @@ pub(super) fn wire(ui: &MainWindow) {
     // ---- System ----
     view.on_update_action(|| act(|s| s.update_action.map(|action| Message::SelfUpdate(action.msg()))));
     view.on_update_auto(|on| emit(Message::SelfUpdate(crate::self_update::Msg::AutoCheck(on))));
+    view.on_update_restart(|on| emit(Message::SelfUpdate(crate::self_update::Msg::AutoRestart(on))));
     view.on_set_nav(|on| emit(Message::ControllerNavigation(on)));
     view.on_set_sign_in(|on| emit(Message::AutoSignIn(on)));
     view.on_set_keep(|on| emit(Message::SignInAfterGame(on)));
@@ -438,6 +439,8 @@ fn strings() -> SettingsStrings {
         updates_title: t("Launcher updates").into(),
         updates_auto: t("Check for launcher updates when Crystal opens").into(),
         updates_note: t("Updates are signed and verified before installation. Running games stay open.").into(),
+        updates_restart: t("Restart automatically to install updates").into(),
+        updates_restart_note: t("Only when no game is running and Crystal is not in use, after a 10-second notice.").into(),
         nav_label: t("Navigate Crystal with a controller").into(),
         nav_note_1: t("D-pad or left stick moves focus. Bottom face button selects; right face button goes back. Shoulders change pages; Start activates Play or Update.").into(),
         nav_note_2: t("Select a dropdown or slider, adjust it with the D-pad, then select again to finish. Text entry and Windows file dialogs use the keyboard and mouse.").into(),
@@ -562,6 +565,7 @@ fn system(view: &SettingsView, app: &App, state: &mut State) {
         privacy: set.privacy,
         language: Lang::ALL.iter().position(|lang| *lang == crate::i18n::current()).map_or(-1, |i| i as i32),
         updates_auto: set.launcher_auto_updates,
+        updates_restart: set.launcher_auto_restart,
         nav: set.controller_navigation,
         sign_in: set.auto_sign_in,
         keep: set.sign_in_after_game,

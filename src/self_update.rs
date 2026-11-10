@@ -1,6 +1,8 @@
 //! Signed launcher releases, downloaded separately from the game updater.
 //! The release signature covers the version, URL, archive length and hash.
 mod apply;
+/// Restarting by itself to install a downloaded update, when nobody would notice.
+pub(crate) mod auto;
 pub(crate) mod model;
 /// The settings card's status as plain data for the Slint front end.
 pub(crate) mod front;
@@ -91,6 +93,21 @@ pub(crate) enum Msg {
     Apply,
     Applied(Result<(), String>),
     AutoCheck(bool),
+    /// Settings → System: restart by itself to install a downloaded update (`auto`).
+    AutoRestart(bool),
+    /// "Not now" on the restart countdown (`auto::AutoRestart::postpone`).
+    Postpone,
+}
+
+/// One line in Crystal's launch history (`launch_log`), never in a preview.
+fn log(config: &Config, line: &str) {
+    crate::launch_log::append_history(&config.history_path(), "Crystal", line, None);
+}
+
+impl Stage {
+    pub(crate) fn version(&self) -> &str {
+        &self.release.payload.version
+    }
 }
 
 fn last_error_path(data: &Path) -> PathBuf {
@@ -103,12 +120,104 @@ pub(crate) fn initial(config: &Config) -> State {
         return State::Idle;
     }
     let state = take_last_error(&config.experiment);
+    let failed = matches!(state, State::Error(_));
+    // A download an earlier run finished and verified is used again, never fetched twice.
+    // After a failed install it is discarded: the next check starts clean.
+    let kept = if failed {
+        None
+    } else {
+        trusted_key()
+            .ok()
+            .and_then(|key| staged(&config.experiment, &key, &current_version()))
+    };
     clean_stale(
         &config.experiment,
         std::env::current_exe().ok().as_deref(),
-        matches!(state, State::Error(_)),
+        failed,
+        kept.as_ref().map(|stage| stage.directory.as_path()),
     );
-    state
+    match kept {
+        Some(stage) => {
+            log(config, &format!("self-update: reusing the verified {} download", stage.version()));
+            State::Ready(stage)
+        }
+        None => state,
+    }
+}
+
+/// A download an earlier run staged, verified again from disk as if it had just arrived: the
+/// metadata's signature against `key`, a version newer than `current`, and the archive's
+/// length and SHA-256. The metadata is written only after the archive verified (`stage`), so
+/// an interrupted download has none and fails here.
+fn load_stage(directory: &Path, key: &[u8; 32], current: &semver::Version) -> Result<Stage, String> {
+    let metadata = directory.join("launcher-update.json");
+    if !fs::symlink_metadata(&metadata).is_ok_and(|m| m.is_file()) {
+        return Err(t("Launcher update download is incomplete.").into());
+    }
+    let release = verify(&read_metadata(&metadata)?, key)?;
+    if release.version <= *current {
+        return Err(t("Launcher updates cannot install an older or identical version.").into());
+    }
+    verify_archive(&directory.join("release.zip"), &release)?;
+    Ok(Stage { release, directory: directory.to_owned() })
+}
+
+/// The newest staged download that still verifies (`load_stage`), if any.
+fn staged(data: &Path, key: &[u8; 32], current: &semver::Version) -> Option<Stage> {
+    let mut best: Option<Stage> = None;
+    for entry in fs::read_dir(data.join("launcher-updates")).ok()?.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        if let Ok(stage) = load_stage(&entry.path(), key, current) {
+            if best.as_ref().is_none_or(|b| stage.release.version > b.release.version) {
+                best = Some(stage);
+            }
+        }
+    }
+    best
+}
+
+/// Before the window or any account work: a verified update an earlier run downloaded but did
+/// not install (Crystal was closed, from the window or the tray, while it waited) is installed
+/// now. `true`: the helper is ready and waiting for this process to exit, so main() returns
+/// and the helper starts the new version. Running games and session workers are never touched.
+pub(crate) fn apply_at_start(config: &Config) -> bool {
+    if std::env::args().any(|a| a.starts_with("--preview")) {
+        return false;
+    }
+    let Ok(key) = trusted_key() else { return false };
+    start_staged(config, &key, &current_version(), apply::start)
+}
+
+fn start_staged(
+    config: &Config,
+    key: &[u8; 32],
+    current: &semver::Version,
+    start: impl FnOnce(&Stage) -> Result<(), String>,
+) -> bool {
+    let data = &config.experiment;
+    // The last install failed: this start reports it and discards the download (`initial`),
+    // so a broken update is never retried at every start.
+    if last_error_path(data).exists() {
+        return false;
+    }
+    let Some(stage) = staged(data, key, current) else { return false };
+    match start(&stage) {
+        Ok(()) => {
+            log(config, &format!("self-update: applied {} at start", stage.version()));
+            true
+        }
+        Err(error) => {
+            log(config, &format!("self-update: could not apply {} at start: {error}", stage.version()));
+            let path = last_error_path(data);
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(path, error);
+            false
+        }
+    }
 }
 
 /// A failed helper run is reported on the next start only, so later starts check again.
@@ -131,13 +240,13 @@ fn clear_last_error(data: &Path) {
     let _ = fs::remove_file(last_error_path(data));
 }
 
-/// Best effort: staging folders from earlier runs, and package backups beside the exe once
-/// no failure needs them; a backup whose restore failed is never removed. Root-level notes
-/// in launcher-updates stay.
-fn clean_stale(data: &Path, exe: Option<&Path>, failed: bool) {
+/// Best effort: staging folders from earlier runs (all but `keep`, the verified download
+/// reused), and package backups beside the exe once no failure needs them; a backup whose
+/// restore failed is never removed. Root-level notes in launcher-updates stay.
+fn clean_stale(data: &Path, exe: Option<&Path>, failed: bool, keep: Option<&Path>) {
     if let Ok(entries) = fs::read_dir(data.join("launcher-updates")) {
         for entry in entries.flatten() {
-            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) && keep != Some(entry.path().as_path()) {
                 let _ = fs::remove_dir_all(entry.path());
             }
         }
@@ -593,9 +702,14 @@ pub(crate) fn update(state: &mut State, msg: Msg, config: &Config, can_restart: 
                 clear_last_error(&config.experiment);
             }
             *state = match result {
-                Ok(stage) => State::Ready(stage),
+                Ok(stage) => {
+                    // Kept on disk: if it is not installed now, the next start installs it.
+                    log(config, &format!("self-update: downloaded and verified {}", stage.version()));
+                    State::Ready(stage)
+                }
                 Err(error) => State::Error(error),
             };
+            // The user asked for "Update and restart": restart now when nothing would be lost.
             if can_restart && matches!(state, State::Ready(_)) {
                 return Effect::done(Msg::Apply);
             }
@@ -603,6 +717,7 @@ pub(crate) fn update(state: &mut State, msg: Msg, config: &Config, can_restart: 
         Msg::Apply if can_restart => {
             if let State::Ready(stage) = state {
                 let stage = stage.clone();
+                log(config, &format!("self-update: installing {} and restarting", stage.version()));
                 *state = State::Applying;
                 return Effect::perform(
                     async move {
@@ -616,7 +731,10 @@ pub(crate) fn update(state: &mut State, msg: Msg, config: &Config, can_restart: 
                 );
             }
         }
-        Msg::Applied(Err(error)) => *state = State::Error(error),
+        Msg::Applied(Err(error)) => {
+            log(config, &format!("self-update: install failed: {error}"));
+            *state = State::Error(error);
+        }
         _ => {}
     }
     Effect::none()
@@ -748,7 +866,7 @@ fn sign_release(args: &[String]) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn signed(version: &str) -> (Vec<u8>, [u8; 32]) {
@@ -770,6 +888,112 @@ mod tests {
     fn release(version: &str) -> Release {
         let (data, key) = signed(version);
         verify(&data, &key).unwrap()
+    }
+
+    /// A finished download of `version` in `data`'s staging folder `name`, as `stage` leaves it:
+    /// the archive, then the signed metadata that names its length and hash.
+    fn staged_download(data: &Path, name: &str, version: &str, archive: &[u8]) -> ([u8; 32], PathBuf) {
+        let key = signature::Ed25519KeyPair::from_seed_unchecked(&[17; 32]).unwrap();
+        let payload = Payload { format: 1, platform: "windows-x86_64".into(), version: version.into(),
+            url: "https://github.com/Offset437/FFXI-Crystal-Launcher/releases/download/v9/Crystal-Launcher.zip".into(),
+            size: archive.len() as u64, sha256: sha256_hex(archive) };
+        let payload = serde_json::to_string(&payload).unwrap();
+        let envelope = Envelope { signature: hex(key.sign(payload.as_bytes()).as_ref()), payload };
+        let directory = data.join("launcher-updates").join(name);
+        fs::create_dir_all(directory.join("verified")).unwrap();
+        fs::write(directory.join("release.zip"), archive).unwrap();
+        fs::write(directory.join("launcher-update.json"), serde_json::to_vec(&envelope).unwrap()).unwrap();
+        (key.public_key().as_ref().try_into().unwrap(), directory)
+    }
+
+    #[test]
+    fn a_verified_download_is_kept_across_restarts_and_reused() {
+        let root = scratch("reuse");
+        let current = semver::Version::parse("1.2.1").unwrap();
+        let (key, directory) = staged_download(&root, "100-1", "1.2.2", &[3; 600]);
+        let stage = staged(&root, &key, &current).expect("the finished download is reused");
+        assert_eq!(stage.version(), "1.2.2");
+        assert_eq!(stage.directory, directory);
+        // The start that reuses it keeps it; every other staging folder goes.
+        fs::create_dir_all(root.join("launcher-updates/200-2")).unwrap();
+        clean_stale(&root, None, false, Some(&stage.directory));
+        assert!(directory.join("release.zip").exists());
+        assert!(!root.join("launcher-updates/200-2").exists());
+        // The newest of two verified downloads wins.
+        staged_download(&root, "300-3", "1.3.0", &[4; 500]);
+        assert_eq!(staged(&root, &key, &current).unwrap().version(), "1.3.0");
+        // Another key's signature, or the running version itself, is not reused.
+        assert!(staged(&root, &[9; 32], &current).is_none());
+        assert!(staged(&root, &key, &semver::Version::parse("2.0.0").unwrap()).is_none(), "older than the running version");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_and_corrupt_downloads_are_discarded() {
+        let root = scratch("corrupt");
+        let current = semver::Version::parse("1.2.1").unwrap();
+        // Interrupted: the archive arrived in part and the metadata was never written.
+        let (key, partial) = staged_download(&root, "1-1", "1.2.2", &[1; 300]);
+        fs::remove_file(partial.join("launcher-update.json")).unwrap();
+        // Same length, one byte changed.
+        let (_, changed) = staged_download(&root, "2-2", "1.2.2", &[2; 300]);
+        let mut bytes = fs::read(changed.join("release.zip")).unwrap();
+        bytes[10] ^= 1;
+        fs::write(changed.join("release.zip"), bytes).unwrap();
+        // Truncated.
+        let (_, short) = staged_download(&root, "3-3", "1.2.2", &[3; 300]);
+        fs::write(short.join("release.zip"), [3; 100]).unwrap();
+        // Tampered metadata.
+        let (_, tampered) = staged_download(&root, "4-4", "1.2.2", &[4; 300]);
+        let text = fs::read_to_string(tampered.join("launcher-update.json")).unwrap();
+        fs::write(tampered.join("launcher-update.json"), text.replace("1.2.2", "1.9.9")).unwrap();
+        assert!(staged(&root, &key, &current).is_none());
+        clean_stale(&root, None, false, None);
+        for directory in [partial, changed, short, tampered] {
+            assert!(!directory.exists(), "{}", directory.display());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_staged_update_installs_at_the_next_start_once() {
+        let root = scratch("at-start");
+        let config = Config { experiment: root.clone(), repository: root.clone(), game_install: None, dat_overlays: vec![] };
+        let current = semver::Version::parse("1.2.1").unwrap();
+        // Nothing staged: the start goes on as usual.
+        assert!(!start_staged(&config, &[0; 32], &current, |_| panic!("nothing to install")));
+        let (key, directory) = staged_download(&root, "5-5", "1.2.2", &[5; 400]);
+        let mut started = None;
+        assert!(start_staged(&config, &key, &current, |stage| { started = Some(stage.directory.clone()); Ok(()) }));
+        assert_eq!(started.as_ref(), Some(&directory), "the helper gets the verified download");
+        // A helper that fails leaves its error for this start to show, and the next start
+        // reports it and discards the download instead of trying again.
+        assert!(!start_staged(&config, &key, &current, |_| Err("helper failed".into())));
+        assert_eq!(fs::read_to_string(last_error_path(&root)).unwrap(), "helper failed");
+        assert!(!start_staged(&config, &key, &current, |_| panic!("never retried after a failure")));
+        let state = take_last_error(&root);
+        assert!(matches!(&state, State::Error(e) if e == "helper failed"));
+        clean_stale(&root, None, true, None);
+        assert!(!directory.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A ready update for other modules' tests (the pill, the automatic restart).
+    pub(crate) fn fixture_stage(version: &str) -> Stage {
+        Stage { release: release(version), directory: std::env::temp_dir().join("crystal-fixture-stage") }
+    }
+
+    #[test]
+    fn the_ready_update_applies_when_asked_and_crystal_is_free() {
+        let root = scratch("apply");
+        let config = Config { experiment: root.clone(), repository: root.clone(), game_install: None, dat_overlays: vec![] };
+        let mut state = State::Ready(fixture_stage("9.0.0"));
+        let _ = update(&mut state, Msg::Apply, &config, false);
+        assert!(matches!(state, State::Ready(_)), "work in flight: it waits");
+        let effect = update(&mut state, Msg::Apply, &config, true);
+        assert!(matches!(state, State::Applying));
+        assert!(effect.is_async(), "the helper starts off the interface thread");
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn scratch(tag: &str) -> PathBuf {
@@ -839,7 +1063,7 @@ mod tests {
 
         let state = take_last_error(&data);
         assert!(matches!(&state, State::Error(e) if e == "helper failed"));
-        clean_stale(&data, Some(&exe), true);
+        clean_stale(&data, Some(&exe), true, None);
         assert!(!updates.join("123-456").exists());
         assert!(updates.join("last-registration-warning.txt").exists());
         // The failure may name this backup, so it survives the start that reports it.
@@ -848,7 +1072,7 @@ mod tests {
         assert!(matches!(take_last_error(&data), State::Idle));
         fs::create_dir_all(install.join(".crystal-previous-3-4")).unwrap();
         fs::write(install.join(".crystal-previous-3-4").join(apply::RESTORE_FAILED), "").unwrap();
-        clean_stale(&data, Some(&exe), false);
+        clean_stale(&data, Some(&exe), false, None);
         assert!(!install.join(".crystal-previous-1-2").exists());
         assert!(install.join(".crystal-previous-3-4").exists(), "its restore failed: the only old copy");
         assert!(install.join("keep").exists());

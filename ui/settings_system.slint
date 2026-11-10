@@ -335,6 +335,12 @@ export component SystemTab inherits VerticalLayout {
             note-1: SettingsView.strings.updates-note;
             toggled(on) => { SettingsView.update-auto(on); }
         }
+        SwitchNotes {
+            text: SettingsView.strings.updates-restart;
+            on: SettingsView.system.updates-restart;
+            note-1: SettingsView.strings.updates-restart-note;
+            toggled(on) => { SettingsView.update-restart(on); }
+        }
     }
 
     // Controller navigation.

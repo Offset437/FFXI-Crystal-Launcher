@@ -360,6 +360,8 @@ impl Host {
             match event {
                 WindowEvent::Focused(focused) => {
                     let focused = *focused;
+                    // The automatic update restart waits while the window is in use.
+                    post(Message::WindowFocus(focused));
                     if let Some(host) = host() {
                         if let Some(shown) = host.window.borrow().as_ref() {
                             shown.ui.global::<Theme>().set_animate(focused);

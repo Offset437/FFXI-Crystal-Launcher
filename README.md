@@ -54,15 +54,15 @@ Get the latest build from [Releases](https://github.com/Offset437/FFXI-Crystal-L
 
 | File | Use it when |
 |---|---|
-| `Crystal-Launcher-1.2.1-Setup.exe` | You want Desktop and Start menu shortcuts. Installs per user, no admin prompt. |
-| `Crystal-Launcher-1.2.1.zip` | You want a portable copy. Unzip and run. |
+| `Crystal-Launcher-1.2.2-Setup.exe` | You want Desktop and Start menu shortcuts. Installs per user, no admin prompt. |
+| `Crystal-Launcher-1.2.2.zip` | You want a portable copy. Unzip and run. |
 | `SHA256SUMS` | You want to verify the download. |
 | `launcher-update.json` | Never. The built-in updater reads it. |
 
 If SmartScreen warns you, choose **More info**, then **Run anyway**. To check the file first, compare its hash with `SHA256SUMS`:
 
 ```powershell
-Get-FileHash .\Crystal-Launcher-1.2.1-Setup.exe -Algorithm SHA256
+Get-FileHash .\Crystal-Launcher-1.2.2-Setup.exe -Algorithm SHA256
 ```
 
 Crystal updates itself. Every update is signed (Ed25519) and verified before it installs.

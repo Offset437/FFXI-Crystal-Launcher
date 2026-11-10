@@ -934,6 +934,43 @@ mod tests {
         assert_eq!(dl.get_update_card().action, "");
     }
 
+    /// The rail's pill for a downloaded update ("1.2.2 ready"): enabled while Crystal can
+    /// restart, and its click sends Apply (install and restart); during the automatic restart's
+    /// countdown it reads "Restarting in 10 s" and its click is "Not now".
+    #[test]
+    fn the_ready_pill_installs_and_restarts_and_its_countdown_postpones() {
+        let _window = headless(1440, 900);
+        let mut app = downloads_app();
+        app.self_update = UpdateState::Ready(crate::self_update::tests::fixture_stage("9.0.0"));
+        assert!(app.can_restart_launcher());
+        let ui = page(&app);
+        let dl = ui.global::<Downloads>();
+        assert!(dl.get_update_banner());
+        assert_eq!(dl.get_update_strip().pill, "9.0.0 ready");
+        assert_eq!(dl.get_update_strip().action, t("Restart to update"), "the pill is enabled");
+        dl.invoke_update_strip_clicked();
+        let sent = take();
+        assert!(matches!(sent.as_slice(), [Message::SelfUpdate(UpdateMsg::Apply)]), "{}", sent.len());
+        // A sign-in in flight: the pill waits (disabled) and says when it installs.
+        app.accounts[0].busy = true;
+        resync(&ui, &app);
+        assert_eq!(dl.get_update_strip().action, "");
+        assert!(dl.get_update_strip().text.contains(t("It installs when Crystal is free, or the next time it starts.")));
+        dl.invoke_update_strip_clicked();
+        assert!(take().is_empty());
+        app.accounts[0].busy = false;
+        // The automatic restart's countdown.
+        let now = std::time::Instant::now();
+        assert_eq!(app.auto_restart.step(crate::self_update::auto::Conditions {
+            enabled: true, ready: true, can_restart: true, ..Default::default() }, now),
+            crate::self_update::auto::Step::Scheduled);
+        resync(&ui, &app);
+        assert!(dl.get_update_strip().pill.starts_with("Restarting in "), "{}", dl.get_update_strip().pill);
+        assert_eq!(dl.get_update_strip().action, t("Not now"));
+        dl.invoke_update_strip_clicked();
+        assert!(matches!(take().as_slice(), [Message::SelfUpdate(UpdateMsg::Postpone)]));
+    }
+
     /// Keyboard Tab and the controller walker reach every control on the page: each press sends
     /// its message (the core is not updated, so nothing moves while walking).
     #[test]

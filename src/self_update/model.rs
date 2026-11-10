@@ -14,10 +14,30 @@ pub(crate) struct Line {
 /// The strip under the title bar, when an update is found, downloading, ready or applying.
 pub(crate) fn banner(app: &App) -> Option<Line> {
     let (text, action) = match &app.self_update {
-        State::Ready(_) => (t("The launcher update is ready.").into(), restart_action(app)),
+        State::Ready(stage) => match countdown(app) {
+            Some(seconds) => (
+                tf("Restarting to install {version} in {seconds} s.", &[("version", &stage.version()), ("seconds", &seconds)]),
+                Some((t("Not now"), Msg::Postpone)),
+            ),
+            None => ready_line(app),
+        },
         _ => shared_status(app)?,
     };
     Some(Line { text, action })
+}
+
+/// The restart countdown's seconds, while it runs.
+fn countdown(app: &App) -> Option<u64> {
+    app.auto_restart.remaining(std::time::Instant::now())
+}
+
+/// A downloaded update: restart now when nothing would be lost; otherwise it says when it
+/// installs (the button returns once Crystal is free).
+fn ready_line(app: &App) -> (String, Option<(&'static str, Msg)>) {
+    match restart_action(app) {
+        Some(action) => (t("The launcher update is ready.").into(), Some(action)),
+        None => (format!("{} {}", t("The launcher update is ready."), t("It installs when Crystal is free, or the next time it starts.")), None),
+    }
 }
 
 /// The rail's pill beside the brand while the banner shows: a few words, and whether work is
@@ -26,7 +46,10 @@ pub(crate) fn pill(app: &App) -> Option<(String, bool)> {
     Some(match &app.self_update {
         State::Available(release) => (tf("{version} available", &[("version", &release.payload.version)]), false),
         State::Downloading => (t("Updating").into(), true),
-        State::Ready(stage) => (tf("{version} ready", &[("version", &stage.release.payload.version)]), false),
+        State::Ready(stage) => match countdown(app) {
+            Some(seconds) => (tf("Restarting in {seconds} s", &[("seconds", &seconds)]), false),
+            None => (tf("{version} ready", &[("version", &stage.version())]), false),
+        },
         State::Applying => (t("Restarting").into(), true),
         _ => return None,
     })
@@ -40,13 +63,26 @@ pub(crate) fn card(app: &App) -> Line {
         State::Checking => (t("Checking for launcher updates…").into(), None),
         State::Current => (t("Crystal Launcher is up to date.").into(), Some((t("Check again"), Msg::Check))),
         State::NotPublished => (t("No launcher releases have been published yet.").into(), Some((t("Check again"), Msg::Check))),
-        State::Ready(stage) => (
-            tf("Crystal Launcher {version} is ready to install.", &[("version", &stage.release.payload.version)]),
-            restart_action(app),
-        ),
+        State::Ready(_) => ready_card(app),
         State::Error(error) => (error.clone(), Some((t("Try again"), Msg::Check))),
     };
     Line { text, action }
+}
+
+/// The card's line for a downloaded update (Settings → System), shared with `front::status`.
+pub(super) fn ready_card(app: &App) -> (String, Option<(&'static str, Msg)>) {
+    let State::Ready(stage) = &app.self_update else { return Default::default() };
+    if let Some(seconds) = countdown(app) {
+        return (
+            tf("Restarting to install {version} in {seconds} s.", &[("version", &stage.version()), ("seconds", &seconds)]),
+            Some((t("Not now"), Msg::Postpone)),
+        );
+    }
+    let ready = tf("Crystal Launcher {version} is ready to install.", &[("version", &stage.version())]);
+    match restart_action(app) {
+        Some(action) => (ready, Some(action)),
+        None => (format!("{ready} {}", t("It installs when Crystal is free, or the next time it starts.")), None),
+    }
 }
 
 #[cfg(test)]

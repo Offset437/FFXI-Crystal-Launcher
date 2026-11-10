@@ -8,6 +8,11 @@ pub(super) fn start(stage: &Stage) -> Result<(), String> {
     verify_archive(&stage.directory.join("release.zip"), &stage.release)?;
     let target = std::env::current_exe().map_err(|e| e.to_string())?;
     validate_target(&target)?;
+    // A download reused from an earlier run may hold an earlier attempt's files; the helper
+    // unpacks into a folder it creates itself.
+    let _ = fs::remove_dir_all(stage.directory.join("apply-verified"));
+    let _ = fs::remove_file(stage.directory.join("helper-ready"));
+    let _ = fs::remove_file(stage.directory.join("last-error.txt"));
     let helper = stage.directory.join("apply-helper.exe");
     fs::copy(&target, &helper).map_err(|e| e.to_string())?;
     let mut command = Command::new(helper);
@@ -16,6 +21,10 @@ pub(super) fn start(stage: &Stage) -> Result<(), String> {
         .arg(std::process::id().to_string())
         .arg(&target)
         .arg(&stage.directory);
+    // A launcher started in the background (Start with Windows) comes back in the background.
+    if std::env::args().any(|arg| arg == "--background") {
+        command.arg("--background");
+    }
     use std::os::windows::process::CommandExt;
     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     let mut child = command.spawn().map_err(|e| e.to_string())?;
@@ -322,12 +331,20 @@ fn refresh_registration_after_restart(
 }
 
 pub(super) fn run(args: &[String]) -> Result<(), String> {
-    if args.len() != 5 {
+    if !(args.len() == 5 || (args.len() == 6 && args[5] == "--background")) {
         return Err("Invalid update helper arguments.".into());
     }
     let pid = args[2].parse::<u32>().map_err(|e| e.to_string())?;
     let target = PathBuf::from(&args[3]);
     let directory = PathBuf::from(&args[4]);
+    let background = args.len() == 6;
+    let relaunch = |target: &Path| {
+        let mut command = Command::new(target);
+        if background {
+            command.arg("--background");
+        }
+        command.spawn()
+    };
     if !directory.is_absolute() {
         return Err("An absolute staging directory is required.".into());
     }
@@ -357,7 +374,7 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
         parent.wait()?;
         parent_closed = true;
         let backup = install_package(&extracted, &target)?;
-        match Command::new(&target).spawn() {
+        match relaunch(&target) {
             Ok(_) => {
                 // No rollback is possible past this point; the backup is only clutter.
                 let _ = fs::remove_dir_all(&backup);
@@ -382,7 +399,7 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
             let _ = fs::write(root.join("last-error.txt"), error);
         }
         if parent_closed {
-            let _ = Command::new(&target).spawn();
+            let _ = relaunch(&target);
         }
     } else if let Some(root) = directory.parent() {
         let _ = fs::remove_file(root.join("last-error.txt"));

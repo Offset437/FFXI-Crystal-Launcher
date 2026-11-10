@@ -1,6 +1,6 @@
 //! The Launcher updates card's status line and action as plain data the Slint page draws.
-use super::{restart_action, shared_status, Msg, State};
-use crate::i18n::{t, tf};
+use super::{shared_status, Msg, State};
+use crate::i18n::t;
 use crate::App;
 
 /// The card's action, comparable (Msg carries releases that are not).
@@ -9,6 +9,7 @@ pub(crate) enum Action {
     Check,
     Download,
     Apply,
+    Postpone,
 }
 
 impl Action {
@@ -17,6 +18,7 @@ impl Action {
             Action::Check => Msg::Check,
             Action::Download => Msg::Download,
             Action::Apply => Msg::Apply,
+            Action::Postpone => Msg::Postpone,
         }
     }
 }
@@ -27,6 +29,7 @@ fn comparable(action: Option<(&'static str, Msg)>) -> Option<(&'static str, Acti
             Msg::Check => Action::Check,
             Msg::Download => Action::Download,
             Msg::Apply => Action::Apply,
+            Msg::Postpone => Action::Postpone,
             _ => return None,
         }))
     })
@@ -40,10 +43,7 @@ pub(crate) fn status(app: &App) -> (String, Option<(&'static str, Action)>) {
         State::Checking => (t("Checking for launcher updates…").into(), None),
         State::Current => (t("Crystal Launcher is up to date.").into(), Some((t("Check again"), Msg::Check))),
         State::NotPublished => (t("No launcher releases have been published yet.").into(), Some((t("Check again"), Msg::Check))),
-        State::Ready(stage) => (
-            tf("Crystal Launcher {version} is ready to install.", &[("version", &stage.release.payload.version)]),
-            restart_action(app),
-        ),
+        State::Ready(_) => super::model::ready_card(app),
         State::Error(error) => (error.clone(), Some((t("Try again"), Msg::Check))),
     };
     (status, comparable(action))

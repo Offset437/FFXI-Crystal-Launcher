@@ -22,6 +22,8 @@ export struct SettingsStrings {
     updates-title: string,
     updates-auto: string,
     updates-note: string,
+    updates-restart: string,
+    updates-restart-note: string,
     nav-label: string,
     nav-note-1: string,
     nav-note-2: string,
@@ -134,6 +136,7 @@ export struct SystemState {
     updates-status: string,
     updates-action: string,
     updates-auto: bool,
+    updates-restart: bool,
     nav: bool,
     sign-in: bool,
     keep: bool,
@@ -397,6 +400,7 @@ export global SettingsView {
     in property <string> version;
     callback update-action();
     callback update-auto(bool);
+    callback update-restart(bool);
     callback set-nav(bool);
     callback set-sign-in(bool);
     callback set-keep(bool);

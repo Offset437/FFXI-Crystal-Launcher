@@ -231,6 +231,10 @@ pub(crate) struct Settings {
     pub reshade: reshade::Preferences,
     #[serde(default = "default_true")]
     pub launcher_auto_updates: bool,
+    /// Settings → System: a downloaded launcher update installs by itself when no game runs
+    /// and nobody is using the window (`self_update::auto`). On by default.
+    #[serde(default = "default_true")]
+    pub launcher_auto_restart: bool,
     #[serde(default = "default_true")]
     pub controller_navigation: bool,
     /// Settings → System: the window's close button keeps Crystal running in the
@@ -279,6 +283,7 @@ impl Default for Settings {
             dgvoodoo: true,
             reshade: reshade::Preferences::default(),
             launcher_auto_updates: true,
+            launcher_auto_restart: true,
             controller_navigation: true,
             close_to_tray: false,
             start_with_windows: false,
@@ -832,6 +837,8 @@ pub(crate) enum Message {
     FriendsAutoAway(u8),
     /// Keyboard or mouse input reached the window (throttled at the source).
     UserInput,
+    /// The window gained (`true`) or lost the keyboard focus (minimising loses it).
+    WindowFocus(bool),
     FriendsQuery(String),
     /// Open a conversation, the Mailbox or the block list (None: nothing).
     FriendsSelect(Option<friends::Pane>),
@@ -1121,6 +1128,8 @@ pub(crate) struct App {
     pub dgvoodoo: dgvoodoo::State,
     pub reshade: reshade::State,
     pub self_update: self_update::State,
+    /// The automatic restart that installs a downloaded update (`self_update::auto`).
+    pub(crate) auto_restart: self_update::auto::AutoRestart,
     pub controller_nav: controller_nav::State,
     /// The launcher features beside Play (`features`); `None` in previews and tests.
     pub(crate) features: Option<features::Runtime>,
@@ -1254,6 +1263,7 @@ impl App {
             dgvoodoo,
             reshade: reshade::State::default(),
             self_update: self_update::State::default(),
+            auto_restart: self_update::auto::AutoRestart::default(),
             controller_nav: controller_nav::State::default(),
             features: None,
             features_sessions: Vec::new(),
@@ -3806,6 +3816,7 @@ impl App {
     /// waits and timers continue, and the renderer (with its GPU device) is released.
     fn hide_window(&mut self) -> Effect<Message> {
         let Some(id) = self.window.take() else { return Effect::none() };
+        self.auto_restart.focused = false;
         self.cancel_account_drag();
         self.title_held = false;
         window_chrome::detach();
@@ -3900,7 +3911,9 @@ impl App {
         let status = (!self.preview).then(|| self.refreshed + self.status_interval());
         let parks = (!self.parks.is_empty()).then(|| self.park_checked.map_or_else(Instant::now, |at| at + pol_less::park::FINGERPRINT_EVERY));
         let flag = (!self.preview && self.flag_wanted()).then(|| self.flag_schedule.next()).flatten();
-        status.into_iter().chain(parks).chain(flag).chain(self.patch_watch.next_due()).min()
+        // A downloaded update's restart countdown, postponement or input grace (none otherwise).
+        let restart = (!self.preview).then(|| { let now = Instant::now(); self.auto_restart.next_due(self.auto_conditions(now), now) }).flatten();
+        status.into_iter().chain(parks).chain(flag).chain(self.patch_watch.next_due()).chain(restart).min()
     }
 
     /// The session flags whose change a quiet window must see at once: a session or game
@@ -4545,7 +4558,61 @@ impl App {
         if let Err(error) = save_settings(&self.config, &self.settings) { self.status = error; }
     }
 
+    /// Handles `message`, then looks again at the automatic restart for a downloaded update
+    /// (`self_update::auto`): every event that can change its answer (a game ending, work
+    /// finishing, focus, input, the tray) arrives as a message, so it needs no polling.
     fn update(&mut self, message: Message) -> Effect<Message> {
+        let effect = self.handle(message);
+        if self.preview { return effect; }
+        let auto = self.auto_restart_step(Instant::now());
+        Effect::batch([effect, auto])
+    }
+
+    /// What the automatic restart sees now.
+    fn auto_conditions(&self, now: Instant) -> self_update::auto::Conditions {
+        self_update::auto::Conditions {
+            enabled: self.settings.launcher_auto_restart,
+            ready: matches!(self.self_update, self_update::State::Ready(_)),
+            can_restart: self.can_restart_launcher(),
+            game_running: self.accounts.iter().any(|row| row.is_playing() || row.game_start_pending()),
+            dialog: self.controller_modal(),
+            user_active: self.auto_restart.user_active(self.window.is_some(), now),
+        }
+    }
+
+    /// Starts, stops or finishes the restart countdown; logs each change with the version.
+    fn auto_restart_step(&mut self, now: Instant) -> Effect<Message> {
+        use self_update::auto::Step;
+        let conditions = self.auto_conditions(now);
+        let step = self.auto_restart.step(conditions, now);
+        let version = match &self.self_update { self_update::State::Ready(stage) => stage.version().to_owned(), _ => String::new() };
+        let history = self.config.history_path();
+        let log = |line: &str| if !self.preview { launch_log::append_history(&history, "Crystal", line, None); };
+        match step {
+            Step::Wait => Effect::none(),
+            Step::Scheduled => {
+                log(&format!("self-update: auto-restart scheduled for {version} in {} s", self_update::auto::COUNTDOWN.as_secs()));
+                // Hidden in the notification area: the pill cannot be seen, so a balloon says it.
+                if self.window.is_none() && !self.preview {
+                    features::notify::balloon(
+                        t("Crystal Launcher is restarting to update"),
+                        &tf("Crystal Launcher {version} installs in {seconds} s. Open Crystal to postpone it.",
+                            &[("version", &version), ("seconds", &self_update::auto::COUNTDOWN.as_secs())]));
+                }
+                Effect::none()
+            }
+            Step::Cancelled => {
+                log(&format!("self-update: auto-restart for {version} waits (Crystal or a game is busy)"));
+                Effect::none()
+            }
+            Step::Apply => {
+                log(&format!("self-update: auto-restart applied {version}"));
+                Effect::done(Message::SelfUpdate(self_update::Msg::Apply))
+            }
+        }
+    }
+
+    fn handle(&mut self, message: Message) -> Effect<Message> {
         if self.closing && !matches!(&message,
             Message::WindowResized(_) | Message::WindowMaximized(_)
             | Message::MinimizeWindow | Message::MaximizeWindow | Message::TitlePressed
@@ -4569,6 +4636,21 @@ impl App {
                 self.persist_settings();
                 if on && !self.preview { return Effect::done(Message::SelfUpdate(self_update::Msg::Check)); }
             }
+            Message::SelfUpdate(self_update::Msg::AutoRestart(on)) => {
+                self.settings.launcher_auto_restart = on;
+                self.persist_settings();
+            }
+            Message::SelfUpdate(self_update::Msg::Postpone) => {
+                self.auto_restart.postpone(Instant::now());
+                if let (false, self_update::State::Ready(stage)) = (self.preview, &self.self_update) {
+                    launch_log::append_history(&self.config.history_path(), "Crystal", &format!(
+                        "self-update: auto-restart postponed for {} ({} h or the next start)", stage.version(),
+                        self_update::auto::POSTPONE.as_secs() / 3600), None);
+                }
+            }
+            // Signed-in idle sessions are separate worker processes: they stay signed in and the
+            // new version reconnects to them at start (`session_worker::find`); accounts with no
+            // session sign in through the normal startup sign-in. Parked hosts close first.
             Message::SelfUpdate(self_update::Msg::Applied(Ok(()))) => { self.close_parks(); tray::set_icon(false); tray::wake_ui_thread_soon(); return Effect::Exit; }
             Message::SelfUpdate(msg) => {
                 if !self.preview {
@@ -4779,7 +4861,9 @@ impl App {
                     }
                 }
             }
+            Message::WindowFocus(focused) => self.auto_restart.focused = focused && self.window.is_some(),
             Message::UserInput => {
+                self.auto_restart.last_input = Some(Instant::now());
                 // Only signed-in sessions whose game is closed; the worker
                 // forwards at most one native_activity per note.
                 if !self.preview {
@@ -6389,6 +6473,10 @@ fn main() {
             }
         }
     };
+    // A verified update downloaded by an earlier run (closed from the window or the tray before
+    // it installed) installs now, before anything starts: its helper waits for this process to
+    // exit, then starts the new version.
+    if !preview && self_update::apply_at_start(&Config::default()) { return; }
     tray::note_ui_thread();
     if let Err(error) = slint_host::run() { eprintln!("{error}"); }
     tray::shutdown();
@@ -8197,6 +8285,84 @@ mod tests {
         assert!(app.launch_blocked());
         let _ = app.update(Message::CloseRequested);
         assert!(app.status.contains("update helper"));
+    }
+
+    /// The automatic restart for a downloaded update, as the app gathers its conditions.
+    #[test]
+    fn a_ready_update_restarts_by_itself_only_when_no_game_runs_and_nobody_uses_crystal() {
+        use self_update::auto::{COUNTDOWN, IDLE_AFTER};
+        let mut app = app();
+        for row in &mut app.accounts {
+            row.busy = false;
+            row.batch_pending = false;
+            row.queued_play = None;
+            row.pid = None;
+            row.game_running = None;
+        }
+        let start = Instant::now();
+        let is_apply = |effect: &Effect<Message>| matches!(effect, Effect::Message(Message::SelfUpdate(self_update::Msg::Apply)));
+        // Nothing downloaded: nothing happens.
+        assert!(matches!(app.auto_restart_step(start), Effect::None));
+        app.self_update = self_update::State::Ready(self_update::tests::fixture_stage("9.0.0"));
+        // A game runs: it waits, with no timer.
+        app.accounts[0].pid = Some(1234);
+        app.accounts[0].game_running = Some(Arc::new(AtomicBool::new(true)));
+        assert!(matches!(app.auto_restart_step(start), Effect::None));
+        assert!(app.auto_restart.remaining(start).is_none());
+        assert_eq!(app.auto_restart.next_due(app.auto_conditions(start), start), None);
+        // The game ends (the session stays signed in at the main menu): scheduled.
+        app.accounts[0].game_running.as_ref().unwrap().store(false, Ordering::Release);
+        assert!(matches!(app.auto_restart_step(start), Effect::None));
+        assert_eq!(app.auto_restart.remaining(start), Some(COUNTDOWN.as_secs()));
+        assert!(is_apply(&app.auto_restart_step(start + COUNTDOWN)), "the countdown ran out");
+        // Someone is using the window: it waits until they stop for a minute.
+        let mut app = app_with_ready();
+        app.window = Some(WindowId::unique());
+        app.auto_restart.focused = true;
+        app.auto_restart.last_input = Some(start);
+        let _ = app.auto_restart_step(start);
+        assert!(app.auto_restart.remaining(start).is_none());
+        let idle = start + IDLE_AFTER;
+        let _ = app.auto_restart_step(idle);
+        assert_eq!(app.auto_restart.remaining(idle), Some(COUNTDOWN.as_secs()));
+        // "Not now" postpones it.
+        let _ = app.update(Message::SelfUpdate(self_update::Msg::Postpone));
+        assert!(app.auto_restart.remaining(idle).is_none());
+        assert!(matches!(app.auto_restart_step(idle + COUNTDOWN), Effect::None));
+        assert!(app.auto_restart.postponed(Instant::now()));
+        // The setting off: never by itself, saved off; the pill still works (its own test).
+        let mut app = app_with_ready();
+        let _ = app.update(Message::SelfUpdate(self_update::Msg::AutoRestart(false)));
+        assert!(!app.settings.launcher_auto_restart);
+        assert!(matches!(app.auto_restart_step(start), Effect::None));
+        assert!(matches!(app.auto_restart_step(start + COUNTDOWN), Effect::None));
+        assert!(app.auto_restart.remaining(start).is_none());
+        assert!(app.can_restart_launcher());
+        // An open dialog or a sign-in in flight waits too.
+        let mut app = app_with_ready();
+        app.show_settings = true;
+        let _ = app.auto_restart_step(start);
+        assert!(app.auto_restart.remaining(start).is_none());
+        app.show_settings = false;
+        app.accounts[0].busy = true;
+        let _ = app.auto_restart_step(start);
+        assert!(app.auto_restart.remaining(start).is_none());
+        // Older settings files without the switch turn it on.
+        let settings: Settings = serde_json::from_str(r#"{"install_path":""}"#).unwrap();
+        assert!(settings.launcher_auto_restart);
+    }
+
+    fn app_with_ready() -> App {
+        let mut app = app();
+        for row in &mut app.accounts {
+            row.busy = false;
+            row.batch_pending = false;
+            row.queued_play = None;
+            row.pid = None;
+            row.game_running = None;
+        }
+        app.self_update = self_update::State::Ready(self_update::tests::fixture_stage("9.0.0"));
+        app
     }
 
     #[test]
