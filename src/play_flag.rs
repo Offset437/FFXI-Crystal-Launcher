@@ -3,7 +3,7 @@
 //!
 //! Crystal reads it only while a "Wait and play" is waiting (owner decision 2026-10-13) or FFXI
 //! is in maintenance, for `$patch_enable` (the update as soon as it is out, patch_watch.rs): one
-//! plain GET at a time, every minute, with the same web client and browser User-Agent as the
+//! plain GET at a time (`anews.pml`, then `sfst02.pml`, as the FFXI page loads them), every minute, with the same web client and browser User-Agent as the
 //! playonline.com reads (`services::web_client`). It never imitates the Viewer: no Viewer
 //! User-Agent, X-POL-VIEWER-VERSION or Accept header, no credentials and no Viewer page
 //! sequence. A fresh reading decides the Play gate both ways over maintenance (`decide`); without
@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 
 /// The English Viewer's FFXI flag file (UTF-8 with a BOM).
 pub const FLAG_URL: &str = "http://wh000.pol.com:51304/pcd/sftp/en-US/ff11/anews.pml";
+/// The FFXI page's second public file (its "scroll news"). The page loads it after `anews.pml`,
+/// and Square Enix may put the switches in either: on 2026-11-10 they were only here.
+pub const SCROLL_URL: &str = "http://wh000.pol.com:51304/pcd/sftp/en-US/ff11/sfst02.pml";
 /// The fixed interval between reads while a Play waits.
 pub const CHECK_EVERY: Duration = Duration::from_secs(60);
 /// How long a reading decides the gate. An older one leaves it to the official status.
@@ -113,9 +116,31 @@ pub fn decide(known: &Known, official: (Availability, String), now: DateTime<Utc
     }
 }
 
-/// Reads the flag once.
+/// Reads the flag once: both files the FFXI page loads, in its order.
 pub async fn read() -> Reading {
-    read_from(FLAG_URL).await
+    let at = Utc::now();
+    let client = match crate::services::web_client() {
+        Ok(client) => client,
+        Err(error) => return Reading { at, result: Err(error), patch: None },
+    };
+    let first = fetch(&client, FLAG_URL).await;
+    let second = fetch(&client, SCROLL_URL).await;
+    merge(at, [first, second])
+}
+
+/// One reading from the page's files in load order. As on the page, a later file's define wins,
+/// so each switch comes from the last file that sets it. A file that failed is skipped; when
+/// every file failed, the first failure is the reading's.
+fn merge(at: DateTime<Utc>, bodies: [Result<Vec<u8>, String>; 2]) -> Reading {
+    let read: Vec<&[u8]> = bodies.iter().filter_map(|body| body.as_deref().ok()).collect();
+    let Some(last) = read.last() else {
+        let error = bodies.into_iter().find_map(Result::err).unwrap_or_default();
+        return Reading { at, result: Err(error), patch: None };
+    };
+    let sets = |body: &&[u8], name: &str| !define_values(&body_defines(body), name).is_empty();
+    let result = parse(read.iter().rev().find(|body| sets(body, "$playbutton_enable")).unwrap_or(last));
+    let patch = read.iter().rev().find(|body| sets(body, "$patch_enable")).and_then(|body| parse_patch(body));
+    Reading { at, result, patch }
 }
 
 /// `read` from `url` (a local fake server in tests). Stamped when the request is made.
@@ -310,6 +335,30 @@ mod tests {
     /// 2026-10-13 during All Worlds Maintenance, and at 01:17:30 local (13 minutes before the
     /// posted end), as served: UTF-8 with a BOM.
     const MAINTENANCE: &str = "\u{feff}<meta http-equiv=\"Cache-Control\" content=\"no-cache\">\n<define name=\"$status\" value=\"The game is unavailable for play during maintenance.\">\n<define name=\"$playbutton_enable\" value=\"0\"><define name=\"$patch_enable\" value=\"1\">";
+    const EMPTY: &str = "\u{feff}<meta http-equiv=\"Cache-Control\" content=\"no-cache\">\n<define name=\"$length\" value=\"0\">";
+
+    /// 2026-11-10: `anews.pml` carried no switches and `sfst02.pml` carried both. Each switch comes
+    /// from the last file that sets it; a failed file is skipped.
+    #[test]
+    fn switches_come_from_the_last_file_that_sets_them() {
+        let at = Utc::now();
+        let ok = |s: &str| Ok(s.as_bytes().to_vec());
+        let r = merge(at, [ok(EMPTY), ok(MAINTENANCE)]);
+        assert!(matches!(r.result, Ok(Flag::Down(Some(_)))));
+        assert_eq!(r.patch, Some(true));
+        let r = merge(at, [ok(UP), ok(EMPTY)]);
+        assert_eq!(r.result, Ok(Flag::Up));
+        let r = merge(at, [ok(MAINTENANCE), ok(UP)]);
+        assert_eq!(r.result, Ok(Flag::Up), "the later file wins");
+        let r = merge(at, [ok(MAINTENANCE), Err("down".into())]);
+        assert_eq!(r.patch, Some(true));
+        let r = merge(at, [ok(EMPTY), ok(EMPTY)]);
+        assert!(r.result.is_err());
+        assert_eq!(r.patch, None);
+        let r = merge(at, [Err("a".into()), Err("b".into())]);
+        assert_eq!(r.result, Err("a".into()));
+    }
+
     const UP: &str = "\u{feff}<meta http-equiv=\"Cache-Control\" content=\"no-cache\">\n<define name=\"$playbutton_enable\" value=\"1\"><define name=\"$patch_enable\" value=\"1\">";
 
     fn instant(s: &str) -> DateTime<Utc> {

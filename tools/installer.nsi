@@ -305,9 +305,107 @@ Function .onInstFailed
   SetErrorLevel 1
 FunctionEnd
 
+; Classifies the entry $2 in $INSTDIR. $R0: 0 unrecognised, 1 Crystal package
+; file or data, 2 stale leftover (old self-update, setup staging or temp file).
+; $R1 holds its attributes. Reparse points are never recognised.
+Function ClassifyEntry
+  StrCpy $R0 0
+  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\$2") i.R1'
+  ${If} $R1 == -1
+    Return
+  ${EndIf}
+  IntOp $R2 $R1 & 0x410
+  ${If} $2 == "crystal"
+  ${OrIf} $2 == "iced-launcher"
+    ${If} $R2 == 16
+      StrCpy $R0 1
+    ${EndIf}
+    Return
+  ${EndIf}
+  ${If} $2 == "Crystal-Launcher.exe"
+  ${OrIf} $2 == "README.md"
+  ${OrIf} $2 == "LICENSE"
+  ${OrIf} $2 == "THIRD_PARTY.md"
+  ${OrIf} $2 == "THIRD_PARTY_LICENSES.txt"
+  ${OrIf} $2 == "Uninstall.exe"
+    ${If} $R2 == 0
+      StrCpy $R0 1
+    ${EndIf}
+    Return
+  ${EndIf}
+  StrCpy $R3 $2 18
+  ${If} $R3 == ".crystal-previous-"
+    ${If} $R2 == 16
+      StrCpy $R0 2
+    ${EndIf}
+    Return
+  ${EndIf}
+  ; Setup staging folders and temp files: ns?????.tmp.
+  StrLen $R3 $2
+  StrCpy $R4 $2 2
+  StrCpy $R5 $2 "" -4
+  ${If} $R3 == 11
+  ${AndIf} $R4 == "ns"
+  ${AndIf} $R5 == ".tmp"
+    IntOp $R3 $R1 & 0x400
+    ${If} $R3 == 0
+      StrCpy $R0 2
+    ${EndIf}
+    Return
+  ${EndIf}
+  StrCpy $R4 $2 23
+  ${If} $R4 == "Crystal-Launcher.exe~RF"
+  ${AndIf} $R5 == ".tmp"
+  ${AndIf} $R2 == 0
+    StrCpy $R0 2
+  ${EndIf}
+FunctionEnd
+
+; Removes the real directory $R6 and its contents. RMDir /r enters junctions
+; and deletes their targets' contents, so links are unlinked here, never entered.
+Function RemoveTree
+  Push $R5
+  Push $R7
+  Push $R8
+  Push $R9
+  ClearErrors
+  FindFirst $R7 $R8 "$R6\*.*"
+  ${IfNot} ${Errors}
+    ${DoWhile} $R8 != ""
+      ${If} $R8 != "."
+      ${AndIf} $R8 != ".."
+        System::Call 'kernel32::GetFileAttributesW(w "$R6\$R8") i.R9'
+        IntOp $R5 $R9 & 0x410
+        ${If} $R9 == -1
+        ${ElseIf} $R5 == 16
+          Push $R6
+          StrCpy $R6 "$R6\$R8"
+          Call RemoveTree
+          Pop $R6
+        ${ElseIf} $R5 == 1040
+          RMDir "$R6\$R8"
+        ${Else}
+          Delete "$R6\$R8"
+        ${EndIf}
+      ${EndIf}
+      ClearErrors
+      FindNext $R7 $R8
+      ${If} ${Errors}
+        ${Break}
+      ${EndIf}
+    ${Loop}
+    FindClose $R7
+  ${EndIf}
+  RMDir "$R6"
+  Pop $R9
+  Pop $R8
+  Pop $R7
+  Pop $R5
+FunctionEnd
+
 Function CheckDestination
-  ; Reinstall can reuse a folder containing only retained launcher data.
-  ; No package file may already exist unless this is a registered upgrade.
+  ; Reinstall or upgrade in place into a folder holding only Crystal's own
+  ; package files, retained data and stale setup/update leftovers.
   ReadRegStr $0 HKCU "${UNINSTALL_KEY}" "InstallLocation"
   ${If} $0 != ""
     StrCmp $0 "$INSTDIR" allowed
@@ -331,14 +429,8 @@ Function CheckDestination
     StrCmp $2 "" empty
     StrCmp $2 "." next
     StrCmp $2 ".." next
-    StrCmp $2 "iced-launcher" retained_data
-    FindClose $1
-    Goto occupied
-  retained_data:
-    System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\iced-launcher") i.r0'
-    ; A real directory only: never accept a file or a reparse-point alias.
-    IntOp $0 $0 & 0x410
-    StrCmp $0 16 next
+    Call ClassifyEntry
+    StrCmp $R0 0 0 next
     FindClose $1
     Goto occupied
   next:
@@ -584,6 +676,34 @@ Section "Crystal Launcher"
   ${If} ${Errors}
     MessageBox MB_OK|MB_ICONEXCLAMATION "Crystal was installed, but some setup backups could not be removed. Package backups are in $StageDir; prior shortcuts are $ShortcutBackup and $DesktopShortcutBackup and the prior uninstall entry is HKCU\$RegistryParent\$RegistryBackup." /SD IDOK
   ${EndIf}
+  ; Best effort: clear stale leftovers of earlier updates and setups, never
+  ; this setup's own staging folder. Linked leftovers are never classified stale.
+  ${GetFileName} "$StageDir" $3
+  ClearErrors
+  FindFirst $1 $2 "$INSTDIR\*.*"
+  ${IfNot} ${Errors}
+    ${DoWhile} $2 != ""
+      ${If} $2 != $3
+        Call ClassifyEntry
+        ${If} $R0 == 2
+          IntOp $R1 $R1 & 0x10
+          ${If} $R1 == 0
+            Delete "$INSTDIR\$2"
+          ${Else}
+            StrCpy $R6 "$INSTDIR\$2"
+            Call RemoveTree
+          ${EndIf}
+        ${EndIf}
+      ${EndIf}
+      ClearErrors
+      FindNext $1 $2
+      ${If} ${Errors}
+        ${Break}
+      ${EndIf}
+    ${Loop}
+    FindClose $1
+  ${EndIf}
+  ClearErrors
   ; Refresh only our shortcut items and their folders after publishing them.
   ; SHCNF_PATHW | SHCNF_FLUSHNOWAIT keeps an unresponsive shell from blocking setup.
   System::Call 'shell32::SHChangeNotify(i 0x2000, i 0x2005, w "$DESKTOP\${SHORTCUT_NAME}.lnk", p 0)'

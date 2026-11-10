@@ -544,6 +544,8 @@ component AccountsSection inherits VerticalLayout {
         flick := Flickable {
             width: parent.width - (root.pinned ? 12px : 0px);
             x: 0;
+            // The wheel scrolls; a mouse drag is a row drag, not a pan (a pan steals the grip's press).
+            mouse-drag-pan-enabled: false;
             content-width: self.width;
             content-height: root.rows-h;
             VerticalLayout {
@@ -673,6 +675,8 @@ export component HomePage inherits VerticalLayout {
         page := Flickable {
             content-width: self.width;
             content-height: body.height;
+            // As the account list: a mouse drag on a row's grip must reach the grip.
+            mouse-drag-pan-enabled: false;
             body := VerticalLayout {
                 width: page.width;
                 height: max(page.height, self.min-height);

@@ -182,6 +182,142 @@ fn wait_and_play_is_shown_in_both_languages() {
     crate::i18n::set(Lang::En);
 }
 
+/// Each account row's drag grip, as its centre in window coordinates, in row order.
+fn grips(window: &slint::Window) -> Vec<slint::LogicalPosition> {
+    let inner = WindowInner::from_pub(window);
+    inner.ensure_tree_instantiated();
+    let start = ItemRc::new_root(inner.component());
+    let mut item = start.clone();
+    let mut found = Vec::new();
+    for _ in 0..100_000 {
+        if item.is_visible() {
+            if let Some(area) = item.downcast::<i_slint_core::items::TouchArea>() {
+                if format!("{:?}", area.as_pin_ref().mouse_cursor()).contains("Grab") {
+                    let geometry = item.geometry();
+                    let at = item.map_to_window(geometry.origin);
+                    found.push(slint::LogicalPosition::new(at.x + geometry.width() / 2.0, at.y + geometry.height() / 2.0));
+                }
+            }
+        }
+        item = item.next_focus_item();
+        if item == start { break; }
+    }
+    found.sort_by(|a, b| a.y.total_cmp(&b.y));
+    found
+}
+
+/// Runs the window's change handlers, hands what the view sent to the core and syncs back,
+/// until nothing more is sent (the host's drain, without a host).
+fn pump(ui: &MainWindow, window: &MinimalSoftwareWindow, app: &mut App) {
+    for _ in 0..8 {
+        slint::platform::update_timers_and_animations();
+        let sent = super::take_sent();
+        if sent.is_empty() { break; }
+        for message in sent { let _ = app.update(message); }
+        render(ui, window, app);
+    }
+}
+
+/// A real pointer drag on the window: press `from`'s grip, move in small steps to `to`'s row,
+/// release. The host's winit listener ends the drag on a left release; it is run here too.
+fn drag_rows(ui: &MainWindow, window: &MinimalSoftwareWindow, app: &mut App, from: usize, to: usize, frame: Option<&mut dyn FnMut(&App)>) {
+    use slint::platform::{PointerEventButton, WindowEvent};
+    let grips = grips(ui.window());
+    assert!(grips.len() > from.max(to), "one grip per row: {grips:?}");
+    let (start, end) = (grips[from], grips[to]);
+    let dispatch = |event| ui.window().dispatch_event(event);
+    dispatch(WindowEvent::PointerMoved { position: start });
+    dispatch(WindowEvent::PointerPressed { position: start, button: PointerEventButton::Left });
+    pump(ui, window, app);
+    let steps = 12;
+    for step in 1..=steps {
+        let y = start.y + (end.y - start.y) * step as f32 / steps as f32;
+        dispatch(WindowEvent::PointerMoved { position: slint::LogicalPosition::new(start.x + 3.0, y) });
+        pump(ui, window, app);
+    }
+    if let Some(frame) = frame { frame(app); }
+    dispatch(WindowEvent::PointerReleased { position: slint::LogicalPosition::new(start.x + 3.0, end.y), button: PointerEventButton::Left });
+    if app.schedule().account_drag { let _ = app.update(Message::AccountDragFinish); }
+    pump(ui, window, app);
+    render(ui, window, app);
+}
+
+/// The window as it is now, into a PNG (CRYSTAL_DRAG_SHOTS: a mid-drag frame).
+fn save_png(window: &MinimalSoftwareWindow, width: u32, height: u32, path: &std::path::Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut pixels = vec![slint::Rgb8Pixel::default(); (width * height) as usize];
+    window.request_redraw();
+    window.draw_if_needed(|renderer| { renderer.render(&mut pixels, width as usize); });
+    let bytes: Vec<u8> = pixels.iter().flat_map(|p| [p.r, p.g, p.b]).collect();
+    imagecrate::save_buffer_with_format(path, &bytes, width, height, imagecrate::ExtendedColorType::Rgb8, imagecrate::ImageFormat::Png).unwrap();
+}
+
+fn order(app: &App) -> Vec<String> { app.accounts.iter().map(|row| row.key.clone()).collect() }
+
+/// The owner's 1.1.0 bug: dragging a row's grip moved nothing. A real press, move and release
+/// on the window reorders the rows, with the few rows that fit and with a list that scrolls.
+#[test]
+fn dragging_a_grip_onto_another_row_reorders_the_accounts() {
+    crate::privacy::set(false);
+    crate::i18n::set(Lang::En);
+    let (ui, window) = main_window();
+    // 3 rows in a tall wide window: nothing scrolls, the only case 1.1.0 handled. 14 rows wide:
+    // the account list scrolls. A narrow, short window: the page scrolls.
+    for (count, width, height) in [(3usize, 1440, 900), (14, 1440, 900), (14, 1440, 650), (3, 900, 650), (14, 900, 650)] {
+        window.set_size(slint::PhysicalSize::new(width, height));
+        let mut app = app(Page::Home, None, false, false);
+        if count > app.accounts.len() {
+            let mut values: Vec<_> = app.accounts.iter().map(|row| row.account.clone()).collect();
+            for i in values.len()..count {
+                let mut extra = values[0].clone();
+                extra.label = format!("Extra {i}");
+                extra.pol_id = format!("XYZ{i:05}");
+                values.push(extra);
+            }
+            app.replace_accounts(values);
+        }
+        app.viewport = crate::effect::Size::new(width as f32, height as f32);
+        ui.global::<super::Theme>().set_scale(super::scale(&app));
+        render(&ui, &window, &app);
+        // Wheel the page down at its right edge (clear of the list and above the footer) until
+        // the first three rows show, as a user would.
+        for _ in 0..60 {
+            let shown = grips(ui.window());
+            // Clear of the footer.
+            if shown.len() >= 3 && shown[2].y < height as f32 - 110.0 { break; }
+            ui.window().dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+                position: slint::LogicalPosition::new(width as f32 - 20.0, height as f32 - 120.0), delta_x: 0.0, delta_y: -40.0,
+            });
+            render(&ui, &window, &app);
+        }
+        eprintln!("case: {count} rows at {width}x{height}: grips {:?}", grips(ui.window()));
+        let original = order(&app);
+        assert_eq!(original.len(), count);
+        // Down: the first row onto the third.
+        let mut seen = None;
+        let shot = std::env::var_os("CRYSTAL_DRAG_SHOTS").map(|dir| std::path::PathBuf::from(dir).join(format!("drag-{count}-rows-{width}x{height}.png")));
+        drag_rows(&ui, &window, &mut app, 0, 2, Some(&mut |app: &App| {
+            seen = Some((app.account_drag.source.clone(), order(app)));
+            if let Some(path) = &shot { save_png(&window, width, height, path); }
+        }));
+        let (source, during) = seen.unwrap();
+        assert_eq!(source.as_ref(), Some(&original[0]), "{count} rows at {height}: the press started the drag");
+        let mut expected = original.clone();
+        let moved = expected.remove(0);
+        expected.insert(2, moved);
+        assert_eq!(during, expected, "{count} rows at {height}: the rows move while dragging");
+        assert_eq!(order(&app), expected, "{count} rows at {height}: the drop keeps the order");
+        assert!(app.account_drag.source.is_none());
+        assert_eq!(app.settings.account_order, expected, "{count} rows at {height}: the drop saves the order");
+        // Up: the third row onto the first (the rows a scrolled-to-the-top list always shows).
+        drag_rows(&ui, &window, &mut app, 2, 0, None);
+        let moved = expected.remove(2);
+        expected.insert(0, moved);
+        assert_eq!(order(&app), expected, "{count} rows at {height}: dragging up");
+        assert_eq!(app.settings.account_order, expected);
+    }
+}
+
 fn updating(app: &mut App, progress: operation::Progress) {
     app.page = Page::Maintenance;
     app.maintenance = Some(MaintenanceKind::Update);

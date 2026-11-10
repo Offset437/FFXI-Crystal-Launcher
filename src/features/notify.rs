@@ -383,15 +383,21 @@ fn deliver(notice: &Notice) -> Delivery {
 /// the balloon, so a short-lived thread owns it, removes it after a few seconds, and reports
 /// whether the shell accepted it.
 fn show_balloon(notice: &Notice) -> Result<(), String> {
-    let (title, body) = (notice.title.clone(), if notice.body.is_empty() { notice.title.clone() } else { notice.body.clone() });
+    let (title, body) = balloon_text(notice);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new().name("notify-balloon".into()).spawn(move || balloon_thread(&title, &body, tx)).map_err(|e| e.to_string())?;
     rx.recv().map_err(|_| t("The notification icon failed.").to_owned())?
 }
 
+/// (balloon title, balloon text). The shell shows no balloon without text, so a notice with
+/// no detail puts its title in the text and leaves the balloon title empty: one line, not two.
+fn balloon_text(notice: &Notice) -> (String, String) {
+    if notice.body.is_empty() { (String::new(), notice.title.clone()) } else { (notice.title.clone(), notice.body.clone()) }
+}
+
 fn balloon_thread(title: &str, body: &str, done: std::sync::mpsc::Sender<Result<(), String>>) {
-    use windows_sys::Win32::UI::Shell::{Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, LoadIconW, HWND_MESSAGE, IDI_APPLICATION};
+    use windows_sys::Win32::UI::Shell::{Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIIF_INFO, NIIF_LARGE_ICON, NIIF_USER, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyIcon, DestroyWindow, GetSystemMetrics, LoadImageW, HWND_MESSAGE, IMAGE_ICON, LR_DEFAULTCOLOR, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON};
     fn copy(dst: &mut [u16], s: &str) {
         let n = dst.len() - 1;
         for (d, c) in dst.iter_mut().zip(s.encode_utf16().take(n)) { *d = c; }
@@ -405,11 +411,21 @@ fn balloon_thread(title: &str, body: &str, done: std::sync::mpsc::Sender<Result<
         data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         data.hWnd = window;
         data.uID = 1;
+        // Crystal's icon (crystal.rc: resource 1) for the notification header and its large
+        // image; the stock information icon only if the resource cannot be loaded.
+        let instance = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
+        let small = LoadImageW(instance, 1 as _, IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+        let large = LoadImageW(instance, 1 as _, IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
         data.uFlags = NIF_ICON;
-        data.hIcon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION);
+        data.hIcon = small as _;
         let added = Shell_NotifyIconW(NIM_ADD, &data) != 0;
         data.uFlags = NIF_INFO;
-        data.dwInfoFlags = NIIF_INFO;
+        if large.is_null() {
+            data.dwInfoFlags = NIIF_INFO;
+        } else {
+            data.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;
+            data.hBalloonIcon = large as _;
+        }
         copy(&mut data.szInfoTitle, title);
         copy(&mut data.szInfo, body);
         let shown = added && Shell_NotifyIconW(NIM_MODIFY, &data) != 0;
@@ -419,6 +435,7 @@ fn balloon_thread(title: &str, body: &str, done: std::sync::mpsc::Sender<Result<
             std::thread::sleep(std::time::Duration::from_secs(9));
             Shell_NotifyIconW(NIM_DELETE, &data);
         }
+        for icon in [small, large] { if !icon.is_null() { DestroyIcon(icon as _); } }
         DestroyWindow(window);
     }
 }
@@ -554,6 +571,16 @@ mod tests {
             assert!(!all.contains("Alyria") && !all.contains("Bob") && !all.contains("Main") && !all.contains("acct"), "{all}");
         }
         assert_eq!(mail_notice("k", "Main Account", false).body, "Mail for Main Account");
+    }
+
+    #[test]
+    fn balloon_never_repeats_the_title_as_its_text() {
+        let friend = friends_notice(&["Fraude".to_string()], None, false);
+        assert_eq!(balloon_text(&friend), (String::new(), "Fraude is online".to_string()));
+        let mail = mail_notice("k", "Main Account", false);
+        assert_eq!(balloon_text(&mail), ("New PlayOnline mail".to_string(), "Mail for Main Account".to_string()));
+        let private = mail_notice("k", "Main Account", true);
+        assert_eq!(balloon_text(&private), (String::new(), "New PlayOnline mail".to_string()));
     }
 
 
