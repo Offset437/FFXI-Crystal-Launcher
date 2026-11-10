@@ -38,7 +38,6 @@ Crystal signs your accounts in to PlayOnline when it opens, and again a few seco
 - **Warm sign-in** is on by default (*Settings → Sign accounts in when Crystal opens*). It is the same PlayOnline sign-in, done before you click instead of after.
 - **Accounts with a one-time password** sign in when you press Play, since the code is needed then.
 - **Even a cold Play is quick.** Each account's game host is started and waiting before you click, so most of those 10–13 s are Square Enix's sign-in servers.
-- **A light footprint.** About 2–5 MB in the notification area and near-zero idle CPU, so Crystal never competes with a full party of clients.
 
 <sub>Times measured on the 1.1.0 build with Windower 4. Server-side sign-in time varies with Square Enix's servers and your connection.</sub>
 
