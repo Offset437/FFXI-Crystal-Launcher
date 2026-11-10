@@ -322,7 +322,7 @@ mod tests {
     fn account() -> Account {
         Account { label: "A".into(), mode: AccountMode::Retail, server: String::new(), pol_id: "ABCD1234".into(), pol_password: String::new(),
             se_id: String::new(), se_password: String::new(), region: 0, launch_with: None, ashita_boot_ini: None, windower_profile: None,
-            pol_handle_names: String::new() }
+            pol_handle_names: String::new(), totp_key: String::new() }
     }
 
     fn lists(registry: Option<&str>) -> (Lists, std::path::PathBuf) {

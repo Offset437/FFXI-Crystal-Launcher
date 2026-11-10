@@ -536,7 +536,7 @@ mod tests {
     fn job(root: &Path, key: &str) -> BatchAccount {
         BatchAccount::new(key.into(),
             Config { experiment: root.into(), repository: root.into(), game_install: None, dat_overlays: Vec::new() },
-            Account { label: key.into(), mode: backend::AccountMode::Retail, server: String::new(), pol_id: key.into(), pol_password: "fixture-secret".into(), se_id: String::new(), se_password: String::new(), region: 0, launch_with: None, ashita_boot_ini: None, windower_profile: None, pol_handle_names: String::new() },
+            Account { label: key.into(), mode: backend::AccountMode::Retail, server: String::new(), pol_id: key.into(), pol_password: "fixture-secret".into(), se_id: String::new(), se_password: String::new(), region: 0, launch_with: None, ashita_boot_ini: None, windower_profile: None, pol_handle_names: String::new(), totp_key: String::new() },
             "123456".into(), Plan { tool: crate::pol_less::Tool::Windower, settings: Default::default(), social_only: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, trigger: Default::default() })
     }
     fn watch_fixture_start(job: &BatchAccount) {

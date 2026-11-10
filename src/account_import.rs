@@ -69,6 +69,8 @@ pub(crate) struct ImportDraft {
     pub pol_slot: Option<u8>,
     /// Preview metadata only. Importing never enables automatic character selection.
     pub character_slot: Option<u8>,
+    /// Forest's authenticator key, in Crystal's stored form (`totp::normalize`), or empty.
+    pub totp_key: String,
     pub notes: Vec<String>,
 }
 
@@ -85,6 +87,7 @@ impl Drop for ImportDraft {
         self.pol_password.zeroize();
         self.se_id.zeroize();
         self.se_password.zeroize();
+        self.totp_key.zeroize();
     }
 }
 
@@ -347,12 +350,14 @@ fn import_forest(
                 draft.notes.push(t("The saved Ashita configuration name was not imported because its format is unsupported.").into());
             }
         }
-        if record
-            .enc_totp_secret
-            .as_ref()
-            .is_some_and(|s| !s.is_empty())
-        {
-            draft.notes.push(t("Forest has an authenticator secret for this account. Crystal will continue to ask for a one-time code.").into());
+        // Forest keeps the authenticator key DPAPI-protected like the password.
+        if let Some(secret) = record.enc_totp_secret.as_deref().filter(|s| !s.is_empty()) {
+            let key = decode_password(secret, &decrypt).ok().map(Zeroizing::new)
+                .and_then(|text| crate::totp::normalize(&text).ok());
+            match key {
+                Some(key) => draft.totp_key.push_str(&key),
+                None => draft.notes.push(t("Forest's authenticator key could not be imported. Enter it in the account editor.").into()),
+            }
         }
         match decode_password(&record.enc_password, &decrypt) {
             Ok(password) => draft.se_password = password,
@@ -429,6 +434,25 @@ mod tests {
         );
         assert!(!format!("{batch:?} {draft:?}").contains("synthetic-password"));
         assert!(!format!("{batch:?} {draft:?}").contains("Demo"));
+    }
+
+    /// Forest's DPAPI-protected authenticator key comes over in Crystal's stored form; one that
+    /// cannot be decrypted or is not base32 is left out with a note.
+    #[test]
+    fn forest_authenticator_key_is_imported_in_stored_form() {
+        // "YQ==" is the password's blob ("a"), "Yg==" the key's ("b").
+        let data = br#"{"Demo":{"EncPassword":"YQ==","EncTotpSecret":"Yg=="}}"#;
+        let import = |key: &'static [u8]| import_forest(data, 0, move |blob: &[u8]| {
+            Ok(Zeroizing::new(if blob == b"a" { b"synthetic-password".to_vec() } else { key.to_vec() }))
+        }).unwrap();
+        let batch = import(b"jbsw y3dp ehpk 3pxp");
+        assert_eq!(batch.drafts[0].totp_key, "JBSWY3DPEHPK3PXP");
+        assert_eq!(batch.drafts[0].se_password, "synthetic-password");
+        assert!(!format!("{batch:?} {:?}", batch.drafts[0]).contains("JBSW"));
+        assert!(!batch.drafts[0].notes.iter().any(|note| note.contains("authenticator")));
+        let bad = import(b"not base32!");
+        assert!(bad.drafts[0].totp_key.is_empty());
+        assert!(bad.drafts[0].notes.iter().any(|note| note.contains("authenticator key could not be imported")));
     }
 
     #[test]

@@ -1317,9 +1317,7 @@ pub(crate) fn spawn_park(config: &Config, account: &Account, plan: &Plan) -> Res
 
 /// Frame 1: no password, no OTP; the plan's per-Play fields are not used before frame 2.
 fn park_frame(config: &Config, account: &Account, plan: &Plan) -> Result<Zeroizing<Vec<u8>>, String> {
-    let mut account = account.clone();
-    account.pol_password.zeroize();
-    account.se_password.zeroize();
+    let account = account.without_secrets();
     let mut plan = plan.clone();
     plan.trigger = Default::default();
     Ok(Zeroizing::new(serde_json::to_vec(&ParkRequest { config: config.clone(), account, plan })
@@ -2797,6 +2795,7 @@ mod tests {
             ashita_boot_ini: None,
             windower_profile: None,
             pol_handle_names: String::new(),
+            totp_key: String::new(),
         }
     }
     fn child_command(test: &str, root: &Path) -> Command {
@@ -2982,15 +2981,17 @@ mod tests {
         Request { config: config.clone(), account, otp: "123456".into(), via: Some(Plan { trigger, ..park_plan() }), elapsed_ms: 0, clicked_clock: None }
     }
 
-    /// 07d §1.4: frame 1 never carries a password or OTP.
+    /// 07d §1.4: frame 1 never carries a password, OTP or authenticator key.
     #[test]
     fn the_park_frame_carries_no_secret() {
         let fixture = Fixture::new();
         let mut plan = park_plan();
         plan.trigger = crate::launch_timing::LaunchTrigger::ParkedPlay;
-        let bytes = park_frame(&config(&fixture.0), &account(), &plan).unwrap();
+        let mut account = account();
+        account.totp_key = "JBSWY3DPEHPK3PXP".into();
+        let bytes = park_frame(&config(&fixture.0), &account, &plan).unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
-        assert!(!text.contains("fixture-password-never-on-disk") && !text.contains("\"otp\""), "{text}");
+        assert!(!text.contains("fixture-password-never-on-disk") && !text.contains("\"otp\"") && !text.contains("JBSWY3DPEHPK3PXP"), "{text}");
         let request: ParkRequest = serde_json::from_slice(&bytes).unwrap();
         assert_eq!((request.account.pol_id.as_str(), request.plan.trigger), ("fixture", crate::launch_timing::LaunchTrigger::Play));
     }

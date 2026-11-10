@@ -170,7 +170,8 @@ fn merge_draft(draft: &ImportDraft, existing: Option<&Account>) -> Account {
     let mut account = existing.cloned().unwrap_or_else(crate::blank_account);
     if existing.is_none() { account.region = draft.region; account.label.clear(); }
     for (target, source) in [(&mut account.label, &draft.label), (&mut account.pol_id, &draft.pol_id),
-        (&mut account.pol_password, &draft.pol_password), (&mut account.se_id, &draft.se_id), (&mut account.se_password, &draft.se_password)] {
+        (&mut account.pol_password, &draft.pol_password), (&mut account.se_id, &draft.se_id), (&mut account.se_password, &draft.se_password),
+        (&mut account.totp_key, &draft.totp_key)] {
         if target.is_empty() { target.clone_from(source); }
     }
     if account.launch_with.is_none() { account.launch_with = draft.launch_with; }

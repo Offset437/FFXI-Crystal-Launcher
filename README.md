@@ -21,7 +21,7 @@
 ## Features
 
 - Launch with vanilla FFXI, Windower 4 or Ashita v4, with a profile picker and optional character auto-login per account.
-- Native PlayOnline sign-in, including one-time codes.
+- Native PlayOnline sign-in, including one-time codes. Save an account's authenticator key and Crystal fills in the code for you.
 - Accounts are signed in when Crystal opens, so Play starts the game right away.
 - Multibox: per-account window layouts, Arrange all and Restore windows, Ctrl+Tab to cycle characters, crash and disconnect recovery, per-client priority and CPU affinity.
 - PlayOnline friends, status and mail, with a privacy mode for streams and screenshots.
@@ -54,15 +54,15 @@ Get the latest build from [Releases](https://github.com/Offset437/FFXI-Crystal-L
 
 | File | Use it when |
 |---|---|
-| `Crystal-Launcher-1.2.0-Setup.exe` | You want Desktop and Start menu shortcuts. Installs per user, no admin prompt. |
-| `Crystal-Launcher-1.2.0.zip` | You want a portable copy. Unzip and run. |
+| `Crystal-Launcher-1.2.1-Setup.exe` | You want Desktop and Start menu shortcuts. Installs per user, no admin prompt. |
+| `Crystal-Launcher-1.2.1.zip` | You want a portable copy. Unzip and run. |
 | `SHA256SUMS` | You want to verify the download. |
 | `launcher-update.json` | Never. The built-in updater reads it. |
 
 If SmartScreen warns you, choose **More info**, then **Run anyway**. To check the file first, compare its hash with `SHA256SUMS`:
 
 ```powershell
-Get-FileHash .\Crystal-Launcher-1.2.0-Setup.exe -Algorithm SHA256
+Get-FileHash .\Crystal-Launcher-1.2.1-Setup.exe -Algorithm SHA256
 ```
 
 Crystal updates itself. Every update is signed (Ed25519) and verified before it installs.

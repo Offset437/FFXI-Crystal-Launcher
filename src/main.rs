@@ -58,6 +58,7 @@ mod startup_prefetch;
 mod startup_task;
 mod stock_socket;
 mod tick_gate;
+mod totp;
 mod tray;
 mod runtime;
 mod slint_host;
@@ -91,6 +92,7 @@ pub(crate) enum Field {
     SeId,
     SePassword,
     PolHandleNames,
+    TotpKey,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -340,6 +342,11 @@ pub(crate) struct AccountRow {
     /// sign-in's refusal marks the account as one that may need a code (owner decision
     /// 2026-10-13). A user's own Play or Connect never changes what Crystal knows that way.
     presign_login: bool,
+    /// PlayOnline refused a code made from the account's authenticator key (no code typed): the
+    /// key is likely wrong. Until a sign-in without a typed code works or the key is edited, the
+    /// row asks for a typed code and Crystal signs nothing in by itself, so a wrong key never
+    /// costs a second refused login.
+    authenticator_refused: bool,
     /// The running session's game was seen running: its end is a game end.
     game_seen: bool,
     /// The user signed out or edited the account during the running session: its end signs
@@ -433,7 +440,20 @@ impl Drop for AccountRow {
         self.otp.zeroize();
     }
 }
+/// Whether `row`'s next sign-in waits for a code typed on it: the account is known to take
+/// one-time codes, or its last typed code was spent, and no authenticator key fills them in;
+/// or PlayOnline refused its key's code (another would be refused too).
+fn wants_typed_code(settings: &Settings, row: &AccountRow) -> bool {
+    row.authenticator_refused
+        || !row.authenticator_ready() && (row.otp_spent || settings.account_otp.contains(&row.key))
+}
+
 impl AccountRow {
+    /// The account's one-time codes come from its saved authenticator key, which PlayOnline has
+    /// not refused: none of its sign-ins waits for a typed code.
+    pub(crate) fn authenticator_ready(&self) -> bool {
+        self.account.mode == AccountMode::Retail && !self.account.totp_key.is_empty() && !self.authenticator_refused
+    }
     pub(crate) fn is_playing(&self) -> bool {
         self.pid.is_some() && self.game_running.as_ref().is_none_or(|g| g.load(Ordering::Acquire))
     }
@@ -609,6 +629,9 @@ pub(crate) struct EditorFlags {
     pub show_password: bool,
     /// A saved account's password field is read-only until Change.
     pub change_password: bool,
+    pub show_totp_key: bool,
+    /// A saved account's authenticator key, when it has one, is read-only until Change.
+    pub change_totp_key: bool,
 }
 
 /// Which of `EditorFlags` an `EditorFlag` message sets.
@@ -619,6 +642,8 @@ pub(crate) enum EditorFlag {
     ShowId,
     ShowPassword,
     ChangePassword,
+    ShowTotpKey,
+    ChangeTotpKey,
 }
 
 impl Editor {
@@ -1904,6 +1929,8 @@ impl App {
                 continue;
             }
             let mut row = if let Some(mut row) = old.remove(&key) {
+                // A changed (or removed) authenticator key is tried afresh.
+                if row.account.totp_key != account.totp_key { row.authenticator_refused = false; }
                 row.account = account;
                 row
             } else {
@@ -1943,6 +1970,7 @@ impl App {
                     otp_spent: false,
                     otp_unknown: false,
                     presign_login: false,
+                    authenticator_refused: false,
                     game_seen: false,
                     resign_declined: false,
                     signed_out: false,
@@ -2067,8 +2095,9 @@ impl App {
             row.launch_trigger = Some(trigger);
             row.network_wait = None;
             let config = self.settings.config_for(&self.config, &row.account);
-            // The pre-sign-in already used the row's code unless a new one was typed since.
-            let presign_otp_spent = row.otp_spent && row.otp.is_empty();
+            // The pre-sign-in already used the row's code unless a new one was typed since (or an
+            // authenticator key makes a fresh one for any second sign-in).
+            let presign_otp_spent = row.otp_spent && row.otp.is_empty() && !row.authenticator_ready();
             row.otp_spent = presign_otp_spent || !row.otp.is_empty();
             // An existing session keeps what is known of its own sign-in (a pre-sign-in's refusal
             // still arrives here); a new one is this Play's own sign-in.
@@ -2381,11 +2410,10 @@ impl App {
                     self.patch_watch.forget_signed(key);
                 }
                 for waiter in job.waiters {
-                    let otp_account = self.settings.account_otp.contains(&waiter.key);
                     let Some(row) = self.accounts.iter_mut().find(|row| row.key == waiter.key) else { continue };
                     row.busy = false;
                     let signed_in = row.pid.is_some() && !waiter.fallback;
-                    if !signed_in && (row.otp_spent || otp_account) && row.otp.is_empty() {
+                    if !signed_in && wants_typed_code(&self.settings, row) && row.otp.is_empty() {
                         // Its host was signed out for the install: a new sign-in needs a new code.
                         row.status = t("FINAL FANTASY XI is updated. Enter a new one-time code, then press Play.").into();
                         row.problem = true;
@@ -2760,10 +2788,12 @@ impl App {
         if !self.vault_ready || self.vault_saving || self.launch_blocked() || self.confirm_close || self.startup_signin_pending { return; }
         let candidates: Vec<String> = self.accounts.iter().filter(|row| {
             if self.patch_watch.signed(&row.key) { return false; }
-            // Known to need no code, as Crystal's own sign-ins (`Settings::presigns`).
+            // Known to need no code, as Crystal's own sign-ins (`Settings::presigns`), or its
+            // codes come from its authenticator key.
             let waits_without_code = self.waiting_plays.iter().any(|wait| wait.keys.contains(&row.key) && !wait.otp.contains(&row.key))
-                && row.account.mode == AccountMode::Retail && !row.otp_spent && row.otp.is_empty()
-                && self.settings.account_no_otp.contains(&row.key) && !self.settings.account_otp.contains(&row.key);
+                && row.account.mode == AccountMode::Retail && row.otp.is_empty()
+                && (row.authenticator_ready() || !row.otp_spent
+                    && self.settings.account_no_otp.contains(&row.key) && !self.settings.account_otp.contains(&row.key));
             (self.presigned_row(row) || waits_without_code)
                 && !self.startup_waiting.iter().any(|(key, _)| *key == row.key) && self.startup_row_free(&row.key)
         }).map(|row| row.key.clone()).collect();
@@ -2900,9 +2930,14 @@ impl App {
                     if let Some((_, code)) = wait.codes.iter().find(|(key, _)| *key == row.key) { row.otp = code.as_str().to_owned(); }
                 }
                 let otp = wait.otp.contains(&row.key) || row.otp_spent || !row.otp.is_empty()
-                    || self.settings.account_otp.contains(&row.key);
+                    || self.settings.account_otp.contains(&row.key) || row.authenticator_refused;
                 if otp && !(codes_fresh && !row.otp.is_empty()) {
                     row.otp.zeroize();
+                    // An authenticator key makes a fresh code in place of a stale typed one.
+                    if row.authenticator_ready() {
+                        keys.push(row.key.clone());
+                        continue;
+                    }
                     row.status = otp_note.into();
                     row.problem = true;
                     self.status = otp_note.into();
@@ -3383,8 +3418,16 @@ impl App {
         self.accounts.iter().any(|row| row.key == key && self.presigned_row(row))
     }
 
+    /// An account with an authenticator key counts as one that needs no typed code: the switch
+    /// alone decides, until PlayOnline refuses one of its codes (then never, until the key is
+    /// edited or a sign-in without a typed code works).
     fn presigned_row(&self, row: &AccountRow) -> bool {
-        row.account.mode == AccountMode::Retail && !row.signed_out && self.settings.presigns(&row.key) && !row.otp_spent && row.otp.is_empty()
+        let known = if row.account.totp_key.is_empty() {
+            self.settings.presigns(&row.key) && !row.otp_spent
+        } else {
+            self.settings.auto_sign_in && !row.authenticator_refused
+        };
+        row.account.mode == AccountMode::Retail && !row.signed_out && known && row.otp.is_empty()
     }
 
     /// Whether `key` may sign back in after its game by itself (see `Resign`): a pre-signed
@@ -3595,10 +3638,7 @@ impl App {
             && row.alive.as_ref().is_none_or(|alive| alive.load(Ordering::Acquire)))
             .map(|row| {
                 let config = self.settings.config_for(&self.config, &row.account);
-                let mut account = row.account.clone();
-                account.pol_password.zeroize();
-                account.se_password.zeroize();
-                (config, account)
+                (config, row.account.without_secrets())
             }).collect()
     }
 
@@ -4302,6 +4342,12 @@ impl App {
                             // teaches that an account needs none. Neither does a Play that reused
                             // such a session (a batch, or a Play queued on it): it signed nothing in.
                             uses_otp = (row.otp_spent || trigger.is_some() && !row.otp_unknown).then_some(row.otp_spent);
+                            if trigger.is_some() && !row.otp_spent && !row.account.totp_key.is_empty() {
+                                // Its own sign-in without a typed code: the authenticator's code
+                                // worked. The account does take codes (kept, should the key go).
+                                row.authenticator_refused = false;
+                                uses_otp = Some(true);
+                            }
                             // The signed-in session stays up; the stock check refused the game start.
                             let refused = patch::parse_update_required(&result.detail);
                             if row.pid != Some(result.pid) { row.host_created = process_created(result.pid); }
@@ -4349,7 +4395,8 @@ impl App {
                             let transient = update.is_none() && launch_log::transient_failure(message)
                                 && !session_worker::reached_authentication(&self.settings.config_for(&self.config, &row.account), &row.account);
                             verdict = !network && !transient;
-                            let otp_spent = row.otp_spent && row.otp.is_empty();
+                            // An authenticator key makes a fresh code for the retry.
+                            let otp_spent = row.otp_spent && row.otp.is_empty() && !row.authenticator_ready();
                             let wanted = match (queued, trigger) {
                                 (Some(clicked), _) if network => Some((NetworkWait::Reissue(clicked), true)),
                                 (Some(clicked), _) if transient => Some((NetworkWait::Reissue(clicked), false)),
@@ -4392,11 +4439,19 @@ impl App {
                                 && launch_log::sign_in_refused(message);
                             let stops_presigning = refused && self.settings.presigns(&key);
                             if refused { uses_otp = Some(true); }
-                            row.status = message.to_owned();
+                            // The row's own member login refused a code its authenticator key made
+                            // (no code was typed): the key is likely wrong. Nothing signs it in
+                            // again by itself; the row asks for a typed code (`needs_code`).
+                            let key_refused = row.authenticator_ready() && !row.otp_spent && row.pid.is_none()
+                                && launch_log::sign_in_refused(message);
+                            if key_refused { row.authenticator_refused = true; }
+                            row.status = if key_refused { t("Authenticator code refused. Check the key.").into() } else { message.to_owned() };
                             row.set_note(if row.network_wait.is_some() {
                                 Some(RowNote::NetworkRetry)
                             } else if wanted.is_some() && otp_spent {
                                 Some(RowNote::OtpSpent)
+                            } else if key_refused {
+                                None
                             } else if stops_presigning {
                                 Some(RowNote::MayNeedOtp)
                             } else { None });
@@ -5040,6 +5095,8 @@ impl App {
                         Field::SeId => &mut editor.account.se_id,
                         Field::SePassword => &mut editor.account.se_password,
                         Field::PolHandleNames => &mut editor.account.pol_handle_names,
+                        // Kept as typed until Save normalizes it (`totp::normalize`).
+                        Field::TotpKey => &mut editor.account.totp_key,
                     };
                     destination.zeroize();
                     *destination = value;
@@ -5060,6 +5117,8 @@ impl App {
                         EditorFlag::ShowId => flags.show_id = on,
                         EditorFlag::ShowPassword => flags.show_password = on,
                         EditorFlag::ChangePassword => flags.change_password = on,
+                        EditorFlag::ShowTotpKey => flags.show_totp_key = on,
+                        EditorFlag::ChangeTotpKey => flags.change_totp_key = on,
                     }
                 }
             }
@@ -5067,6 +5126,19 @@ impl App {
                 if let Some(editor) = self.editor_mut().filter(|_| (1..=16).contains(&slot)) { editor.auto_login.character_slot = slot; }
             }
             Message::SaveAccount => {
+                // The authenticator key as typed (spaces, lowercase, padding) is saved in its
+                // stored form; a key that is not base32 keeps the sheet open with the reason.
+                if let Some(editor) = self.editor.as_mut() {
+                    let key = &mut editor.account.totp_key;
+                    if key.trim().is_empty() || editor.account.mode != AccountMode::Retail {
+                        key.zeroize();
+                    } else {
+                        match totp::normalize(key) {
+                            Ok(normalized) => { key.zeroize(); key.push_str(&normalized); }
+                            Err(error) => { self.status = error.message().into(); return Effect::none(); }
+                        }
+                    }
+                }
                 if let Some(editor) = &self.editor {
                     if self.settings.launch_with_for(&editor.account) == crate::backend::LaunchWith::Native {
                         if editor.dat_overlays.len() > 8 { self.status = t("Choose at most eight DAT overlay folders.").into(); return Effect::none(); }
@@ -5374,9 +5446,9 @@ impl App {
                         // Every restarted Play signs in again after the updater signed out its
                         // session. An OTP account needs a replacement code; one entered during
                         // the update stays on the row until the normal launch consumes it.
-                        let otp_account = self.settings.account_otp.contains(&key);
+                        let settings = &self.settings;
                         if let Some(row) = self.accounts.iter_mut().find(|row| row.key == key
-                            && (row.otp_spent || otp_account) && row.otp.is_empty() && !row.busy && row.pid.is_none()) {
+                            && wants_typed_code(settings, row) && row.otp.is_empty() && !row.busy && row.pid.is_none()) {
                             row.status = t("That one-time code was used. Enter a new one, then press Play.").into();
                             row.problem = true;
                             continue;
@@ -5545,7 +5617,8 @@ impl App {
                         // A new account's "Sign in now", under the
                         // Settings switch and never for a one-time-password account.
                         let sign_in = self.editor.as_ref()
-                            .filter(|editor| editor.key.is_none() && editor.flags.sign_in_now && !editor.flags.uses_otp && self.settings.auto_sign_in)
+                            .filter(|editor| editor.key.is_none() && editor.flags.sign_in_now && self.settings.auto_sign_in
+                                && (!editor.flags.uses_otp || !editor.account.totp_key.is_empty()))
                             .map(|editor| account_key(&editor.account));
                         self.editor = None;
                         self.park_checked = None;
@@ -5770,6 +5843,7 @@ fn blank_account() -> Account {
         ashita_boot_ini: None,
         windower_profile: None,
         pol_handle_names: String::new(),
+        totp_key: String::new(),
     }
 }
 
@@ -10135,6 +10209,151 @@ mod tests {
         assert!(app.settings.account_otp.contains(&refused_key) && !app.settings.presigns(&refused_key));
         assert!(!app.accounts[0].status_text().contains("may need a one-time password") && !app.accounts[2].status_text().contains("may need a one-time password"));
         let _ = std::fs::remove_dir_all(&app.config.experiment);
+    }
+
+    const TEST_TOTP_KEY: &str = "JBSWY3DPEHPK3PXP";
+
+    /// An account with an authenticator key needs no typed code: it is signed in when Crystal
+    /// opens and again after its game, like an account without codes, even one known to take
+    /// codes or whose last typed code was spent, and its row shows no code boxes. The switch and
+    /// a code the user typed still win.
+    #[test]
+    fn an_authenticator_key_makes_an_otp_account_sign_in_by_itself() {
+        let (mut app, key) = resign_app("authenticator-presign");
+        app.settings.note_sign_in(&key, true);
+        assert!(!app.presigned(&key) && account_row::needs_code(&app, &app.accounts[0]), "an OTP account without a key");
+        app.accounts[0].account.totp_key = TEST_TOTP_KEY.into();
+        assert!(app.accounts[0].authenticator_ready());
+        assert!(app.presigned(&key) && app.resign_eligible(&key));
+        assert!(!account_row::needs_code(&app, &app.accounts[0]));
+        assert_eq!(account_row::row_state(&app, &app.accounts[0]), account_row::RowState::Idle);
+        assert!(!account_row::row_view(&app, &app.accounts[0]).otp, "no code boxes on its row");
+        // A spent typed code does not matter: the key makes a fresh one.
+        app.accounts[0].otp_spent = true;
+        assert!(app.presigned(&key) && !wants_typed_code(&app.settings, &app.accounts[0]));
+        app.accounts[0].otp_spent = false;
+        // The user's choices win: the switch, and a code typed for their own Play.
+        app.settings.auto_sign_in = false;
+        assert!(!app.presigned(&key));
+        app.settings.auto_sign_in = true;
+        app.accounts[0].otp = "123456".into();
+        assert!(!app.presigned(&key));
+        app.accounts[0].otp.clear();
+        // When Crystal opens, and after its game.
+        app.startup_signin_pending = true;
+        assert_eq!(app.take_startup_signins(), vec![key.clone()]);
+        game_ends(&mut app, 0, signed_out());
+        assert!(app.accounts[0].resign.is_some(), "it signs back in after its game");
+        // Its own sign-in without a typed code works: the account stays known to take codes
+        // (should the key be removed) and stays eligible.
+        let row = &mut app.accounts[0];
+        (row.busy, row.resign, row.launch_trigger) = (true, None, Some(launch_timing::LaunchTrigger::StartupSignIn));
+        app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult {
+            pid: 41, detail: "Signed in.".into(), alive: Arc::new(AtomicBool::new(true)),
+            game_running: Arc::new(AtomicBool::new(false)), log: PathBuf::new(),
+            outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
+        })));
+        assert!(app.settings.account_otp.contains(&key) && app.presigned(&key));
+        // A failure that never reached a verdict retries once the network is back, as for an
+        // account without codes: the key makes the retry's code.
+        let row = &mut app.accounts[0];
+        (row.pid, row.alive, row.game_running) = (None, None, None);
+        (row.busy, row.otp_spent, row.launch_trigger, row.presign_login) = (true, true, Some(launch_timing::LaunchTrigger::StartupSignIn), true);
+        app.worker_event(WorkerEvent::Complete(key.clone(),
+            Err("Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -19). (Windower via crystal-loader).".into())));
+        assert_eq!(app.accounts[0].network_wait, Some(NetworkWait::StartupRetry));
+        let _ = std::fs::remove_dir_all(&app.config.experiment);
+    }
+
+    /// A code made from the key that PlayOnline refuses: the row says so in one short line and
+    /// shows the code boxes, so the next attempt can be a typed code. Nothing signs the account
+    /// in again by itself (no retry, none after its game, none at the next start), whatever
+    /// started the refused sign-in. A sign-in without a typed code that works, or an edited
+    /// key, makes the key usable again.
+    #[test]
+    fn a_refused_authenticator_code_falls_back_to_a_typed_code_and_is_not_retried() {
+        i18n::set(i18n::Lang::En);
+        let refused = "Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -1036). (Windower via crystal-loader).";
+        for trigger in [launch_timing::LaunchTrigger::StartupSignIn, launch_timing::LaunchTrigger::SignInAfterGame,
+            launch_timing::LaunchTrigger::Play, launch_timing::LaunchTrigger::QueuedPlay] {
+            let (mut app, key) = resign_app("authenticator-refused");
+            app.accounts[0].account.totp_key = TEST_TOTP_KEY.into();
+            let row = &mut app.accounts[0];
+            (row.busy, row.preparing_session, row.launch_trigger, row.presign_login) = (true, true, Some(trigger), trigger.is_presign());
+            app.worker_event(WorkerEvent::Complete(key.clone(), Err(refused.into())));
+            let row = &app.accounts[0];
+            assert!(row.authenticator_refused && !row.authenticator_ready(), "{trigger:?}");
+            assert_eq!(row.status_text(), "Authenticator code refused. Check the key.", "{trigger:?}");
+            assert!(row.network_wait.is_none() && row.resign.is_none() && row.queued_play.is_none(), "{trigger:?}");
+            assert_eq!(account_row::row_state(&app, row), account_row::RowState::NeedsCode, "{trigger:?}");
+            let view = account_row::row_view(&app, row);
+            assert!(view.otp && view.detail == "Authenticator code refused. Check the key.", "{trigger:?}");
+            assert!(!app.presigned(&key) && wants_typed_code(&app.settings, row), "{trigger:?}");
+            // Nothing signs it in by itself any more.
+            let _ = app.update(Message::Tick);
+            game_ends(&mut app, 0, signed_out());
+            assert!(app.accounts[0].resign.is_none() && app.take_resigns(Instant::now() + RESIGN_DELAY).is_empty(), "{trigger:?}");
+            app.startup_signin_pending = true;
+            assert!(app.take_startup_signins().is_empty() && app.startup_waiting.is_empty(), "{trigger:?}");
+            app.maintenance_sign_ins();
+            assert!(app.launches.as_ref().unwrap().is_empty(), "never retried: {trigger:?}");
+            // A typed code is the next attempt.
+            app.accounts[0].otp = "123456".into();
+            assert!(matches!(account_row::row_view(&app, &app.accounts[0]).action, Some((_, Message::SignIn(_), true))));
+            app.accounts[0].otp.clear();
+            let _ = std::fs::remove_dir_all(&app.config.experiment);
+        }
+        // A refusal of a typed code says nothing about the key.
+        let (mut app, key) = resign_app("authenticator-typed-refused");
+        app.accounts[0].account.totp_key = TEST_TOTP_KEY.into();
+        let row = &mut app.accounts[0];
+        (row.busy, row.otp_spent, row.launch_trigger) = (true, true, Some(launch_timing::LaunchTrigger::Play));
+        app.worker_event(WorkerEvent::Complete(key.clone(), Err(refused.into())));
+        assert!(!app.accounts[0].authenticator_refused && app.accounts[0].status == refused);
+        // A sign-in without a typed code that works clears a refusal.
+        app.accounts[0].authenticator_refused = true;
+        let row = &mut app.accounts[0];
+        (row.busy, row.otp_spent, row.launch_trigger) = (true, false, Some(launch_timing::LaunchTrigger::Play));
+        app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult {
+            pid: 41, detail: "Client started".into(), alive: Arc::new(AtomicBool::new(true)),
+            game_running: Arc::new(AtomicBool::new(true)), log: PathBuf::new(),
+            outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
+        })));
+        assert!(app.accounts[0].authenticator_ready());
+        // An edited key is tried afresh.
+        app.accounts[0].authenticator_refused = true;
+        let mut accounts: Vec<Account> = app.accounts.iter().map(|row| row.account.clone()).collect();
+        accounts[0].totp_key = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".into();
+        app.replace_accounts(accounts.clone());
+        assert!(app.accounts[0].authenticator_ready());
+        // The same key saved again keeps the refusal.
+        app.accounts[0].authenticator_refused = true;
+        app.replace_accounts(accounts);
+        assert!(app.accounts[0].authenticator_refused);
+        let _ = std::fs::remove_dir_all(&app.config.experiment);
+    }
+
+    /// The account sheet saves the key as typed from a setup page (spaces, lowercase, padding)
+    /// in its stored form, refuses one with other characters with a short reason (the sheet
+    /// stays open), and clears it when emptied.
+    #[test]
+    fn the_account_sheet_saves_the_authenticator_key_in_its_stored_form() {
+        i18n::set(i18n::Lang::En);
+        let mut app = app();
+        let key = app.accounts[0].key.clone();
+        let _ = app.update(Message::EditAccount(key.clone()));
+        for (typed, error) in [("jbsw y3dp ehpk 3px1", totp::KeyError::Characters), ("jbsw y3dp", totp::KeyError::Length)] {
+            let _ = app.update(Message::EditorChanged(Field::TotpKey, typed.into()));
+            let _ = app.update(Message::SaveAccount);
+            assert_eq!(app.status, error.message(), "{typed}");
+            assert_eq!(app.editor.as_ref().unwrap().account.totp_key, typed, "kept for correction");
+        }
+        let _ = app.update(Message::EditorChanged(Field::TotpKey, "jbsw y3dp ehpk 3pxp ====".into()));
+        let _ = app.update(Message::SaveAccount);
+        assert_eq!(app.editor.as_ref().unwrap().account.totp_key, TEST_TOTP_KEY);
+        let _ = app.update(Message::EditorChanged(Field::TotpKey, "   ".into()));
+        let _ = app.update(Message::SaveAccount);
+        assert!(app.editor.as_ref().unwrap().account.totp_key.is_empty());
     }
 
     /// Owner decision 2026-10-13: the Settings switch, off, stops Crystal's own sign-ins at its

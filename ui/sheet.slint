@@ -151,6 +151,22 @@ export component AccountSheet inherits SideSheet {
                     edited(value) => { View.sheet-edited(5, value); }
                 }
             }
+            // The Square Enix authenticator key, under the passwords: masked like them, Show (or
+            // Change on a saved key) beside it, its note under it.
+            if View.sheet.retail: VerticalLayout {
+                spacing: Theme.label-gap;
+                FieldWithButton {
+                    caption: View.sheet-strings.totp-key;
+                    placeholder: View.sheet-strings.totp-key-placeholder;
+                    text <=> View.sheet-totp-key;
+                    password: View.sheet.totp-key-masked;
+                    enabled: View.sheet.totp-key-enabled;
+                    button: View.sheet.totp-key-button;
+                    edited(value) => { View.sheet-edited(7, value); }
+                    pressed => { View.sheet-flag(View.sheet.totp-key-enabled ? 5 : 6, true); }
+                }
+                Note { text: View.sheet-strings.totp-key-note; }
+            }
             Labelled {
                 caption: View.sheet-strings.region;
                 Segmented {

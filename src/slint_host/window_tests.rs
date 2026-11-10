@@ -111,6 +111,46 @@ fn privacy_mode_masks_every_identity_on_every_page() {
     assert!(friends.iter().any(|text| text == "Alyria") && friends.iter().any(|text| text.contains("Rhapsodies")), "{friends:?}");
 }
 
+/// The account sheet's authenticator key: a saved key is masked and read-only until Change,
+/// then Show reveals it, except in privacy mode, where it stays masked. Its caption and note
+/// show for retail accounts, in English and Japanese.
+#[test]
+fn the_authenticator_key_is_masked_unless_shown_and_always_in_privacy_mode() {
+    crate::privacy::set(false);
+    let (ui, window) = main_window();
+    for lang in Lang::ALL {
+        crate::i18n::set(lang);
+        let mut app = crate::tests::app();
+        app.accounts[0].account.totp_key = "JBSWY3DPEHPK3PXP".into();
+        let key = app.accounts[0].key.clone();
+        let _ = app.update(Message::EditAccount(key));
+        let shown = render(&ui, &window, &app);
+        assert!(shown.iter().any(|text| text == t("Authenticator key")), "{shown:?}");
+        assert!(shown.iter().any(|text| text == t("From Square Enix's authenticator setup. Codes are filled in for you.")), "{shown:?}");
+        let sheet = || ui.global::<super::View>().get_sheet();
+        assert!(sheet().totp_key_masked && !sheet().totp_key_enabled && sheet().totp_key_button == t("Change"));
+        let _ = app.update(Message::EditorFlag(crate::EditorFlag::ChangeTotpKey, true));
+        render(&ui, &window, &app);
+        assert!(sheet().totp_key_masked && sheet().totp_key_enabled && sheet().totp_key_button == t("Show"));
+        let _ = app.update(Message::EditorFlag(crate::EditorFlag::ShowTotpKey, true));
+        render(&ui, &window, &app);
+        assert!(!sheet().totp_key_masked && sheet().totp_key_button == t("Hide"));
+        crate::privacy::set(true);
+        render(&ui, &window, &app);
+        assert!(sheet().totp_key_masked, "privacy mode masks a shown key");
+        crate::privacy::set(false);
+        // An account without a key takes one at once.
+        let mut app = crate::tests::app();
+        let key = app.accounts[1].key.clone();
+        let _ = app.update(Message::EditAccount(key));
+        render(&ui, &window, &app);
+        assert!(sheet().totp_key_masked && sheet().totp_key_enabled && sheet().totp_key_button == t("Show"));
+        let _ = app.update(Message::CloseEditor);
+        assert!(render(&ui, &window, &app).iter().all(|text| !text.contains("JBSWY3DPEHPK3PXP")), "a closed sheet keeps no key");
+    }
+    crate::i18n::set(Lang::En);
+}
+
 /// The layout zooms only below the 1440 px design width, and no further than 0.8.
 #[test]
 fn scale_reflows_above_design_width_and_shrinks_below() {
@@ -582,6 +622,16 @@ fn skyline_screenshots() {
     shot("settings-dark", &mut settings, 1440, 900, false);
     let mut downloads = app(Page::Maintenance, None, false, false);
     shot("downloads-light", &mut downloads, 1440, 900, true);
+    // The account sheet of an account with a saved authenticator key (masked, Change).
+    let mut sheet = app(Page::Home, None, false, false);
+    sheet.accounts[0].account.totp_key = "JBSWY3DPEHPK3PXP".into();
+    let key = sheet.accounts[0].key.clone();
+    let _ = sheet.update(Message::EditAccount(key));
+    shot("sheet-authenticator-dark", &mut sheet, 1440, 900, false);
+    shot("sheet-authenticator-light", &mut sheet, 1440, 900, true);
+    crate::i18n::set(Lang::Ja);
+    shot("sheet-authenticator-ja", &mut sheet, 1440, 900, false);
+    crate::i18n::set(Lang::En);
 }
 
 /// CRYSTAL_GAUGE_SHOTS=<dir>: the crystal wherever it shows, dark and light, at 1x and 150 %:

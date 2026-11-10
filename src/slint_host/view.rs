@@ -36,7 +36,7 @@ impl std::fmt::Display for CharacterSelect {
     }
 }
 const EDITOR_LAUNCH: [Option<LaunchWith>; 4] = [None, Some(LaunchWith::Windower), Some(LaunchWith::Ashita), Some(LaunchWith::Vanilla)];
-const FIELDS: [Field; 7] = [Field::Label, Field::Server, Field::PolId, Field::PolPassword, Field::SeId, Field::SePassword, Field::PolHandleNames];
+const FIELDS: [Field; 8] = [Field::Label, Field::Server, Field::PolId, Field::PolPassword, Field::SeId, Field::SePassword, Field::PolHandleNames, Field::TotpKey];
 /// A one-time code's digits.
 const CODE_LEN: usize = 6;
 
@@ -211,6 +211,8 @@ pub(super) fn wire(ui: &MainWindow) {
         2 => Message::EditorFlag(EditorFlag::ShowId, !s.flags.show_id),
         3 => Message::EditorFlag(EditorFlag::ShowPassword, !s.flags.show_password),
         4 => Message::EditorFlag(EditorFlag::ChangePassword, true),
+        5 => Message::EditorFlag(EditorFlag::ShowTotpKey, !s.flags.show_totp_key),
+        6 => Message::EditorFlag(EditorFlag::ChangeTotpKey, true),
         _ => return None,
     })));
     view.on_sheet_auto_login(|on| send(Message::EditorAutoLogin(on)));
@@ -363,6 +365,9 @@ fn sheet_strings() -> SheetStrings {
         region: t("Region").into(),
         region_note: t("Retail launch is currently verified with the US configuration.").into(),
         uses_otp: t("Uses a one-time password (security token)").into(),
+        totp_key: t("Authenticator key").into(),
+        totp_key_placeholder: t("Optional").into(),
+        totp_key_note: t("From Square Enix's authenticator setup. Codes are filled in for you.").into(),
         handles: t("PlayOnline handle setup (optional)").into(),
         handles_placeholder: t("Public handle name").into(),
         handles_note: t("Registers your characters on first login. Up to eight per handle, separated by commas.").into(),
@@ -1149,6 +1154,7 @@ fn sheet(view: &View, app: &App, state: &mut State) {
         put!(view, get_sheet_se_id, set_sheet_se_id, SharedString::new());
         put!(view, get_sheet_se_password, set_sheet_se_password, SharedString::new());
         put!(view, get_sheet_handles, set_sheet_handles, SharedString::new());
+        put!(view, get_sheet_totp_key, set_sheet_totp_key, SharedString::new());
         put!(view, get_sheet_folder, set_sheet_folder, SharedString::new());
         return;
     };
@@ -1162,6 +1168,8 @@ fn sheet(view: &View, app: &App, state: &mut State) {
     let row = editor.key.as_ref().and_then(|key| app.accounts.iter().find(|row| &row.key == key));
     let active = row.is_some_and(|row| row.busy || row.pid.is_some());
     let can_type = !editing || flags.change_password;
+    // A saved key is guarded like the password; an account without one takes a key at once.
+    let key_can_type = !editing || flags.change_totp_key || row.is_none_or(|row| row.account.totp_key.is_empty());
 
     // Launch.
     let default = app.settings.launch_with;
@@ -1215,10 +1223,12 @@ fn sheet(view: &View, app: &App, state: &mut State) {
         }
         None => (false, Ink::Sub, String::new(), String::new(), false, String::new(), false, false),
     };
-    let allowed = app.settings.auto_sign_in && !flags.uses_otp;
+    // An authenticator key fills in the codes: such an account signs in like one without codes.
+    let codes_typed = flags.uses_otp && account.totp_key.trim().is_empty();
+    let allowed = app.settings.auto_sign_in && !codes_typed;
     let sign_in_note = if !app.settings.auto_sign_in {
         t("Automatic sign-in is off in Settings → System.")
-    } else if flags.uses_otp {
+    } else if codes_typed {
         t("One-time password accounts sign in when you type a code on Home.")
     } else {
         ""
@@ -1247,6 +1257,9 @@ fn sheet(view: &View, app: &App, state: &mut State) {
         handles_masked: privacy,
         region: i32::from(account.region.min(2)),
         uses_otp: flags.uses_otp,
+        totp_key_masked: privacy || !flags.show_totp_key,
+        totp_key_enabled: key_can_type,
+        totp_key_button: (if !key_can_type { t("Change") } else if flags.show_totp_key { t("Hide") } else { t("Show") }).into(),
         launch_index,
         launch_hint: launch_hint.into(),
         tool,
@@ -1284,6 +1297,7 @@ fn sheet(view: &View, app: &App, state: &mut State) {
     put!(view, get_sheet_se_id, set_sheet_se_id, account.se_id.as_str().into());
     put!(view, get_sheet_se_password, set_sheet_se_password, account.se_password.as_str().into());
     put!(view, get_sheet_handles, set_sheet_handles, account.pol_handle_names.as_str().into());
+    put!(view, get_sheet_totp_key, set_sheet_totp_key, account.totp_key.as_str().into());
     put!(view, get_sheet_folder, set_sheet_folder, editor.game_install.as_str().into());
 }
 

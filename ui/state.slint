@@ -170,6 +170,9 @@ export struct SheetStrings {
     region: string,
     region-note: string,
     uses-otp: string,
+    totp-key: string,
+    totp-key-placeholder: string,
+    totp-key-note: string,
     handles: string,
     handles-placeholder: string,
     handles-note: string,
@@ -214,6 +217,11 @@ export struct Sheet {
     handles-masked: bool,
     region: int,
     uses-otp: bool,
+    /// The authenticator key field: masked unless shown (always in privacy mode), and on a saved
+    /// account that has a key, read-only until Change, like the password.
+    totp-key-masked: bool,
+    totp-key-enabled: bool,
+    totp-key-button: string,
     launch-index: int,
     launch-hint: string,
     /// 0 no tool field, 1 Ashita boot config, 2 Windower profile.
@@ -363,16 +371,18 @@ export global View {
     in-out property <string> sheet-se-id;
     in-out property <string> sheet-se-password;
     in-out property <string> sheet-handles;
+    in-out property <string> sheet-totp-key;
     in-out property <string> sheet-folder;
     callback close-sheet();
     callback save-sheet();
     /// A field changed: 0 label, 1 server, 2 PlayOnline ID, 3 password, 4 Square Enix ID,
-    /// 5 Square Enix password, 6 handle names (crate::Field's order).
+    /// 5 Square Enix password, 6 handle names, 7 authenticator key (crate::Field's order).
     callback sheet-edited(int, string);
     callback sheet-folder-edited(string);
     callback sheet-region(int);
     callback sheet-launch(int);
-    /// crate::EditorFlag's order: uses OTP, sign in now, show ID, show password, change password.
+    /// crate::EditorFlag's order: uses OTP, sign in now, show ID, show password, change password,
+    /// show authenticator key, change authenticator key.
     callback sheet-flag(int, bool);
     callback sheet-auto-login(bool);
     callback sheet-slot(int);

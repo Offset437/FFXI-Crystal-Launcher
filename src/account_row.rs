@@ -23,10 +23,12 @@ fn clock_at(at: std::time::Instant) -> String {
     let ago = chrono::Duration::from_std(at.elapsed()).unwrap_or_default();
     (chrono::Local::now() - ago).format("%H:%M").to_string()
 }
-/// Whether the row is an account that needs a one-time code before it can sign in.
+/// Whether the row is an account that needs a one-time code before it can sign in. An account
+/// with an authenticator key needs none typed, unless PlayOnline refused one of its codes.
 pub(crate) fn needs_code(app: &App, item: &crate::AccountRow) -> bool {
     item.account.mode == AccountMode::Retail
-        && (app.settings.account_otp.contains(&item.key) || !item.otp.is_empty())
+        && (!item.otp.is_empty() || item.authenticator_refused
+            || !item.authenticator_ready() && app.settings.account_otp.contains(&item.key))
 }
 /// Which state an account row shows, in priority order (its colour needs only this).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,7 +137,9 @@ pub(crate) fn row_view(app: &App, item: &crate::AccountRow) -> RowView {
             // Code boxes only where a code could be the answer: a refused member login, or a
             // spent code. A loader that never connected, a crash or a version stop asked for none
             // (live 2026-11-10: two timed-out rows looked like they wanted a code).
-            row.otp = idle && (crate::launch_log::sign_in_refused(&item.status) || item.otp_spent);
+            // An authenticator key answers both.
+            row.otp = idle && !item.authenticator_ready()
+                && (crate::launch_log::sign_in_refused(&item.status) || item.otp_spent);
             if item.log.is_some() && idle {
                 row.action = Some((t("View log").into(), Message::OpenLog(item.key.clone()), false));
             }

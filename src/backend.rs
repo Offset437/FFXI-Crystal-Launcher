@@ -233,6 +233,11 @@ pub struct Account {
     /// existing handle and character assignments alone.
     #[serde(default)]
     pub pol_handle_names: String,
+    /// Retail only: the Square Enix authenticator key (base32, stored form `totp::normalize`),
+    /// or empty. Kept in the encrypted vault beside the passwords; sign-ins make their one-time
+    /// codes from it (`totp`).
+    #[serde(default)]
+    pub totp_key: String,
 }
 /// The game front end the launch profile starts. Native is retained only to read
 /// older settings and account vaults; it is not an available launch route.
@@ -272,6 +277,15 @@ impl Account {
     fn has_launch_settings(&self) -> bool {
         self.launch_with.is_some() || self.ashita_boot_ini.is_some() || self.windower_profile.is_some()
     }
+    /// A copy for work that never signs in (parking a host, controller settings): no
+    /// passwords and no authenticator key.
+    pub(crate) fn without_secrets(&self) -> Self {
+        let mut account = self.clone();
+        account.pol_password.zeroize();
+        account.se_password.zeroize();
+        account.totp_key.zeroize();
+        account
+    }
 }
 impl Drop for Account {
     fn drop(&mut self) {
@@ -280,6 +294,7 @@ impl Drop for Account {
         self.se_id.zeroize();
         self.se_password.zeroize();
         self.pol_handle_names.zeroize();
+        self.totp_key.zeroize();
     }
 }
 
@@ -306,6 +321,11 @@ fn validate_account(account: &Account) -> Result<(), String> {
         if name.is_empty() || !crate::pol_less::tools::valid_profile(name) {
             return Err(t("The Windower profile name can't contain quotes or control characters.").into());
         }
+    }
+    if !account.totp_key.is_empty()
+        && (account.mode != AccountMode::Retail || !crate::totp::is_stored_form(&account.totp_key))
+    {
+        return Err(t("The authenticator key can only contain the letters A–Z and the digits 2–7.").into());
     }
     match account.mode {
         AccountMode::Private => {
@@ -368,15 +388,20 @@ fn validate_host(server: &str) -> Result<(), String> {
     Ok(())
 }
 const VAULT_LIMIT: usize = 4 * 1024 * 1024;
-/// Version 1: the six login fields. Version 2 adds the per-account launch settings. Vaults
-/// whose accounts have no launch settings are still written as version 1, so an older
-/// launcher can read them.
+/// Version 1: the six login fields. Version 2 adds the per-account launch settings; version 3
+/// adds the authenticator key. Each vault is written in the oldest version that holds what its
+/// accounts have (no launch settings: version 1; no key: at most version 2), so an older
+/// launcher can read it.
 const VAULT_V1: &[u8; 8] = b"XIAC001\n";
 const VAULT_V2: &[u8; 8] = b"XIAC002\n";
+const VAULT_V3: &[u8; 8] = b"XIAC003\n";
 /// Bytes per account before its variable-length text: mode, region and six length prefixes;
-/// version 2 adds the launch byte and two more prefixes.
+/// version 2 adds the launch byte and two more prefixes, version 3 one more prefix.
 const ACCOUNT_FIXED_V1: usize = 26;
 const ACCOUNT_FIXED_V2: usize = ACCOUNT_FIXED_V1 + 9;
+const ACCOUNT_FIXED_V3: usize = ACCOUNT_FIXED_V2 + 4;
+/// The longest stored authenticator key (`totp::normalize`).
+const TOTP_KEY_LIMIT: usize = 128;
 
 fn launch_with_code(value: Option<LaunchWith>) -> u8 {
     match value {
@@ -400,7 +425,8 @@ fn launch_with_from_code(code: u8) -> Result<Option<LaunchWith>, String> {
 
 // Length-prefixed UTF-8 avoids unprotected JSON escape/reallocation buffers.
 fn encode_accounts(accounts: &[Account]) -> Result<Zeroizing<Vec<u8>>, String> {
-    let v2 = accounts.iter().any(Account::has_launch_settings);
+    let v3 = accounts.iter().any(|account| !account.totp_key.is_empty());
+    let v2 = v3 || accounts.iter().any(Account::has_launch_settings);
     /// Version 2's text fields; empty stands for "use the default".
     fn launch_fields(account: &Account) -> [&String; 2] {
         static EMPTY: String = String::new();
@@ -413,8 +439,11 @@ fn encode_accounts(accounts: &[Account]) -> Result<Zeroizing<Vec<u8>>, String> {
     for account in accounts {
         validate_account(account)?;
         size = size
-            .checked_add(if v2 { ACCOUNT_FIXED_V2 } else { ACCOUNT_FIXED_V1 })
+            .checked_add(if v3 { ACCOUNT_FIXED_V3 } else if v2 { ACCOUNT_FIXED_V2 } else { ACCOUNT_FIXED_V1 })
             .ok_or(t("Saved accounts are too large."))?;
+        if v3 {
+            size = size.checked_add(account.totp_key.len()).ok_or(t("Saved accounts are too large."))?;
+        }
         for field in [
             &account.label,
             &account.server,
@@ -441,7 +470,7 @@ fn encode_accounts(accounts: &[Account]) -> Result<Zeroizing<Vec<u8>>, String> {
         .try_into()
         .map_err(|_| t("Too many saved accounts."))?;
     let mut plaintext = Zeroizing::new(Vec::with_capacity(size));
-    plaintext.extend_from_slice(if v2 { VAULT_V2 } else { VAULT_V1 });
+    plaintext.extend_from_slice(if v3 { VAULT_V3 } else if v2 { VAULT_V2 } else { VAULT_V1 });
     plaintext.extend_from_slice(&count.to_le_bytes());
     let put = |plaintext: &mut Zeroizing<Vec<u8>>, field: &String| {
         plaintext.extend_from_slice(&(field.len() as u32).to_le_bytes());
@@ -469,6 +498,9 @@ fn encode_accounts(accounts: &[Account]) -> Result<Zeroizing<Vec<u8>>, String> {
                 put(&mut plaintext, field);
             }
         }
+        if v3 {
+            put(&mut plaintext, &account.totp_key);
+        }
     }
     debug_assert_eq!(plaintext.len(), size);
     Ok(plaintext)
@@ -494,13 +526,14 @@ fn decode_accounts(mut plaintext: &[u8]) -> Result<Vec<Account>, String> {
     if plaintext.len() > VAULT_LIMIT {
         return Err(t("Unsupported saved-account vault format.").into());
     }
-    let v2 = match take(&mut plaintext, 8)? {
-        magic if magic == VAULT_V1 => false,
-        magic if magic == VAULT_V2 => true,
+    let (v2, v3) = match take(&mut plaintext, 8)? {
+        magic if magic == VAULT_V1 => (false, false),
+        magic if magic == VAULT_V2 => (true, false),
+        magic if magic == VAULT_V3 => (true, true),
         _ => return Err(t("Unsupported saved-account vault format.").into()),
     };
     let count = u32::from_le_bytes(take(&mut plaintext, 4)?.try_into().unwrap()) as usize;
-    if count > plaintext.len() / if v2 { ACCOUNT_FIXED_V2 } else { ACCOUNT_FIXED_V1 } {
+    if count > plaintext.len() / if v3 { ACCOUNT_FIXED_V3 } else if v2 { ACCOUNT_FIXED_V2 } else { ACCOUNT_FIXED_V1 } {
         return Err(t("Invalid saved-account count.").into());
     }
     let mut accounts = Vec::new();
@@ -528,6 +561,7 @@ fn decode_accounts(mut plaintext: &[u8]) -> Result<Vec<Account>, String> {
             ashita_boot_ini = text(field(&mut plaintext, 255)?);
             windower_profile = text(field(&mut plaintext, 128)?);
         }
+        let mut totp_key = if v3 { field(&mut plaintext, TOTP_KEY_LIMIT)? } else { Zeroizing::new(String::new()) };
         let account = Account {
             label: std::mem::take(&mut *label),
             mode,
@@ -541,6 +575,7 @@ fn decode_accounts(mut plaintext: &[u8]) -> Result<Vec<Account>, String> {
             ashita_boot_ini,
             windower_profile,
             pol_handle_names: String::new(),
+            totp_key: std::mem::take(&mut *totp_key),
         };
         validate_account(&account)?;
         accounts.push(account);
@@ -774,6 +809,7 @@ mod tests {
             ashita_boot_ini: None,
             windower_profile: None,
             pol_handle_names: String::new(),
+            totp_key: String::new(),
         }
     }
     fn retail() -> Account {
@@ -790,6 +826,7 @@ mod tests {
             ashita_boot_ini: None,
             windower_profile: None,
             pol_handle_names: String::new(),
+            totp_key: String::new(),
         }
     }
     /// A version-1 vault, byte for byte as launchers before per-account launch settings wrote it.
@@ -866,6 +903,71 @@ mod tests {
         bad_launch[fixed] = 9;
         assert!(decode_accounts(&bad_launch).is_err());
     }
+    /// The authenticator key lives in the DPAPI vault beside the passwords: it round-trips, the
+    /// file on disk holds neither its text nor its bytes, and a vault without any key keeps its
+    /// older version (an older launcher still reads it).
+    #[test]
+    fn authenticator_keys_round_trip_encrypted_and_never_reach_the_disk_in_plaintext() {
+        let key = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+        let mut with_key = retail();
+        with_key.totp_key = key.into();
+        let plain = retail();
+        assert_eq!(&encode_accounts(&[plain.clone()]).unwrap()[..8], b"XIAC001\n", "no key, no launch settings: version 1");
+        let encoded = encode_accounts(&[with_key.clone(), plain.clone(), account()]).unwrap();
+        assert_eq!(&encoded[..8], b"XIAC003\n");
+        let decoded = decode_accounts(&encoded).unwrap();
+        assert_eq!(decoded[0].totp_key, key);
+        assert!(decoded[1].totp_key.is_empty() && decoded[2].totp_key.is_empty());
+        assert_eq!(decoded[0].pol_password, "synthetic");
+        for end in 0..encoded.len() {
+            assert!(decode_accounts(&encoded[..end]).is_err());
+        }
+        // Older vaults read with no key.
+        let mut launch = retail();
+        launch.launch_with = Some(LaunchWith::Ashita);
+        let v2 = encode_accounts(&[launch]).unwrap();
+        assert_eq!(&v2[..8], b"XIAC002\n");
+        assert!(decode_accounts(&v2).unwrap()[0].totp_key.is_empty());
+
+        let directory = std::env::temp_dir().join(format!("crystal-totp-vault-{}", unique_id().unwrap()));
+        let config = Config { experiment: directory.clone(), repository: directory.clone(), game_install: None, dat_overlays: Vec::new() };
+        save_accounts(&config, &[with_key.clone(), plain]).unwrap();
+        let ciphertext = fs::read(config.vault_path()).unwrap();
+        let decoded_key = b"\x48\x65\x6c\x6c\x6f\x21\xde\xad\xbe\xef"; // JBSWY3DPEHPK3PXP's bytes
+        for needle in [key.as_bytes(), &key.as_bytes()[..16], key.to_ascii_lowercase().as_bytes(), decoded_key] {
+            assert!(!ciphertext.windows(needle.len()).any(|part| part == needle), "plaintext key on disk");
+        }
+        let restored = load_accounts(&config).unwrap();
+        assert_eq!(restored[0].totp_key, key);
+        assert!(restored[1].totp_key.is_empty());
+        drop(restored);
+        // Clearing the key saves the vault without it.
+        with_key.totp_key.clear();
+        save_accounts(&config, &[with_key]).unwrap();
+        assert!(load_accounts(&config).unwrap()[0].totp_key.is_empty());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn authenticator_keys_are_validated_before_storage() {
+        let mut value = retail();
+        for bad in ["jbswy3dpehpk3pxp", "JBSW Y3DP EHPK 3PXP", "JBSWY3DPEHPK3PX1", "SHORT"] {
+            value.totp_key = bad.into();
+            assert!(encode_accounts(&[value.clone()]).is_err(), "{bad}: only the stored form is saved");
+        }
+        value.totp_key = "JBSWY3DPEHPK3PXP".into();
+        assert!(encode_accounts(&[value]).is_ok());
+        let mut private = account();
+        private.totp_key = "JBSWY3DPEHPK3PXP".into();
+        assert!(encode_accounts(&[private]).is_err(), "private-server accounts have no authenticator");
+        // A copy that never signs in carries no secrets.
+        let mut keyed = retail();
+        keyed.totp_key = "JBSWY3DPEHPK3PXP".into();
+        let stripped = keyed.without_secrets();
+        assert!(stripped.totp_key.is_empty() && stripped.pol_password.is_empty() && stripped.se_password.is_empty());
+        assert_eq!(stripped.pol_id, keyed.pol_id);
+    }
+
     #[test]
     fn launch_settings_are_validated() {
         let mut value = retail();

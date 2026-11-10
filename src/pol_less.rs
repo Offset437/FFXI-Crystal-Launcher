@@ -2617,6 +2617,7 @@ mod tests {
             ashita_boot_ini: None,
             windower_profile: None,
             pol_handle_names: String::new(),
+            totp_key: String::new(),
         };
         let plan = Plan {
             social_only: false,
@@ -2672,7 +2673,7 @@ mod tests {
         let account = Account { label: "Fixture".into(), mode: crate::backend::AccountMode::Retail,
             server: String::new(), pol_id: "ABCD1234".into(), pol_password: "synthetic".into(),
             se_id: "synthetic".into(), se_password: "synthetic".into(), region: 0,
-            launch_with: None, ashita_boot_ini: None, windower_profile: None, pol_handle_names: String::new() };
+            launch_with: None, ashita_boot_ini: None, windower_profile: None, pol_handle_names: String::new(), totp_key: String::new() };
         let plan = Plan { tool: Tool::Vanilla, social_only: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, trigger: Default::default(),
             settings: ToolSettings { loader: loader.to_string_lossy().into_owned(),
                 ashita: root.join("missing-ashita").to_string_lossy().into_owned(),
@@ -2736,7 +2737,7 @@ mod tests {
         let account = Account { label: "Fixture".into(), mode: crate::backend::AccountMode::Retail,
             server: String::new(), pol_id: "ABCD1234".into(), pol_password: "synthetic".into(),
             se_id: "synthetic".into(), se_password: "synthetic".into(), region: 0,
-            launch_with: None, ashita_boot_ini: None, windower_profile: None, pol_handle_names: String::new() };
+            launch_with: None, ashita_boot_ini: None, windower_profile: None, pol_handle_names: String::new(), totp_key: String::new() };
         let mut plan = Plan { tool: Tool::Windower, social_only: false,
             auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, trigger: Default::default(),
             settings: ToolSettings { loader: loader.to_string_lossy().into_owned(),
@@ -3557,7 +3558,7 @@ mod tests {
     fn retail_account() -> Account {
         Account { label: "Parked".into(), mode: crate::backend::AccountMode::Retail, server: String::new(), pol_id: "ABCD1234".into(),
             pol_password: "synthetic-pw".into(), se_id: "synthetic".into(), se_password: "synthetic-se".into(), region: 0,
-            launch_with: None, ashita_boot_ini: None, windower_profile: None, pol_handle_names: String::new() }
+            launch_with: None, ashita_boot_ini: None, windower_profile: None, pol_handle_names: String::new(), totp_key: String::new() }
     }
 
     fn parked_plan(trigger: crate::launch_timing::LaunchTrigger) -> Plan {

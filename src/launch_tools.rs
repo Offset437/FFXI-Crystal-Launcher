@@ -401,6 +401,7 @@ mod tests {
             ashita_boot_ini: None,
             windower_profile: None,
             pol_handle_names: String::new(),
+            totp_key: String::new(),
         }
     }
 

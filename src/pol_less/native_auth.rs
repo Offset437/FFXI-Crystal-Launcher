@@ -21,7 +21,10 @@ struct Input {
     pol_password: Zeroizing<String>,
     se_id: Zeroizing<String>,
     se_secret: Zeroizing<[u8; 20]>,
+    /// The code typed on the account's row, or empty.
     otp: Zeroizing<String>,
+    /// With no code typed, the account's authenticator makes one when the credentials go out.
+    authenticator: Option<crate::totp::Authenticator>,
     key: String,
     handle_names: Zeroizing<String>,
 }
@@ -90,6 +93,13 @@ impl NativeAuth {
         if !otp.is_empty() && (otp.len() != 6 || !otp.bytes().all(|b| b.is_ascii_digit())) {
             return Err(t("Enter a six-digit one-time code, or leave it empty.").into());
         }
+        // A typed code wins: it is the user's answer after an authenticator code was refused.
+        let authenticator = if otp.is_empty() && !account.totp_key.is_empty() {
+            Some(crate::totp::Authenticator::new(&account.totp_key, &directory)
+                .ok_or(t("The authenticator key can only contain the letters A–Z and the digits 2–7."))?)
+        } else {
+            None
+        };
         let utf16 = Zeroizing::new(account.se_password.encode_utf16().collect::<Vec<_>>());
         let se_secret =
             crystal_pol::credential::EditorSecret::from_utf16(&utf16).into_native_secret();
@@ -100,6 +110,7 @@ impl NativeAuth {
                 se_id: Zeroizing::new(account.se_id.clone()),
                 se_secret,
                 otp,
+                authenticator,
                 key: backend::account_key(account),
                 handle_names: Zeroizing::new(account.pol_handle_names.clone()),
             })),
@@ -414,13 +425,17 @@ impl NativeAuth {
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .ok_or(t("Native POL credentials were already handed to the game host."))?;
+        // An authenticator account's code is made here, as the credentials leave for the host:
+        // the same six digits a typed code would be, in the same field.
+        let generated = input.authenticator.as_ref().map(crate::totp::Authenticator::code);
+        let otp = generated.as_ref().unwrap_or(&input.otp);
         // Preallocate all secret fields, preventing discarded allocation copies.
         let fields: [(&str, &[u8]); 6] = [
             ("pol_id", input.pol_id.as_bytes()),
             ("pol_password", input.pol_password.as_bytes()),
             ("se_id", input.se_id.as_bytes()),
             ("se_secret", &*input.se_secret),
-            ("otp", input.otp.as_bytes()),
+            ("otp", otp.as_bytes()),
             ("handle_names", input.handle_names.as_bytes()),
         ];
         let capacity = head.len()
@@ -820,6 +835,7 @@ mod tests {
             ashita_boot_ini: None,
             windower_profile: None,
             pol_handle_names: "PublicOne, PublicTwo".into(),
+            totp_key: String::new(),
         };
         let mut auth =
             NativeAuth::new(&account, Zeroizing::new("123456".into()), PathBuf::new()).unwrap();
@@ -858,6 +874,37 @@ mod tests {
         assert!(auth.session_line(Path::new(r"C:\Games\FFXI")).is_err());
     }
 
+    /// An account with an authenticator key and no typed code sends a code made from the key as
+    /// the credentials leave (recording its time step, never the code); a typed code wins, and
+    /// nothing else in the line changes.
+    #[test]
+    fn an_authenticator_key_fills_in_the_code_when_the_credentials_go_out() {
+        let directory = std::env::temp_dir().join(format!("crystal-authenticator-{}", backend::unique_id().unwrap()));
+        let key = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        let mut account = play_account();
+        account.totp_key = key.into();
+        let sent = |otp: &str| {
+            let auth = NativeAuth::new(&account, Zeroizing::new(otp.into()), directory.clone()).unwrap();
+            assert!(crate::totp::recorded_step(&directory).is_none() || !otp.is_empty(), "no code is made before the line");
+            let line = auth.credentials_line().unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&line).unwrap();
+            assert!(!String::from_utf8_lossy(&line).contains(key), "the key never leaves");
+            String::from_utf8(pipe::base64_decode(value["native_auth"]["otp"].as_str().unwrap()).unwrap()).unwrap()
+        };
+        let code = sent("");
+        let step = crate::totp::recorded_step(&directory).expect("the step is recorded");
+        assert_eq!(code, crate::totp::code_at(key, step).as_str());
+        assert!(code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit()));
+        let ledger = std::fs::read_to_string(directory.join("authenticator-step")).unwrap();
+        assert!(!ledger.contains(&code), "the record holds the step, not the code");
+        assert_eq!(sent("654321"), "654321", "a typed code wins");
+        assert_eq!(crate::totp::recorded_step(&directory), Some(step), "and makes no code");
+        // An invalid saved key never reaches the host.
+        account.totp_key = "not a key".into();
+        assert!(NativeAuth::new(&account, Zeroizing::new(String::new()), directory.clone()).is_err());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     fn play_account() -> Account {
         Account {
             label: "test".into(),
@@ -872,6 +919,7 @@ mod tests {
             ashita_boot_ini: None,
             windower_profile: None,
             pol_handle_names: String::new(),
+            totp_key: String::new(),
         }
     }
 

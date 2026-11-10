@@ -442,7 +442,7 @@ fn strings() -> SettingsStrings {
         nav_note_1: t("D-pad or left stick moves focus. Bottom face button selects; right face button goes back. Shoulders change pages; Start activates Play or Update.").into(),
         nav_note_2: t("Select a dropdown or slider, adjust it with the D-pad, then select again to finish. Text entry and Windows file dialogs use the keyboard and mouse.").into(),
         sign_in_label: t("Sign accounts in when Crystal opens").into(),
-        sign_in_note: t("Accounts with a one-time password sign in when you press Play.").into(),
+        sign_in_note: t("Accounts with a one-time password sign in when you press Play, unless they have an authenticator key.").into(),
         keep_label: t("Keep PlayOnline signed in after FFXI closes").into(),
         keep_note: t("Keeps the session for the next Play. Applies to new sign-ins.").into(),
         start_label: t("Start Crystal in the background when Windows starts").into(),
