@@ -1,7 +1,7 @@
 //! Read-only account import. Sources are never changed, and drafts are never saved here.
 //! Forest credentials are decrypted only after an explicit import request.
 
-use crate::{i18n::t, ui::LaunchWith};
+use crate::{i18n::t, backend::LaunchWith};
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use std::{
@@ -12,7 +12,6 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-#[path = "account_import/pol.rs"]
 mod pol;
 
 const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
@@ -38,16 +37,6 @@ pub(crate) struct ImportSource {
     pub kind: SourceKind,
     pub path: PathBuf,
     pub region: Option<u8>,
-}
-
-impl fmt::Display for ImportSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self.kind {
-            SourceKind::PlayOnline => "PlayOnline",
-            SourceKind::Forest => "Forest",
-        };
-        write!(f, "{name} · {}", self.path.display())
-    }
 }
 
 #[derive(Clone, Default)]
@@ -318,9 +307,7 @@ fn import_forest(
     region: u8,
     decrypt: impl Fn(&[u8]) -> Result<Zeroizing<Vec<u8>>, String>,
 ) -> Result<ImportBatch, String> {
-    if bytes.len() > MAX_FILE_BYTES {
-        return Err(t("The import file is too large.").into());
-    }
+    // `import_file` read at most MAX_FILE_BYTES (`read_bounded`).
     // File.ReadAllText also accepts a UTF-8 BOM. No other text encodings are guessed.
     let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
     let entries: ForestEntries = serde_json::from_slice(bytes)
@@ -400,137 +387,24 @@ fn decode_base64(input: &str) -> Result<Zeroizing<Vec<u8>>, ()> {
     if input.len() > 16_384 {
         return Err(());
     }
+    // .NET's Convert.ToBase64String output, possibly wrapped across lines.
     let text: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    if text.is_empty() || text.len() % 4 != 0 {
+    if text.is_empty() {
         return Err(());
     }
-    let digit = |b| match b {
-        b'A'..=b'Z' => Ok(b - b'A'),
-        b'a'..=b'z' => Ok(b - b'a' + 26),
-        b'0'..=b'9' => Ok(b - b'0' + 52),
-        b'+' => Ok(62),
-        b'/' => Ok(63),
-        _ => Err(()),
-    };
-    let mut decoded = Zeroizing::new(Vec::with_capacity(text.len() / 4 * 3));
-    for (i, group) in text.chunks_exact(4).enumerate() {
-        let a = digit(group[0])?;
-        let b = digit(group[1])?;
-        decoded.push((a << 2) | (b >> 4));
-        let last = i + 1 == text.len() / 4;
-        if group[2] == b'=' {
-            if !last || group[3] != b'=' || b & 15 != 0 {
-                return Err(());
-            }
-            continue;
-        }
-        let c = digit(group[2])?;
-        decoded.push((b << 4) | (c >> 2));
-        if group[3] == b'=' {
-            if !last || c & 3 != 0 {
-                return Err(());
-            }
-        } else {
-            decoded.push((c << 6) | digit(group[3])?);
-        }
-    }
-    Ok(decoded)
+    crate::b64::decode_padded(&text).map(Zeroizing::new).ok_or(())
 }
 
-#[cfg(windows)]
 fn unprotect_password(input: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
-    use windows_sys::Win32::{
-        Foundation::LocalFree,
-        Security::Cryptography::{
-            CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
-        },
-    };
-    struct Output(CRYPT_INTEGER_BLOB);
-    impl Drop for Output {
-        fn drop(&mut self) {
-            if !self.0.pbData.is_null() {
-                unsafe {
-                    std::slice::from_raw_parts_mut(self.0.pbData, self.0.cbData as usize).zeroize();
-                    LocalFree(self.0.pbData as _);
-                }
-            }
-        }
-    }
-    let input = CRYPT_INTEGER_BLOB {
-        cbData: input
-            .len()
-            .try_into()
-            .map_err(|_| "Invalid credential size")?,
-        pbData: input.as_ptr() as _,
-    };
-    let mut output = Output(CRYPT_INTEGER_BLOB {
-        cbData: 0,
-        pbData: std::ptr::null_mut(),
-    });
-    let ok = unsafe {
-        CryptUnprotectData(
-            &input,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-            std::ptr::null(),
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut output.0,
-        )
-    };
-    if ok == 0 || output.0.pbData.is_null() || output.0.cbData == 0 || output.0.cbData > 512 {
-        return Err(t("Windows could not decrypt this account password.").into());
-    }
-    Ok(Zeroizing::new(
-        unsafe { std::slice::from_raw_parts(output.0.pbData, output.0.cbData as usize) }.to_vec(),
-    ))
+    crate::win::unprotect(input)
+        .ok()
+        .filter(|password| !password.is_empty() && password.len() <= 512)
+        .ok_or_else(|| t("Windows could not decrypt this account password.").into())
 }
 
-#[cfg(not(windows))]
-fn unprotect_password(_: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
-    Err(t("Forest password import requires Windows.").into())
-}
-
-#[cfg(windows)]
+/// The PlayOnline Viewer folders the registry names, per region (HKLM and HKCU, both views).
 fn pol_installations() -> Vec<(u8, PathBuf)> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::System::Registry::{
-        RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6432KEY,
-    };
-    let mut roots = Vec::new();
-    for (region, vendor) in [(0, "PlayOnlineUS"), (1, "PlayOnlineEU"), (2, "PlayOnline")] {
-        let key: Vec<u16> = format!("SOFTWARE\\{vendor}\\InstallFolder\0")
-            .encode_utf16()
-            .collect();
-        let name: Vec<u16> = "1000\0".encode_utf16().collect();
-        let mut value = [0u16; 2048];
-        let mut bytes = (value.len() * 2) as u32;
-        let ok = unsafe {
-            RegGetValueW(
-                HKEY_LOCAL_MACHINE,
-                key.as_ptr(),
-                name.as_ptr(),
-                RRF_RT_REG_SZ | RRF_SUBKEY_WOW6432KEY,
-                std::ptr::null_mut(),
-                value.as_mut_ptr() as _,
-                &mut bytes,
-            )
-        };
-        if ok == 0 && bytes > 2 && bytes as usize <= value.len() * 2 && bytes % 2 == 0 {
-            if let Some(end) = value[..bytes as usize / 2].iter().position(|c| *c == 0) {
-                let root = PathBuf::from(std::ffi::OsString::from_wide(&value[..end]));
-                if root.is_absolute() {
-                    roots.push((region, root));
-                }
-            }
-        }
-    }
-    roots
-}
-
-#[cfg(not(windows))]
-fn pol_installations() -> Vec<(u8, PathBuf)> {
-    Vec::new()
+    crate::win::reg::install_folders("1000", &crate::win::reg::REGIONS)
 }
 
 #[cfg(test)]
@@ -599,7 +473,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     #[test]
     fn windows_dpapi_recovers_only_the_synthetic_current_user_password() {
         use windows_sys::Win32::{

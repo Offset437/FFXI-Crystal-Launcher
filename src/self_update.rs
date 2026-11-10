@@ -1,16 +1,20 @@
 //! Signed launcher releases, downloaded separately from the game updater.
 //! The release signature covers the version, URL, archive length and hash.
 mod apply;
+pub(crate) mod model;
+/// The settings card's status as plain data for the Slint front end.
+pub(crate) mod front;
 
 use crate::{
     backend::Config,
     i18n::{t, tf},
-    App, Message,
+    App,
 };
-use iced::{Element, Task};
+use crate::effect::Effect;
 use reqwest::{Client, Url};
 use ring::signature::{self, KeyPair};
 use serde::{Deserialize, Serialize};
+use crate::pol_less::tools::embedded::{hex, sha256_hex};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -19,8 +23,8 @@ use std::{
     time::Duration,
 };
 
-const INDEX: &str = "https://api.github.com/repos/Offset437/Crystal-Launcher/releases?per_page=10";
-const RELEASE_PATH: &str = "/Offset437/Crystal-Launcher/releases/download/";
+const INDEX: &str = "https://api.github.com/repos/Offset437/FFXI-Crystal-Launcher/releases?per_page=10";
+const RELEASE_PATH: &str = "/Offset437/FFXI-Crystal-Launcher/releases/download/";
 const PUBLIC_KEY: &str = include_str!("../assets/update-public-key.hex");
 const MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
 const MAX_METADATA: usize = 512 * 1024;
@@ -53,6 +57,8 @@ struct Envelope {
 #[derive(Clone, Debug)]
 pub(crate) struct Release {
     payload: Payload,
+    /// `payload.version`, parsed once by verify().
+    version: semver::Version,
     envelope: Vec<u8>,
 }
 
@@ -87,15 +93,75 @@ pub(crate) enum Msg {
     AutoCheck(bool),
 }
 
+fn last_error_path(data: &Path) -> PathBuf {
+    data.join("launcher-updates").join("last-error.txt")
+}
+
 pub(crate) fn initial(config: &Config) -> State {
-    let path = config.experiment.join("launcher-updates/last-error.txt");
+    // Design previews read the real data folder; they must not consume or clean it.
+    if std::env::args().any(|a| a.starts_with("--preview")) {
+        return State::Idle;
+    }
+    let state = take_last_error(&config.experiment);
+    clean_stale(
+        &config.experiment,
+        std::env::current_exe().ok().as_deref(),
+        matches!(state, State::Error(_)),
+    );
+    state
+}
+
+/// A failed helper run is reported on the next start only, so later starts check again.
+fn take_last_error(data: &Path) -> State {
+    let path = last_error_path(data);
     let mut text = String::new();
-    if let Ok(file) = fs::File::open(path) {
-        if file.take(32 * 1024).read_to_string(&mut text).is_ok() && !text.is_empty() {
-            return State::Error(text);
+    let Ok(file) = fs::File::open(&path) else {
+        return State::Idle;
+    };
+    let read = file.take(32 * 1024).read_to_string(&mut text).is_ok();
+    let _ = fs::remove_file(&path);
+    if read && !text.is_empty() {
+        State::Error(text)
+    } else {
+        State::Idle
+    }
+}
+
+fn clear_last_error(data: &Path) {
+    let _ = fs::remove_file(last_error_path(data));
+}
+
+/// Best effort: staging folders from earlier runs, and package backups beside the exe once
+/// no failure needs them; a backup whose restore failed is never removed. Root-level notes
+/// in launcher-updates stay.
+fn clean_stale(data: &Path, exe: Option<&Path>, failed: bool) {
+    if let Ok(entries) = fs::read_dir(data.join("launcher-updates")) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                let _ = fs::remove_dir_all(entry.path());
+            }
         }
     }
-    State::Idle
+    let Some(folder) = exe.and_then(Path::parent) else {
+        return;
+    };
+    if failed {
+        return; // The error text may name the backup holding the previous package.
+    }
+    if let Ok(entries) = fs::read_dir(folder) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(".crystal-previous-")
+                && entry.file_type().is_ok_and(|t| t.is_dir())
+                && !entry.path().join(apply::RESTORE_FAILED).exists()
+            {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+}
+
+fn current_version() -> semver::Version {
+    semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap()
 }
 
 fn read_metadata(path: &Path) -> Result<Vec<u8>, String> {
@@ -115,7 +181,7 @@ fn bytes<const N: usize>(hex: &str) -> Result<[u8; N], String> {
         return Err(t("Invalid launcher update signature or checksum.").into());
     }
     let mut output = [0; N];
-    for (i, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+    for (i, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let digit = |b: u8| (b as char).to_digit(16).map(|x| x as u8);
         output[i] = digit(pair[0])
             .zip(digit(pair[1]))
@@ -123,10 +189,6 @@ fn bytes<const N: usize>(hex: &str) -> Result<[u8; N], String> {
             .ok_or(t("Invalid launcher update signature or checksum."))?;
     }
     Ok(output)
-}
-
-fn hex(input: &[u8]) -> String {
-    input.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn trusted_key() -> Result<[u8; 32], String> {
@@ -216,6 +278,7 @@ fn verify(envelope: &[u8], key: &[u8; 32]) -> Result<Release, String> {
     bytes::<32>(&payload.sha256)?;
     Ok(Release {
         payload,
+        version,
         envelope: envelope.to_vec(),
     })
 }
@@ -241,6 +304,8 @@ async fn body(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, 
 struct PublishedRelease {
     #[serde(default)]
     draft: bool,
+    #[serde(default)]
+    prerelease: bool,
     assets: Vec<Asset>,
 }
 #[derive(Deserialize)]
@@ -269,8 +334,15 @@ async fn check() -> Result<Option<Release>, String> {
         .await?,
     )
     .map_err(|_| t("GitHub returned invalid launcher release metadata."))?;
-    let mut newest: Option<Release> = None;
-    for release in releases.into_iter().filter(|r| !r.draft).take(10) {
+    let mut candidates = Vec::new();
+    // Pre-releases are for testers (builds that are pre-releases themselves); the GitHub API
+    // never lists drafts to anonymous callers.
+    let tester = !current_version().pre.is_empty();
+    for release in releases
+        .into_iter()
+        .filter(|r| offered(r, tester))
+        .take(10)
+    {
         let Some(asset) = release
             .assets
             .into_iter()
@@ -278,28 +350,57 @@ async fn check() -> Result<Option<Release>, String> {
         else {
             continue;
         };
-        let url = Url::parse(&asset.browser_download_url)
-            .map_err(|_| t("Invalid launcher update URL."))?;
-        if !asset_url(&url, ".json") {
-            return Err(t("Invalid launcher update URL.").into());
-        }
-        let response = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .error_for_status()
-            .map_err(|e| e.to_string())?;
-        let candidate = verify(&body(response, MAX_METADATA).await?, &key)?;
-        let version = semver::Version::parse(&candidate.payload.version).unwrap();
-        if newest
-            .as_ref()
-            .is_none_or(|r| version > semver::Version::parse(&r.payload.version).unwrap())
-        {
-            newest = Some(candidate);
+        candidates.push(fetch_release(&client, &asset.browser_download_url, &key).await);
+    }
+    newest(candidates, &current_version())
+}
+
+/// Whether a published release is considered: never a draft, a flagged pre-release only on
+/// a pre-release build (`newest` then compares versions).
+fn offered(release: &PublishedRelease, tester: bool) -> bool {
+    !release.draft && (tester || !release.prerelease)
+}
+
+async fn fetch_release(client: &Client, url: &str, key: &[u8; 32]) -> Result<Release, String> {
+    let url = Url::parse(url).map_err(|_| t("Invalid launcher update URL."))?;
+    if !asset_url(&url, ".json") {
+        return Err(t("Invalid launcher update URL.").into());
+    }
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+    verify(&body(response, MAX_METADATA).await?, key)
+}
+
+/// The highest verified release. A broken release is skipped; its error is reported only
+/// when no release verifies. A stable build never picks a signed pre-release version.
+fn newest(
+    candidates: Vec<Result<Release, String>>,
+    current: &semver::Version,
+) -> Result<Option<Release>, String> {
+    let mut newest: Option<Release> = None;
+    let mut first_error = None;
+    for candidate in candidates {
+        match candidate {
+            Ok(release) if current.pre.is_empty() && !release.version.pre.is_empty() => {}
+            Ok(release) => {
+                if newest.as_ref().is_none_or(|r| release.version > r.version) {
+                    newest = Some(release);
+                }
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
         }
     }
-    Ok(newest)
+    match (newest, first_error) {
+        (None, Some(error)) => Err(error),
+        (newest, _) => Ok(newest),
+    }
 }
 
 fn verify_archive(path: &Path, release: &Release) -> Result<(), String> {
@@ -308,14 +409,7 @@ fn verify_archive(path: &Path, release: &Release) -> Result<(), String> {
         return Err(t("Launcher update download is incomplete.").into());
     }
     let mut hash = Sha256::new();
-    let mut buffer = [0; 64 * 1024];
-    loop {
-        let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
-        if count == 0 {
-            break;
-        }
-        hash.update(&buffer[..count]);
-    }
+    std::io::copy(&mut file, &mut hash).map_err(|e| e.to_string())?;
     if hash.finalize().as_slice() != bytes::<32>(&release.payload.sha256)? {
         return Err(t("Launcher update checksum did not match.").into());
     }
@@ -388,6 +482,14 @@ async fn download(release: Release, data: PathBuf) -> Result<Stage, String> {
             .as_nanos()
     ));
     fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    let staged = stage(&release, &directory).await;
+    if staged.is_err() {
+        let _ = fs::remove_dir_all(&directory);
+    }
+    staged.map(|()| Stage { release, directory })
+}
+
+async fn stage(release: &Release, directory: &Path) -> Result<(), String> {
     let archive = directory.join("release.zip");
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -417,24 +519,19 @@ async fn download(release: Release, data: PathBuf) -> Result<Stage, String> {
     }
     file.sync_all().map_err(|e| e.to_string())?;
     drop(file);
-    verify_archive(&archive, &release)?;
+    verify_archive(&archive, release)?;
     fs::write(directory.join("launcher-update.json"), &release.envelope)
         .map_err(|e| e.to_string())?;
     let extracted = directory.join("verified");
     fs::create_dir(&extracted).map_err(|e| e.to_string())?;
-    unpack(&archive, &extracted)?;
-    Ok(Stage { release, directory })
+    unpack(&archive, &extracted)
 }
 
-pub(crate) fn busy(state: &State) -> bool {
-    matches!(state, State::Downloading | State::Applying)
-}
+type Action = Option<(&'static str, Msg)>;
 
-pub(crate) fn banner(app: &App) -> Option<Element<'_, Message>> {
-    use crate::ui::{colors, control, Tone, BODY};
-    use iced::widget::{container, row, text};
-    use iced::{Alignment, Length};
-    let (label, action) = match &app.self_update {
+/// Status text and action for the states the banner and the settings card share.
+fn shared_status(app: &App) -> Option<(String, Action)> {
+    Some(match &app.self_update {
         State::Available(release) => (
             tf(
                 "Crystal Launcher {version} is available.",
@@ -446,58 +543,34 @@ pub(crate) fn banner(app: &App) -> Option<Element<'_, Message>> {
             t("Downloading and verifying the launcher update…").into(),
             None,
         ),
-        State::Ready(_) => (
-            t("The launcher update is ready.").into(),
-            app.can_restart_launcher()
-                .then_some((t("Restart to update"), Msg::Apply)),
-        ),
         State::Applying => (t("Restarting Crystal Launcher…").into(), None),
         _ => return None,
-    };
-    let c = colors(app.settings.light_theme);
-    let action = action
-        .map(|(label, msg)| {
-            control(
-                c,
-                Tone::Secondary,
-                None,
-                label,
-                Some(Message::SelfUpdate(msg)),
-                None,
-            )
-        })
-        .unwrap_or_else(|| iced::widget::Space::new().into());
-    Some(
-        container(
-            row![
-                text(label)
-                    .font(BODY)
-                    .size(13)
-                    .color(c.accent)
-                    .width(Length::Fill),
-                action
-            ]
-            .align_y(Alignment::Center)
-            .spacing(16),
-        )
-        .padding([6, 48])
-        .width(Length::Fill)
-        .into(),
-    )
+    })
 }
 
-pub(crate) fn update(state: &mut State, msg: Msg, config: &Config, can_restart: bool) -> Task<Msg> {
+fn restart_action(app: &App) -> Action {
+    app.can_restart_launcher()
+        .then_some((t("Restart to update"), Msg::Apply))
+}
+
+pub(crate) fn update(state: &mut State, msg: Msg, config: &Config, can_restart: bool) -> Effect<Msg> {
     match msg {
-        Msg::Check if !matches!(state, State::Checking) && !busy(state) => {
+        // Never while busy, and never over a found or downloaded update (that would drop it).
+        Msg::Check
+            if matches!(
+                state,
+                State::Idle | State::Current | State::NotPublished | State::Error(_)
+            ) =>
+        {
             *state = State::Checking;
-            return Task::perform(check(), Msg::Checked);
+            return Effect::perform(check(), Msg::Checked);
         }
         Msg::Checked(result) => {
+            if result.is_ok() {
+                clear_last_error(&config.experiment);
+            }
             *state = match result {
-                Ok(Some(release))
-                    if semver::Version::parse(&release.payload.version).unwrap()
-                        > semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap() =>
-                {
+                Ok(Some(release)) if release.version > current_version() => {
                     State::Available(release)
                 }
                 Ok(Some(_)) => State::Current,
@@ -509,26 +582,29 @@ pub(crate) fn update(state: &mut State, msg: Msg, config: &Config, can_restart: 
             if let State::Available(release) = state {
                 let release = release.clone();
                 *state = State::Downloading;
-                return Task::perform(
+                return Effect::perform(
                     download(release, config.experiment.clone()),
                     Msg::Downloaded,
                 );
             }
         }
         Msg::Downloaded(result) => {
+            if result.is_ok() {
+                clear_last_error(&config.experiment);
+            }
             *state = match result {
                 Ok(stage) => State::Ready(stage),
                 Err(error) => State::Error(error),
             };
             if can_restart && matches!(state, State::Ready(_)) {
-                return Task::done(Msg::Apply);
+                return Effect::done(Msg::Apply);
             }
         }
         Msg::Apply if can_restart => {
             if let State::Ready(stage) = state {
                 let stage = stage.clone();
                 *state = State::Applying;
-                return Task::perform(
+                return Effect::perform(
                     async move {
                         tokio::task::spawn_blocking(move || apply::start(&stage))
                             .await
@@ -543,96 +619,7 @@ pub(crate) fn update(state: &mut State, msg: Msg, config: &Config, can_restart: 
         Msg::Applied(Err(error)) => *state = State::Error(error),
         _ => {}
     }
-    Task::none()
-}
-
-pub(crate) fn view(app: &App) -> Element<'_, Message> {
-    use crate::ui::{colors, control, Tone, BODY};
-    use iced::widget::{column, container, row, text};
-    use iced::{Alignment, Length};
-    let c = colors(app.settings.light_theme);
-    let (status, action) = match &app.self_update {
-        State::Idle => (
-            t("Launcher updates have not been checked.").into(),
-            Some((t("Check for launcher updates"), Msg::Check)),
-        ),
-        State::Checking => (t("Checking for launcher updates…").into(), None),
-        State::Current => (
-            t("Crystal Launcher is up to date.").into(),
-            Some((t("Check again"), Msg::Check)),
-        ),
-        State::NotPublished => (
-            t("No launcher releases have been published yet.").into(),
-            Some((t("Check again"), Msg::Check)),
-        ),
-        State::Available(release) => (
-            tf(
-                "Crystal Launcher {version} is available.",
-                &[("version", &release.payload.version)],
-            ),
-            Some((t("Update and restart"), Msg::Download)),
-        ),
-        State::Downloading => (
-            t("Downloading and verifying the launcher update…").into(),
-            None,
-        ),
-        State::Ready(stage) => (
-            tf(
-                "Crystal Launcher {version} is ready to install.",
-                &[("version", &stage.release.payload.version)],
-            ),
-            app.can_restart_launcher()
-                .then_some((t("Restart to update"), Msg::Apply)),
-        ),
-        State::Applying => (t("Restarting Crystal Launcher…").into(), None),
-        State::Error(error) => (error.clone(), Some((t("Try again"), Msg::Check))),
-    };
-    let action = action
-        .map(|(label, msg)| {
-            control(
-                c,
-                Tone::Secondary,
-                None,
-                label,
-                Some(Message::SelfUpdate(msg)),
-                None,
-            )
-        })
-        .unwrap_or_else(|| iced::widget::Space::new().into());
-    column![
-        row![
-            text(t("Launcher updates"))
-                .font(BODY)
-                .size(16)
-                .color(c.ink)
-                .width(Length::Fill),
-            text(env!("CARGO_PKG_VERSION"))
-                .font(BODY)
-                .size(13)
-                .color(c.sub)
-        ],
-        row![
-            container(crate::ui::private_text(app, &status, 13.0, BODY, c.sub)).width(Length::Fill),
-            action
-        ]
-        .spacing(16)
-        .align_y(Alignment::Center),
-        crate::controller_nav::toggler(app.settings.launcher_auto_updates)
-            .label(t("Check for launcher updates when Crystal opens"))
-            .on_toggle(|on| Message::SelfUpdate(Msg::AutoCheck(on)))
-            .font(BODY)
-            .text_size(13)
-            .size(18),
-        text(t(
-            "Updates are signed and verified before installation. Running games stay open."
-        ))
-        .font(BODY)
-        .size(12)
-        .color(c.sub),
-    ]
-    .spacing(12)
-    .padding([12, 0])
-    .into()
+    Effect::none()
 }
 
 /// Release tooling and the post-exit helper run before account storage or UI.
@@ -739,7 +726,7 @@ fn sign_release(args: &[String]) -> Result<(), String> {
         version: version.clone(),
         url: url.to_string(),
         size: archive_bytes.len() as u64,
-        sha256: hex(&Sha256::digest(&archive_bytes)),
+        sha256: sha256_hex(&archive_bytes),
     };
     let payload = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
     let signed = Envelope {
@@ -767,7 +754,7 @@ mod tests {
     fn signed(version: &str) -> (Vec<u8>, [u8; 32]) {
         let key = signature::Ed25519KeyPair::from_seed_unchecked(&[17; 32]).unwrap();
         let payload = Payload { format: 1, platform: "windows-x86_64".into(), version: version.into(),
-            url: "https://github.com/Offset437/Crystal-Launcher/releases/download/v0.2.0/Crystal-Launcher.zip".into(),
+            url: "https://github.com/Offset437/FFXI-Crystal-Launcher/releases/download/v0.2.0/Crystal-Launcher.zip".into(),
             size: 400, sha256: "ab".repeat(32) };
         let payload = serde_json::to_string(&payload).unwrap();
         let envelope = Envelope {
@@ -778,6 +765,129 @@ mod tests {
             serde_json::to_vec(&envelope).unwrap(),
             key.public_key().as_ref().try_into().unwrap(),
         )
+    }
+
+    fn release(version: &str) -> Release {
+        let (data, key) = signed(version);
+        verify(&data, &key).unwrap()
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "crystal-update-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn one_broken_release_does_not_hide_a_valid_newer_one() {
+        let current = semver::Version::parse("0.2.0").unwrap();
+        let picked = newest(
+            vec![Ok(release("0.5.0")), Err("bad signature".into()), Ok(release("0.4.1"))],
+            &current,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(picked.payload.version, "0.5.0");
+        // A backport published later still loses to the higher version.
+        let picked = newest(vec![Ok(release("0.4.2")), Ok(release("0.5.0"))], &current)
+            .unwrap()
+            .unwrap();
+        assert_eq!(picked.payload.version, "0.5.0");
+        assert_eq!(
+            newest(vec![Err("first".into()), Err("second".into())], &current).unwrap_err(),
+            "first"
+        );
+        assert!(newest(vec![], &current).unwrap().is_none());
+    }
+
+    #[test]
+    fn stable_builds_skip_signed_pre_release_versions() {
+        let stable = semver::Version::parse("0.2.0").unwrap();
+        let picked = newest(vec![Ok(release("0.3.0-beta.1")), Ok(release("0.2.1"))], &stable)
+            .unwrap()
+            .unwrap();
+        assert_eq!(picked.payload.version, "0.2.1");
+        let beta = semver::Version::parse("0.3.0-beta.1").unwrap();
+        let picked = newest(vec![Ok(release("0.3.0-beta.2"))], &beta).unwrap().unwrap();
+        assert_eq!(picked.payload.version, "0.3.0-beta.2");
+        let flagged: Vec<PublishedRelease> =
+            serde_json::from_str(r#"[{"prerelease":true,"assets":[]},{"assets":[]}]"#).unwrap();
+        assert!(flagged[0].prerelease && !flagged[1].prerelease);
+        assert!(!offered(&flagged[0], false) && offered(&flagged[1], false));
+        assert!(offered(&flagged[0], true) && offered(&flagged[1], true), "a beta build is offered the next beta");
+    }
+
+    #[test]
+    fn a_failed_update_is_reported_once_and_staging_is_cleaned() {
+        let root = scratch("stale");
+        let data = root.join("data");
+        let updates = data.join("launcher-updates");
+        fs::create_dir_all(updates.join("123-456/verified")).unwrap();
+        fs::write(updates.join("last-registration-warning.txt"), "warning").unwrap();
+        fs::write(updates.join("last-error.txt"), "helper failed").unwrap();
+        let install = root.join("install");
+        fs::create_dir_all(install.join(".crystal-previous-1-2")).unwrap();
+        fs::create_dir_all(install.join("keep")).unwrap();
+        let exe = install.join("Crystal-Launcher.exe");
+
+        let state = take_last_error(&data);
+        assert!(matches!(&state, State::Error(e) if e == "helper failed"));
+        clean_stale(&data, Some(&exe), true);
+        assert!(!updates.join("123-456").exists());
+        assert!(updates.join("last-registration-warning.txt").exists());
+        // The failure may name this backup, so it survives the start that reports it.
+        assert!(install.join(".crystal-previous-1-2").exists());
+
+        assert!(matches!(take_last_error(&data), State::Idle));
+        fs::create_dir_all(install.join(".crystal-previous-3-4")).unwrap();
+        fs::write(install.join(".crystal-previous-3-4").join(apply::RESTORE_FAILED), "").unwrap();
+        clean_stale(&data, Some(&exe), false);
+        assert!(!install.join(".crystal-previous-1-2").exists());
+        assert!(install.join(".crystal-previous-3-4").exists(), "its restore failed: the only old copy");
+        assert!(install.join("keep").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checking_never_replaces_a_found_or_downloaded_update() {
+        let root = scratch("ready");
+        let config = Config {
+            experiment: root.clone(),
+            repository: root.clone(),
+            game_install: None,
+            dat_overlays: vec![],
+        };
+        let stage = Stage {
+            release: release("9.0.0"),
+            directory: root.join("stage"),
+        };
+        for mut state in [
+            State::Ready(stage),
+            State::Available(release("9.0.0")),
+            State::Checking,
+            State::Downloading,
+            State::Applying,
+        ] {
+            let before = format!("{state:?}");
+            let _ = update(&mut state, Msg::Check, &config, false);
+            assert_eq!(format!("{state:?}"), before);
+        }
+        let mut state = State::Error("old".into());
+        let _ = update(&mut state, Msg::Check, &config, false);
+        assert!(matches!(state, State::Checking));
+        fs::create_dir_all(root.join("launcher-updates")).unwrap();
+        fs::write(last_error_path(&root), "old").unwrap();
+        let _ = update(&mut state, Msg::Checked(Ok(None)), &config, false);
+        assert!(matches!(state, State::NotPublished));
+        assert!(!last_error_path(&root).exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -792,7 +902,7 @@ mod tests {
 
     #[test]
     fn only_crystals_https_release_assets_are_accepted() {
-        let good = "https://github.com/Offset437/Crystal-Launcher/releases/download/v1/Crystal-Launcher.zip";
+        let good = "https://github.com/Offset437/FFXI-Crystal-Launcher/releases/download/v1/Crystal-Launcher.zip";
         assert!(asset_url(&Url::parse(good).unwrap(), ".zip"));
         for bad in [
             good.replace("https:", "http:"),
@@ -853,7 +963,7 @@ mod tests {
         let (metadata, key) = signed("0.2.0");
         let mut release = verify(&metadata, &key).unwrap();
         let original = vec![7; 400];
-        release.payload.sha256 = hex(&Sha256::digest(&original));
+        release.payload.sha256 = sha256_hex(&original);
         fs::write(&archive, &original).unwrap();
         verify_archive(&archive, &release).unwrap();
         let mut changed = original;

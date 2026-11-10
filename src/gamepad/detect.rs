@@ -223,15 +223,16 @@ enum Command {
     Rumble(usize),
 }
 
-fn commands() -> &'static Mutex<Option<mpsc::Sender<Command>>> {
-    static C: OnceLock<Mutex<Option<mpsc::Sender<Command>>>> = OnceLock::new();
+/// The running worker's command channel, tagged with the worker's number.
+fn commands() -> &'static Mutex<Option<(u64, mpsc::Sender<Command>)>> {
+    static C: OnceLock<Mutex<Option<(u64, mpsc::Sender<Command>)>>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(None))
 }
 
 /// Asks the worker to buzz a controller briefly.
 pub(crate) fn rumble(id: usize) {
     if let Ok(guard) = commands().lock() {
-        if let Some(tx) = guard.as_ref() {
+        if let Some((_, tx)) = guard.as_ref() {
             let _ = tx.send(Command::Rumble(id));
         }
     }
@@ -246,7 +247,6 @@ fn q(v: f32) -> f32 {
 /// native codes even when the SDL mapping leaves them unnamed.
 /// DualSense USB declares 15 buttons; Bluetooth declares only 14, so the
 /// mic button requires USB for both capture and ordinary FFXI DirectInput.
-#[cfg(any(windows, test))]
 fn sony_extra_buttons(family: Family, buttons: impl IntoIterator<Item = (u32, bool)>) -> u32 {
     buttons.into_iter().fold(0, |mask, (code, pressed)| {
         let button = match (family, code) {
@@ -287,7 +287,6 @@ fn read_pad(id: gilrs::GamepadId, g: &gilrs::Gamepad, hardware: &hardware::Snaps
             input.buttons |= b.bit();
         }
     }
-    #[cfg(windows)]
     {
         input.buttons |= sony_extra_buttons(
             family,
@@ -370,8 +369,10 @@ fn play_rumble(gilrs: &mut gilrs::Gilrs, id: usize) -> Option<gilrs::ff::Effect>
 
 /// Runs the controller thread, calling `emit` with the full list whenever a
 /// controller connects, disconnects, changes input, or changes reported power
-/// or transport. Returns when `emit` reports the receiver is gone.
-pub(crate) fn run(mut emit: impl FnMut(Vec<Pad>) -> bool) {
+/// or transport. Returns when `emit` reports the receiver is gone, or as soon
+/// as `keep_going` says so (checked every pass, so a thread whose listener
+/// went away stops even while nothing changes).
+pub(crate) fn run(mut emit: impl FnMut(Vec<Pad>) -> bool, keep_going: impl Fn() -> bool) {
     let mut gilrs = match gilrs::Gilrs::new() {
         Ok(g) => g,
         Err(gilrs::Error::NotImplemented(g)) => g,
@@ -380,17 +381,23 @@ pub(crate) fn run(mut emit: impl FnMut(Vec<Pad>) -> bool) {
             return;
         }
     };
+    static WORKERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let worker = WORKERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (tx, rx) = mpsc::channel();
     if let Ok(mut guard) = commands().lock() {
-        *guard = Some(tx);
+        *guard = Some((worker, tx));
     }
     let mut last: Option<Vec<Pad>> = None;
     let mut effects: Vec<(Instant, gilrs::ff::Effect)> = Vec::new();
     let mut hardware = hardware::Snapshot::refresh();
     let mut last_power = Instant::now();
-    loop {
+    while keep_going() {
+        // gilrs updates pad state only while events are drained, so with no
+        // event and no hardware refresh the pads are unchanged.
+        let mut changed = last.is_none();
         let mut topology_changed = false;
         while let Some(event) = gilrs.next_event() {
+            changed = true;
             topology_changed |= matches!(event.event, gilrs::EventType::Connected | gilrs::EventType::Disconnected);
         }
         while let Ok(Command::Rumble(id)) = rx.try_recv() {
@@ -404,15 +411,20 @@ pub(crate) fn run(mut emit: impl FnMut(Vec<Pad>) -> bool) {
         if topology_changed || last_power.elapsed() >= Duration::from_secs(5) {
             hardware = hardware::Snapshot::refresh();
             last_power = Instant::now();
+            changed = true;
         }
-        let now = snapshot(&gilrs, &hardware);
-        if !publish_change(&mut last, now, &mut emit) {
+        if changed && !publish_change(&mut last, snapshot(&gilrs, &hardware), &mut emit) {
             break;
         }
-        std::thread::sleep(Duration::from_millis(16));
+        // Input drives the launcher only while its window is in front (controller navigation,
+        // the Controller page's live view): behind a game, a slow look for (dis)connects.
+        std::thread::sleep(Duration::from_millis(if crate::window_chrome::is_foreground() || !effects.is_empty() { 16 } else { 250 }));
     }
+    // A newer thread may have installed its own sender meanwhile; keep that one.
     if let Ok(mut guard) = commands().lock() {
-        *guard = None;
+        if guard.as_ref().is_some_and(|(owner, _)| *owner == worker) {
+            *guard = None;
+        }
     }
 }
 
@@ -515,32 +527,5 @@ mod tests {
         // and synthesized D-pad events must never become extra buttons.
         assert_eq!(sony_extra_buttons(Family::DualSense, [(0x1000d, true), (0x2000e, true), (u32::MAX, true)]), 0);
         assert_eq!(sony_extra_buttons(Family::DualSense, []), 0);
-    }
-
-    /// Lists the controllers connected to this machine:
-    /// `cargo test gamepad_list_pads -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn gamepad_list_pads() {
-        let mut gilrs = gilrs::Gilrs::new().expect("gilrs");
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_millis(1500) {
-            while gilrs.next_event().is_some() {}
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let pads = snapshot(&gilrs, &hardware::Snapshot::refresh());
-        println!("{} controller(s)", pads.len());
-        for p in &pads {
-            println!(
-                "{} | {} | vid {:04X?} pid {:04X?} | {} | rumble {} | buttons {:#x}",
-                p.name,
-                p.family.label(),
-                p.vid,
-                p.pid,
-                p.connection(),
-                p.rumble,
-                p.input.buttons
-            );
-        }
     }
 }

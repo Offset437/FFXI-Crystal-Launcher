@@ -51,7 +51,7 @@ impl WindowerProfile {
             bump_mapping: false,
             sound: true,
             always_play_sound: true,
-            always_enable_gamepad: true,
+            always_enable_gamepad: false,
         }
     }
 
@@ -60,15 +60,7 @@ impl WindowerProfile {
         let get = |name: &str| fields.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
         let int = |name: &str, default: i32| get(name).and_then(|v| v.trim().parse().ok()).unwrap_or(default);
         let float = |name: &str, default: f32| get(name).and_then(|v| v.trim().parse().ok()).unwrap_or(default);
-        let boolean = |name: &str, default: bool| {
-            get(name)
-                .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
-                    "true" => Some(true),
-                    "false" => Some(false),
-                    _ => None,
-                })
-                .unwrap_or(default)
-        };
+        let boolean = |name: &str, default: bool| get(name).and_then(parse_bool).unwrap_or(default);
         let window_mode = match get("windowmode").map(str::to_ascii_lowercase).as_deref() {
             Some("window") => WindowMode::Window,
             Some("fullscreen") => WindowMode::Fullscreen,
@@ -86,9 +78,25 @@ impl WindowerProfile {
             bump_mapping: boolean("bumpmapping", false),
             sound: boolean("sound", true),
             always_play_sound: boolean("alwaysplaysound", true),
-            always_enable_gamepad: boolean("alwaysenablegamepad", true),
+            always_enable_gamepad: explicit_gamepad(fields) == Some(true),
         }
     }
+}
+
+/// `bool.Parse` as Windower reads its elements: case-insensitive `true`/`false`, trimmed.
+fn parse_bool(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// What a profile says about `<alwaysenablegamepad>`: `None` when the element is missing or not
+/// a boolean. Windower itself defaults to on; Crystal never turns background gamepad on unless
+/// the profile says so, because that setting reaches every game the profile starts.
+fn explicit_gamepad(fields: &[(String, String)]) -> Option<bool> {
+    fields.iter().find(|(n, _)| n == "alwaysenablegamepad").and_then(|(_, v)| parse_bool(v))
 }
 
 /// One `<profile>`: its trimmed name (`None` without a `name` attribute) and the text of each
@@ -96,6 +104,21 @@ impl WindowerProfile {
 struct XmlProfile {
     name: String,
     fields: Vec<(String, String)>,
+}
+
+/// Windower's profiles are exactly the root's `<profile>` children (case-sensitive name).
+/// `element_depth`: 1 for the root element, 2 for its children.
+pub(super) fn is_root_profile(element_depth: usize, e: &quick_xml::events::BytesStart) -> bool {
+    element_depth == 2 && e.name().as_ref() == b"profile"
+}
+
+/// A `<profile>`'s trimmed `name` attribute; empty without one (the default profile).
+pub(super) fn profile_name(e: &quick_xml::events::BytesStart) -> String {
+    e.attributes()
+        .flatten()
+        .find(|a| a.key.as_ref() == b"name")
+        .and_then(|a| a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok().map(|v| v.trim().to_owned()))
+        .unwrap_or_default()
 }
 
 /// The root's `<profile>` children. `Err` for XML that doesn't parse or ends early (Windower may
@@ -115,28 +138,17 @@ fn xml_profiles(xml: &[u8]) -> Result<Vec<XmlProfile>, String> {
         match event {
             Event::Start(e) => {
                 depth += 1;
-                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                if depth == 2 && name == "profile" {
-                    let attribute = e
-                        .attributes()
-                        .flatten()
-                        .find(|a| a.key.as_ref() == b"name")
-                        .and_then(|a| a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok().map(|v| v.into_owned()));
-                    profile = Some(XmlProfile { name: attribute.unwrap_or_default().trim().to_owned(), fields: Vec::new() });
+                if is_root_profile(depth, &e) {
+                    profile = Some(XmlProfile { name: profile_name(&e), fields: Vec::new() });
                 } else if depth == 3 && profile.is_some() {
-                    field = Some((name, String::new()));
+                    field = Some((String::from_utf8_lossy(e.name().as_ref()).into_owned(), String::new()));
                 }
             }
             Event::Empty(e) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                if depth == 1 && name == "profile" {
-                    let attribute = e
-                        .attributes()
-                        .flatten()
-                        .find(|a| a.key.as_ref() == b"name")
-                        .and_then(|a| a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok().map(|v| v.into_owned()));
-                    profiles.push(XmlProfile { name: attribute.unwrap_or_default().trim().to_owned(), fields: Vec::new() });
+                if is_root_profile(depth + 1, &e) {
+                    profiles.push(XmlProfile { name: profile_name(&e), fields: Vec::new() });
                 } else if depth == 2 {
+                    let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                     if let Some(p) = profile.as_mut() {
                         p.fields.push((name, String::new()));
                     }
@@ -189,6 +201,19 @@ fn xml_profiles(xml: &[u8]) -> Result<Vec<XmlProfile>, String> {
         return Err(t("settings.xml ends early").into());
     }
     Ok(profiles)
+}
+
+/// A profile as the picker shows it: its trimmed name ("" = the default) and only its explicit
+/// `<alwaysenablegamepad>`. Everything else in the file (other tools keep plaintext passwords
+/// there) is dropped here.
+pub(crate) struct ProfileSummary {
+    pub name: String,
+    pub gamepad: Option<bool>,
+}
+
+/// The root's `<profile>` children in file order, reduced to [`ProfileSummary`].
+pub(crate) fn profile_summaries(xml: &[u8]) -> Result<Vec<ProfileSummary>, String> {
+    Ok(xml_profiles(xml)?.into_iter().map(|p| ProfileSummary { gamepad: explicit_gamepad(&p.fields), name: p.name }).collect())
 }
 
 /// What settings.xml says, independent of how it is written: every element, attribute and
@@ -386,17 +411,33 @@ pub(crate) fn for_windower(windower: &Path, profile: &str) -> Result<WindowerSet
     Ok(WindowerSettings { json: to_json(&values), count: values.len(), note })
 }
 
-fn apply_menu(values: &mut Vec<(&'static str, Value)>, (w, h): (u32, u32)) {
-    values.retain(|(key, _)| !matches!(*key, "0037" | "0038"));
-    values.extend([("0037", Value::Dword(w)), ("0038", Value::Dword(h))]);
-}
-
 pub(crate) fn menu_settings(size: Option<(u32, u32)>) -> WindowerSettings {
-    let mut values = Vec::new();
     // An empty object prepares live controller updates without overriding the
     // initial registry or a launch tool's own controller configuration.
-    if let Some(size) = size { apply_menu(&mut values, size); }
+    let values = size.map_or_else(Vec::new, |(w, h)| vec![("0037", Value::Dword(w)), ("0038", Value::Dword(h))]);
     WindowerSettings { json: to_json(&values), count: values.len(), note: None }
+}
+
+/// `settings` with the launcher features' values (`features::runtime::launch_values`: a
+/// remembered window's resolution and mode, background mute) set over the computed ones. A
+/// resolution that replaces a known one scales its render size (`0003`/`0004`) and a profile's
+/// menu size (`0037`/`0038`, when set) by the same factor, so the profile's proportions hold.
+pub(crate) fn with_overrides(settings: WindowerSettings, overrides: &[(&str, u32)]) -> WindowerSettings {
+    if overrides.is_empty() { return settings; }
+    let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str::<serde_json::Value>(&settings.json) else { return settings };
+    for (side, render, menu) in [("0001", "0003", "0037"), ("0002", "0004", "0038")] {
+        let Some(&(_, new)) = overrides.iter().find(|(name, _)| *name == side) else { continue };
+        if let Some(old) = map.get(side).and_then(serde_json::Value::as_u64).filter(|old| *old > 0) {
+            for scaled in [render, menu] {
+                if let Some(value) = map.get(scaled).and_then(serde_json::Value::as_u64).filter(|v| *v > 0) {
+                    map.insert(scaled.to_owned(), serde_json::Value::from((value * u64::from(new) + old / 2) / old));
+                }
+            }
+        }
+    }
+    for (name, value) in overrides { map.insert((*name).to_owned(), serde_json::Value::from(*value)); }
+    let count = map.len();
+    WindowerSettings { json: serde_json::Value::Object(map).to_string(), count, note: settings.note }
 }
 
 /// Adds `"ffxi_settings":<json>` to a `session` line (`{...}\n`). The old buffer is zeroized
@@ -416,8 +457,7 @@ pub(crate) fn splice(line: Zeroizing<Vec<u8>>, json: &str) -> Result<Zeroizing<V
 
 /// The primary display's registry mode, as Windower's `Display.GetCurrentDisplayMode` reads it
 /// (`EnumDisplaySettings(<primary>, ENUM_REGISTRY_SETTINGS)`).
-#[cfg(windows)]
-fn primary_display_mode() -> Option<(i32, i32)> {
+pub(super) fn primary_display_mode() -> Option<(i32, i32)> {
     use windows_sys::Win32::Graphics::Gdi::{
         EnumDisplayDevicesW, EnumDisplaySettingsW, DEVMODEW, DISPLAY_DEVICEW, DISPLAY_DEVICE_PRIMARY_DEVICE, ENUM_REGISTRY_SETTINGS,
     };
@@ -441,31 +481,18 @@ fn primary_display_mode() -> Option<(i32, i32)> {
         return (w > 0 && h > 0).then_some((w, h));
     }
 }
-#[cfg(not(windows))]
-fn primary_display_mode() -> Option<(i32, i32)> {
-    None
+
+/// Whether a `padmode000` value has its fifth field (background gamepad) on.
+pub(crate) fn padmode_background(padmode: &str) -> bool {
+    padmode.split(',').nth(4).is_some_and(|f| f.trim() == "1")
 }
 
 /// The registry's current `padmode000` (Windower keeps every field but the fifth).
-#[cfg(windows)]
-fn registry_padmode() -> Option<String> {
-    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6432KEY};
-    let key: Vec<u16> = r"SOFTWARE\PlayOnlineUS\SquareEnix\FinalFantasyXI".encode_utf16().chain(Some(0)).collect();
-    let value: Vec<u16> = "padmode000".encode_utf16().chain(Some(0)).collect();
-    let mut buffer = vec![0u16; 256];
-    let mut size = (buffer.len() * 2) as u32;
-    let status = unsafe {
-        RegGetValueW(HKEY_LOCAL_MACHINE, key.as_ptr(), value.as_ptr(), RRF_RT_REG_SZ | RRF_SUBKEY_WOW6432KEY, std::ptr::null_mut(), buffer.as_mut_ptr() as _, &mut size)
-    };
-    if status != 0 {
-        return None;
-    }
-    let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
-    Some(String::from_utf16_lossy(&buffer[..len]))
-}
-#[cfg(not(windows))]
-fn registry_padmode() -> Option<String> {
-    None
+pub(crate) fn registry_padmode() -> Option<String> {
+    use crate::win::reg::{self, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6432KEY};
+    let key = r"SOFTWARE\PlayOnlineUS\SquareEnix\FinalFantasyXI";
+    let units = reg::string(HKEY_LOCAL_MACHINE, key, "padmode000", RRF_RT_REG_SZ | RRF_SUBKEY_WOW6432KEY, 256)?;
+    Some(String::from_utf16_lossy(&units))
 }
 
 #[cfg(test)]
@@ -497,7 +524,8 @@ mod tests {
 
     #[test]
     fn defaults_follow_windower() {
-        // A sparse profile: Load's defaults (borderless, sound on, gamepad on, scale 1).
+        // A sparse profile: Load's defaults (borderless, sound on, scale 1), except background
+        // gamepad, which stays off unless the profile says so (see the incident test below).
         let v = values(XML, "MULE", None, None);
         assert_eq!(
             v,
@@ -505,13 +533,13 @@ mod tests {
                 "0000": 0, "0001": 1280, "0002": 720, "0003": 1280, "0004": 720,
                 "0007": 1, "0017": 0, "0021": 1, "0028": 0,
                 "0034": 0, "0035": 1, "0037": 0, "0038": 0,
-                "padmode000": "0,0,0,0,1,0"
+                "padmode000": "0,0,0,0,0,0"
             })
         );
         // No resolution: the primary display's mode, borderless.
         let v = values(XML, "", Some((2560, 1440)), Some("0,0"));
         assert_eq!((v["0001"].as_u64(), v["0002"].as_u64(), v["0034"].as_u64()), (Some(2560), Some(1440), Some(3)));
-        assert_eq!(v["padmode000"], "0,0,0,0,1,0");
+        assert_eq!(v["padmode000"], "0,0,0,0,0,0");
         // A stale explicit selection must not silently reset the user's layout.
         assert!(windower_profile(Some(XML.as_bytes()), "Nobody").is_err());
         assert!(windower_profile(None, "Main").is_err());
@@ -528,6 +556,34 @@ mod tests {
             assert!(v.get(name).is_none(), "{name}");
         }
         assert_eq!(v["0034"], 3);
+    }
+
+    /// Incident: every account silently got the default profile, and Windower's own default of
+    /// background gamepad on came with it. Only an explicit `true` turns it on.
+    #[test]
+    fn background_gamepad_is_on_only_when_the_profile_says_so() {
+        let pad = |xml: Option<&str>, profile: &str| {
+            let p = windower_profile(xml.map(str::as_bytes), profile).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&to_json(&windower_values(&p, None, Some("1,1,0,0,1,0")))).unwrap();
+            v["padmode000"].as_str().unwrap().to_owned()
+        };
+        // The unnamed default profile without the element, and a missing settings.xml.
+        assert_eq!(pad(Some(XML), ""), "1,1,0,0,0,0");
+        assert_eq!(pad(None, ""), "1,1,0,0,0,0");
+        // A named profile settings.xml doesn't have is constructed, never on.
+        assert_eq!(pad(Some("<settings/>"), ""), "1,1,0,0,0,0");
+        // Explicit false, an unparsable value and an empty element are off; true in any case is on.
+        let one = |inner: &str| format!("<settings><profile name=\"p\">{inner}</profile></settings>");
+        for off in ["<alwaysenablegamepad>false</alwaysenablegamepad>", "<alwaysenablegamepad>yes</alwaysenablegamepad>", "<alwaysenablegamepad/>", "<alwaysenablegamepad>1</alwaysenablegamepad>"] {
+            assert_eq!(pad(Some(&one(off)), "p"), "1,1,0,0,0,0", "{off}");
+        }
+        assert_eq!(pad(Some(&one("<alwaysenablegamepad> True </alwaysenablegamepad>")), "p"), "1,1,0,0,1,0");
+        // The first element wins, as Windower reads it.
+        assert_eq!(pad(Some(&one("<alwaysenablegamepad>false</alwaysenablegamepad><alwaysenablegamepad>true</alwaysenablegamepad>")), "p"), "1,1,0,0,0,0");
+        // Summaries carry the explicit value only, and nothing else of the file.
+        let s = profile_summaries(XML.as_bytes()).unwrap();
+        assert_eq!(s.iter().map(|p| (p.name.as_str(), p.gamepad)).collect::<Vec<_>>(), [("", None), ("Main", Some(false)), ("Mule", None)]);
+        assert!(padmode_background("0,0,0,0,1,0") && !padmode_background("0,0,0,0,0,0") && !padmode_background("1") && !padmode_background(""));
     }
 
     #[test]
@@ -572,6 +628,30 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&for_windower(&dir, "Main").unwrap().json).unwrap();
         assert_eq!((v["0001"].as_u64(), v["0034"].as_u64()), (Some(1920), Some(1)));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn feature_overrides_set_resolution_mode_and_mute_keeping_the_profile_proportions() {
+        let main = for_profile_json(XML, "Main");
+        let out = with_overrides(main.clone(), &[("0001", 1280), ("0002", 720), ("0034", 3), ("0035", 0)]);
+        let v: serde_json::Value = serde_json::from_str(&out.json).unwrap();
+        // 1920x1080 with 2x supersampling and a 1.5 UI scale, moved to 1280x720.
+        assert_eq!((v["0001"].as_u64(), v["0002"].as_u64()), (Some(1280), Some(720)));
+        assert_eq!((v["0003"].as_u64(), v["0004"].as_u64()), (Some(2560), Some(1440)));
+        assert_eq!((v["0037"].as_u64(), v["0038"].as_u64()), (Some(853), Some(480)));
+        assert_eq!((v["0034"].as_u64(), v["0035"].as_u64()), (Some(3), Some(0)));
+        assert_eq!(v["padmode000"], serde_json::from_str::<serde_json::Value>(&main.json).unwrap()["padmode000"]);
+        assert_eq!(out.count, v.as_object().unwrap().len());
+        // Other launch methods serve only the menu size: the resolution is added, nothing scaled.
+        let menu = with_overrides(menu_settings(Some((1024, 576))), &[("0001", 1280), ("0002", 720)]);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&menu.json).unwrap(), serde_json::json!({"0001":1280,"0002":720,"0037":1024,"0038":576}));
+        // No overrides: unchanged.
+        assert_eq!(with_overrides(main.clone(), &[]).json, main.json);
+    }
+
+    fn for_profile_json(xml: &str, profile: &str) -> WindowerSettings {
+        let values = windower_values(&windower_profile(Some(xml.as_bytes()), profile).unwrap(), None, None);
+        WindowerSettings { json: to_json(&values), count: values.len(), note: None }
     }
 
     #[test]

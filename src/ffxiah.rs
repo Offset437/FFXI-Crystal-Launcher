@@ -55,7 +55,7 @@ fn request(client: &reqwest::Client, query: &str, sid: u8) -> reqwest::RequestBu
 }
 
 pub(crate) async fn search(query: String, world: &'static str) -> Result<Results, String> {
-    let sid = crate::ui::ah_server_id(world).ok_or_else(|| t("Choose a valid FFXIAH world.").to_owned())?;
+    let sid = ah_server_id(world).ok_or_else(|| t("Choose a valid FFXIAH world.").to_owned())?;
     if query.trim().is_empty() || query.chars().count() > 160 {
         return Err(t("Enter an item name of up to 160 characters.").into());
     }
@@ -69,17 +69,21 @@ pub(crate) async fn search(query: String, world: &'static str) -> Result<Results
         }))
         .build().map_err(|e| tf("FFXIAH lookup failed: {error}", &[("error", &e)]))?;
     let (html, url) = read_page(request(&client, &query, sid)).await?;
-    let mut results = parse(&html, &url, sid)?;
+    // Parsed once; the document is dropped before the next await.
+    let (mut results, other_url) = {
+        let doc = Html::parse_document(&html);
+        (parse(&doc, &url, sid)?, counterpart_url(&doc, &url, sid))
+    };
     // Exact searches redirect to one listing; its single/stack sibling has
     // separate stock and sales. Keep the first listing if that fetch fails.
-    if let Some(other_url) = counterpart_url(&html, &url, sid) {
+    if let Some(other_url) = other_url {
         let other = async {
             let (html, final_url) = read_page(client.get(other_url.clone())
                 .header(reqwest::header::COOKIE, format!("sid={sid}"))).await?;
             if listing_key(&final_url) != listing_key(&other_url) {
                 return Err(t("FFXIAH's item page could not be read.").to_owned());
             }
-            let mut other = parse(&html, &final_url, sid)?;
+            let mut other = parse(&Html::parse_document(&html), &final_url, sid)?;
             if other.items.len() != 1 || other.items[0].stack.is_some() != listing_key(&other_url).is_some_and(|(_, stack)| stack) {
                 return Err(t("FFXIAH's item page could not be read.").to_owned());
             }
@@ -130,11 +134,10 @@ fn item_summary(doc: &Html) -> Option<scraper::ElementRef<'_>> {
     doc.select(&selector(".item-name")).next()?.ancestors()
         .filter_map(scraper::ElementRef::wrap).find(|element| element.value().name() == "table")
 }
-fn counterpart_url(html: &str, url: &reqwest::Url, sid: u8) -> Option<reqwest::Url> {
+fn counterpart_url(doc: &Html, url: &reqwest::Url, sid: u8) -> Option<reqwest::Url> {
     let current = reqwest::Url::parse(&item_url(url.as_str(), url, sid)?).ok()?;
     let (id, stack) = listing_key(&current)?;
-    let doc = Html::parse_document(html);
-    item_summary(&doc)?.select(&selector("a[href]")).find_map(|link| {
+    item_summary(doc)?.select(&selector("a[href]")).find_map(|link| {
         let candidate = reqwest::Url::parse(&item_url(link.value().attr("href")?, url, sid)?).ok()?;
         let (other_id, other_stack) = listing_key(&candidate)?;
         (other_id == id && other_stack != stack).then_some(candidate)
@@ -144,19 +147,16 @@ fn item_url(href: &str, base: &reqwest::Url, sid: u8) -> Option<String> {
     let mut url = base.join(href).ok()?;
     if url.host_str() != Some(HOST) || url.port().is_some() || !url.username().is_empty() || url.password().is_some() { return None; }
     if !matches!(url.scheme(), "http" | "https") { return None; }
-    let id = url.path().strip_prefix("/item/")?.split('/').next()?;
-    if id.is_empty() || !id.bytes().all(|c| c.is_ascii_digit()) { return None; }
+    let stack = listing_key(&url)?.1;
     url.set_scheme("https").ok()?;
     url.set_fragment(None);
-    let stack = url.query_pairs().any(|(k, v)| k == "stack" && v == "1");
     url.set_query(None);
     if stack { url.query_pairs_mut().append_pair("stack", "1"); }
     url.query_pairs_mut().append_pair("sid", &sid.to_string());
     Some(url.into())
 }
 
-fn parse(html: &str, url: &reqwest::Url, sid: u8) -> Result<Results, String> {
-    let doc = Html::parse_document(html);
+fn parse(doc: &Html, url: &reqwest::Url, sid: u8) -> Result<Results, String> {
     // Never label fallback/default-world data as the requested world's data.
     let selected = doc.select(&selector("#ffxi-main-server-select option[selected]"))
         .next().and_then(|e| e.value().attr("value")).and_then(|v| v.parse::<u8>().ok());
@@ -187,7 +187,7 @@ fn parse(html: &str, url: &reqwest::Url, sid: u8) -> Result<Results, String> {
             .filter(|n| !n.is_empty() && n.len() <= 512)
             .ok_or_else(|| t("FFXIAH's item page could not be read.").to_owned())?;
         let stack = doc.select(&selector(".item-name")).next().and_then(|element| stack_size(&plain(element), &name));
-        let stock = item_summary(&doc)
+        let stock = item_summary(doc)
             .and_then(|table| table.select(&selector(".stock")).next())
             .and_then(|element| number(&plain(element)));
         // Exact-name searches redirect to the item page. Read its public sales
@@ -208,9 +208,81 @@ fn parse(html: &str, url: &reqwest::Url, sid: u8) -> Result<Results, String> {
 #[derive(serde::Deserialize)]
 struct Sale { price: u64 }
 
+/// The FFXIAH server picked when the launcher opens.
+pub(crate) const DEFAULT_AH_SERVER: &str = "Asura";
+/// The active retail worlds with FFXIAH's server ids (its `sid` select).
+pub(crate) const AH_SERVERS: [(&str, u8); 16] = [
+    ("Asura", 28),
+    ("Bahamut", 1),
+    ("Bismarck", 25),
+    ("Carbuncle", 6),
+    ("Cerberus", 23),
+    ("Fenrir", 7),
+    ("Lakshmi", 27),
+    ("Leviathan", 11),
+    ("Odin", 12),
+    ("Phoenix", 5),
+    ("Quetzalcoatl", 16),
+    ("Ragnarok", 20),
+    ("Shiva", 2),
+    ("Siren", 17),
+    ("Sylph", 8),
+    ("Valefor", 9),
+];
+/// Open the search for the wiki matching the launcher's selected language.
+pub(crate) fn wiki_search_url(query: &str) -> String {
+    let url = match crate::i18n::current() {
+        crate::i18n::Lang::En => {
+            let mut url = reqwest::Url::parse("https://www.bg-wiki.com/index.php").expect("static URL");
+            url.query_pairs_mut().append_pair("search", query.trim());
+            url
+        },
+        crate::i18n::Lang::Ja => {
+            let mut url = reqwest::Url::parse("https://wiki.ffo.jp/search.cgi").expect("static URL");
+            url.query_pairs_mut().extend_pairs([
+                ("CCC", "愛"), ("Command", "Search"), ("qf", query.trim()),
+                ("order", "match"), ("ffotype", "title"), ("type", "title"),
+            ]);
+            url
+        },
+    };
+    url.into()
+}
+pub(crate) fn ah_server_id(server: &str) -> Option<u8> {
+    AH_SERVERS.iter().find(|(name, _)| *name == server).map(|(_, id)| *id)
+}
+/// Browser fallback. FFXIAH's saved world cookie overrides this URL's `sid`;
+/// the native lookup sends its own isolated cookie instead.
+pub(crate) fn ah_search_url(query: &str, server: &str) -> String {
+    let mut url = reqwest::Url::parse("https://www.ffxiah.com/search/item").expect("static URL");
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("q", query.trim());
+        if let Some(sid) = ah_server_id(server) {
+            pairs.append_pair("sid", &sid.to_string());
+        }
+    }
+    url.into()
+}
+/// `value` with thousands separators, as FFXIAH shows prices.
+pub(crate) fn grouped_number(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) { out.push(','); }
+        out.push(c);
+    }
+    out
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn parse(html: &str, url: &reqwest::Url, sid: u8) -> Result<Results, String> {
+        super::parse(&Html::parse_document(html), url, sid)
+    }
+    fn counterpart_url(html: &str, url: &reqwest::Url, sid: u8) -> Option<reqwest::Url> {
+        super::counterpart_url(&Html::parse_document(html), url, sid)
+    }
     fn page(world: u8, body: &str) -> String {
         format!("<html><select id='ffxi-main-server-select'><option selected value='{world}'>World</option></select>{body}</html>")
     }
@@ -328,5 +400,58 @@ mod tests {
                 println!("{world}: exact lookup {} stack {:?}, price {:?}, stock {:?}", item.name, item.stack, item.price, item.stock);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn wiki_search_encodes_the_query() {
+        crate::i18n::set(crate::i18n::Lang::En);
+        assert_eq!(
+            wiki_search_url("  Sortie gear & aug "),
+            "https://www.bg-wiki.com/index.php?search=Sortie+gear+%26+aug"
+        );
+        crate::i18n::set(crate::i18n::Lang::Ja);
+        let search = wiki_search_url("  サルベージ & 装備  ");
+        assert!(crate::allowed_link(&search));
+        let url = reqwest::Url::parse(&search).unwrap();
+        assert_eq!(url.host_str(), Some("wiki.ffo.jp"));
+        assert_eq!(url.path(), "/search.cgi");
+        let pairs: std::collections::BTreeMap<_, _> = url.query_pairs().collect();
+        assert_eq!(pairs.len(), 6);
+        assert_eq!(pairs.get("qf").unwrap(), "サルベージ & 装備");
+        assert_eq!(pairs.get("CCC").unwrap(), "愛");
+        assert_eq!(pairs.get("Command").unwrap(), "Search");
+        crate::i18n::set(crate::i18n::Lang::En);
+        assert_eq!(wiki_search_url("Sortie"), "https://www.bg-wiki.com/index.php?search=Sortie");
+    }
+
+    #[test]
+    fn ah_browser_fallback_encodes_the_query_and_world_hint() {
+        assert_eq!(ah_search_url("Ridill", "Asura"), "https://www.ffxiah.com/search/item?q=Ridill&sid=28");
+        assert_eq!(ah_search_url("Hope Staff", "Bismarck"), "https://www.ffxiah.com/search/item?q=Hope+Staff&sid=25");
+        assert_eq!(ah_search_url("Ridill", "Nowhere"), "https://www.ffxiah.com/search/item?q=Ridill");
+    }
+
+    #[test]
+    fn every_listed_server_has_a_distinct_id() {
+        let mut ids: Vec<u8> = AH_SERVERS.iter().map(|(_, id)| *id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), AH_SERVERS.len());
+        assert_eq!(AH_SERVERS[0].0, DEFAULT_AH_SERVER);
+        assert!(crate::allowed_link(&wiki_search_url("x")));
+        assert!(crate::allowed_link(&ah_search_url("x", "Asura")));
+    }
+
+    #[test]
+    fn prices_group_thousands() {
+        assert_eq!(grouped_number(0), "0");
+        assert_eq!(grouped_number(999), "999");
+        assert_eq!(grouped_number(1_000), "1,000");
+        assert_eq!(grouped_number(12_345_678), "12,345,678");
     }
 }

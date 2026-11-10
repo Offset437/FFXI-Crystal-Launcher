@@ -1,0 +1,132 @@
+// Crystal Launcher's Slint front end (feature `slint-ui`). The core (`App` in src/main.rs) owns
+// every piece of state; src/slint_host/view.rs pushes it into these properties after each
+// message and turns these callbacks back into core messages. Every user-visible string comes
+// from Rust (`i18n::t`), never from this markup.
+import "../assets/fonts/SourceSans3-Regular.ttf";
+import "../assets/fonts/SourceSans3-Medium.ttf";
+import "../assets/fonts/SourceSans3-Semibold.ttf";
+import "../assets/fonts/SourceSans3-Bold.ttf";
+import "../assets/fonts/SourceSerif4-It.ttf";
+import "../assets/fonts/JetBrainsMono-Medium.ttf";
+import { Theme } from "theme.slint";
+import { ChromeBar, ResizeEdges } from "chrome.slint";
+import { View } from "state.slint";
+import { TitleContent } from "titlebar.slint";
+import { HomePage, PlayBar } from "home.slint";
+import { AccountSheet } from "sheet.slint";
+import { FriendsPage, FriendsView } from "friends.slint";
+import { Downloads, DownloadsPage, SettingsDialog, UpdateStrip } from "downloads.slint";
+import { LauncherUpdatesCard, WindowsComponents } from "downloads_system.slint";
+import { SettingsPage, SettingsView } from "settings.slint";
+import { CloseDialog, ImportDialog } from "settings_dialogs.slint";
+import { Features, FeaturesSheet, RelaunchBanner } from "features.slint";
+import { Nav } from "widgets.slint";
+import { Dialogs, DeleteDialog, DetailsDialog, AhDialog } from "dialogs.slint";
+
+// Nav.modal is set with the account sheet and the launcher settings dialog
+// (src/slint_host/downloads.rs): while either is open, the title bar, the page and the play bar
+// are out of Tab's and the controller's reach.
+export { Theme, View, FriendsView, Downloads, SettingsView, Features, Nav, Dialogs }
+
+export component MainWindow inherits Window {
+    // ---- the host's contract (src/slint_host/mod.rs) ----
+    /// The window is maximised (the caption shows Restore, no resize edges).
+    in property <bool> window-maximized;
+    /// Caption buttons' accessible names.
+    in property <string> minimize-label;
+    in property <string> maximize-label;
+    in property <string> restore-label;
+    in property <string> close-label;
+    callback minimize-clicked();
+    callback maximize-clicked();
+    callback close-clicked();
+    callback title-pressed();
+    callback title-moved();
+    callback title-released();
+    /// A resize edge was grabbed (effect::Edge's order).
+    callback resize-pressed(int);
+    /// The window's logical size changed.
+    callback resized(length, length);
+    /// Escape that no control took (ControllerBack).
+    callback escape();
+    /// The taskbar and Alt+Tab icon (assets/crystal-icon-64.rgba).
+    in property <image> window-icon;
+
+    title: "Crystal Launcher";
+    icon: root.window-icon;
+    no-frame: true;
+    min-width: 900px;
+    min-height: 650px;
+    preferred-width: 1440px;
+    preferred-height: 900px;
+    background: Theme.bg;
+    default-font-family: Theme.sans;
+    default-font-size: Theme.type-body;
+    changed width => { root.resized(self.width, self.height); }
+    changed height => { root.resized(self.width, self.height); }
+
+    // Every key a control rejects ends here: Escape goes back. It never
+    // takes the focus itself (not a Tab or controller stop).
+    FocusScope {
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.escape();
+                return accept;
+            }
+            return reject;
+        }
+    VerticalLayout {
+        ChromeBar {
+            maximized: root.window-maximized;
+            minimize-label: root.minimize-label;
+            maximize-label: root.maximize-label;
+            restore-label: root.restore-label;
+            close-label: root.close-label;
+            minimize-clicked => { root.minimize-clicked(); }
+            maximize-clicked => { root.maximize-clicked(); }
+            close-clicked => { root.close-clicked(); }
+            title-pressed => { root.title-pressed(); }
+            title-moved => { root.title-moved(); }
+            title-released => { root.title-released(); }
+            TitleContent { }
+        }
+        if Downloads.update-banner: UpdateStrip { }
+        if View.page == 0: HomePage { vertical-stretch: 1; }
+        if View.page == 1: FriendsPage { vertical-stretch: 1; }
+        if View.page == 2: DownloadsPage { vertical-stretch: 1; }
+        if View.page == 3: SettingsPage { vertical-stretch: 1; }
+        if Features.relaunches.length > 0: RelaunchBanner { }
+        PlayBar { }
+    }
+    if View.sheet-open: AccountSheet { }
+    if Features.open: FeaturesSheet { }
+    if Downloads.settings-open: SettingsDialog { }
+    if SettingsView.import-open: ImportDialog { }
+    if SettingsView.close-open: CloseDialog { }
+    if Dialogs.delete-open: DeleteDialog { }
+    if Dialogs.details-open: DetailsDialog { }
+    if Dialogs.ah-open: AhDialog { }
+    if !root.window-maximized: ResizeEdges {
+        resize-pressed(edge) => { root.resize-pressed(edge); }
+    }
+    }
+}
+
+/// Settings → System's Launcher updates and Windows components cards on their own, drawn from the
+/// same view model: the headless tests and screenshots render them here until the Settings page
+/// places them.
+export component SystemCards inherits Window {
+    background: Theme.bg;
+    default-font-family: Theme.sans;
+    default-font-size: Theme.type-body;
+    preferred-width: 900px;
+    VerticalLayout {
+        padding: 24px;
+        spacing: 14px;
+        alignment: start;
+        LauncherUpdatesCard { }
+        WindowsComponents { }
+    }
+}

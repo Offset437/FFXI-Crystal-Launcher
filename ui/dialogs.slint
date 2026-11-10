@@ -1,0 +1,381 @@
+// The delete confirmation, Connection & activity and the
+// FFXIAH price lookup: one dialog frame each over the dimmed window
+// (src/slint_host/dialogs.rs decides which one shows). Every string comes from
+// Rust.
+import { Theme } from "theme.slint";
+import { View, Ink } from "state.slint";
+import { DialogFrame } from "settings_dialogs.slint";
+import { Glyph, Icon, Control, Tone, IconButton, Field, Pressable, Rule, ScrollThumb } from "widgets.slint";
+
+export struct DialogStrings {
+    cancel: string,
+    delete-account: string,
+    delete-body: string,
+    details-title: string,
+    details-sub: string,
+    service: string,
+    game-version: string,
+    installed: string,
+    latest: string,
+    world-status: string,
+    notices: string,
+    latest-activity: string,
+    open-downloads: string,
+    done: string,
+    close: string,
+    search: string,
+    find-item: string,
+    ah-note: string,
+    open-ffxiah: string,
+    truncated: string,
+}
+
+/// What Connection & activity shows.
+export struct DetailsState {
+    service: string,
+    service-glyph: Glyph,
+    service-ink: Ink,
+    /// The service note and "Last checked", once a check came back.
+    has-services: bool,
+    service-note: string,
+    checked: string,
+    patch: string,
+    patch-glyph: Glyph,
+    patch-ink: Ink,
+    /// The patch line under the state (masked in privacy mode), once a check came back.
+    patch-detail: string,
+    /// The Installed / Latest tile.
+    versions: bool,
+    installed: string,
+    installed-mono: bool,
+    latest: string,
+    latest-mono: bool,
+    activity: string,
+}
+
+/// One FFXIAH match.
+export struct AhItem {
+    name: string,
+    caption: string,
+    price: string,
+    stock: string,
+}
+
+export struct AhState {
+    query: string,
+    heading: string,
+    /// Searching, the error, or no matches; empty once matches show.
+    message: string,
+    truncated: bool,
+    warning: string,
+}
+
+export global Dialogs {
+    in property <DialogStrings> strings;
+    in property <bool> delete-open;
+    in property <string> delete-title;
+    in property <bool> details-open;
+    in property <DetailsState> details;
+    in property <bool> ah-open;
+    in property <AhState> ah;
+    in property <[AhItem]> ah-items;
+    callback delete-cancel();
+    callback delete-confirm();
+    callback details-close();
+    callback world-status();
+    callback notices();
+    callback open-downloads();
+    callback ah-close();
+    callback ah-open-item(int);
+    callback ah-open-site();
+}
+
+component Caption inherits Text {
+    font-size: Theme.type-caption * Theme.scale;
+    font-weight: 600;
+    color: Theme.sub;
+}
+
+component SubText inherits Text {
+    font-size: Theme.type-caption * Theme.scale;
+    color: Theme.sub;
+    wrap: word-wrap;
+}
+
+/// The title, its line, and the close button.
+component DialogHeader inherits HorizontalLayout {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <string> close-label;
+    callback close();
+    private property <float> s: Theme.scale;
+    padding-top: 24px * root.s;
+    padding-left: 24px * root.s;
+    padding-right: (24px - 10.5px) * root.s;
+    padding-bottom: 20px * root.s;
+    spacing: 16px * root.s;
+    VerticalLayout {
+        horizontal-stretch: 1;
+        spacing: 4px * root.s;
+        Text { text: root.title; font-size: Theme.type-title * root.s; font-weight: 600; color: Theme.ink; wrap: word-wrap; }
+        Text { text: root.subtitle; font-size: Theme.type-small * root.s; color: Theme.sub; wrap: word-wrap; }
+    }
+    VerticalLayout {
+        alignment: start;
+        IconButton {
+            side: Theme.control-h * root.s;
+            glyph-size: 15px * root.s;
+            hint: root.close-label;
+            glyph: Glyph.close;
+            clicked => { root.close(); }
+        }
+    }
+}
+
+/// "Delete {label}?" before an account's saved details go.
+export component DeleteDialog inherits DialogFrame {
+    private property <float> s: Theme.scale;
+    dialog-width: 500px * root.s;
+    dialog-height: layout.preferred-height;
+    // The safe choice takes the focus.
+    init => { cancel.focus(); }
+    layout := VerticalLayout {
+        VerticalLayout {
+            padding-top: 24px * root.s;
+            padding-left: 24px * root.s;
+            padding-right: 24px * root.s;
+            padding-bottom: 8px * root.s;
+            spacing: 12px * root.s;
+            Text { text: Dialogs.delete-title; font-size: Theme.type-dialog * root.s; font-weight: 600; color: Theme.ink; wrap: word-wrap; }
+            Text { text: Dialogs.strings.delete-body; font-size: Theme.type-small * root.s; color: Theme.sub; wrap: word-wrap; }
+        }
+        HorizontalLayout {
+            padding: 24px * root.s;
+            padding-top: 16px * root.s;
+            spacing: 8px * root.s;
+            Rectangle { horizontal-stretch: 1; }
+            cancel := Control { scale: root.s; text: Dialogs.strings.cancel; clicked => { Dialogs.delete-cancel(); } }
+            Control { scale: root.s; tone: Tone.danger; text: Dialogs.strings.delete-account; clicked => { Dialogs.delete-confirm(); } }
+        }
+    }
+}
+
+/// A caption over an icon and a value, with its notes under it.
+component StatusBlock inherits VerticalLayout {
+    in property <string> caption;
+    in property <Glyph> glyph;
+    in property <Ink> ink;
+    in property <string> value;
+    private property <float> s: Theme.scale;
+    // Equal columns: the dialog's three rows share one two-column grid.
+    horizontal-stretch: 1;
+    min-width: 0px;
+    preferred-width: 0px;
+    spacing: 8px * root.s;
+    alignment: start;
+    Caption { text: root.caption; }
+    HorizontalLayout {
+        spacing: 8px * root.s;
+        alignment: start;
+        Icon { cross-axis-self-alignment: center; glyph: root.glyph; size: 16px * root.s; tint: View.tone(root.ink); }
+        Text { text: root.value; font-size: Theme.type-lead * root.s; color: Theme.ink; vertical-alignment: center; }
+    }
+    @children
+}
+
+/// A version under its caption.
+component Version inherits VerticalLayout {
+    in property <string> caption;
+    in property <string> value;
+    in property <bool> mono;
+    horizontal-stretch: 1;
+    min-width: 0px;
+    preferred-width: 0px;
+    spacing: 6px * Theme.scale;
+    Caption { text: root.caption; }
+    Text { text: root.value; font-family: root.mono ? Theme.mono : Theme.sans; font-size: Theme.type-small * Theme.scale; color: Theme.ink; }
+}
+
+/// Connection & activity: service status, the game version and the launcher's latest message.
+export component DetailsDialog inherits DialogFrame {
+    private property <float> s: Theme.scale;
+    dialog-width: 600px * root.s;
+    dialog-height: layout.preferred-height;
+    init => { done.focus(); }
+    layout := VerticalLayout {
+        DialogHeader {
+            title: Dialogs.strings.details-title;
+            subtitle: Dialogs.strings.details-sub;
+            close-label: Dialogs.strings.close;
+            close => { Dialogs.details-close(); }
+        }
+        Rule { }
+        VerticalLayout {
+            padding: 24px * root.s;
+            spacing: 20px * root.s;
+            HorizontalLayout {
+                spacing: Theme.gutter * root.s;
+                StatusBlock {
+                    caption: Dialogs.strings.service;
+                    glyph: Dialogs.details.service-glyph;
+                    ink: Dialogs.details.service-ink;
+                    value: Dialogs.details.service;
+                    if Dialogs.details.has-services: VerticalLayout {
+                        spacing: 2px * root.s;
+                        SubText { text: Dialogs.details.service-note; }
+                        SubText { text: Dialogs.details.checked; }
+                    }
+                }
+                StatusBlock {
+                    caption: Dialogs.strings.game-version;
+                    glyph: Dialogs.details.patch-glyph;
+                    ink: Dialogs.details.patch-ink;
+                    value: Dialogs.details.patch;
+                    if Dialogs.details.patch-detail != "": SubText { text: Dialogs.details.patch-detail; }
+                }
+            }
+            if Dialogs.details.versions: Rectangle {
+                background: Theme.tint;
+                border-radius: Theme.radius-inner;
+                HorizontalLayout {
+                    padding-top: 12px * root.s;
+                    padding-bottom: 12px * root.s;
+                    padding-left: 16px * root.s;
+                    padding-right: 16px * root.s;
+                    spacing: Theme.gutter * root.s;
+                    Version { caption: Dialogs.strings.installed; value: Dialogs.details.installed; mono: Dialogs.details.installed-mono; }
+                    Version { caption: Dialogs.strings.latest; value: Dialogs.details.latest; mono: Dialogs.details.latest-mono; }
+                }
+            }
+            // The status blocks' columns.
+            HorizontalLayout {
+                spacing: Theme.gutter * root.s;
+                HorizontalLayout {
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    alignment: start;
+                    Control { scale: root.s; glyph: Glyph.arrow-right; text: Dialogs.strings.world-status; clicked => { Dialogs.world-status(); } }
+                }
+                HorizontalLayout {
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    alignment: start;
+                    Control { scale: root.s; glyph: Glyph.arrow-right; text: Dialogs.strings.notices; clicked => { Dialogs.notices(); } }
+                }
+            }
+            Rule { tint: Theme.hairline; }
+            VerticalLayout {
+                spacing: 8px * root.s;
+                Caption { text: Dialogs.strings.latest-activity; }
+                Text { text: Dialogs.details.activity; font-size: Theme.type-body * root.s; color: Theme.ink; wrap: word-wrap; }
+            }
+        }
+        Rule { }
+        HorizontalLayout {
+            padding: 16px * root.s;
+            padding-left: 24px * root.s;
+            padding-right: 24px * root.s;
+            spacing: 8px * root.s;
+            Rectangle { horizontal-stretch: 1; }
+            Control { scale: root.s; glyph: Glyph.arrow-right; text: Dialogs.strings.open-downloads; clicked => { Dialogs.open-downloads(); } }
+            done := Control { scale: root.s; tone: Tone.primary; text: Dialogs.strings.done; clicked => { Dialogs.details-close(); } }
+        }
+    }
+}
+
+/// One match: its name, price and stock, opening its FFXIAH page.
+component AhRow inherits Pressable {
+    in property <AhItem> item;
+    private property <float> s: Theme.scale;
+    label: root.item.name;
+    border-radius: Theme.radius-inner;
+    background: root.hot ? Theme.tint : transparent;
+    height: row.preferred-height;
+    row := HorizontalLayout {
+        padding-top: 12px * root.s;
+        padding-bottom: 12px * root.s;
+        padding-left: 10px * root.s;
+        padding-right: 10px * root.s;
+        spacing: 12px * root.s;
+        Text { horizontal-stretch: 1; text: root.item.name; font-size: Theme.type-body * root.s; color: Theme.ink; vertical-alignment: center; overflow: elide; }
+        VerticalLayout {
+            width: 150px * root.s;
+            alignment: center;
+            Text { text: root.item.caption; font-size: Theme.type-micro * root.s; color: Theme.sub; }
+            Text { text: root.item.price; font-size: Theme.type-body * root.s; font-weight: 600; color: Theme.ink; }
+        }
+        Text { width: 105px * root.s; text: root.item.stock; font-size: Theme.type-caption * root.s; color: Theme.sub; vertical-alignment: center; }
+        Icon { cross-axis-self-alignment: center; glyph: Glyph.external-link; size: 14px * root.s; tint: Theme.sub; }
+    }
+}
+
+/// FFXIAH prices for the searched item on the chosen world.
+export component AhDialog inherits DialogFrame {
+    private property <float> s: Theme.scale;
+    dialog-width: 760px * root.s;
+    dialog-height: min(layout.preferred-height, 900px * root.s);
+    init => { close.focus(); }
+    layout := VerticalLayout {
+        DialogHeader {
+            title: "FFXIAH";
+            subtitle: Dialogs.ah.query;
+            close-label: Dialogs.strings.close;
+            close => { Dialogs.ah-close(); }
+        }
+        Rule { }
+        Rectangle {
+            vertical-stretch: 1;
+            preferred-height: body.content-height;
+            body := Flickable {
+                content-width: self.width;
+                content-height: form.preferred-height;
+                form := VerticalLayout {
+                    width: body.width;
+                    padding: 24px * root.s;
+                    spacing: 16px * root.s;
+                    alignment: start;
+                    Text { text: Dialogs.ah.heading; font-size: Theme.type-heading * root.s; font-weight: 600; color: Theme.accent; }
+                    HorizontalLayout {
+                        spacing: Theme.sp-s * root.s;
+                        Field {
+                            height: 36px * root.s;
+                            glyph: Glyph.search;
+                            pad-x: 10px * root.s;
+                            font-size: 14px * root.s;
+                            placeholder: Dialogs.strings.find-item;
+                            text <=> View.ah-query;
+                            edited(value) => { View.ah-edited(value); }
+                            accepted => { View.ah-search(); }
+                        }
+                        Control { scale: root.s; glyph: Glyph.search; text: Dialogs.strings.search; clicked => { View.ah-search(); } }
+                    }
+                    if Dialogs.ah.message != "": Text { text: Dialogs.ah.message; font-size: Theme.type-body * root.s; color: Theme.sub; wrap: word-wrap; }
+                    for item[i] in Dialogs.ah-items: AhRow { item: item; clicked => { Dialogs.ah-open-item(i); } }
+                    if Dialogs.ah.truncated: SubText { text: Dialogs.strings.truncated; }
+                    if Dialogs.ah.warning != "": SubText { text: Dialogs.ah.warning; }
+                }
+            }
+            ScrollThumb {
+                x: parent.width - 8px;
+                height: parent.height;
+                content-y: body.content-y;
+                content-height: body.content-height;
+                visible-height: body.height;
+            }
+        }
+        Rule { }
+        VerticalLayout {
+            padding: 16px * root.s;
+            padding-left: 24px * root.s;
+            padding-right: 24px * root.s;
+            spacing: 12px * root.s;
+            SubText { text: Dialogs.strings.ah-note; }
+            HorizontalLayout {
+                spacing: Theme.sp-s * root.s;
+                Control { scale: root.s; glyph: Glyph.external-link; text: Dialogs.strings.open-ffxiah; clicked => { Dialogs.ah-open-site(); } }
+                Rectangle { horizontal-stretch: 1; }
+                close := Control { scale: root.s; tone: Tone.primary; text: Dialogs.strings.close; clicked => { Dialogs.ah-close(); } }
+            }
+        }
+    }
+}

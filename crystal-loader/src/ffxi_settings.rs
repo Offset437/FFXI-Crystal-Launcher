@@ -155,6 +155,22 @@ pub fn active() -> bool {
     store().is_some()
 }
 
+/// The game's own enable flag, rather than Windower's background-input flag.
+/// Unknown or malformed values keep the normal DirectInput discovery path.
+pub(crate) fn controller_enabled() -> Option<bool> {
+    let state = store();
+    controller_enabled_value(&state.as_ref()?.values)
+}
+
+fn controller_enabled_value(values: &[RegData]) -> Option<bool> {
+    let value = values.iter().find(|value| value.name.eq_ignore_ascii_case("padmode000"))?;
+    if value.ty != REG_SZ { return None; }
+    let text = std::str::from_utf8(value.data.split(|byte| *byte == 0).next()?).ok()?;
+    let fields: Vec<_> = text.split(',').map(str::trim).collect();
+    if fields.len() < 6 || !fields[..6].iter().all(|field| matches!(*field, "0" | "1")) { return None; }
+    Some(fields[0] == "1")
+}
+
 pub(crate) fn controller_ready() -> bool {
     if !REGISTRY_DONE.load(Ordering::Acquire) || !active() { return false; }
     let wrappers = [w_open_key as *const () as usize, w_open_key_ex as *const () as usize,
@@ -164,14 +180,15 @@ pub(crate) fn controller_ready() -> bool {
 }
 
 fn import_matches(slot: usize, expected: usize) -> bool {
-    use windows_sys::Win32::System::{Diagnostics::Debug::ReadProcessMemory, Threading::GetCurrentProcess};
-    let mut current = 0usize;
-    let mut count = 0;
-    let size = std::mem::size_of::<usize>();
     // A later injector must not make the stock reload bypass our overrides.
-    slot != 0 && unsafe { ReadProcessMemory(GetCurrentProcess(), slot as *const c_void,
-        (&mut current as *mut usize).cast(), size, &mut count) != 0 }
-        && count == size && current == expected
+    slot != 0 && crate::mem::read::<usize>(slot) == Some(expected)
+}
+
+/// The only values a live controller request may carry.
+pub(crate) const CONTROLLER_KEYS: [&str; 3] = ["padmode000", "padsin000", "padguid000"];
+
+pub(crate) fn is_controller_key(name: &str) -> bool {
+    CONTROLLER_KEYS.iter().any(|key| name.eq_ignore_ascii_case(key))
 }
 
 /// Replace only the live controller's process-local values. The game's
@@ -192,7 +209,7 @@ fn update_controller_store(state: &mut Store, settings: &FfxiSettings, key: usiz
     }
     // Keep this boundary narrow even if a future caller omits its validation.
     if settings.entries.iter().any(|(name, value)| {
-        !["padmode000", "padsin000", "padguid000"].iter().any(|known| name.eq_ignore_ascii_case(known))
+        !is_controller_key(name)
             || !matches!(value, SettingValue::Text(text) if text.is_ascii())
     }) {
         return Err("The live request contains unsupported controller settings.");
@@ -445,69 +462,6 @@ unsafe fn create_component(original_index: usize, clsid: *const GUID, outer: *mu
 
 // --- import tables ------------------------------------------------------------
 
-/// One import of one DLL in a loaded module: its name (when the module kept its name table)
-/// and the address of its IAT entry.
-#[derive(Debug, Clone)]
-pub struct ImportSlot {
-    pub name: Option<String>,
-    pub slot: *mut usize,
-}
-
-/// Reads a loaded module's import directory for `dll` (case-insensitive).
-///
-/// # Safety
-/// `base` must be a mapped module image.
-pub unsafe fn import_slots(base: usize, dll: &str) -> Vec<ImportSlot> {
-    let rd32 = |at: usize| std::ptr::read_unaligned(at as *const u32) as usize;
-    let rd16 = |at: usize| std::ptr::read_unaligned(at as *const u16);
-    let mut out = Vec::new();
-    if base == 0 || rd16(base) != 0x5A4D {
-        return out;
-    }
-    let nt = base + rd32(base + 0x3C);
-    let opt = nt + 24;
-    let (dir_at, thunk) = match rd16(opt) {
-        0x10B => (opt + 96 + 8, 4usize),
-        0x20B => (opt + 112 + 8, 8usize),
-        _ => return out,
-    };
-    if thunk != std::mem::size_of::<usize>() {
-        return out;
-    }
-    let imports = rd32(dir_at);
-    if imports == 0 {
-        return out;
-    }
-    let mut desc = base + imports;
-    loop {
-        let (names, name, first) = (rd32(desc), rd32(desc + 12), rd32(desc + 16));
-        if name == 0 || first == 0 {
-            break;
-        }
-        let this = CStr::from_ptr((base + name) as *const _).to_bytes();
-        if this.eq_ignore_ascii_case(dll.as_bytes()) {
-            let mut i = 0;
-            loop {
-                let slot = (base + first + i * thunk) as *mut usize;
-                if std::ptr::read_unaligned(slot) == 0 {
-                    break;
-                }
-                let entry_name = if names == 0 {
-                    None
-                } else {
-                    let e = std::ptr::read_unaligned((base + names + i * thunk) as *const usize);
-                    let ordinal = e & (1usize << (thunk * 8 - 1)) != 0;
-                    (!ordinal && e != 0).then(|| CStr::from_ptr((base + e + 2) as *const _).to_string_lossy().into_owned())
-                };
-                out.push(ImportSlot { name: entry_name, slot });
-                i += 1;
-            }
-        }
-        desc += 20;
-    }
-    out
-}
-
 /// Which slots to redirect: for each wanted function (name, the system's own address), the
 /// slot whose name matches, or, when the module has no name table, whose current value is the
 /// system's address. Returns (slot index, wanted index).
@@ -524,30 +478,13 @@ pub fn plan(slots: &[(Option<&str>, usize)], wanted: &[(&str, usize)]) -> Vec<(u
     out
 }
 
-/// Points an IAT entry at `value` (the IAT is usually read-only).
-///
-/// # Safety
-/// `slot` is an IAT entry of a loaded module.
-unsafe fn write_slot(slot: *mut usize, value: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_READWRITE};
-    let size = std::mem::size_of::<usize>();
-    let mut old = 0;
-    if VirtualProtect(slot.cast(), size, PAGE_READWRITE, &mut old) == 0 {
-        return false;
-    }
-    std::ptr::write_unaligned(slot, value);
-    let mut ignored = 0;
-    VirtualProtect(slot.cast(), size, old, &mut ignored);
-    true
-}
-
 /// Redirects the `wanted` imports of `dll` in the module at `base` to (wrapper, ORIGINAL
 /// index) pairs. Returns how many were redirected.
 ///
 /// # Safety
 /// `base` is a loaded module.
 unsafe fn redirect(base: usize, dll: &str, wanted: &[(&str, usize, usize)]) -> usize {
-    let slots = import_slots(base, dll);
+    let slots = crate::iat::import_slots(base, dll);
     let view: Vec<(Option<&str>, usize)> = slots.iter().map(|s| (s.name.as_deref(), std::ptr::read_unaligned(s.slot))).collect();
     // The address the Windows loader put in the IAT (our own `system_fn` is an import stub).
     let dll_base = module(dll);
@@ -572,7 +509,9 @@ unsafe fn redirect(base: usize, dll: &str, wanted: &[(&str, usize, usize)]) -> u
             continue;
         }
         ORIGINAL[index].store(current, Ordering::Release);
-        if write_slot(slots[s].slot, wrapper) {
+        // Only over the value just read: an injector that changed the slot
+        // since then keeps it.
+        if crate::iat::swap(slots[s].slot as usize, current, wrapper).is_ok_and(|s| s.changed) {
             if index < REGISTRY_SLOTS.len() { REGISTRY_SLOTS[index].store(slots[s].slot as usize, Ordering::Release); }
             done += 1;
         }
@@ -580,11 +519,7 @@ unsafe fn redirect(base: usize, dll: &str, wanted: &[(&str, usize, usize)]) -> u
     done
 }
 
-fn module(name: &str) -> usize {
-    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: NUL-terminated name.
-    unsafe { windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(wide.as_ptr()) as usize }
-}
+use crate::win::module_base as module;
 
 static APPLY: Mutex<()> = Mutex::new(());
 
@@ -604,6 +539,7 @@ pub fn apply_to_ffximain() -> bool {
     if base == 0 {
         return false;
     }
+    crate::boot_timing::install(base);
     if crate::game::selected_game_directory() {
         // SAFETY: FFXiMain is loaded; retain its original injector/COM import separately
         // from FFXi.dll's import, which may have a different hook.
@@ -638,6 +574,21 @@ pub fn apply_to_ffximain() -> bool {
     true
 }
 
+/// FFXi.dll and FFXiMain.dll were unloaded after their game (game_modules).
+/// Their import slots are gone; the next mappings are redirected afresh, and
+/// nothing here keeps an address inside the old images.
+pub(crate) fn module_unloaded() {
+    let _one = APPLY.lock().unwrap_or_else(|e| e.into_inner());
+    FFXIMAIN_DONE.store(false, Ordering::Release);
+    REGISTRY_DONE.store(false, Ordering::Release);
+    for slot in &REGISTRY_SLOTS { slot.store(0, Ordering::Release); }
+    // Only the old images' import slots called the wrappers; zero falls back to
+    // the system function until the next redirect records the new original.
+    for original in &ORIGINAL { original.store(0, Ordering::Release); }
+    KEY_LOGGED.store(false, Ordering::Relaxed);
+    if let Some(s) = store().as_mut() { s.keys.clear(); s.reads = 0; s.writes = 0; }
+}
+
 /// Watches FFXi.dll's `CoCreateInstance`, which loads FFXiMain for `GameMain`.
 pub fn hook_ffxi_dll(base: usize) -> bool {
     if (!active() && !crate::game::selected_game_directory()) || base == 0 {
@@ -656,6 +607,21 @@ pub fn hook_ffxi_dll(base: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_enable_uses_the_first_flag_and_rejects_unknown_values() {
+        let enabled = |text: &str| controller_enabled_value(&[
+            reg_data("padmode000", &SettingValue::Text(text.into()), &to_ansi)
+        ]);
+        assert_eq!(enabled("0,0,0,0,1,0"), Some(false));
+        assert_eq!(enabled("1,0,0,0,0,0"), Some(true));
+        assert_eq!(enabled(" 0 ,1,0,0,1,1"), Some(false));
+        for value in ["", "0", "0,0,0,0,broken,0", "2,0,0,0,0,0"] {
+            assert_eq!(enabled(value), None);
+        }
+        assert_eq!(controller_enabled_value(&[]), None);
+        assert_eq!(controller_enabled_value(&[reg_data("padmode000", &SettingValue::Dword(0), &to_ansi)]), None);
+    }
 
     #[test]
     fn live_controller_rejects_an_import_replaced_by_another_owner() {
@@ -762,19 +728,6 @@ mod tests {
         assert_eq!(plan(&slots, &wanted), vec![(1, 0), (2, 1), (0, 3)]);
     }
 
-    #[test]
-    fn import_slots_read_this_executable() {
-        // The test binary imports kernel32 functions; every slot holds a resolved address.
-        // SAFETY: GetModuleHandleW(NULL) is the executable.
-        let base = unsafe { windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()) as usize };
-        // SAFETY: the running executable's image.
-        let slots = unsafe { import_slots(base, "KERNEL32.dll") };
-        assert!(!slots.is_empty());
-        assert!(slots.iter().all(|s| unsafe { std::ptr::read_unaligned(s.slot) } != 0));
-        assert!(slots.iter().any(|s| s.name.as_deref().is_some_and(|n| n.starts_with("Get"))), "{:?}", slots.iter().map(|s| &s.name).collect::<Vec<_>>());
-        assert!(unsafe { import_slots(base, "no-such.dll") }.is_empty());
-    }
-
     // --- the wrappers against a fake registry ---
 
     const FAKE_KEY: usize = 0x4242;
@@ -838,7 +791,7 @@ mod tests {
         assert_eq!(FAKE_QUERIES.load(Ordering::SeqCst), queries + 1);
         let sets = FAKE_SETS.load(Ordering::SeqCst);
         let value = 1600u32.to_le_bytes();
-        assert_eq!(unsafe { w_set_value_ex(tracked, b"0001\0".as_ptr(), 0, REG_DWORD, value.as_ptr(), 4) }, 0);
+        assert_eq!(unsafe { w_set_value_ex(tracked, c"0001".as_ptr().cast(), 0, REG_DWORD, value.as_ptr(), 4) }, 0);
         assert_eq!(FAKE_SETS.load(Ordering::SeqCst), sets + 1, "empty scope preserves ordinary writes");
         let settings = FfxiSettings::new(vec![
             ("0001".into(), SettingValue::Dword(1920)),
@@ -883,10 +836,10 @@ mod tests {
         // A write of an overridden name stays in-process; others reach the registry.
         let sets = FAKE_SETS.load(Ordering::SeqCst);
         let v = 1280u32.to_le_bytes();
-        assert_eq!(unsafe { w_set_value_ex(FAKE_KEY as HKEY, b"0001\0".as_ptr(), 0, REG_DWORD, v.as_ptr(), 4) }, 0);
+        assert_eq!(unsafe { w_set_value_ex(FAKE_KEY as HKEY, c"0001".as_ptr().cast(), 0, REG_DWORD, v.as_ptr(), 4) }, 0);
         assert_eq!(FAKE_SETS.load(Ordering::SeqCst), sets);
         assert_eq!(read_dword(FAKE_KEY, b"0001\0"), (0, REG_DWORD, 1280));
-        assert_eq!(unsafe { w_set_value_ex(FAKE_KEY as HKEY, b"0005\0".as_ptr(), 0, REG_DWORD, v.as_ptr(), 4) }, 0);
+        assert_eq!(unsafe { w_set_value_ex(FAKE_KEY as HKEY, c"0005".as_ptr().cast(), 0, REG_DWORD, v.as_ptr(), 4) }, 0);
         assert_eq!(FAKE_SETS.load(Ordering::SeqCst), sets + 1);
 
         // After the close, the handle value is no longer ours.

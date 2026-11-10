@@ -6,11 +6,6 @@ use std::{
     fs,
     io::Read,
     path::{Component, Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex,
-    },
-    time::{Duration, Instant},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,14 +29,17 @@ impl Product {
             Self::Ashita => &["AshitaV4", "Ashita v4", "Ashita4", "Ashita"],
         }
     }
-    fn executable(self, name: &str) -> bool {
-        let names: &[&str] = match self {
+    /// The file names that mark the product's folder, best first.
+    fn executables(self) -> &'static [&'static str] {
+        match self {
             Self::Ffxi => &["FFXiMain.dll", "FFXi.dll", "FFXiMain.exe"],
             Self::PlayOnline => &["pol.exe"],
             Self::Windower => &["Windower.exe"],
             Self::Ashita => &["Ashita-cli.exe", "Ashita.exe"],
-        };
-        names.iter().any(|n| name.eq_ignore_ascii_case(n))
+        }
+    }
+    fn executable(self, name: &str) -> bool {
+        self.executables().iter().any(|n| name.eq_ignore_ascii_case(n))
     }
     fn display_name(self, name: &str) -> bool {
         let name = name.to_ascii_lowercase();
@@ -90,30 +88,13 @@ pub(crate) fn find(product: Product, preferred: Option<&Path>) -> Option<PathBuf
     if let Some(folder) = preferred.and_then(|p| validated_folder(product, p)) {
         return Some(folder);
     }
-    #[cfg(windows)]
     if let Some(folder) = windows::registered_folder(product) {
         return Some(folder);
     }
-    candidates(product).iter().find_map(|p| validated_folder(product, p))
+    discover(Some(product))[product.index()].iter().find_map(|p| validated_folder(product, p))
 }
 
 type Inventory = [Vec<PathBuf>; 4];
-static CACHE: Mutex<Option<(u64, Instant, Inventory)>> = Mutex::new(None);
-static GENERATION: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn invalidate() {
-    // The UI's Find action never waits for a scan currently holding CACHE.
-    GENERATION.fetch_add(1, Ordering::AcqRel);
-}
-
-pub(crate) fn candidates(product: Product) -> Vec<PathBuf> {
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    let generation = GENERATION.load(Ordering::Acquire);
-    if cache.as_ref().is_none_or(|(saved, at, _)| *saved != generation || at.elapsed() > Duration::from_secs(30)) {
-        *cache = Some((generation, Instant::now(), discover()));
-    }
-    cache.as_ref().unwrap().2[product.index()].clone()
-}
 
 fn push(list: &mut Vec<PathBuf>, path: PathBuf) {
     if !path.as_os_str().is_empty() && !list.iter().any(|p| p.as_os_str().eq_ignore_ascii_case(path.as_os_str())) {
@@ -132,11 +113,16 @@ fn remember(inventory: &mut Inventory, product: Product, hint: &Path) {
     }
 }
 
-fn discover() -> Inventory {
+fn target_found(inventory: &Inventory, target: Option<Product>) -> bool {
+    target.is_some_and(|product| !inventory[product.index()].is_empty())
+}
+
+fn discover(target: Option<Product>) -> Inventory {
     let mut inventory: Inventory = Default::default();
     let mut roots = Vec::new();
     let mut shortcuts = Vec::new();
     system_hints(&mut inventory, &mut roots, &mut shortcuts);
+    if target_found(&inventory, target) { return inventory; }
     // Installed POL and FFXI usually share a vendor folder. A selected product
     // may be registered even when the sibling registration is missing.
     for product in [Product::Ffxi, Product::PlayOnline] {
@@ -176,29 +162,22 @@ fn discover() -> Inventory {
         for product in Product::ALL {
             remember(&mut inventory, product, root);
         }
+        if target_found(&inventory, target) { return inventory; }
     }
-    scan_shortcuts(&mut inventory, &shortcuts);
-    scan_roots(&mut inventory, &roots);
+    scan_shortcuts(&mut inventory, &shortcuts, target);
+    if target_found(&inventory, target) { return inventory; }
+    scan_roots(&mut inventory, &roots, target);
     inventory
 }
 
 fn plain_directory(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| {
-        if !m.is_dir() || m.file_type().is_symlink() {
-            return false;
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            if m.file_attributes() & 0x400 != 0 {
-                return false;
-            }
-        }
-        true
+        use std::os::windows::fs::MetadataExt;
+        m.is_dir() && !m.file_type().is_symlink() && m.file_attributes() & 0x400 == 0
     })
 }
 
-fn scan_roots(inventory: &mut Inventory, roots: &[PathBuf]) {
+fn scan_roots(inventory: &mut Inventory, roots: &[PathBuf], target: Option<Product>) {
     // Broad enough for unpacked tools in a nested Downloads/Games folder, but
     // never recursively walk whole disks, junctions, source trees or caches.
     let mut remaining = 1600usize;
@@ -218,6 +197,7 @@ fn scan_roots(inventory: &mut Inventory, roots: &[PathBuf]) {
             for product in Product::ALL {
                 remember(inventory, product, &folder);
             }
+            if target_found(inventory, target) { return; }
             if depth >= 3 {
                 continue;
             }
@@ -250,7 +230,7 @@ fn scan_roots(inventory: &mut Inventory, roots: &[PathBuf]) {
     }
 }
 
-fn scan_shortcuts(inventory: &mut Inventory, roots: &[PathBuf]) {
+fn scan_shortcuts(inventory: &mut Inventory, roots: &[PathBuf], target: Option<Product>) {
     let mut remaining = 1024usize;
     for root in roots {
         if !local_candidate(root) || !plain_directory(root) {
@@ -282,6 +262,7 @@ fn scan_shortcuts(inventory: &mut Inventory, roots: &[PathBuf]) {
                             }
                         }
                     }
+                    if target_found(inventory, target) { return; }
                 }
                 if remaining == 0 {
                     return;
@@ -293,15 +274,13 @@ fn scan_shortcuts(inventory: &mut Inventory, roots: &[PathBuf]) {
 
 fn read_shortcut(path: &Path) -> Option<Vec<u8>> {
     let metadata = fs::symlink_metadata(path).ok()?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 * 1024 {
-        return None;
-    }
-    #[cfg(windows)]
+    use std::os::windows::fs::MetadataExt;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > 1024 * 1024
+        || metadata.file_attributes() & 0x400 != 0
     {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 {
-            return None;
-        }
+        return None;
     }
     let mut bytes = Vec::new();
     fs::File::open(path).ok()?.take(1024 * 1024 + 1).read_to_end(&mut bytes).ok()?;
@@ -346,7 +325,7 @@ fn shortcut_paths(bytes: &[u8]) -> Vec<PathBuf> {
             let data = &info[offset..];
             if unicode {
                 let words: Vec<_> =
-                    data.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).take_while(|n| *n != 0).collect();
+                    data.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes([b[0], b[1]])).take_while(|n| *n != 0).collect();
                 String::from_utf16(&words).ok()
             } else {
                 let end = data.iter().position(|b| *b == 0)?;
@@ -378,7 +357,7 @@ fn shortcut_paths(bytes: &[u8]) -> Vec<PathBuf> {
         };
         if flag == 16 {
             let value = if unicode {
-                String::from_utf16(&data.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect::<Vec<_>>())
+                String::from_utf16(&data.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes([b[0], b[1]])).collect::<Vec<_>>())
                     .ok()
             } else {
                 Some(ansi(data))
@@ -392,22 +371,10 @@ fn shortcut_paths(bytes: &[u8]) -> Vec<PathBuf> {
     paths
 }
 
-#[cfg(windows)]
 fn ansi(bytes: &[u8]) -> String {
-    use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
-    let mut wide = vec![0u16; bytes.len()];
-    // SAFETY: bounded slices with matching input/output lengths.
-    let size = unsafe {
-        MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), bytes.len() as i32, wide.as_mut_ptr(), wide.len() as i32)
-    };
-    String::from_utf16_lossy(&wide[..size.max(0) as usize])
-}
-#[cfg(not(windows))]
-fn ansi(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
+    crate::win::codepage::decode(crate::win::codepage::ACP, bytes, false).unwrap_or_default()
 }
 
-#[cfg(windows)]
 fn local_candidate(path: &Path) -> bool {
     use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
     let path = crate::backend::plain_windows_path(path);
@@ -418,19 +385,11 @@ fn local_candidate(path: &Path) -> bool {
     if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || !matches!(bytes[2], b'\\' | b'/') {
         return false;
     }
-    let root: Vec<_> = format!("{}:\\", char::from(bytes[0])).encode_utf16().chain(Some(0)).collect();
+    let root = crate::win::wide(&format!("{}:\\", char::from(bytes[0])));
     // DRIVE_FIXED: automatic discovery never probes disconnected network or USB drives.
     unsafe { GetDriveTypeW(root.as_ptr()) == 3 }
 }
-#[cfg(not(windows))]
-fn local_candidate(path: &Path) -> bool {
-    path.is_absolute()
-}
 
-#[cfg(not(windows))]
-fn system_hints(_: &mut Inventory, _: &mut Vec<PathBuf>, _: &mut Vec<PathBuf>) {}
-
-#[cfg(windows)]
 fn system_hints(inventory: &mut Inventory, roots: &mut Vec<PathBuf>, shortcuts: &mut Vec<PathBuf>) {
     windows::registry_hints(inventory, roots, shortcuts);
     windows::running_hints(inventory);
@@ -462,71 +421,21 @@ fn system_hints(inventory: &mut Inventory, roots: &mut Vec<PathBuf>, shortcuts: 
     }
 }
 
-#[cfg(windows)]
 mod windows {
     use super::*;
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Registry::*;
-
-    fn wide(value: &str) -> Vec<u16> {
-        value.encode_utf16().chain(Some(0)).collect()
-    }
+    use crate::win::reg::{self, Key, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use crate::win::reg::{KEY_ENUMERATE_SUB_KEYS, KEY_WOW64_32KEY, KEY_WOW64_64KEY};
+    use crate::win::reg::{RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6432KEY, RRF_SUBKEY_WOW6464KEY};
 
     fn value(hive: HKEY, key: &str, name: &str, view: u32) -> Option<String> {
-        let key = wide(key);
-        let name = wide(name);
-        let mut buffer = vec![0u16; 16384];
-        let mut size = (buffer.len() * 2) as u32;
         // RegGetValue expands REG_EXPAND_SZ itself; bound data and never read a
         // command line, credential, or arbitrary registry tree.
-        let status = unsafe {
-            RegGetValueW(
-                hive,
-                key.as_ptr(),
-                name.as_ptr(),
-                RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | view,
-                std::ptr::null_mut(),
-                buffer.as_mut_ptr().cast(),
-                &mut size,
-            )
-        };
-        if status != ERROR_SUCCESS || size > buffer.len() as u32 * 2 {
-            return None;
-        }
-        let length = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
-        String::from_utf16(&buffer[..length]).ok().filter(|s| !s.is_empty())
+        let units = reg::string(hive, key, name, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | view, 16384)?;
+        String::from_utf16(&units).ok().filter(|s| !s.is_empty())
     }
 
     fn subkeys(hive: HKEY, path: &str, view: u32) -> Vec<String> {
-        let mut key = std::ptr::null_mut();
-        let path = wide(path);
-        if unsafe { RegOpenKeyExW(hive, path.as_ptr(), 0, KEY_ENUMERATE_SUB_KEYS | view, &mut key) } != ERROR_SUCCESS {
-            return Vec::new();
-        }
-        let mut keys = Vec::new();
-        for index in 0..2048 {
-            let mut name = [0u16; 256];
-            let mut size = name.len() as u32;
-            if unsafe {
-                RegEnumKeyExW(
-                    key,
-                    index,
-                    name.as_mut_ptr(),
-                    &mut size,
-                    std::ptr::null(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            } != ERROR_SUCCESS
-            {
-                break;
-            }
-            keys.push(String::from_utf16_lossy(&name[..size as usize]));
-        }
-        unsafe { RegCloseKey(key) };
-        keys
+        Key::open(hive, path, KEY_ENUMERATE_SUB_KEYS | view).map(|key| key.subkeys(2048)).unwrap_or_default()
     }
 
     fn location(raw: &str) -> Option<PathBuf> {
@@ -539,35 +448,35 @@ mod windows {
         (!path.is_empty()).then(|| PathBuf::from(path))
     }
 
+    /// Where the registry says `product` is, in one hive and view: PlayOnline's InstallFolder
+    /// entry (FFXI and PlayOnline; US is the current runtime region, so finding paths adds no
+    /// claim of native authentication support for another region), then the App Paths entry
+    /// of each of its executables (not FFXI's, which are DLLs). `true` marks InstallFolder.
+    fn registry_paths(product: Product, hive: HKEY, view: u32) -> Vec<(PathBuf, bool)> {
+        let mut paths = Vec::new();
+        let title = match product {
+            Product::Ffxi => Some("0001"),
+            Product::PlayOnline => Some("1000"),
+            Product::Windower | Product::Ashita => None,
+        };
+        if let Some(path) = title.and_then(|title| value(hive, r"SOFTWARE\PlayOnlineUS\InstallFolder", title, view)) {
+            paths.extend(location(&path).map(|path| (path, true)));
+        }
+        if product != Product::Ffxi {
+            for exe in product.executables() {
+                let key = format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}");
+                paths.extend(value(hive, &key, "", view).and_then(|s| location(&s)).map(|path| (path, false)));
+            }
+        }
+        paths
+    }
+
     /// Common launches need a handful of registry reads, not a full inventory.
     /// A missing/stale entry still reaches the broader cached discovery below.
     pub(super) fn registered_folder(product: Product) -> Option<PathBuf> {
         for hive in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
             for view in [RRF_SUBKEY_WOW6432KEY, RRF_SUBKEY_WOW6464KEY] {
-                let paths: Vec<_> = match product {
-                    Product::Ffxi | Product::PlayOnline => {
-                        let title = if product == Product::Ffxi { "0001" } else { "1000" };
-                        value(hive, r"SOFTWARE\PlayOnlineUS\InstallFolder", title, view).into_iter().collect()
-                    }
-                    Product::Windower | Product::Ashita => {
-                        let exes: &[&str] = if product == Product::Windower {
-                            &["Windower.exe"]
-                        } else {
-                            &["Ashita-cli.exe", "Ashita.exe"]
-                        };
-                        exes.iter()
-                            .filter_map(|exe| {
-                                value(
-                                    hive,
-                                    &format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}"),
-                                    "",
-                                    view,
-                                )
-                            })
-                            .collect()
-                    }
-                };
-                for path in paths.into_iter().filter_map(|s| location(&s)) {
+                for (path, _) in registry_paths(product, hive, view) {
                     if !local_candidate(&path) {
                         continue;
                     }
@@ -585,27 +494,13 @@ mod windows {
             for (read_view, open_view) in
                 [(RRF_SUBKEY_WOW6432KEY, KEY_WOW64_32KEY), (RRF_SUBKEY_WOW6464KEY, KEY_WOW64_64KEY)]
             {
-                // US is the current runtime region; finding paths adds no new
-                // claim of native authentication support for another region.
-                for (product, title) in [(Product::Ffxi, "0001"), (Product::PlayOnline, "1000")] {
-                    if let Some(path) =
-                        value(hive, r"SOFTWARE\PlayOnlineUS\InstallFolder", title, read_view).and_then(|s| location(&s))
-                    {
+                for product in Product::ALL {
+                    for (path, install_folder) in registry_paths(product, hive, read_view) {
                         remember(inventory, product, &path);
-                        if let Some(parent) = path.parent() {
-                            push(roots, parent.to_path_buf());
-                        }
-                    }
-                }
-                for (product, exes) in [
-                    (Product::Windower, &["Windower.exe"][..]),
-                    (Product::Ashita, &["Ashita.exe", "Ashita-cli.exe"][..]),
-                    (Product::PlayOnline, &["pol.exe"][..]),
-                ] {
-                    for exe in exes {
-                        let key = format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}");
-                        if let Some(path) = value(hive, &key, "", read_view).and_then(|s| location(&s)) {
-                            remember(inventory, product, &path);
+                        if install_folder {
+                            if let Some(parent) = path.parent() {
+                                push(roots, parent.to_path_buf());
+                            }
                         }
                     }
                 }
@@ -663,42 +558,17 @@ mod windows {
     }
 
     pub(super) fn running_hints(inventory: &mut Inventory) {
-        use windows_sys::Win32::System::{
-            Diagnostics::ToolHelp::*,
-            Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION},
-        };
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        if snapshot == INVALID_HANDLE_VALUE {
-            return;
-        }
-        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
-        for _ in 0..4096 {
-            if !has_entry {
-                break;
+        for entry in crate::win::process::processes().unwrap_or_default() {
+            let products: Vec<_> = Product::ALL.into_iter().filter(|p| p.executable(&entry.name)).collect();
+            if products.is_empty() {
+                continue;
             }
-            let length = entry.szExeFile.iter().position(|c| *c == 0).unwrap_or(entry.szExeFile.len());
-            let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
-            if Product::ALL.iter().any(|p| p.executable(&name)) {
-                let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID) };
-                if !process.is_null() {
-                    let mut path = vec![0u16; 32768];
-                    let mut length = path.len() as u32;
-                    if unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length) } != 0 {
-                        let path = PathBuf::from(std::ffi::OsString::from_wide(&path[..length as usize]));
-                        for product in Product::ALL {
-                            if product.executable(&name) {
-                                remember(inventory, product, &path);
-                            }
-                        }
-                    }
-                    unsafe { CloseHandle(process) };
+            if let Ok(path) = crate::win::process::image_path(entry.pid) {
+                for product in products {
+                    remember(inventory, product, &path);
                 }
             }
-            has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
         }
-        unsafe { CloseHandle(snapshot) };
     }
 }
 
@@ -726,7 +596,7 @@ mod tests {
             fs::write(folder.join(marker), b"fixture").unwrap();
         }
         let mut inventory = Default::default();
-        scan_roots(&mut inventory, &[root.join("Games"), root.join("Downloads")]);
+        scan_roots(&mut inventory, &[root.join("Games"), root.join("Downloads")], None);
         for (product, path) in [(Product::Ashita, &ashita), (Product::Windower, &windower), (Product::Ffxi, &game)] {
             assert_eq!(inventory[product.index()], [validated_folder(product, path).unwrap()]);
         }
@@ -751,7 +621,35 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
+    fn launch_lookup_stops_at_the_requested_product_but_inventory_keeps_all_copies() {
+        let root = fixture();
+        let first = root.join("first");
+        let later = root.join("later");
+        for folder in [&first, &later] {
+            fs::create_dir(folder).unwrap();
+            fs::write(folder.join("Windower.exe"), b"fixture").unwrap();
+        }
+        fs::write(later.join("Ashita-cli.exe"), b"fixture").unwrap();
+        let roots = [first.clone(), later.clone()];
+        let mut launch = Inventory::default();
+        scan_roots(&mut launch, &roots, Some(Product::Windower));
+        assert_eq!(launch[Product::Windower.index()], [validated_folder(Product::Windower, &first).unwrap()]);
+        assert!(launch[Product::Ashita.index()].is_empty(), "later folders are unnecessary for this launch");
+
+        let mut inventory = Inventory::default();
+        scan_roots(&mut inventory, &roots, None);
+        assert_eq!(inventory[Product::Windower.index()].len(), 2, "the folder picker still discovers every copy");
+        assert_eq!(inventory[Product::Ashita.index()], [validated_folder(Product::Ashita, &later).unwrap()]);
+
+        for target in [Product::Ashita, Product::PlayOnline] {
+            let mut lookup = Inventory::default();
+            scan_roots(&mut lookup, &roots, Some(target));
+            assert_eq!(lookup, inventory, "another product or a missing target must not stop at Windower");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn steam_style_forward_slashes_are_valid_local_search_roots() {
         let root = fixture();
         let tool = root.join("Windower");
@@ -759,7 +657,7 @@ mod tests {
         fs::write(tool.join("Windower.exe"), b"fixture").unwrap();
         let steam_style = PathBuf::from(root.to_string_lossy().replace('\\', "/"));
         let mut inventory = Default::default();
-        scan_roots(&mut inventory, &[steam_style]);
+        scan_roots(&mut inventory, &[steam_style], None);
         assert_eq!(inventory[Product::Windower.index()], [validated_folder(Product::Windower, &tool).unwrap()]);
         fs::remove_dir_all(root).unwrap();
     }

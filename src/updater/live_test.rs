@@ -71,13 +71,16 @@ async fn official_copy_update_repair_and_cancel_resume() {
     eprintln!("Baseline: {}", baseline.summary);
     assert!(baseline.verified, "A clean baseline is required before introducing controlled damage");
 
+    // Stock's sequence: the version request and the file list each on their own connection,
+    // then one download connection, closed like stock.
     let operation = Operation::new();
-    let mut session = Session::connect(&operation).await.unwrap();
-    let reply = session.exchange(&polp::hello(&tags()), 2, &operation).await.unwrap();
-    let text = decode_payload(&reply[16..], MAX_MANIFEST).unwrap();
-    let m = manifest::parse(std::str::from_utf8(&text).unwrap()).unwrap();
-    validate_manifest(&m).unwrap();
-    assert_eq!(m.latest_stamp(), Some(baseline.version.as_str()));
+    let server = Product::Ffxi.server();
+    let installed = crate::patch::installed_for_request(&root);
+    assert_eq!(official_version(Product::Ffxi, server, &installed, &operation).await.unwrap(), baseline.version);
+    let text = official_list(Product::Ffxi, server, &operation).await.unwrap();
+    let m = parse_list(Product::Ffxi, &text).unwrap();
+    assert_eq!(Product::Ffxi.latest_stamp(&m), Some(baseline.version.as_str()));
+    let mut session = Session::connect_to(Product::Ffxi, server, &operation).await.unwrap();
     let history = |path: &str| m.files.iter().find(|h| h.path == path).unwrap();
     let old_file = history("config.sys");
     let missing_file = history("patch.sin");
@@ -112,7 +115,7 @@ async fn official_copy_update_repair_and_cancel_resume() {
     let direct = decode_payload(&direct, old_file.current().sig.len as usize).unwrap();
     assert_eq!(delta_result, direct);
     assert_eq!(FileSig::of(&delta_result), old_file.current().sig);
-    drop(session);
+    session.close().await;
     eprintln!("Production delta output matches the independently downloaded current full file");
 
     // Cancel after Apply, while the complete-install verification is in progress.
@@ -121,7 +124,7 @@ async fn official_copy_update_repair_and_cancel_resume() {
     let watched = cancel.clone();
     let monitor = tokio::spawn(async move {
         loop {
-            if watched.snapshot().stage == "Verify" {
+            if watched.snapshot().stage == crate::operation::Stage::Verify {
                 watched.cancel();
                 break;
             }
@@ -154,7 +157,7 @@ async fn official_copy_update_repair_and_cancel_resume() {
     assert_eq!(fs::read(&modified_path).unwrap(), custom);
     assert_eq!(crate::patch::installed_for_request(&root), baseline.version, "patch.ver still records the same version");
     let installed_list = manifest::parse(&fs::read_to_string(root.join("patch.cfg")).unwrap()).unwrap();
-    assert_eq!(installed_list.latest_stamp(), Some(baseline.version.as_str()), "patch.cfg still lists the same version");
+    assert_eq!(Product::Ffxi.latest_stamp(&installed_list), Some(baseline.version.as_str()), "patch.cfg still lists the same version");
     assert!(!root.join(STATE_DIR).join("kept").join(&modified_file.path).exists(), "a file left in place has no kept copy");
     eprintln!("Update/resume: {}", updated.summary);
 

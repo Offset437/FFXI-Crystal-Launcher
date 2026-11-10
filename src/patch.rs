@@ -12,11 +12,12 @@
 //! * the game's check (`W20`, product `0001`, port 53001, FFXI's installed version) when
 //!   Play is pressed, after the main menu's publish and before the game starts
 //!   (07a w20-after-publish; the launcher decides when).
+//!
 //! Neither is queried on refresh, on a timer, or after a settings save. Both go out on
 //! `stock_socket`'s Viewer-shaped socket. Empty versions are sent only for a fresh install.
 
 use crate::i18n::{t, tf};
-use crate::updater::polp;
+use crate::updater::{polp, Product};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 #[cfg(test)]
@@ -24,12 +25,11 @@ use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-const SOURCE: &str = "tcp://pc001W2U.pol.com:53001";
 const HEADER: usize = 16;
 const MAX_VERSION_FRAME: usize = 4096;
 /// How long a launch waits for the patch server before starting anyway (unreachable
 /// server = unverified, exactly as before; it is never a reason to refuse a launch).
-const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Leads the message that stops a start because the installed version is not the server's.
 pub(crate) const UPDATE_REQUIRED: &str = "Update required:";
 /// `gate`'s update-required sentence (its `tf` key; a test keeps the two equal).
@@ -40,30 +40,6 @@ const UPDATE_REQUIRED_TEMPLATE: &str = "Update required: installed {local}, offi
 const LEGACY_UPDATE_REQUIRED: [&str; 1] = [
     "アップデートが必要です（インストール済み：{local}、公式サーバー：{remote}）。FINAL FANTASY XIを起動する前に、［ダウンロード］でゲームフォルダーを選択し、［アップデート］（または［修復］）を選んでください。",
 ];
-
-/// One product the patch server knows: its host, platform tag and product id (the port
-/// is `53000 + product id`).
-#[derive(Clone, Copy)]
-struct Product {
-    host: &'static str,
-    platform: [u8; 4],
-    title: [u8; 4],
-}
-const FFXI: Product = Product { host: crate::dns::GAME_PATCH_HOST, platform: *b"W20\0", title: *b"0001" };
-const VIEWER: Product = Product { host: crate::dns::VIEWER_PATCH_HOST, platform: *b"W2U\0", title: *b"1000" };
-
-impl Product {
-    fn title(&self) -> &str {
-        std::str::from_utf8(&self.title).unwrap_or("0000")
-    }
-    fn server(&self) -> String {
-        format!("{}:{}", self.host, 53000 + self.title().parse::<u16>().unwrap_or(0))
-    }
-    /// The stock 88-byte version frame carrying `installed` (empty only for a fresh install).
-    fn request(&self, installed: &str) -> Vec<u8> {
-        polp::version(&polp::Tags { platform: self.platform, title: self.title }, installed.as_bytes())
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchState {
@@ -84,7 +60,6 @@ pub struct PatchReport {
     /// None for version-only checks; an actual file operation reports its
     /// observed result without changing the installed-version launch gate.
     pub files_verified: Option<bool>,
-    pub source_url: Option<String>,
 }
 
 /// What is installed, as the stock client reads it.
@@ -100,14 +75,14 @@ enum Local {
     Interrupted(String),
 }
 
-fn read_local(install: &Path, title: &str) -> Local {
+fn read_local(install: &Path, product: Product) -> Local {
     if let Err(error) = check_recovery_state(install) {
         let journal = std::fs::symlink_metadata(install.join(".xi-updater/transaction.json")).is_ok();
         return if journal { Local::Interrupted(error) } else { Local::Updating(error) };
     }
     match std::fs::metadata(install.join("patch.ver")) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Local::Fresh,
-        _ => match local_version_for(install, title) {
+        _ => match local_version_for(install, product) {
             Ok(version) => Local::Installed(version),
             Err(error) => Local::Unreadable(error),
         },
@@ -126,12 +101,9 @@ fn check_recovery_state(install: &Path) -> Result<(), String> {
 /// refuses another launcher's active update before reading an older patch.ver.
 /// The updater's own version request deliberately uses read_local directly.
 pub(crate) fn check_update_state(install: &Path) -> Result<Option<std::fs::File>, String> {
+    use std::os::windows::fs::OpenOptionsExt;
     let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)] {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
-    }
+    options.read(true).share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
     let lock = match options.open(install.join(".xi-updater/lock")) {
         Ok(lock) => Some(lock),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -141,9 +113,9 @@ pub(crate) fn check_update_state(install: &Path) -> Result<Option<std::fs::File>
     Ok(lock)
 }
 
-fn read_local_for_launch(install: &Path, title: &str) -> (Local, Option<std::fs::File>) {
+fn read_local_for_launch(install: &Path, product: Product) -> (Local, Option<std::fs::File>) {
     match check_update_state(install) {
-        Ok(lock) => (read_local(install, title), lock),
+        Ok(lock) => (read_local(install, product), lock),
         Err(error) => (Local::Updating(error), None),
     }
 }
@@ -152,11 +124,11 @@ fn read_local_for_launch(install: &Path, title: &str) -> (Local, Option<std::fs:
 /// empty for a fresh install. A patch.ver that cannot be decoded (the case Repair exists
 /// for) also sends empty, since there is no installed version to report.
 pub(crate) fn installed_for_request(install: &Path) -> String {
-    installed_for_request_for(install, "0001")
+    installed_for_request_for(install, Product::Ffxi)
 }
 
-pub(crate) fn installed_for_request_for(install: &Path, title: &str) -> String {
-    match read_local(install, title) {
+pub(crate) fn installed_for_request_for(install: &Path, product: Product) -> String {
+    match read_local(install, product) {
         Local::Installed(version) => version,
         Local::Fresh | Local::Unreadable(_) | Local::Updating(_) | Local::Interrupted(_) => String::new(),
     }
@@ -165,9 +137,14 @@ pub(crate) fn installed_for_request_for(install: &Path, title: &str) -> String {
 /// Reads the applied-version record only. No network: the server is asked when Play
 /// is pressed (`check_before_launch`) and by Check files / Update / Repair.
 pub fn local_report(install: &Path) -> PatchReport {
-    let local = read_local(install, FFXI.title());
+    let local = read_local(install, Product::Ffxi);
     let installed = matches!(local, Local::Installed(_));
+    // An unfinished update or a journal refuses a launch, but the applied version is still
+    // in patch.ver: show it instead of a placeholder when it decodes.
+    let applied = matches!(local, Local::Updating(_) | Local::Interrupted(_))
+        .then(|| local_version_for(install, Product::Ffxi).ok()).flatten();
     let mut result = game_report(local, Err(t("Not checked").into()));
+    if let Some(version) = applied { result.local_version = version; }
     result.remote_version = t("Not checked").into();
     if installed {
         result.detail = t("The official patch server is asked when you press Play, before FINAL FANTASY XI starts.").into();
@@ -177,47 +154,22 @@ pub fn local_report(install: &Path) -> PatchReport {
 
 /// The installed record against a version the official server just reported (the updater's).
 pub fn report_with_remote(install: &Path, remote: &str) -> PatchReport {
-    game_report(read_local(install, FFXI.title()), Ok(remote.to_owned()))
+    game_report(read_local(install, Product::Ffxi), Ok(remote.to_owned()))
 }
 
 fn game_report(local: Local, remote: Result<String, String>) -> PatchReport {
-    match local {
-        Local::Installed(version) => report(Ok(version), remote),
-        Local::Fresh => PatchReport {
-            state: PatchState::Required,
-            local_version: t("Not initialized").into(),
-            remote_version: remote.unwrap_or_else(|_| t("Unavailable").into()),
-            detail: t("FFXI has not completed its initial update. Choose Update to finish and create its installed-version record.").into(),
-            files_verified: None,
-            source_url: Some(SOURCE.into()),
-        },
-        Local::Unreadable(error) => PatchReport {
-            state: PatchState::Required,
-            local_version: t("Unavailable").into(),
-            remote_version: remote.unwrap_or_else(|_| t("Unavailable").into()),
-            detail: tf("The installed-version record cannot be read: {error}. Use Repair files under Downloads → Troubleshooting to verify the installation and rebuild it with backups.", &[("error", &error)]),
-            files_verified: None,
-            source_url: Some(SOURCE.into()),
-        },
-        Local::Updating(error) => PatchReport {
-            state: PatchState::Required,
-            local_version: t("Unavailable").into(),
-            remote_version: remote.unwrap_or_else(|_| t("Unavailable").into()),
-            detail: error,
-            files_verified: None,
-            source_url: Some(SOURCE.into()),
-        },
-        Local::Interrupted(error) => PatchReport {
-            state: PatchState::Interrupted,
-            local_version: t("Unavailable").into(),
-            remote_version: remote.unwrap_or_else(|_| t("Unavailable").into()),
-            detail: error,
-            files_verified: None,
-            source_url: Some(SOURCE.into()),
-        },
-    }
+    let (state, local_version, detail) = match local {
+        Local::Installed(version) => return report(Ok(version), remote),
+        Local::Fresh => (PatchState::Required, t("Not initialized").into(),
+            t("FFXI has not completed its initial update. Choose Update to finish and create its installed-version record.").into()),
+        Local::Unreadable(error) => (PatchState::Required, t("Unavailable").into(),
+            tf("The installed-version record cannot be read: {error}. Use Repair files under Downloads → Troubleshooting to verify the installation and rebuild it with backups.", &[("error", &error)])),
+        Local::Updating(error) => (PatchState::Required, t("Unavailable").into(), error),
+        Local::Interrupted(error) => (PatchState::Interrupted, t("Unavailable").into(), error),
+    };
+    PatchReport { state, local_version, remote_version: remote.unwrap_or_else(|_| t("Unavailable").into()), detail,
+        files_verified: None }
 }
-
 /// Keep a valid version record separate from the outcome of an actual file
 /// check. A matching patch.ver alone cannot make missing/outdated files ready.
 pub(crate) fn report_after_operation(install: &Path, files: &crate::updater::Report, mode: crate::updater::Mode) -> PatchReport {
@@ -284,9 +236,6 @@ pub(crate) const STOCK_CLOSE_MAX: Duration = Duration::from_millis(115);
 /// `tests::the_loader_waits_out_the_whole_w2u`).
 #[cfg(test)]
 pub(crate) const VIEWER_CHECK_BUDGET: Duration = Duration::from_millis(12_000 + 10_000 + 10_000 + 115);
-/// W2U :54000, W20 :53001 (53000 + product id).
-const VIEWER_PORT: u16 = 54000;
-const FFXI_PORT: u16 = 53001;
 
 /// One connection attempt of a version check, phase by phase (`None`: not reached).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -353,7 +302,26 @@ impl CheckTiming {
 /// (08 §4 item 6). The W20 never retries (07d §2.3): one attempt, its failure is
 /// Unverified as before.
 pub(crate) fn check_before_launch_timed(install: &Path) -> (LaunchCheck, CheckTiming) {
-    ffxi_check(install, crate::dns::GAME_PATCH_HOST, FFXI_PORT, &mut SystemNet)
+    let (check, timing) = ffxi_check(install, Product::Ffxi.host(), Product::Ffxi.port(), &mut SystemNet);
+    remember_game_reply(install, &check);
+    // An update follows this refusal in the same session (proposal 09 phase 2): its first
+    // connection keeps stock's FIN → SYN gap from this W20's FIN. The game is not starting, so
+    // waiting for that FIN (≤ 115 ms after the reply) costs nothing.
+    if matches!(check, LaunchCheck::Update(_)) {
+        if let Some(at) = last_w20_close(Duration::from_millis(500)) {
+            crate::updater::note_patch_closed(crate::updater::Product::Ffxi, at);
+        }
+    }
+    (check, timing)
+}
+
+/// The version the server just reported is remembered (`official_versions`), so the
+/// Downloads page can show it later without asking again. Only a reply that was parsed
+/// counts: an unreachable server or an unreadable local record leaves the memory alone.
+fn remember_game_reply(install: &Path, check: &LaunchCheck) {
+    if let LaunchCheck::Start(report) | LaunchCheck::Update(report) = check {
+        crate::official_versions::learn_game(install, &report.remote_version);
+    }
 }
 
 /// The check and the gate in one, for a start that has no use for the report, with its
@@ -378,7 +346,7 @@ fn ffxi_check(install: &Path, host: &str, port: u16, net: &mut dyn Net) -> (Laun
 pub(crate) trait Net {
     /// Attempt 1 of either check: the system resolver and its cache, as round 1, asking for
     /// A records only as stock does (`dns::resolve_a`).
-    fn resolve(&mut self, host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, crate::dns::NetError> {
+    fn resolve(&mut self, host: &str, port: u16) -> Result<Vec<std::net::SocketAddrV4>, crate::dns::NetError> {
         crate::dns::resolve_a(host, port)
             .map_err(|e| crate::dns::NetError::from_io(crate::dns::NetStage::Resolve, &e, Duration::ZERO))
     }
@@ -427,7 +395,7 @@ fn w2u_exchange(host: &str, port: u16, request: &[u8], limit: Duration, net: &mu
         net.sleep(pause);
         timing.network_wait += pause;
         let (result, attempt) = exchange_attempt(|limit| net.resolve_fresh(host, limit)
-            .map(|found| found.into_iter().map(|ip| std::net::SocketAddr::from((ip, port))).collect()), request, limit, true, true);
+            .map(|found| found.into_iter().map(|ip| std::net::SocketAddrV4::new(ip, port)).collect()), request, limit, true, true);
         let error = attempt.error.clone();
         timing.attempts.push(attempt);
         match error {
@@ -446,32 +414,19 @@ fn w2u_exchange(host: &str, port: u16, request: &[u8], limit: Duration, net: &mu
 }
 
 fn check_with(install: &Path, send: impl FnOnce(&[u8]) -> Result<Vec<u8>, String>) -> LaunchCheck {
-    let (local, _update_lock) = read_local_for_launch(install, FFXI.title());
+    let (local, _update_lock) = read_local_for_launch(install, Product::Ffxi);
     let remote = match &local {
-        Local::Installed(version) => send(&FFXI.request(version)).and_then(|frame| parse_reply(&frame)),
-        Local::Fresh => send(&FFXI.request("")).and_then(|frame| parse_reply(&frame)),
+        Local::Installed(version) => send(&Product::Ffxi.request(version)).and_then(|frame| parse_reply(&frame)),
+        Local::Fresh => send(&Product::Ffxi.request("")).and_then(|frame| parse_reply(&frame)),
         // Never fall back to an anonymous request for a record that cannot be read.
         Local::Unreadable(error) | Local::Updating(error) | Local::Interrupted(error) => Err(tf("No version request sent: {error}", &[("error", error)])),
     };
-    let verdict = match (&local, &remote) {
-        (Local::Installed(l), Ok(r)) if l == r => Verdict::Start,
-        (Local::Installed(_), Ok(_)) => Verdict::Update,
-        (Local::Fresh | Local::Unreadable(_) | Local::Updating(_) | Local::Interrupted(_), _) => Verdict::Update,
-        _ => Verdict::Unverified,
+    let verdict: fn(PatchReport) -> LaunchCheck = match (&local, &remote) {
+        (Local::Installed(l), Ok(r)) if l == r => LaunchCheck::Start,
+        (Local::Installed(_), Err(_)) => LaunchCheck::Unverified,
+        _ => LaunchCheck::Update,
     };
-    let report = game_report(local, remote);
-    match verdict {
-        Verdict::Start => LaunchCheck::Start(report),
-        Verdict::Update => LaunchCheck::Update(report),
-        Verdict::Unverified => LaunchCheck::Unverified(report),
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Verdict {
-    Start,
-    Update,
-    Unverified,
+    verdict(game_report(local, remote))
 }
 
 /// Turns a check into the gate every game start passes: `Ok(note)` to start (the note is
@@ -482,6 +437,12 @@ pub fn gate(check: LaunchCheck) -> Result<String, String> {
             "Game version {version} matches the official server.",
             &[("version", &report.local_version)],
         )),
+        // A refusal sent no request (unreadable, locked or interrupted record): its own cause,
+        // never the parseable text, which would claim the server named a newer version.
+        // A fresh install whose request got no reply keeps the parseable text (and the Update
+        // button): Update is how it finishes, whatever the server names.
+        LaunchCheck::Update(report) if !Product::Ffxi.valid_stamp(&report.remote_version)
+            && !is_not_initialized(&report.local_version) => Err(report.detail),
         // Starts with `UPDATE_REQUIRED`; `parse_update_required` reads it back.
         // The main button turns into Update from the report this carries.
         LaunchCheck::Update(report) => Err(tf(
@@ -507,14 +468,30 @@ pub fn parse_update_required(message: &str) -> Option<PatchReport> {
             .chain(LEGACY_UPDATE_REQUIRED)
             .find_map(|template| parse_update_required_with(message, template))
     })?;
+    // Only a version the server named is an update to show (an older worker may still word a
+    // refusal that sent no request this way, with placeholders), or a fresh install, which
+    // Update finishes even when the server did not answer.
+    let fresh = is_not_initialized(&local);
+    if !Product::Ffxi.valid_stamp(&remote) && !fresh { return None; }
+    let detail = if fresh {
+        t("FFXI has not completed its initial update. Choose Update to finish and create its installed-version record.")
+    } else {
+        t("A newer official version is available.")
+    };
     Some(PatchReport {
         state: PatchState::Required,
         local_version: local,
         remote_version: remote,
-        detail: t("A newer official version is available.").into(),
+        detail: detail.into(),
         files_verified: None,
-        source_url: Some(SOURCE.into()),
     })
+}
+
+/// `game_report`'s local version for a fresh install, in any language (a worker words it in
+/// the language it started with).
+fn is_not_initialized(local: &str) -> bool {
+    local == "Not initialized"
+        || crate::i18n::Lang::ALL.into_iter().any(|lang| crate::i18n::t_in(lang, "Not initialized") == local)
 }
 
 fn parse_english_update_required(message: &str) -> Option<(String, String)> {
@@ -551,7 +528,14 @@ pub(crate) fn parse_update_required_with(message: &str, template: &str) -> Optio
 /// Returns only after the connection is closed. Never cached. With the 07d §2.3
 /// retry for "network not ready" and the phases of every attempt.
 pub(crate) fn viewer_connect_check_timed(dir: &Path) -> crate::viewer::ConnectCheck {
-    viewer_connect_net(dir, crate::dns::VIEWER_PATCH_HOST, VIEWER_PORT, CHECK_TIMEOUT, &mut SystemNet)
+    let check = viewer_connect_net(dir, Product::Viewer.host(), Product::Viewer.port(), CHECK_TIMEOUT, &mut SystemNet);
+    // The server's answer is remembered for the Downloads page (`official_versions`).
+    match &check.verdict {
+        crate::viewer::ConnectVerdict::Current { version } => crate::official_versions::learn_playonline(version),
+        crate::viewer::ConnectVerdict::Outdated { remote, .. } => crate::official_versions::learn_playonline(remote),
+        _ => {}
+    }
+    check
 }
 
 fn viewer_connect_net(dir: &Path, host: &str, port: u16, limit: Duration, net: &mut dyn Net) -> crate::viewer::ConnectCheck {
@@ -575,10 +559,10 @@ fn viewer_connect_with(dir: &Path, send: impl FnOnce(&[u8]) -> Result<Vec<u8>, S
 /// updater's read-shared lock is held across the exchange, as for W20.
 fn viewer_verdict(dir: &Path, send: impl FnOnce(&[u8]) -> Result<Vec<u8>, Unanswered>) -> crate::viewer::ConnectVerdict {
     use crate::viewer::ConnectVerdict;
-    let (local, _update_lock) = read_local_for_launch(dir, VIEWER.title());
+    let (local, _update_lock) = read_local_for_launch(dir, Product::Viewer);
     let request = match &local {
-        Local::Installed(version) => VIEWER.request(version),
-        Local::Fresh => VIEWER.request(""),
+        Local::Installed(version) => Product::Viewer.request(version),
+        Local::Fresh => Product::Viewer.request(""),
         // Nothing is sent for a record that cannot be vouched for (never an empty request).
         Local::Updating(error) | Local::Interrupted(error) => return ConnectVerdict::Failed(error.clone()),
         Local::Unreadable(error) => return ConnectVerdict::Failed(tf("Could not verify PlayOnline: {error}", &[("error", error)])),
@@ -600,8 +584,8 @@ fn viewer_verdict(dir: &Path, send: impl FnOnce(&[u8]) -> Result<Vec<u8>, Unansw
 /// Reuse the shared updater's validated version reply, including after a
 /// partial/cancelled transaction, without starting a second network request.
 pub(crate) fn viewer_report_with_remote(dir: &Path, remote: Option<&str>) -> PatchReport {
-    viewer_report(read_local(dir, VIEWER.title()), remote
-        .filter(|version| valid_viewer_version(version)).map(|version| Ok(version.to_owned()))
+    viewer_report(read_local(dir, Product::Viewer), remote
+        .filter(|version| Product::Viewer.valid_stamp(version)).map(|version| Ok(version.to_owned()))
         .unwrap_or_else(|| Err(t("Not checked").into())))
 }
 
@@ -631,7 +615,6 @@ fn viewer_report(local: Local, remote: Result<String, String>) -> PatchReport {
         remote_version: remote.unwrap_or_else(|_| t("Unavailable").into()),
         detail,
         files_verified: None,
-        source_url: Some(format!("tcp://{}", VIEWER.server())),
     }
 }
 
@@ -648,14 +631,14 @@ fn exchange(server: &str, request: &[u8], limit: Duration) -> Result<Vec<u8>, St
 /// short-lived thread. Returns the attempt's phases too.
 #[cfg(test)]
 fn exchange_closing(server: &str, request: &[u8], limit: Duration, wait_close: bool) -> (Result<Vec<u8>, String>, Attempt) {
-    exchange_attempt(|_| server.to_socket_addrs().map(Iterator::collect)
+    exchange_attempt(|_| server.to_socket_addrs().map(|found| found.filter_map(|address| match address { std::net::SocketAddr::V4(v4) => Some(v4), _ => None }).collect())
         .map_err(|e| crate::dns::NetError::from_io(crate::dns::NetStage::Resolve, &e, Duration::ZERO)), request, limit, wait_close, false)
 }
 
 /// One attempt of `exchange`, phase by phase: `resolve` (given the attempt's limit)
 /// yields the addresses to try in order. Returns the user-facing error with the
 /// attempt's phases and its `dns::NetError`.
-fn exchange_attempt(resolve: impl FnOnce(Duration) -> Result<Vec<std::net::SocketAddr>, crate::dns::NetError>,
+fn exchange_attempt(resolve: impl FnOnce(Duration) -> Result<Vec<std::net::SocketAddrV4>, crate::dns::NetError>,
     request: &[u8], limit: Duration, wait_close: bool, fresh_dns: bool) -> (Result<Vec<u8>, String>, Attempt) {
     let mut attempt = Attempt { fresh_dns, ..Attempt::default() };
     match run_attempt(resolve, request, limit, wait_close, &mut attempt) {
@@ -667,7 +650,7 @@ fn exchange_attempt(resolve: impl FnOnce(Duration) -> Result<Vec<std::net::Socke
     }
 }
 
-fn run_attempt(resolve: impl FnOnce(Duration) -> Result<Vec<std::net::SocketAddr>, crate::dns::NetError>,
+fn run_attempt(resolve: impl FnOnce(Duration) -> Result<Vec<std::net::SocketAddrV4>, crate::dns::NetError>,
     request: &[u8], limit: Duration, wait_close: bool, attempt: &mut Attempt) -> Result<Vec<u8>, (crate::dns::NetError, String)> {
     use crate::dns::{NetError, NetStage};
     let started = Instant::now();
@@ -746,11 +729,87 @@ fn run_attempt(resolve: impl FnOnce(Duration) -> Result<Vec<std::net::SocketAddr
         attempt.close = Some(replied.elapsed());
     } else {
         // A failed spawn closes at once (the stream drops with the closure).
-        let _ = std::thread::Builder::new().name("patch-close".into())
-            .spawn(move || crate::stock_socket::close_after_reply(stream, replied));
+        background_close_started();
+        let spawned = std::thread::Builder::new().name("patch-close".into())
+            .spawn(move || {
+                crate::stock_socket::close_after_reply(stream, replied);
+                background_close_done(Instant::now());
+            });
+        if spawned.is_err() { background_close_done(Instant::now()); }
         attempt.close_in_background = true;
     }
     Ok(frame)
+}
+
+/// W20 connections still closing on their own thread (`run_attempt`), and when the last one
+/// closed (its FIN). An update a Play's W20 asked for opens its first connection
+/// `updater::NEXT_CONNECTION_GAP` after that FIN, as stock opens its prompt connection.
+static W20_CLOSES: (std::sync::Mutex<(usize, Option<Instant>)>, std::sync::Condvar) =
+    (std::sync::Mutex::new((0, None)), std::sync::Condvar::new());
+
+fn background_close_started() {
+    W20_CLOSES.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
+}
+
+fn background_close_done(at: Instant) {
+    let mut closes = W20_CLOSES.0.lock().unwrap_or_else(|e| e.into_inner());
+    closes.0 = closes.0.saturating_sub(1);
+    closes.1 = Some(closes.1.map_or(at, |known| known.max(at)));
+    W20_CLOSES.1.notify_all();
+}
+
+/// When this process's last W20 closed, once every W20 still closing has (at most `limit`).
+pub(crate) fn last_w20_close(limit: Duration) -> Option<Instant> {
+    let deadline = Instant::now() + limit;
+    let mut closes = W20_CLOSES.0.lock().unwrap_or_else(|e| e.into_inner());
+    while closes.0 > 0 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() { break; }
+        closes = W20_CLOSES.1.wait_timeout(closes, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    closes.1
+}
+
+/// Where a session worker or the batch coordinator leaves the FIN of a W20 that asked for an
+/// update, for the window's update to space its first connection from (`take_update_close`).
+const UPDATE_CLOSE_FILE: &str = "w20-closed.json";
+/// An older note is not this Play's.
+const UPDATE_CLOSE_FRESH: Duration = Duration::from_secs(120);
+
+/// After a W20 that asked for an update in this process: leave its FIN in the account's
+/// `directory` for the window (another process) that runs the update. Local only; best effort.
+pub(crate) fn save_update_close(directory: &Path) {
+    let Some(at) = last_w20_close(Duration::from_millis(500)) else { return };
+    let Some(stamp) = crate::launch_timing::MonotonicStamp::capture(at) else { return };
+    if let Ok(bytes) = serde_json::to_vec(&stamp) { let _ = std::fs::write(directory.join(UPDATE_CLOSE_FILE), bytes); }
+}
+
+/// The W20 FIN `save_update_close` left in `directory` (and remove it), when it is recent.
+pub(crate) fn take_update_close(directory: &Path) -> Option<Instant> {
+    let path = directory.join(UPDATE_CLOSE_FILE);
+    let bytes = std::fs::read(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    let stamp: crate::launch_timing::MonotonicStamp = serde_json::from_slice(&bytes).ok()?;
+    let at = crate::launch_timing::MonotonicStamp::restore(Some(stamp), 0);
+    (at.elapsed() < UPDATE_CLOSE_FRESH).then_some(at)
+}
+
+/// Whether `message` is a W20 refusal (`gate`'s update-required text).
+pub(crate) fn is_update_refusal(message: &str) -> bool {
+    parse_update_required(message).is_some()
+}
+
+/// The official version a Play's refusal (`report`) asks the game folder to update to, when an
+/// update can follow in the same session: the server named a valid version, and the folder is
+/// installed at another one (or freshly, without a record). `None` when no in-session update
+/// applies (no reply, an unreadable or locked record, or the folder is already that version).
+pub(crate) fn in_session_update(install: &Path, report: &PatchReport) -> Option<String> {
+    if report.state != PatchState::Required || !Product::Ffxi.valid_stamp(&report.remote_version) { return None; }
+    match read_local(install, Product::Ffxi) {
+        Local::Installed(version) if version != report.remote_version => Some(report.remote_version.clone()),
+        Local::Fresh => Some(report.remote_version.clone()),
+        _ => None,
+    }
 }
 
 fn read_exact_by(stream: &mut TcpStream, mut buffer: &mut [u8], deadline: Instant) -> std::io::Result<()> {
@@ -773,22 +832,16 @@ fn read_exact_by(stream: &mut TcpStream, mut buffer: &mut [u8], deadline: Instan
     Ok(())
 }
 
-/// Locate the installed product on this PC. Historical callers use this name;
-/// registry entries take priority, with validated local evidence as fallback.
-pub(crate) fn registry_install_folder(title: &str) -> Option<std::path::PathBuf> {
-    let product = match title {
-        "0001" => crate::discovery::Product::Ffxi,
-        "1000" => crate::discovery::Product::PlayOnline,
-        _ => return None,
-    };
-    crate::discovery::find(product, None)
+/// Locate the installed product on this PC: registry entries first, with validated local
+/// evidence as fallback.
+pub(crate) fn install_folder(product: Product) -> Option<std::path::PathBuf> {
+    crate::discovery::find(product.discovery(), None)
 }
 
 /// Keep a valid selected installation, otherwise discover it on this PC.
 /// Markers identify the game folder even when its first update has not run or
 /// a binary is missing and needs repair. The version record is checked separately.
 pub(crate) fn find_game_installation(preferred: Option<&Path>) -> Option<std::path::PathBuf> {
-    if preferred.is_none() { crate::discovery::invalidate(); }
     crate::discovery::find(crate::discovery::Product::Ffxi, preferred)
 }
 
@@ -811,7 +864,6 @@ fn report(local: Result<String, String>, remote: Result<String, String>) -> Patc
             .unwrap_or_else(|_| t("Unavailable").into()),
         detail: String::new(),
         files_verified: None,
-        source_url: Some(SOURCE.into()),
     };
     result.detail = match (local, remote) {
         (Ok(local), Ok(remote)) if local == remote => {
@@ -819,10 +871,10 @@ fn report(local: Result<String, String>, remote: Result<String, String>) -> Patc
             t("FFXI's installed-version record matches the official patch server. Check files verifies file integrity.").into()
         }
         (Ok(local), Ok(remote)) => {
-            match (stamp_key(&local), stamp_key(&remote)) {
+            match (Product::Ffxi.stamp_order(&local), Product::Ffxi.stamp_order(&remote)) {
                 (Some(a), Some(b)) if a < b => {
                     result.state = PatchState::Required;
-                    t("A newer official version is available. Press Update to install it.").into()
+                    t("A newer version is available.").into()
                 }
                 _ => t("Local metadata is newer than the official server response; update status cannot be established.").into(),
             }
@@ -834,26 +886,23 @@ fn report(local: Result<String, String>, remote: Result<String, String>) -> Patc
     result
 }
 
-fn stamp_key(stamp: &str) -> Option<(u32, u32)> {
-    let (date, revision) = stamp.split_once('_')?;
-    if date.len() != 8
-        || !date.starts_with('3')
-        || !date.bytes().all(|b| b.is_ascii_digit())
-        || revision.is_empty()
-        || !revision.bytes().all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    Some((date.parse().ok()?, revision.parse().ok()?))
-}
-
-
-/// The applied version in `install\patch.ver`, decoded with the key for product `title`
+/// The applied version in `install\patch.ver`, decoded with the key for `product`
 /// (`0001` FFXI, `1000` the PlayOnline Viewer; the registry holds one key per product).
-fn local_version_for(install: &Path, title: &str) -> Result<String, String> {
+fn local_version_for(install: &Path, product: Product) -> Result<String, String> {
     let path = install.join("patch.ver");
-    let file = std::fs::File::open(&path)
-        .map_err(|e| tf("Cannot read applied-version record {path}: {error}", &[("path", &path.display()), ("error", &e)]))?;
+    // A writer that briefly denies sharing (the updater replacing the record, a scanner)
+    // must not leave the installed version a placeholder: retry a few times.
+    let mut attempt = 0;
+    let file = loop {
+        match std::fs::File::open(&path) {
+            Ok(file) => break file,
+            Err(e) if attempt < 4 && (e.kind() == std::io::ErrorKind::PermissionDenied || matches!(e.raw_os_error(), Some(32 | 33))) => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            Err(e) => return Err(tf("Cannot read applied-version record {path}: {error}", &[("path", &path.display()), ("error", &e)])),
+        }
+    };
     let mut bytes = Vec::new();
     file.take(289)
         .read_to_end(&mut bytes)
@@ -863,15 +912,8 @@ fn local_version_for(install: &Path, title: &str) -> Result<String, String> {
     }
     // The title-specific Interface value is a patch-record codec seed, not an
     // account credential. The native decoder also tries the no-registry seed.
-    for seed in patch_seeds_for(title) {
-        let decoded = if title == FFXI.title() {
-            decode_patch_record(&bytes, seed)
-        } else {
-            decode_record_for(&bytes, seed, title)
-        };
-        if let Ok(version) = decoded {
-            return Ok(version);
-        }
+    if let Some(version) = patch_seeds_for(product).into_iter().find_map(|seed| decode_record_for(&bytes, seed, product).ok()) {
+        return Ok(version);
     }
     Err(t("Cannot validate/decode applied-version record patch.ver with the installed patch keys. Downloaded patch.cfg does not prove an update was applied.").into())
 }
@@ -880,16 +922,16 @@ fn local_version_for(install: &Path, title: &str) -> Result<String, String> {
 /// A missing record uses the installed title key (or POL's seed-1 fallback).
 #[cfg(test)]
 pub(crate) fn applied_seed(install: &Path) -> Result<u64, String> {
-    applied_seed_for(install, "0001")
+    applied_seed_for(install, Product::Ffxi)
 }
 
-pub(crate) fn applied_seed_for(install: &Path, title: &str) -> Result<u64, String> {
+pub(crate) fn applied_seed_for(install: &Path, product: Product) -> Result<u64, String> {
     let path = install.join("patch.ver");
     match std::fs::read(&path) {
-        Ok(bytes) => patch_seeds_for(title).into_iter()
-            .find(|seed| decode_record_for(&bytes, *seed, title).is_ok())
+        Ok(bytes) => patch_seeds_for(product).into_iter()
+            .find(|seed| decode_record_for(&bytes, *seed, product).is_ok())
             .ok_or_else(|| t("Existing patch.ver cannot be validated; refusing to replace its applied-version record").into()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(patch_seeds_for(title)[0]),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(patch_seeds_for(product)[0]),
         Err(e) => Err(tf("Cannot read {path}: {error}", &[("path", &path.display()), ("error", &e)])),
     }
 }
@@ -899,23 +941,23 @@ pub(crate) fn applied_seed_for(install: &Path, title: &str) -> Result<u64, Strin
 /// a transaction backup rather than treating it as a successfully applied version.
 #[cfg(test)]
 pub(crate) fn repair_seed(install: &Path) -> Result<u64, String> {
-    repair_seed_for(install, "0001")
+    repair_seed_for(install, Product::Ffxi)
 }
 
-pub(crate) fn repair_seed_for(install: &Path, title: &str) -> Result<u64, String> {
-    match applied_seed_for(install, title) {
+pub(crate) fn repair_seed_for(install: &Path, product: Product) -> Result<u64, String> {
+    match applied_seed_for(install, product) {
         Ok(seed) => Ok(seed),
         Err(_) => {
             // Still report read/access errors; only codec-invalid regular files
             // are eligible for explicit metadata repair.
             let bytes = std::fs::read(install.join("patch.ver")).map_err(|e| e.to_string())?;
-            if patch_seeds_for(title)
+            if patch_seeds_for(product)
                 .iter()
-                .any(|s| decode_record_for(&bytes, *s, title).is_ok())
+                .any(|s| decode_record_for(&bytes, *s, product).is_ok())
             {
                 return Err(t("Applied record unexpectedly changed during repair preparation").into());
             }
-            Ok(patch_seeds_for(title)[0])
+            Ok(patch_seeds_for(product)[0])
         }
     }
 }
@@ -923,55 +965,55 @@ pub(crate) fn repair_seed_for(install: &Path, title: &str) -> Result<u64, String
 /// Inverse of the validated retail codec below; used only after all files verify.
 #[cfg(test)]
 pub(crate) fn encode_applied_record(version: &str, seed: u64) -> Result<Vec<u8>, String> {
-    encode_applied_record_for(version, seed, "0001")
+    encode_applied_record_for(version, seed, Product::Ffxi)
 }
 
-pub(crate) fn encode_applied_record_for(version: &str, seed: u64, title: &str) -> Result<Vec<u8>, String> {
-    if !valid_product_version(version, title) { return Err(t("Unsupported applied version").into()); }
+pub(crate) fn encode_applied_record_for(version: &str, seed: u64, product: Product) -> Result<Vec<u8>, String> {
+    if !product.valid_stamp(version) { return Err(t("Unsupported applied version").into()); }
     encode_record(version, seed)
 }
 
-fn decode_record_for(bytes: &[u8], seed: u64, title: &str) -> Result<String, String> {
+fn decode_record_for(bytes: &[u8], seed: u64, product: Product) -> Result<String, String> {
     let version = decode_patch_text(bytes, seed)?;
-    if !valid_product_version(&version, title) { return Err(t("Unsupported applied version").into()); }
+    if !product.valid_stamp(&version) { return Err(t("Unsupported applied version").into()); }
     Ok(version)
 }
 
-fn valid_product_version(version: &str, title: &str) -> bool {
-    match title {
-        "0001" => stamp_key(version).is_some(),
-        "1000" => valid_viewer_version(version),
-        _ => false,
-    }
-}
 
-fn encode_record(version: &str, seed: u64) -> Result<Vec<u8>, String> {
-    if version.len() >= 256 {
-        return Err(t("Applied version is too long").into());
-    }
+/// The record codec's per-word keys from `seed` (polcore key schedule 10007bc0).
+fn key_schedule(seed: u64) -> [u64; 32] {
     let key = seed.to_le_bytes();
     let mut first = [0u8; 8];
-    first[..4].copy_from_slice(
-        &u32::from_le_bytes(key[4..].try_into().unwrap())
-            .rotate_left(16)
-            .to_le_bytes(),
-    );
-    first[4..].copy_from_slice(
-        &u32::from_le_bytes(key[..4].try_into().unwrap())
-            .rotate_left(8)
-            .to_le_bytes(),
-    );
+    first[..4].copy_from_slice(&u32::from_le_bytes(key[4..].try_into().unwrap()).rotate_left(16).to_le_bytes());
+    first[4..].copy_from_slice(&u32::from_le_bytes(key[..4].try_into().unwrap()).rotate_left(8).to_le_bytes());
     first[0] = first[0].wrapping_add(0x45);
     for i in 1..8 {
-        first[i] = first[i].wrapping_add(first[i - 1]).wrapping_sub(0x2c)
-            ^ first[i - 1].wrapping_shl(2)
-            ^ 0x45;
+        first[i] = first[i].wrapping_add(first[i - 1]).wrapping_sub(0x2c) ^ first[i - 1].wrapping_shl(2) ^ 0x45;
     }
     let mut schedule = [0u64; 32];
     schedule[0] = u64::from_le_bytes(first);
     for i in 1..32 {
         schedule[i] = schedule[i - 1].wrapping_mul(5);
     }
+    schedule
+}
+
+/// Word `i`'s position mask: its byte offset repeated in four 10-bit steps, plus the codec's
+/// constant (the same in both directions).
+fn counter_mask(i: usize) -> u64 {
+    let counter = (i * 8) as u64;
+    let mut expanded = counter;
+    for _ in 0..3 {
+        expanded = (expanded << 10) | counter;
+    }
+    expanded.wrapping_add(0xa1652347)
+}
+
+fn encode_record(version: &str, seed: u64) -> Result<Vec<u8>, String> {
+    if version.len() >= 256 {
+        return Err(t("Applied version is too long").into());
+    }
+    let schedule = key_schedule(seed);
     let mut plain = [0u8; 288];
     plain[24..24 + version.len()].copy_from_slice(version.as_bytes());
     plain[280..284].copy_from_slice(&280u32.to_le_bytes());
@@ -984,15 +1026,9 @@ fn encode_record(version: &str, seed: u64) -> Result<Vec<u8>, String> {
     for i in 0..36 {
         let word = schedule[i % 32];
         let key = word.to_le_bytes();
-        let counter = (i * 8) as u64;
-        let mut expanded = counter;
-        for _ in 0..3 {
-            expanded = (expanded << 10) | counter;
-        }
         let value =
             u64::from_le_bytes(plain[i * 8..i * 8 + 8].try_into().unwrap()).rotate_right(32);
-        let block =
-            ((value ^ word ^ expanded.wrapping_add(0xa1652347)).wrapping_add(word)).to_le_bytes();
+        let block = ((value ^ word ^ counter_mask(i)).wrapping_add(word)).to_le_bytes();
         let mut chain = (i as u8) ^ 0x45;
         for j in 0..8 {
             let mut v = block[j];
@@ -1008,105 +1044,51 @@ fn encode_record(version: &str, seed: u64) -> Result<Vec<u8>, String> {
     }
     Ok(cipher)
 }
-
-
 /// Candidate keys for the record of product `title`, as polcore builds them (slot 1171:
 /// 1004a170 / 1004a090 / 10049f60): the registry string `Interface\<title>` folded into
 /// eight bytes by `key[i % 8] += c`, plus the product number (1 for FFXI, 1000 for the
 /// Viewer); with no usable string, the product number alone.
-#[cfg(windows)]
-fn patch_seeds_for(title: &str) -> Vec<u64> {
-    let product = title.parse::<u64>().unwrap_or(0);
-    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+fn patch_seeds_for(product: Product) -> Vec<u64> {
+    let (title, number) = (product.title(), product.number());
+    use crate::win::reg::{self, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
     let mut seeds = Vec::new();
-    for region in ["PlayOnlineUS", "PlayOnlineEU", "PlayOnline"] {
-        let path: Vec<u16> = format!(r"SOFTWARE\WOW6432Node\{region}\Interface")
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
-        let name: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
-        let mut value = [0u16; 128];
-        let mut len = std::mem::size_of_val(&value) as u32;
-        let status = unsafe {
-            RegGetValueW(
-                HKEY_LOCAL_MACHINE,
-                path.as_ptr(),
-                name.as_ptr(),
-                RRF_RT_REG_SZ,
-                std::ptr::null_mut(),
-                value.as_mut_ptr().cast(),
-                &mut len,
-            )
-        };
-        if status != 0 {
+    for (_, region) in reg::REGIONS {
+        let path = format!(r"SOFTWARE\WOW6432Node\{region}\Interface");
+        let Some(value) = reg::string(HKEY_LOCAL_MACHINE, &path, title, RRF_RT_REG_SZ, 128) else {
             continue;
-        }
-        let value = &value[..(len as usize / 2).min(value.len())];
-        let end = value.iter().position(|c| *c == 0).unwrap_or(value.len());
+        };
         // The installed viewer reads an ANSI key; published patch keys are ASCII.
         // Unsupported encodings remain Unknown instead of inventing a seed.
-        if value[..end].iter().any(|c| *c > 127) {
+        if value.iter().any(|c| *c > 127) {
             continue;
         }
         let mut key = [0u8; 8];
-        for (i, c) in value[..end].iter().enumerate() {
+        for (i, c) in value.iter().enumerate() {
             key[i % 8] = key[i % 8].wrapping_add(*c as u8);
         }
-        seeds.push(u64::from_le_bytes(key).wrapping_add(product));
+        seeds.push(u64::from_le_bytes(key).wrapping_add(number));
     }
-    seeds.push(product);
+    seeds.push(number);
     seeds
 }
-#[cfg(not(windows))]
-fn patch_seeds_for(title: &str) -> Vec<u64> {
-    vec![title.parse::<u64>().unwrap_or(0)]
-}
 
-/// Applied-version codec traced statically from installed polcore.dll
+/// The applied-version codec, without a product's version rule (the Viewer's own record holds
+/// a different style of version, `20110829_E`; `decode_record_for` applies the product's).
+/// Traced statically from installed polcore.dll
 /// SHA256 73b1864bf522d3aa6ec28e9f4bb226fcee956f7f4848a238c9c2d756dc703b06:
 /// table slot +0x124c -> 1004a0e0, 1004a170, 1004a220, 100081e0;
 /// key schedule 10007bc0; inverse byte/mix stages 100080c0/10008000;
 /// trailer validation 10008130. app.dll 1029da51 supplies title index 1;
 /// its completion path 102a4cbb writes this record after patching.
 /// No original DLL is loaded, and no account/profile/session data is read.
-fn decode_patch_record(cipher: &[u8], seed: u64) -> Result<String, String> {
-    let version = decode_patch_text(cipher, seed)?;
-    stamp_key(&version).ok_or("patch.ver has an unsupported applied version")?;
-    Ok(version)
-}
-
-/// The codec without FFXI's version-stamp rule: the Viewer's own record holds a different
-/// style of version (`20110829_E`).
 fn decode_patch_text(cipher: &[u8], seed: u64) -> Result<String, String> {
     if cipher.len() != 288 {
         return Err("unsupported patch.ver length".into());
     }
-    let key = seed.to_le_bytes();
-    let mut first = [0u8; 8];
-    first[..4].copy_from_slice(
-        &u32::from_le_bytes(key[4..].try_into().unwrap())
-            .rotate_left(16)
-            .to_le_bytes(),
-    );
-    first[4..].copy_from_slice(
-        &u32::from_le_bytes(key[..4].try_into().unwrap())
-            .rotate_left(8)
-            .to_le_bytes(),
-    );
-    first[0] = first[0].wrapping_add(0x45);
-    for i in 1..8 {
-        first[i] = first[i].wrapping_add(first[i - 1]).wrapping_sub(0x2c)
-            ^ first[i - 1].wrapping_shl(2)
-            ^ 0x45;
-    }
-    let mut schedule = [0u64; 32];
-    schedule[0] = u64::from_le_bytes(first);
-    for i in 1..32 {
-        schedule[i] = schedule[i - 1].wrapping_mul(5);
-    }
+    let schedule = key_schedule(seed);
     let mut plain = [0u8; 288];
     let mut checksum = 0u32;
-    for (i, chunk) in cipher.chunks_exact(8).enumerate() {
+    for (i, chunk) in cipher.as_chunks::<8>().0.iter().enumerate() {
         let word = schedule[i % 32];
         let key = word.to_le_bytes();
         let mut chain = (i as u8) ^ 0x45;
@@ -1119,13 +1101,7 @@ fn decode_patch_text(cipher: &[u8], seed: u64) -> Result<String, String> {
             }
             block[j] = value;
         }
-        let counter = (i * 8) as u64;
-        let mut expanded = counter;
-        for _ in 0..3 {
-            expanded = (expanded << 10) | counter;
-        }
-        let mixed =
-            u64::from_le_bytes(block).wrapping_sub(word) ^ expanded.wrapping_add(0xa1652347) ^ word;
+        let mixed = u64::from_le_bytes(block).wrapping_sub(word) ^ counter_mask(i) ^ word;
         block = mixed.rotate_left(32).to_le_bytes();
         plain[i * 8..i * 8 + 8].copy_from_slice(&block);
         if i < 35 {
@@ -1169,8 +1145,8 @@ fn parse_reply_for(frame: &[u8], viewer: bool) -> Result<String, String> {
         return Err(t("Official patch reply checksum failed").into());
     }
     match u32::from_le_bytes(frame[12..16].try_into().unwrap()) {
-        8 => {}
-        5 => return Err((if viewer { t("Official patch server rejected the PlayOnline request") } else { t("Official patch server rejected the Windows FFXI request") }).into()),
+        polp::kind::VERSION_REPLY => {}
+        polp::kind::VERSION_REJECTED => return Err((if viewer { t("Official patch server rejected the PlayOnline request") } else { t("Official patch server rejected the Windows FFXI request") }).into()),
         _ => return Err(t("Official patch server returned an unexpected reply type").into()),
     }
     let body = &frame[HEADER..];
@@ -1189,16 +1165,14 @@ fn parse_reply_for(frame: &[u8], viewer: bool) -> Result<String, String> {
     let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
     let version = std::str::from_utf8(bytes)
         .map_err(|_| t("Official version string is not ASCII").to_string())?;
-    let valid = if viewer { valid_viewer_version(version) } else { stamp_key(version).is_some() };
+    let valid = if viewer { Product::Viewer.valid_stamp(version) } else { Product::Ffxi.valid_stamp(version) };
     if !valid { return Err(t("Official patch server returned an unsupported version format").into()); }
     Ok(version.into())
 }
 
+/// A PlayOnline Viewer version stamp (`Product::valid_stamp`).
 pub(crate) fn valid_viewer_version(version: &str) -> bool {
-    version.split_once('_').is_some_and(|(date, suffix)|
-        date.len() == 8 && date.starts_with('2') && date.bytes().all(|b| b.is_ascii_digit())
-        && !suffix.is_empty()
-        && suffix.len() <= 16 && suffix.bytes().all(|b| b.is_ascii_alphanumeric()))
+    Product::Viewer.valid_stamp(version)
 }
 
 #[cfg(test)]
@@ -1240,23 +1214,12 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "Read-only check of this PC's registered FFXI installation"]
-    fn game_detection_reads_the_installed_windows_registration() {
-        let started = std::time::Instant::now();
-        let found = find_game_installation(None).expect("No installed US FFXI folder was detected");
-        let registered = registry_install_folder("0001").expect("No US FFXI registration");
-        assert_eq!(found, crate::backend::plain_windows_path(&std::fs::canonicalize(registered).unwrap()));
-        println!("Detected {} in {:?}", found.display(), started.elapsed());
-    }
-
     #[test]
     fn applied_encoder_roundtrips_installed_and_fallback_seeds() {
         for seed in [1, 0x123456789abcdef0, 0xffffffffffffffff] {
             let bytes = encode_applied_record("30260904_1", seed).unwrap();
-            assert_eq!(decode_patch_record(&bytes, seed).unwrap(), "30260904_1");
-            assert!(decode_patch_record(&bytes, seed.wrapping_add(1)).is_err());
+            assert_eq!(decode_record_for(&bytes, seed, Product::Ffxi).unwrap(), "30260904_1");
+            assert!(decode_record_for(&bytes, seed.wrapping_add(1), Product::Ffxi).is_err());
         }
     }
 
@@ -1264,18 +1227,18 @@ mod tests {
     fn product_records_keep_viewer_revisions_and_title_keys_separate() {
         let root = install_with(None, false);
         for version in ["20061212_3", "20110829_E"] {
-            let seed = applied_seed_for(&root, "1000").unwrap();
-            let bytes = encode_applied_record_for(version, seed, "1000").unwrap();
+            let seed = applied_seed_for(&root, Product::Viewer).unwrap();
+            let bytes = encode_applied_record_for(version, seed, Product::Viewer).unwrap();
             std::fs::write(root.join("patch.ver"), &bytes).unwrap();
-            assert_eq!(local_version_for(&root, "1000").unwrap(), version);
-            assert_eq!(applied_seed_for(&root, "1000").unwrap(), seed);
-            assert!(decode_record_for(&bytes, seed, "0001").is_err());
-            assert!(encode_applied_record_for(version, seed, "0001").is_err());
+            assert_eq!(local_version_for(&root, Product::Viewer).unwrap(), version);
+            assert_eq!(applied_seed_for(&root, Product::Viewer).unwrap(), seed);
+            assert!(decode_record_for(&bytes, seed, Product::Ffxi).is_err());
+            assert!(encode_applied_record_for(version, seed, Product::Ffxi).is_err());
         }
-        assert!(encode_applied_record_for("30260904_1", 1, "1000").is_err());
+        assert!(encode_applied_record_for("30260904_1", 1, Product::Viewer).is_err());
         std::fs::write(root.join("patch.ver"), b"corrupt record").unwrap();
-        assert!(applied_seed_for(&root, "1000").is_err());
-        assert!(repair_seed_for(&root, "1000").is_ok());
+        assert!(applied_seed_for(&root, Product::Viewer).is_err());
+        assert!(repair_seed_for(&root, Product::Viewer).is_ok());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1302,15 +1265,15 @@ mod tests {
         let hex = "93d1f53dc7021e030368992fdb33a909a01cc9c400909ab19d1466c3c1cfdeca519d825677206ae569b460062824a77c74b7fd85a5e9772fbeee98d934bf99500fb9ad69fb38f00a2e90fcb0f52edb34bd6bb94b6e38ef566c3ab3ff942916bd9446bb66932f6c0de63c291e823c5ca507fe653157947991a2befea820c175e9f471000c2155c1da69f89d654d1dee78efe2fabedb448e725555b916ac82837fd6f205c9f80d1fe72d5cc9732af399718f566bc9e8a7851e663e1f9afe67dfcbbc62e403ddd2780f2034a8f34c167717224f0d2bb067996082a18a87743134d8da2febe096f1d57fbbe2df3bcdc67a24010994481b52ed0a79c4b180a2d1109bb3f0e8300acfd3ce234da00632da40e08039f00d891913384f2d7bf25984bb5d";
         let mut fixture: Vec<u8> = hex
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
             .collect();
-        assert_eq!(decode_patch_record(&fixture, 1).unwrap(), "30260904_1");
+        assert_eq!(decode_record_for(&fixture, 1, Product::Ffxi).unwrap(), "30260904_1");
         assert_eq!(encode_applied_record("30260904_1", 1).unwrap(), fixture);
-        assert!(decode_patch_record(&fixture, 2).is_err());
+        assert!(decode_record_for(&fixture, 2, Product::Ffxi).is_err());
         fixture[24] ^= 1;
-        assert!(decode_patch_record(&fixture, 1).is_err());
-        assert!(decode_patch_record(&fixture[..287], 1).is_err());
+        assert!(decode_record_for(&fixture, 1, Product::Ffxi).is_err());
+        assert!(decode_record_for(&fixture[..287], 1, Product::Ffxi).is_err());
     }
 
     #[test]
@@ -1372,7 +1335,6 @@ mod tests {
             remote_version: "30260905_0".into(),
             detail: String::new(),
             files_verified: None,
-            source_url: None,
         };
         crate::i18n::set(crate::i18n::Lang::En);
         assert!(gate(LaunchCheck::Update(report.clone())).unwrap_err().starts_with(UPDATE_REQUIRED_TEMPLATE.split_once('{').unwrap().0));
@@ -1400,23 +1362,11 @@ mod tests {
         // A gate key edit must update the parser's copy too.
         // (Its definition, and gate's tf call.)
         assert_eq!(include_str!("patch.rs").matches(&format!("\"{UPDATE_REQUIRED_TEMPLATE}\"")).count(), 2);
-        // English keeps working through both routes.
-        let english = gate(LaunchCheck::Update(PatchReport {
-            state: PatchState::Required,
-            local_version: "30260904_1".into(),
-            remote_version: "30260905_0".into(),
-            detail: String::new(),
-            files_verified: None,
-            source_url: None,
-        }))
-        .unwrap_err();
-        assert!(english.starts_with(UPDATE_REQUIRED));
-        assert!(parse_update_required(&english).is_some());
     }
 
     fn hex(text: &str) -> Vec<u8> {
         text.as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
             .collect()
     }
@@ -1430,14 +1380,14 @@ mod tests {
 
     #[test]
     fn stock_frames_are_reproduced_byte_for_byte() {
-        assert_eq!(VIEWER.request("20110829_E"), hex(STOCK_VIEWER));
-        assert_eq!(FFXI.request("30260904_1"), hex(STOCK_FFXI));
+        assert_eq!(Product::Viewer.request("20110829_E"), hex(STOCK_VIEWER));
+        assert_eq!(Product::Ffxi.request("30260904_1"), hex(STOCK_FFXI));
         // The names stock looks up (captures 2026-10-13 00:21 and 00:49).
-        assert_eq!(VIEWER.server(), "pt008.pol.com:54000");
-        assert_eq!(FFXI.server(), "pc001W2U.pol.com:53001");
+        assert_eq!(Product::Viewer.server(), "pt008.pol.com:54000");
+        assert_eq!(Product::Ffxi.server(), "pc001W2U.pol.com:53001");
         // Empty is the fresh-install shape only; it is never produced for an installed version.
-        assert_eq!(FFXI.request(""), hex(OLD_EMPTY));
-        assert_ne!(FFXI.request("30260904_1"), FFXI.request(""));
+        assert_eq!(Product::Ffxi.request(""), hex(OLD_EMPTY));
+        assert_ne!(Product::Ffxi.request("30260904_1"), Product::Ffxi.request(""));
     }
 
     fn install_with(version: Option<&str>, stamped: bool) -> std::path::PathBuf {
@@ -1520,7 +1470,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     #[test]
     fn another_launcher_update_blocks_version_checks_without_changing_its_record() {
         use std::os::windows::fs::OpenOptionsExt;
@@ -1562,6 +1511,12 @@ mod tests {
         std::fs::write(broken.join("patch.ver"), [7u8; 288]).unwrap();
         let outcome = check_with(&broken, |_| panic!("no request may be sent for an unreadable record"));
         assert!(matches!(outcome, LaunchCheck::Update(_)));
+        // The refusal keeps its own cause (Repair), never a parseable "newer version" text.
+        let refusal = gate(outcome).unwrap_err();
+        assert!(!refusal.starts_with(UPDATE_REQUIRED) && refusal.contains("Repair"), "{refusal}");
+        assert!(parse_update_required(&refusal).is_none() && !is_update_refusal(&refusal));
+        // An older worker's placeholder wording does not become an update either.
+        assert!(parse_update_required("Update required: installed Unavailable, official Unavailable.").is_none());
         assert_eq!(installed_for_request(&broken), "");
 
         let fresh = install_with(None, true);
@@ -1586,8 +1541,40 @@ mod tests {
         let shown = report_with_remote(&root, "30260904_1");
         assert_eq!(shown.state, PatchState::Required);
         assert_eq!(shown.remote_version, "30260904_1");
-        assert!(gate(check_with(&root, |_| Err("offline".into()))).is_err());
+        // A fresh install keeps the Update affordance when the server did not answer.
+        let refusal = gate(check_with(&root, |_| Err("offline".into()))).unwrap_err();
+        let parsed = parse_update_required(&refusal).expect("a fresh install's refusal offers Update");
+        assert_eq!(parsed.local_version, t("Not initialized"));
+        assert!(parsed.detail.contains("initial update"), "{}", parsed.detail);
         assert!(!root.join("patch.ver").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_unfinished_update_still_shows_the_installed_version() {
+        let root = install_with(Some("30260904_1"), true);
+        std::fs::create_dir_all(root.join(".xi-updater")).unwrap();
+        std::fs::write(root.join(".xi-updater/transaction.json"), b"journal").unwrap();
+        let shown = local_report(&root);
+        assert_eq!(shown.state, PatchState::Interrupted);
+        assert_eq!(shown.local_version, "30260904_1", "the record decodes, so the page shows it");
+        assert_eq!(shown.remote_version, t("Not checked"));
+        // An undecodable record stays a placeholder: there is no version to show.
+        std::fs::write(root.join("patch.ver"), vec![7u8; 288]).unwrap();
+        assert_eq!(local_report(&root).local_version, t("Unavailable"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn check_files_report_reads_the_record_and_opens_no_connection() {
+        let root = install_with(Some("30260904_1"), true);
+        let files = crate::updater::Report { version: "30260904_1".into(), total: 2, current: 2, verified: true, ..Default::default() };
+        let opened = crate::stock_socket::OPENED.with(|n| n.get());
+        let shown = report_after_operation(&root, &files, crate::updater::Mode::Check);
+        assert_eq!(crate::stock_socket::OPENED.with(|n| n.get()), opened);
+        assert_eq!(shown.local_version, "30260904_1");
+        assert_eq!(shown.remote_version, t("Not checked"), "the official version is the page's remembered one, not this report's");
+        assert!(!crate::official_versions::is_version(&shown.remote_version));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1663,7 +1650,7 @@ mod tests {
     #[test]
     fn the_viewer_check_sends_the_viewers_own_installed_version() {
         let viewer = install_with(Some("20110829_E"), false);
-        assert_eq!(read_local(&viewer, VIEWER.title()), Local::Installed("20110829_E".into()));
+        assert_eq!(read_local(&viewer, Product::Viewer), Local::Installed("20110829_E".into()));
         let mut sent = Vec::new();
         let verdict = viewer_connect_with(&viewer, |request| { sent = request.to_vec(); Ok(hex(STOCK_VIEWER_REPLY)) });
         assert_eq!(sent, hex(STOCK_VIEWER));
@@ -1692,13 +1679,13 @@ mod tests {
     fn viewer_initialization_and_a_version_mismatch_require_its_own_update() {
         let fresh = install_with(None, false);
         let verdict = viewer_connect_with(&fresh, |request| {
-            assert_eq!(request, VIEWER.request(""));
+            assert_eq!(request, Product::Viewer.request(""));
             Ok(viewer_reply("20110829_E"))
         });
         assert_eq!(verdict, ConnectVerdict::Outdated { local: "Not initialized".into(), remote: "20110829_E".into() });
         let old = install_with(Some("20070101_E"), false);
         let verdict = viewer_connect_with(&old, |request| {
-            assert_eq!(request, VIEWER.request("20070101_E"));
+            assert_eq!(request, Product::Viewer.request("20070101_E"));
             Ok(viewer_reply("20110829_E"))
         });
         assert_eq!(verdict, ConnectVerdict::Outdated { local: "20070101_E".into(), remote: "20110829_E".into() });
@@ -1721,19 +1708,6 @@ mod tests {
         std::fs::remove_dir_all(viewer).unwrap();
     }
 
-    /// On a machine with the stock Viewer installed, its patch.ver must decode with the
-    /// product-1000 registry key (not the FFXI one).
-    #[test]
-    fn an_installed_viewers_own_record_decodes_with_its_own_key() {
-        let Some(dir) = registry_install_folder(VIEWER.title()) else { return };
-        if !dir.join("patch.ver").is_file() {
-            return;
-        }
-        match read_local(&dir, VIEWER.title()) {
-            Local::Installed(version) => eprintln!("Viewer version {version}"),
-            other => panic!("the Viewer's patch.ver did not decode: {other:?}"),
-        }
-    }
     fn serve(reply: Vec<u8>, chunk: usize, linger: Duration) -> (String, std::thread::JoinHandle<Vec<u8>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -1754,7 +1728,7 @@ mod tests {
     #[test]
     fn handles_a_fragmented_tcp_version_reply() {
         let (address, server) = serve(reply(), 3, Duration::ZERO);
-        let frame = exchange(&address, &FFXI.request("30260904_1"), Duration::from_secs(5)).unwrap();
+        let frame = exchange(&address, &Product::Ffxi.request("30260904_1"), Duration::from_secs(5)).unwrap();
         assert_eq!(parse_reply(&frame).unwrap(), "30260904_1");
         assert_eq!(server.join().unwrap(), hex(STOCK_FFXI));
     }
@@ -1763,7 +1737,7 @@ mod tests {
     fn a_silent_server_times_out_instead_of_hanging_a_launch() {
         let (address, server) = serve(Vec::new(), 1, Duration::from_millis(800));
         let started = Instant::now();
-        let error = exchange(&address, &FFXI.request("30260904_1"), Duration::from_millis(300)).unwrap_err();
+        let error = exchange(&address, &Product::Ffxi.request("30260904_1"), Duration::from_millis(300)).unwrap_err();
         assert!(error.contains("reply"), "{error}");
         assert!(started.elapsed() < Duration::from_millis(790));
         server.join().unwrap();
@@ -1792,7 +1766,7 @@ mod tests {
     #[test]
     fn the_client_closes_like_stock_after_the_reply_and_returns_only_once_closed() {
         let (address, server) = serve_closes(hex(STOCK_FFXI_REPLY), 1);
-        let frame = exchange(&address, &FFXI.request("30260904_1"), Duration::from_secs(5)).unwrap();
+        let frame = exchange(&address, &Product::Ffxi.request("30260904_1"), Duration::from_secs(5)).unwrap();
         let returned = Instant::now();
         assert_eq!(parse_reply(&frame).unwrap(), "30260904_1");
         let (request, replied, eof) = server.join().unwrap().remove(0);
@@ -1806,7 +1780,7 @@ mod tests {
     #[test]
     fn the_ffxi_check_returns_at_the_reply_and_still_closes_like_stock() {
         let (address, server) = serve_closes(hex(STOCK_FFXI_REPLY), 1);
-        let (frame, attempt) = exchange_closing(&address, &FFXI.request("30260904_1"), Duration::from_secs(5), false);
+        let (frame, attempt) = exchange_closing(&address, &Product::Ffxi.request("30260904_1"), Duration::from_secs(5), false);
         let returned = Instant::now();
         let frame = frame.unwrap();
         let phases = CheckTiming { attempts: vec![attempt], ..CheckTiming::default() }.phases().unwrap();
@@ -1839,12 +1813,12 @@ mod tests {
     // --- round 2 (07d §2, §6 S2): loopback plus an injected resolver and sleeper, never real DNS ---
 
     use crate::dns::{NetError, NetStage};
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::{Ipv4Addr, SocketAddrV4};
 
     /// Attempt 1 answers `first` after `first_delay`; retries take `fresh` in order (the
     /// last one repeats). Sleeps are counted, not slept, and advance `elapsed`.
     struct FakeNet {
-        first: Result<Vec<SocketAddr>, NetError>,
+        first: Result<Vec<SocketAddrV4>, NetError>,
         first_delay: Duration,
         fresh: Vec<Result<Vec<Ipv4Addr>, NetError>>,
         /// How long each fresh lookup takes (really slept: the exchange deadline sees it).
@@ -1854,14 +1828,14 @@ mod tests {
         forgot: u32,
     }
     impl FakeNet {
-        fn new(first: Result<Vec<SocketAddr>, NetError>, fresh: Vec<Result<Vec<Ipv4Addr>, NetError>>) -> FakeNet {
+        fn new(first: Result<Vec<SocketAddrV4>, NetError>, fresh: Vec<Result<Vec<Ipv4Addr>, NetError>>) -> FakeNet {
             FakeNet { first, first_delay: Duration::ZERO, fresh, fresh_delay: Duration::ZERO, fresh_calls: 0, sleeps: Vec::new(), forgot: 0 }
         }
     }
     impl Net for FakeNet {
-        fn resolve(&mut self, host: &str, port: u16) -> Result<Vec<SocketAddr>, NetError> {
+        fn resolve(&mut self, host: &str, port: u16) -> Result<Vec<SocketAddrV4>, NetError> {
             // Each check looks up its own product's host, as stock does.
-            assert_eq!(host, if port == FFXI_PORT { crate::dns::GAME_PATCH_HOST } else { crate::dns::VIEWER_PATCH_HOST });
+            assert_eq!(host, if port == Product::Ffxi.port() { crate::dns::GAME_PATCH_HOST } else { crate::dns::VIEWER_PATCH_HOST });
             std::thread::sleep(self.first_delay);
             self.first.clone()
         }
@@ -1957,7 +1931,7 @@ mod tests {
     fn a_local_connect_failure_also_waits_for_the_network() {
         // Connecting to 0.0.0.0 fails in the local stack (WSAEADDRNOTAVAIL 10049) at once.
         let viewer = install_with(Some("20110829_E"), false);
-        let unusable = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 54000));
+        let unusable = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 54000);
         let mut net = FakeNet::new(Ok(vec![unusable]), vec![Ok(vec![Ipv4Addr::UNSPECIFIED])]);
         let check = w2u(&viewer, 54000, CHECK_TIMEOUT, &mut net);
         let first = check.timing.attempts[0].error.clone().unwrap();
@@ -1970,10 +1944,10 @@ mod tests {
     #[test]
     fn an_unanswered_w2u_never_retries() {
         let viewer = install_with(Some("20110829_E"), false);
-        let at = |address: &str| -> SocketAddr { address.parse().unwrap() };
+        let at = |address: &str| -> SocketAddrV4 { address.parse().unwrap() };
         let no_retry = |net: &FakeNet| { assert_eq!((net.fresh_calls, net.sleeps.len(), net.forgot), (0, 0, 0)); };
         // Refused (10061: the server answered).
-        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let free = at(&std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string());
         let mut net = FakeNet::new(Ok(vec![free]), vec![Ok(vec![Ipv4Addr::LOCALHOST])]);
         let check = w2u(&viewer, free.port(), CHECK_TIMEOUT, &mut net);
         assert!(matches!(check.verdict, ConnectVerdict::Unreachable(_)), "{:?}", check.verdict);
@@ -2009,13 +1983,13 @@ mod tests {
     fn the_w20_never_retries_and_returns_its_phases_on_any_thread() {
         let install = install_with(Some("30260904_1"), true);
         let (address, server) = serve_closes(hex(STOCK_FFXI_REPLY), 1);
-        let address: SocketAddr = address.parse().unwrap();
+        let address: SocketAddrV4 = address.parse().unwrap();
         let dir = install.clone();
         let (clean, failed) = std::thread::spawn(move || {
             let mut net = FakeNet::new(Ok(vec![address]), vec![Ok(vec![Ipv4Addr::LOCALHOST])]);
-            let clean = ffxi_check(&dir, crate::dns::GAME_PATCH_HOST, FFXI_PORT, &mut net);
+            let clean = ffxi_check(&dir, Product::Ffxi.host(), Product::Ffxi.port(), &mut net);
             let mut down = FakeNet::new(Err(dns_error(11001)), vec![Ok(vec![Ipv4Addr::LOCALHOST])]);
-            let failed = ffxi_check(&dir, crate::dns::GAME_PATCH_HOST, FFXI_PORT, &mut down);
+            let failed = ffxi_check(&dir, Product::Ffxi.host(), Product::Ffxi.port(), &mut down);
             assert_eq!((down.fresh_calls, down.sleeps.len(), down.forgot), (0, 0, 0), "W20 never retries");
             (clean, failed)
         }).join().unwrap();
@@ -2059,12 +2033,12 @@ mod tests {
     fn the_w2u_budget_covers_the_retry_window_and_the_hosts_agree() {
         assert_eq!(VIEWER_CHECK_BUDGET, NETWORK_WAIT + CHECK_TIMEOUT + CHECK_TIMEOUT + STOCK_CLOSE_MAX);
         assert!(STOCK_CLOSE_MAX >= crate::stock_socket::CLOSE_AFTER_REPLY.1);
-        assert_eq!((VIEWER.server(), FFXI.server()), (format!("{}:{VIEWER_PORT}", crate::dns::VIEWER_PATCH_HOST),
-            format!("{}:{FFXI_PORT}", crate::dns::GAME_PATCH_HOST)));
-        assert_eq!(SOURCE, format!("tcp://{}", FFXI.server()));
-        // The updater's connections use the same names.
-        assert_eq!((crate::updater::Product::Viewer.server(), crate::updater::Product::Ffxi.server()),
-            (VIEWER.server().as_str(), FFXI.server().as_str()));
+        // One product identity: its server string is its stock host and `53000 + number` port.
+        for product in [Product::Viewer, Product::Ffxi] {
+            assert_eq!(product.server(), format!("{}:{}", product.host(), product.port()));
+        }
+        assert_eq!((Product::Viewer.port(), Product::Ffxi.port()), (54000, 53001));
+        assert_eq!((Product::Viewer.host(), Product::Ffxi.host()), (crate::dns::VIEWER_PATCH_HOST, crate::dns::GAME_PATCH_HOST));
     }
 
     /// 07d §3: the loader pumps frames for its VIEWER_CHECK_LIMIT while the W2U runs, so

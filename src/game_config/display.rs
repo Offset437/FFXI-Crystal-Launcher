@@ -5,12 +5,11 @@
 pub(crate) fn modes() -> (Vec<(u32, u32)>, Option<(u32, u32)>) {
     let (mut list, current) = enumerate();
     list.retain(|&(w, h)| w >= 800 && h >= 600);
-    list.sort_unstable_by(|a, b| (b.0 * b.1, b.0).cmp(&(a.0 * a.1, a.0)));
+    list.sort_unstable_by_key(|&(w, h)| std::cmp::Reverse((w * h, w)));
     list.dedup();
     (list, current)
 }
 
-#[cfg(windows)]
 fn enumerate() -> (Vec<(u32, u32)>, Option<(u32, u32)>) {
     use windows_sys::Win32::Graphics::Gdi::{EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS};
     let blank = || {
@@ -37,11 +36,6 @@ fn enumerate() -> (Vec<(u32, u32)>, Option<(u32, u32)>) {
         .then_some((mode.dmPelsWidth, mode.dmPelsHeight))
         .filter(|&(w, h)| w > 0 && h > 0);
     (list, current)
-}
-
-#[cfg(not(windows))]
-fn enumerate() -> (Vec<(u32, u32)>, Option<(u32, u32)>) {
-    (Vec::new(), None)
 }
 
 /// What a preview shows: a typical 4K monitor's list.

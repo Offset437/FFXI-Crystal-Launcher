@@ -1,5 +1,5 @@
 use crate::{account_import::{self, ImportBatch, ImportDraft, ImportSource}, backend::{Account, AccountMode}, i18n::t, App, Editor, Message};
-use iced::Task;
+use crate::effect::Effect;
 
 #[derive(Default)]
 pub(crate) struct State {
@@ -24,7 +24,7 @@ pub(crate) enum Msg {
 }
 
 impl App {
-    pub(crate) fn import_update(&mut self, msg: Msg) -> Task<Message> {
+    pub(crate) fn import_update(&mut self, msg: Msg) -> Effect<Message> {
         let state = &mut self.account_import;
         match msg {
             Msg::Open if self.vault_ready && !self.vault_saving => {
@@ -32,22 +32,22 @@ impl App {
                 state.busy = true;
                 state.generation = state.generation.wrapping_add(1);
                 let generation = state.generation;
-                return Task::perform(async {
+                return Effect::perform(async {
                     tokio::task::spawn_blocking(account_import::detect_sources).await.unwrap_or_default()
                 }, move |sources| Message::AccountImport(Msg::Sources(generation, sources)));
             }
             Msg::Close => { state.open = false; state.busy = false; state.batch = None; state.generation = state.generation.wrapping_add(1); }
             Msg::Sources(generation, sources) if state.open && generation == state.generation => {
                 state.busy = false;
-                if state.path.is_empty() {
-                    if let Some(source) = sources.first() {
-                        state.path = source.path.to_string_lossy().into_owned();
-                        state.region = source.region.unwrap_or(0);
-                    }
-                }
                 if state.companion.is_empty() {
                     if let Some(source) = sources.iter().find(|s| s.kind == account_import::SourceKind::PlayOnline) {
                         state.companion = source.path.to_string_lossy().into_owned();
+                    }
+                }
+                if state.path.is_empty() {
+                    if let Some(source) = sources.first() {
+                        state.path = source.path.to_string_lossy().into_owned();
+                        state.region = source_region(source, &sources, &state.companion).unwrap_or(0);
                     }
                 }
                 state.sources = sources;
@@ -55,7 +55,11 @@ impl App {
             Msg::Source(index) if !state.busy => {
                 if let Some(source) = state.sources.get(index) {
                     state.path = source.path.to_string_lossy().into_owned();
-                    state.region = source.region.unwrap_or(0);
+                    // A Forest file has no region of its own: keep the current one
+                    // (or the companion's), which also decodes the companion file.
+                    if let Some(region) = source_region(source, &state.sources, &state.companion) {
+                        state.region = region;
+                    }
                     state.batch = None;
                     state.error.clear();
                 }
@@ -68,7 +72,7 @@ impl App {
                 state.busy = true;
                 state.generation = state.generation.wrapping_add(1);
                 let generation = state.generation;
-                return Task::perform(async move {
+                return Effect::perform(async move {
                     rfd::AsyncFileDialog::new().add_filter("PlayOnline / Forest", &["bin", "dat"])
                         .pick_file().await.map(|f| f.path().to_path_buf())
                 }, move |path| Message::AccountImport(Msg::Picked(generation, companion, path)));
@@ -91,7 +95,7 @@ impl App {
                 let path = crate::plain_text_path(state.path.trim());
                 let companion = state.use_companion.then(|| crate::plain_text_path(state.companion.trim()));
                 let region = state.region;
-                return Task::perform(async move {
+                return Effect::perform(async move {
                     tokio::task::spawn_blocking(move || {
                         let mut batch = account_import::import_file(std::path::Path::new(&path), region)?;
                         if let Some(path) = companion {
@@ -113,11 +117,11 @@ impl App {
                     let existing = matches.next();
                     if matches.next().is_some() {
                         state.error = t("More than one saved account matches. Edit the saved account directly.").into();
-                        return Task::none();
+                        return Effect::none();
                     }
                     if existing.is_some_and(|row| row.busy || row.pid.is_some()) {
                         state.error = t("Close this account's game and sign out before editing its login.").into();
-                        return Task::none();
+                        return Effect::none();
                     }
                     let key = existing.map(|row| row.key.clone());
                     let account = merge_draft(draft, existing.map(|row| &row.account));
@@ -126,6 +130,11 @@ impl App {
                     self.editor = Some(Editor {
                         game_install: key.as_ref().and_then(|key| self.settings.account_installs.get(key)).cloned().unwrap_or_default(),
                         dat_overlays: key.as_ref().and_then(|key| self.settings.account_overlays.get(key)).cloned().unwrap_or_default(),
+                        flags: crate::EditorFlags {
+                            uses_otp: key.as_ref().is_some_and(|key| self.settings.account_otp.contains(key)),
+                            sign_in_now: key.is_none(),
+                            ..Default::default()
+                        },
                         auto_login, key, account,
                     });
                     state.open = false;
@@ -134,8 +143,19 @@ impl App {
             }
             _ => {}
         }
-        Task::none()
+        Effect::none()
     }
+}
+
+/// The region a chosen source implies: its own (a PlayOnline install), else the
+/// detected PlayOnline install the companion path names. Both files are decoded
+/// with one region, since `fill_from_pol` only joins members of the same region.
+fn source_region(source: &ImportSource, sources: &[ImportSource], companion: &str) -> Option<u8> {
+    source.region.or_else(|| {
+        sources.iter()
+            .find(|s| s.kind == account_import::SourceKind::PlayOnline && s.path.to_string_lossy().eq_ignore_ascii_case(companion.trim()))
+            .and_then(|s| s.region)
+    })
 }
 
 fn matches_existing(draft: &ImportDraft, account: &Account) -> bool {
@@ -179,5 +199,18 @@ mod tests {
         draft.region = 2;
         assert!(matches_existing(&draft, &saved), "POL identity does not depend on the import region");
         assert_eq!(merge_draft(&draft, Some(&saved)).region, saved.region);
+    }
+
+    #[test]
+    fn a_forest_source_takes_the_companion_install_region_not_us() {
+        use account_import::SourceKind;
+        let source = |kind, path: &str, region| ImportSource { kind, path: path.into(), region };
+        let sources = vec![
+            source(SourceKind::PlayOnline, r"C:\POL\JP\usr\all\login_w.bin", Some(2)),
+            source(SourceKind::Forest, r"C:\Users\u\AppData\Roaming\Forest\creds.dat", None),
+        ];
+        assert_eq!(source_region(&sources[0], &sources, ""), Some(2));
+        assert_eq!(source_region(&sources[1], &sources, r"c:\pol\jp\usr\all\login_w.bin"), Some(2));
+        assert_eq!(source_region(&sources[1], &sources, r"D:\elsewhere\login_w.bin"), None, "keeps the chosen region");
     }
 }

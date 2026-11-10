@@ -1,6 +1,5 @@
 //! The game's settings as values: the numbered entries under
-//! `...\SquareEnix\FinalFantasyXI`, their meanings, defaults, and the `.reg`
-//! text codec the native client reads.
+//! `...\SquareEnix\FinalFantasyXI`, their meanings and defaults.
 //!
 //! Meanings come from the community's documentation of the key (Ashita v4's
 //! boot-config reference, FFXIclopedia's registry notes) and from what the
@@ -115,31 +114,6 @@ pub(crate) fn font_types() -> [(u32, &'static str); 3] {
     [(0, t("Compressed")), (1, t("Uncompressed")), (2, t("High quality"))]
 }
 
-/// The only font type the native client starts with. Uncompressed (1) and
-/// High quality (2) stop host64 during startup, right after the D3D8 device
-/// is made, with "FATAL at 102dbbc4: indirect call/jump to an address with no
-/// translation": FFXiMain's image loader longjmps back into itself, a path the
-/// recompiled client cannot follow. Every other managed value starts fine.
-pub(crate) const NATIVE_FONT_TYPE: u32 = 0;
-
-/// Whether the native client starts with `value` for `key`.
-pub(crate) fn native_supports(key: &str, value: u32) -> bool {
-    match key {
-        FONT_TYPE => value == NATIVE_FONT_TYPE,
-        _ => true,
-    }
-}
-
-/// Replaces stored values the native client cannot start with by ones it
-/// can; returns the keys it changed. Missing entries stay missing.
-pub(crate) fn guard_native(values: &mut Values) -> Vec<&'static str> {
-    if matches!(values.get(FONT_TYPE), None | Some(Data::Dword(NATIVE_FONT_TYPE))) {
-        return Vec::new();
-    }
-    values.insert(FONT_TYPE.into(), Data::Dword(NATIVE_FONT_TYPE));
-    vec![FONT_TYPE]
-}
-
 pub(crate) const MAX_SOUNDS_RANGE: (u32, u32) = (12, 20);
 pub(crate) const MIN_WINDOW: (u32, u32) = (640, 480);
 /// The smallest interface the native client's sign-in screen accepts.
@@ -190,8 +164,7 @@ pub(crate) fn default_menu_scale(window_h: u32) -> f32 {
     MENU_SCALES
         .iter()
         .copied()
-        .filter(|s| *s <= wanted.max(1.0) + 0.01)
-        .last()
+        .rfind(|s| *s <= wanted.max(1.0) + 0.01)
         .unwrap_or(1.0)
 }
 
@@ -257,14 +230,14 @@ pub(crate) fn changed_keys(original: &Values, edited: &Values) -> Vec<&'static s
 }
 
 /// Checks a set of values before it is written.
-pub(crate) fn validate(values: &Values, ascii_paths_only: bool) -> Result<(), String> {
+pub(crate) fn validate(values: &Values) -> Result<(), String> {
     let get = |k| dword(values, k).unwrap_or(0);
     if get(WINDOW_W) < MIN_WINDOW.0 || get(WINDOW_H) < MIN_WINDOW.1 {
         return Err(t("The window resolution must be at least 640 × 480.").into());
     }
     // Windower uses a zero pair for automatic (1x) menus. It is a valid
     // retail setting, not a zero-sized interface; partial pairs are invalid.
-    let automatic_menu = !ascii_paths_only && get(MENU_W) == 0 && get(MENU_H) == 0;
+    let automatic_menu = get(MENU_W) == 0 && get(MENU_H) == 0;
     if !automatic_menu && (get(MENU_W) < MIN_MENU.0 || get(MENU_H) < MIN_MENU.1) {
         return Err(t("The menu resolution must be at least 512 × 384.").into());
     }
@@ -283,9 +256,6 @@ pub(crate) fn validate(values: &Values, ascii_paths_only: bool) -> Result<(), St
             if !path.is_absolute() {
                 return Err(t("Enter the screenshot folder as a full path, such as D:\\Pictures\\FFXI.").into());
             }
-            if ascii_paths_only && !dir.is_ascii() {
-                return Err(t("The native client reads the screenshot folder as plain ASCII; choose a folder without accented or non-Latin characters.").into());
-            }
             if dir.len() > 200 {
                 return Err(t("The screenshot folder path is too long for the game.").into());
             }
@@ -297,258 +267,9 @@ pub(crate) fn validate(values: &Values, ascii_paths_only: bool) -> Result<(), St
     Ok(())
 }
 
-// ---- .reg text ----
-
-/// Decodes a `.reg` file's bytes: UTF-16LE with a BOM (what `reg export`
-/// writes), UTF-8 with or without a BOM, else Latin-1.
-pub(crate) fn decode_text(bytes: &[u8]) -> String {
-    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
-        let units: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        return String::from_utf16_lossy(&units);
-    }
-    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
-    match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_owned(),
-        Err(_) => bytes.iter().map(|&b| b as char).collect(),
-    }
-}
-
-/// The section header for a vendor key ("PlayOnlineUS"), as the native
-/// client's registry names it once WOW6432Node is folded away.
-pub(crate) fn section_path(vendor: &str) -> String {
-    format!("HKEY_LOCAL_MACHINE\\SOFTWARE\\{vendor}\\SquareEnix\\FinalFantasyXI")
-}
-
-fn fold_header(header: &str) -> String {
-    let lower = header.trim().to_ascii_lowercase();
-    lower.replacen("\\software\\wow6432node\\", "\\software\\", 1)
-}
-
-/// The FinalFantasyXI values of `vendor` in a `.reg` text, later lines
-/// winning. Other sections are ignored.
-pub(crate) fn parse_reg(text: &str, vendor: &str) -> Values {
-    let wanted = fold_header(&section_path(vendor));
-    let mut values = Values::new();
-    let mut inside = false;
-    let mut pending = String::new();
-    for raw in text.split('\n') {
-        let raw = raw.trim_end_matches('\r');
-        // A trailing backslash continues a hex value on the next line.
-        if !pending.is_empty() {
-            pending.push_str(raw.trim_start());
-        } else {
-            pending.push_str(raw);
-        }
-        if pending.ends_with('\\') && !pending.trim_start().starts_with('[') && hex_continues(&pending) {
-            pending.pop();
-            continue;
-        }
-        let line = std::mem::take(&mut pending);
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix('[') {
-            let header = rest.split(']').next().unwrap_or("");
-            inside = !header.starts_with('-') && fold_header(header) == wanted;
-            continue;
-        }
-        if !inside || !(line.starts_with('"') || line.starts_with('@')) {
-            continue;
-        }
-        if let Some((name, data)) = parse_value(line) {
-            match data {
-                Some(data) => {
-                    values.insert(name, data);
-                }
-                None => {
-                    values.remove(&name);
-                }
-            }
-        }
-    }
-    values
-}
-
-/// Whether a line ending in a backslash is a hex value's continuation rather
-/// than a string ending in an escaped backslash.
-fn hex_continues(line: &str) -> bool {
-    line.split_once('=')
-        .map(|(_, v)| v.trim_start().starts_with("hex"))
-        .unwrap_or(false)
-}
-
-/// `"name"=...` into its name and data; `None` data for a deletion (`=-`).
-fn parse_value(line: &str) -> Option<(String, Option<Data>)> {
-    let (name, rest) = if let Some(rest) = line.strip_prefix('@') {
-        (String::new(), rest)
-    } else {
-        let (name, rest) = unquote(&line[1..])?;
-        (name, rest)
-    };
-    let rest = rest.trim_start().strip_prefix('=')?.trim_start();
-    if rest == "-" {
-        return Some((name, None));
-    }
-    if let Some(s) = rest.strip_prefix('"') {
-        let (s, _) = unquote(s)?;
-        return Some((name, Some(Data::Text(s))));
-    }
-    if let Some(hex) = rest.strip_prefix("dword:") {
-        let v = u32::from_str_radix(hex.trim(), 16).ok()?;
-        return Some((name, Some(Data::Dword(v))));
-    }
-    if let Some(rest) = rest.strip_prefix("hex") {
-        let (kind, bytes) = match rest.strip_prefix('(') {
-            Some(r) => {
-                let (k, b) = r.split_once(')')?;
-                (u32::from_str_radix(k.trim(), 16).ok()?, b)
-            }
-            None => (3, rest),
-        };
-        let bytes = bytes.trim_start().strip_prefix(':')?;
-        let raw: Vec<u8> = bytes
-            .split(',')
-            .map(str::trim)
-            .filter(|b| !b.is_empty())
-            .map(|b| u8::from_str_radix(b, 16))
-            .collect::<Result<_, _>>()
-            .ok()?;
-        // hex(1) is a string, as the native client writes a path holding a backslash.
-        if kind == 1 {
-            let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
-            let s: String = raw[..end].iter().map(|&b| b as char).collect();
-            return Some((name, Some(Data::Text(s))));
-        }
-        if kind == 4 && raw.len() == 4 {
-            return Some((name, Some(Data::Dword(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])))));
-        }
-        return Some((name, Some(Data::Binary(raw))));
-    }
-    None
-}
-
-/// A quoted string's contents (after the opening quote) and what follows the
-/// closing quote. `\\` and `\"` are unescaped.
-fn unquote(s: &str) -> Option<(String, &str)> {
-    let mut out = String::new();
-    let mut chars = s.char_indices();
-    while let Some((i, c)) = chars.next() {
-        match c {
-            '\\' => {
-                if let Some((_, n)) = chars.next() {
-                    out.push(n);
-                }
-            }
-            '"' => return Some((out, &s[i + 1..])),
-            c => out.push(c),
-        }
-    }
-    None
-}
-
-fn quote(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// A REGEDIT4 file (CRLF) holding `values` under the vendor's FinalFantasyXI
-/// key, in the line format the native client's loader and its in-game
-/// Config > Display rewriter both accept.
-pub(crate) fn encode_reg(values: &Values, vendor: &str) -> String {
-    let mut out = format!("REGEDIT4\r\n\r\n[{}]\r\n", section_path(vendor));
-    for (name, data) in values {
-        let name = if name.is_empty() {
-            "@".to_owned()
-        } else {
-            format!("\"{}\"", quote(name))
-        };
-        match data {
-            Data::Dword(v) => out.push_str(&format!("{name}=dword:{v:08x}\r\n")),
-            Data::Text(s) => out.push_str(&format!("{name}=\"{}\"\r\n", quote(s))),
-            Data::Binary(b) => {
-                let hex: Vec<String> = b.iter().map(|x| format!("{x:02x}")).collect();
-                out.push_str(&format!("{name}=hex:{}\r\n", hex.join(",")));
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const SAMPLE: &str = "Windows Registry Editor Version 5.00\r\n\r\n\
-[HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\PlayOnlineUS\\InstallFolder]\r\n\
-\"0001\"=\"C:\\\\Games\\\\FINAL FANTASY XI\\\\\"\r\n\r\n\
-[HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\PlayOnlineUS\\SquareEnix\\FinalFantasyXI]\r\n\
-\"padmode000\"=\"1,1,0,0,0,1\"\r\n\
-\"bFirst\"=hex:00\r\n\
-\"0000\"=dword:00000006\r\n\
-\"0001\"=dword:00000d70\r\n\
-\"0002\"=dword:000005a0\r\n\
-\"0031\"=dword:3bc49ba6\r\n\
-\"0042\"=\"D:\\\\Shots \\\"XI\\\"\"\r\n";
-
-    #[test]
-    fn game_config_parses_registry_export_and_folds_wow6432node() {
-        let v = parse_reg(SAMPLE, "PlayOnlineUS");
-        assert_eq!(dword(&v, "0000"), Some(6));
-        assert_eq!(dword(&v, "0001"), Some(3440));
-        assert_eq!(dword(&v, "0002"), Some(1440));
-        assert_eq!(dword(&v, "0031"), Some(0x3bc49ba6));
-        assert_eq!(v.get("bFirst"), Some(&Data::Binary(vec![0])));
-        assert_eq!(text_value(&v, "padmode000"), Some("1,1,0,0,0,1"));
-        assert_eq!(text_value(&v, "0042"), Some("D:\\Shots \"XI\""));
-        // InstallFolder's 0001 belongs to another key.
-        assert!(!v.values().any(|d| matches!(d, Data::Text(t) if t.contains("Games"))));
-        // Another region's section is not this one.
-        assert!(parse_reg(SAMPLE, "PlayOnlineEU").is_empty());
-    }
-
-    #[test]
-    fn game_config_decodes_utf16_exports() {
-        let mut bytes = vec![0xFF, 0xFE];
-        for u in SAMPLE.encode_utf16() {
-            bytes.extend_from_slice(&u.to_le_bytes());
-        }
-        let text = decode_text(&bytes);
-        assert_eq!(parse_reg(&text, "PlayOnlineUS"), parse_reg(SAMPLE, "PlayOnlineUS"));
-        assert_eq!(decode_text(b"\xEF\xBB\xBFREGEDIT4"), "REGEDIT4");
-    }
-
-    #[test]
-    fn game_config_later_lines_and_files_win_and_deletions_apply() {
-        let text = "REGEDIT4\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\PlayOnlineUS\\SquareEnix\\FinalFantasyXI]\n\
-\"0001\"=dword:00000500\n\"0034\"=dword:00000001\n\"0001\"=dword:00000780\n\"0034\"=-\n";
-        let v = parse_reg(text, "PlayOnlineUS");
-        assert_eq!(dword(&v, "0001"), Some(1920));
-        assert_eq!(v.get("0034"), None);
-    }
-
-    #[test]
-    fn game_config_reads_native_client_overlay_forms() {
-        // saved.reg as the native client writes it: hex(1) strings, multi-line hex.
-        let text = "REGEDIT4\n\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\PlayOnlineUS\\SquareEnix\\FinalFantasyXI]\n\
-\"0042\"=hex(1):43,3a,5c,58,00\n\"blob\"=hex:01,02,\\\n  03,04\n\"0044\"=dword:00000001\n";
-        let v = parse_reg(text, "PlayOnlineUS");
-        assert_eq!(text_value(&v, "0042"), Some("C:\\X"));
-        assert_eq!(v.get("blob"), Some(&Data::Binary(vec![1, 2, 3, 4])));
-        assert_eq!(dword(&v, "0044"), Some(1));
-    }
-
-    #[test]
-    fn game_config_encode_round_trips_every_type() {
-        let mut v = defaults((2560, 1440));
-        v.insert(SCREENSHOT_DIR.into(), Data::Text("D:\\Pictures\\\"FFXI\"".into()));
-        v.insert("bFirst".into(), Data::Binary(vec![0, 0xAB]));
-        v.insert("padmode000".into(), Data::Text("1,1,0,0,0,1".into()));
-        let text = encode_reg(&v, "PlayOnlineUS");
-        assert!(text.starts_with("REGEDIT4\r\n\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\PlayOnlineUS\\SquareEnix\\FinalFantasyXI]\r\n"));
-        // The native client's Config > Display rewrites lines of exactly this shape.
-        assert!(text.contains("\"0001\"=dword:00000a00\r\n"));
-        assert_eq!(parse_reg(&text, "PlayOnlineUS"), v);
-    }
 
     #[test]
     fn game_config_gamma_is_float_bits_with_two_decimals() {
@@ -583,14 +304,22 @@ mod tests {
         }
         assert_eq!(dword(&d, WINDOW_W), Some(1920));
         assert_eq!(dword(&d, MENU_H), Some(1080));
-        validate(&d, true).unwrap();
+        validate(&d).unwrap();
         // A tiny desktop still yields a usable window.
         assert_eq!(dword(&defaults((320, 200)), WINDOW_W), Some(640));
     }
 
     #[test]
     fn game_config_changed_keys_only_reports_managed_differences() {
-        let original = parse_reg(SAMPLE, "PlayOnlineUS");
+        let original: Values = [
+            ("padmode000".to_string(), Data::Text("1,1,0,0,0,1".into())),
+            ("bFirst".to_string(), Data::Binary(vec![0])),
+            (MIP_MAPPING.to_string(), Data::Dword(6)),
+            (WINDOW_W.to_string(), Data::Dword(3440)),
+            (WINDOW_H.to_string(), Data::Dword(1440)),
+            ("0031".to_string(), Data::Dword(0x3bc4_9ba6)),
+        ]
+        .into();
         let mut edited = original.clone();
         edited.insert("0031".into(), Data::Dword(1)); // unmanaged
         assert!(changed_keys(&original, &edited).is_empty());
@@ -600,51 +329,24 @@ mod tests {
     }
 
     #[test]
-    fn game_config_native_guard_keeps_font_type_compressed() {
-        // 0036 = 1 or 2 alone stops host64 at startup (FATAL at 102dbbc4); 0 starts.
-        assert!(native_supports(FONT_TYPE, 0));
-        assert!(!native_supports(FONT_TYPE, 1));
-        assert!(!native_supports(FONT_TYPE, 2));
-        assert!(native_supports(WINDOW_MODE, 3));
-        // The settings file that crashed the client: only the font type changes.
-        let text = "REGEDIT4\r\n\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\PlayOnlineUS\\SquareEnix\\FinalFantasyXI]\r\n\
-\"0000\"=dword:00000006\r\n\"0001\"=dword:00000f00\r\n\"0002\"=dword:00000870\r\n\"0003\"=dword:00001000\r\n\
-\"0004\"=dword:00001000\r\n\"0018\"=dword:00000002\r\n\"0021\"=dword:00000001\r\n\"0022\"=dword:00000000\r\n\
-\"0034\"=dword:00000003\r\n\"0036\"=dword:00000002\r\n\"0037\"=dword:00000a00\r\n\"0038\"=dword:000005a0\r\n";
-        let crashed = parse_reg(text, "PlayOnlineUS");
-        let mut v = crashed.clone();
-        assert_eq!(guard_native(&mut v), vec![FONT_TYPE]);
-        assert_eq!(dword(&v, FONT_TYPE), Some(NATIVE_FONT_TYPE));
-        v.insert(FONT_TYPE.into(), Data::Dword(2));
-        assert_eq!(v, crashed);
-        // Already safe, or absent: nothing changes.
-        let mut d = defaults((3840, 2160));
-        assert!(guard_native(&mut d).is_empty());
-        d.remove(FONT_TYPE);
-        assert!(guard_native(&mut d).is_empty());
-        assert!(!d.contains_key(FONT_TYPE));
-        // A value of the wrong type is replaced too.
-        d.insert(FONT_TYPE.into(), Data::Text("2".into()));
-        assert_eq!(guard_native(&mut d), vec![FONT_TYPE]);
-        assert_eq!(dword(&d, FONT_TYPE), Some(0));
-    }
-
-    #[test]
     fn game_config_validation_rejects_unusable_values() {
         let mut v = defaults((1920, 1080));
         v.insert(WINDOW_W.into(), Data::Dword(320));
-        assert!(validate(&v, false).is_err());
+        assert!(validate(&v).is_err());
         let mut v = defaults((1920, 1080));
         v.insert(MAX_SOUNDS.into(), Data::Dword(40));
-        assert!(validate(&v, false).is_err());
+        assert!(validate(&v).is_err());
         let mut v = defaults((1920, 1080));
         v.insert(SCREENSHOT_DIR.into(), Data::Text("relative\\shots".into()));
-        assert!(validate(&v, false).is_err());
+        assert!(validate(&v).is_err());
         let dir = std::env::temp_dir();
         v.insert(SCREENSHOT_DIR.into(), Data::Text(dir.display().to_string()));
-        validate(&v, false).unwrap();
-        v.insert(SCREENSHOT_DIR.into(), Data::Text("C:\\Bilder\\Größe".into()));
-        let err = validate(&v, true).unwrap_err();
-        assert!(err.contains("ASCII"));
+        validate(&v).unwrap();
+        // Windower's automatic (0, 0) menu is valid; a partial pair is not.
+        v.insert(MENU_W.into(), Data::Dword(0));
+        v.insert(MENU_H.into(), Data::Dword(0));
+        validate(&v).unwrap();
+        v.insert(MENU_H.into(), Data::Dword(720));
+        assert!(validate(&v).is_err());
     }
 }

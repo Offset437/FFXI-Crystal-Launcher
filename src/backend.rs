@@ -3,8 +3,8 @@
 
 use sha1::{Digest, Sha1};
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -36,20 +36,13 @@ impl Default for Config {
     }
 }
 impl Config {
-    /// Keep existing checkout data in place; packaged copies use this Windows user's data folder.
+    /// Data lives in this Windows user's data folder; the optional runtime files sit
+    /// next to the executable.
     fn from_locations(executable: &Path, user_data: &Path) -> Self {
         let executable_dir = executable.parent().unwrap_or_else(|| Path::new("."));
-        let checkout = executable_dir.ancestors()
-            .find(|path| path.join("iced-launcher/Cargo.toml").is_file());
-        let package = checkout.unwrap_or(executable_dir);
-        let bundled_runtime = package.join("native-runtime");
-        let legacy_runtime = package.parent().unwrap_or(package).join("xi-on-mac-windows");
-        let repository = if !bundled_runtime.exists() && checkout.is_some() {
-            legacy_runtime
-        } else { bundled_runtime };
         Self {
-            experiment: checkout.unwrap_or(user_data).to_path_buf(),
-            repository,
+            experiment: user_data.to_path_buf(),
+            repository: executable_dir.join("native-runtime"),
             game_install: None,
             dat_overlays: Vec::new(),
         }
@@ -75,6 +68,10 @@ impl Config {
     pub fn history_path(&self) -> PathBuf {
         self.experiment.join("iced-launcher/launch-history.log")
     }
+    /// The startup files learned per game folder (`startup_prefetch`).
+    pub(crate) fn startup_prefetch_path(&self) -> PathBuf {
+        self.experiment.join("iced-launcher/startup-prefetch.json")
+    }
     pub(crate) fn account_directory(&self, account: &Account) -> PathBuf {
         let key = account_key(account);
         let mapping: std::collections::BTreeMap<String, String> =
@@ -90,11 +87,7 @@ impl Config {
         self.experiment.join("test-launcher/data").join(directory)
     }
     fn legacy_directory_key(&self, account: &Account) -> String {
-        let mut hash = Sha1::new();
-        hash.update(match account.mode {
-            AccountMode::Private => b"private\0",
-            AccountMode::Retail => b"retail\0\0",
-        });
+        let mut hash = mode_hasher(account.mode);
         hash.update(account.server.as_bytes());
         hash.update([0]);
         hash.update(account.pol_id.as_bytes());
@@ -125,14 +118,10 @@ impl Config {
         }
         fs::create_dir_all(path.parent().unwrap())
             .map_err(|_| t("Could not create launcher data directory."))?;
-        let temporary = path.with_extension("json.tmp");
-        fs::write(
-            &temporary,
-            serde_json::to_vec(&mapping)
-                .map_err(|_| t("Could not encode account directory mappings."))?,
-        )
-        .map_err(|_| t("Could not save account directory mappings."))?;
-        replace_file(&temporary, &path)
+        let bytes = serde_json::to_vec(&mapping)
+            .map_err(|_| t("Could not encode account directory mappings."))?;
+        crate::fsutil::write_atomic(&path, &bytes)
+            .map_err(|_| t("Could not save account directory mappings.").into())
     }
 }
 
@@ -196,12 +185,18 @@ pub struct LaunchResult {
     pub timing: String,
 }
 
-pub fn account_key(account: &Account) -> String {
+/// The account keys' hash, started with the account mode's 8-byte prefix.
+fn mode_hasher(mode: AccountMode) -> Sha1 {
     let mut hash = Sha1::new();
-    hash.update(match account.mode {
+    hash.update(match mode {
         AccountMode::Private => b"private\0",
         AccountMode::Retail => b"retail\0\0",
     });
+    hash
+}
+
+pub fn account_key(account: &Account) -> String {
+    let mut hash = mode_hasher(account.mode);
     if account.mode == AccountMode::Private {
         hash.update(account.server.trim().to_ascii_lowercase());
     }
@@ -234,8 +229,38 @@ pub struct Account {
     pub ashita_boot_ini: Option<String>,
     /// The Windower profile this account starts with; `None` uses the Launch tools default.
     pub windower_profile: Option<String>,
+    /// Player-chosen public handles for first-time POL setup. Empty leaves
+    /// existing handle and character assignments alone.
+    #[serde(default)]
+    pub pol_handle_names: String,
 }
-pub(crate) use crate::ui::LaunchWith;
+/// The game front end the launch profile starts. Native is retained only to read
+/// older settings and account vaults; it is not an available launch route.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum LaunchWith {
+    Native,
+    #[default]
+    Windower,
+    Ashita,
+    Vanilla,
+}
+impl LaunchWith {
+    pub(crate) const ALL: [LaunchWith; 3] = [LaunchWith::Vanilla, LaunchWith::Windower, LaunchWith::Ashita];
+
+    pub(crate) fn retail(self) -> Self {
+        if self == Self::Native { Self::default() } else { self }
+    }
+}
+impl std::fmt::Display for LaunchWith {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            LaunchWith::Native => t("Unavailable client"),
+            LaunchWith::Windower => "Windower",
+            LaunchWith::Ashita => "Ashita",
+            LaunchWith::Vanilla => t("Vanilla"),
+        })
+    }
+}
 impl Account {
     /// What this account launches with, given the global default.
     pub(crate) fn effective_launch_with(&self, default: LaunchWith) -> LaunchWith {
@@ -254,6 +279,7 @@ impl Drop for Account {
         self.pol_password.zeroize();
         self.se_id.zeroize();
         self.se_password.zeroize();
+        self.pol_handle_names.zeroize();
     }
 }
 
@@ -264,6 +290,9 @@ fn validate_account(account: &Account) -> Result<(), String> {
     }
     if account.region > 2 {
         return Err(t("Choose US, EU or JP.").into());
+    }
+    if account.pol_handle_names.len() > 512 || account.pol_handle_names.chars().any(char::is_control) {
+        return Err(t("PlayOnline handle names must be at most 512 bytes and contain no control characters.").into());
     }
     if account.server.len() > 253 || account.se_id.len() > 16 || account.se_password.len() > 512 {
         return Err(t("An account field exceeds its supported length.").into());
@@ -511,6 +540,7 @@ fn decode_accounts(mut plaintext: &[u8]) -> Result<Vec<Account>, String> {
             launch_with,
             ashita_boot_ini,
             windower_profile,
+            pol_handle_names: String::new(),
         };
         validate_account(&account)?;
         accounts.push(account);
@@ -545,20 +575,14 @@ pub fn load_or_import_accounts(config: &Config) -> Result<Vec<Account>, String> 
 }
 
 fn load_accounts_file(path: &Path) -> Result<Vec<Account>, String> {
-    let metadata = match fs::metadata(&path) {
-        Ok(value) => value,
+    let file = match File::open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(_) => return Err(t("Could not open the saved-account vault.").into()),
     };
-    if metadata.len() > 4 * 1024 * 1024 {
-        return Err(t("The saved-account vault is too large.").into());
-    }
     let mut encrypted = Vec::new();
-    File::open(path)
-        .and_then(|file| {
-            file.take(VAULT_LIMIT as u64 + 1)
-                .read_to_end(&mut encrypted)
-        })
+    file.take(VAULT_LIMIT as u64 + 1)
+        .read_to_end(&mut encrypted)
         .map_err(|_| t("Could not read the saved-account vault."))?;
     if encrypted.len() > VAULT_LIMIT {
         return Err(t("The saved-account vault is too large.").into());
@@ -576,38 +600,30 @@ pub fn save_accounts(config: &Config, accounts: &[Account]) -> Result<(), String
     let path = config.vault_path();
     let directory = path.parent().ok_or(t("Invalid saved-account location."))?;
     fs::create_dir_all(directory).map_err(|_| t("Could not create the saved-account directory."))?;
-    let temporary = directory.join(format!("accounts-{}.tmp", unique_id()?));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|_| t("Could not create the encrypted saved-account file."))?;
-        file.write_all(&encrypted)
-            .and_then(|_| file.sync_all())
-            .map_err(|_| t("Could not write the encrypted saved-account file."))?;
-        drop(file);
-        replace_file(&temporary, &path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    crate::fsutil::write_atomic(&path, &encrypted).map_err(|failed| {
+        if failed.replacing {
+            t("Could not replace the saved-account vault; its previous version was kept.").into()
+        } else {
+            t("Could not write the encrypted saved-account file.").into()
+        }
+    })
 }
 
-#[cfg(windows)]
-fn protect(input: &[u8]) -> Result<Vec<u8>, String> {
+/// DPAPI's view of `input`, borrowed for one call.
+fn dpapi_blob(input: &[u8]) -> Result<windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB, String> {
+    Ok(windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB {
+        cbData: input.len().try_into().map_err(|_| t("Account data is too large."))?,
+        pbData: input.as_ptr() as *mut u8,
+    })
+}
+
+pub(crate) fn protect(input: &[u8]) -> Result<Vec<u8>, String> {
     use windows_sys::Win32::{
         Foundation::LocalFree,
         Security::Cryptography::{CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB},
     };
-    let input_blob = CRYPT_INTEGER_BLOB {
-        cbData: input
-            .len()
-            .try_into()
-            .map_err(|_| t("Account data is too large."))?,
-        pbData: input.as_ptr() as *mut u8,
-    };
+    let input_blob = dpapi_blob(input)?;
+
     let mut output: CRYPT_INTEGER_BLOB = unsafe { std::mem::zeroed() };
     unsafe {
         // DPAPI's default scope binds this vault to the current Windows user.
@@ -631,83 +647,11 @@ fn protect(input: &[u8]) -> Result<Vec<u8>, String> {
         Ok(bytes)
     }
 }
-#[cfg(windows)]
-fn unprotect(input: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
-    use windows_sys::Win32::{
-        Foundation::LocalFree,
-        Security::Cryptography::{
-            CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
-        },
-    };
-    let input_blob = CRYPT_INTEGER_BLOB {
-        cbData: input
-            .len()
-            .try_into()
-            .map_err(|_| t("Account data is too large."))?,
-        pbData: input.as_ptr() as *mut u8,
-    };
-    let mut output: CRYPT_INTEGER_BLOB = unsafe { std::mem::zeroed() };
-    unsafe {
-        if CryptUnprotectData(
-            &input_blob,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-            std::ptr::null(),
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut output,
-        ) == 0
-        {
-            return Err(tf(
-                "Windows could not decrypt these accounts for the current user (error {code}).",
-                &[("code", &windows_sys::Win32::Foundation::GetLastError())],
-            ));
-        }
-        let bytes = Zeroizing::new(
-            std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec(),
-        );
-        std::slice::from_raw_parts_mut(output.pbData, output.cbData as usize).zeroize();
-        LocalFree(output.pbData as _);
-        Ok(bytes)
-    }
-}
-#[cfg(not(windows))]
-fn protect(_: &[u8]) -> Result<Vec<u8>, String> {
-    Err(t("Saved accounts require Windows DPAPI.").into())
-}
-#[cfg(not(windows))]
-fn unprotect(_: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
-    Err(t("Saved accounts require Windows DPAPI.").into())
-}
-
-#[cfg(windows)]
-fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    if unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        Err(t("Could not replace the saved-account vault; its previous version was kept.").into())
-    } else {
-        Ok(())
-    }
-}
-#[cfg(not(windows))]
-fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
-    fs::rename(source, destination).map_err(|_| t("Could not replace the saved-account vault.").into())
+pub(crate) fn unprotect(input: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+    dpapi_blob(input)?;
+    crate::win::unprotect(input).map_err(|code| {
+        tf("Windows could not decrypt these accounts for the current user (error {code}).", &[("code", &code)])
+    })
 }
 
 pub(crate) fn unique_id() -> Result<String, String> {
@@ -739,9 +683,7 @@ pub fn login_with_progress(
     let history = config.history_path();
     let result = login_inner(config, account, otp, via, Timeline::begin_at(clicked), progress);
     if let Err(error) = &result {
-        let (message, log) = crate::launch_log::split_log(error);
-        let message: String = message.chars().take(240).collect();
-        crate::launch_log::append_history(&history, &label, &message, log.as_deref());
+        crate::launch_log::record_failure(&history, &label, error);
     }
     result
 }
@@ -779,7 +721,6 @@ mod tests {
         assert!(first.vault_path().starts_with(&first_user));
     }
 
-    #[cfg(windows)]
     #[test]
     fn moving_or_reinstalling_the_package_keeps_the_existing_encrypted_accounts() {
         let root = std::env::temp_dir().join(format!("crystal-reinstall-{}", unique_id().unwrap()));
@@ -796,21 +737,6 @@ mod tests {
         assert_eq!(fs::read(replacement.vault_path()).unwrap(), before);
         drop(restored);
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn checkout_builds_preserve_existing_accounts_and_prefer_a_bundled_runtime() {
-        let root = std::env::temp_dir().join(format!("crystal-checkout-{}", unique_id().unwrap()));
-        let project = root.join("test");
-        fs::create_dir_all(project.join("iced-launcher")).unwrap();
-        fs::write(project.join("iced-launcher/Cargo.toml"), "[package]").unwrap();
-        let executable = project.join("iced-launcher/target/release/xi-launcher.exe");
-        let config = Config::from_locations(&executable, &root.join("user-data"));
-        assert_eq!(config.experiment, project);
-        assert_eq!(config.repository, root.join("xi-on-mac-windows"));
-        assert_eq!(config.vault_path(), project.join("iced-launcher/accounts.dpapi"));
-        fs::create_dir(project.join("native-runtime")).unwrap();
-        assert_eq!(Config::from_locations(&executable, &root.join("user-data")).repository, project.join("native-runtime"));
     }
 
     #[test]
@@ -847,6 +773,7 @@ mod tests {
             launch_with: None,
             ashita_boot_ini: None,
             windower_profile: None,
+            pol_handle_names: String::new(),
         }
     }
     fn retail() -> Account {
@@ -862,6 +789,7 @@ mod tests {
             launch_with: None,
             ashita_boot_ini: None,
             windower_profile: None,
+            pol_handle_names: String::new(),
         }
     }
     /// A version-1 vault, byte for byte as launchers before per-account launch settings wrote it.
@@ -897,6 +825,18 @@ mod tests {
         assert_eq!(&again[..], &old[..]);
     }
     #[test]
+    fn public_handle_setup_does_not_change_the_password_vault_format_or_contents() {
+        let mut account=retail();
+        let before=encode_accounts(&[account.clone()]).unwrap();
+        account.pol_handle_names="PublicHandle".into();
+        let after=encode_accounts(&[account]).unwrap();
+        assert_eq!(*before,*after);
+        let decoded=decode_accounts(&after).unwrap();
+        assert_eq!(decoded[0].pol_password,"synthetic");
+        assert!(decoded[0].pol_handle_names.is_empty(),"public setup is saved separately in launcher settings");
+    }
+
+    #[test]
     fn launch_settings_round_trip_in_a_version_two_vault() {
         let mut main = retail();
         main.launch_with = Some(LaunchWith::Windower);
@@ -914,7 +854,7 @@ mod tests {
         assert_eq!(decoded[0].ashita_boot_ini, None);
         assert_eq!(decoded[1].launch_with, Some(LaunchWith::Ashita));
         assert_eq!(decoded[1].ashita_boot_ini.as_deref(), Some("mule.ini"));
-        assert_eq!((decoded[2].launch_with.clone(), decoded[2].windower_profile.clone()), (None, None));
+        assert_eq!((decoded[2].launch_with, decoded[2].windower_profile.clone()), (None, None));
         assert_eq!(decoded[2].pol_password, "synthetic secret");
         for end in 0..encoded.len() {
             assert!(decode_accounts(&encoded[..end]).is_err());
@@ -1052,7 +992,6 @@ mod tests {
         bad_count[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(decode_accounts(&bad_count).is_err());
     }
-    #[cfg(windows)]
     #[test]
     fn dpapi_round_trip_replaces_encrypted_vault_and_rejects_corruption() {
         let directory =

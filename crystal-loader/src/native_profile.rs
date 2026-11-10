@@ -105,11 +105,11 @@ fn install_default(api: &Api) {
     api.zero(845);
     let mut record = vec![0u8; RECORD_LEN];
     let base = record.as_mut_ptr() as usize;
-    api.call(858, &[base + 8, b"WindowsNetWork\0".as_ptr() as usize]);
+    api.call(858, &[base + 8, c"WindowsNetWork".as_ptr() as usize]);
     record[0x10c..0x110].copy_from_slice(&1u32.to_le_bytes()); // kind: LAN
     record[0x558..0x55c].copy_from_slice(&1u32.to_le_bytes()); // proxy: none
-    api.call(892, &[base + 0x55c, b"\0".as_ptr() as usize]);
-    api.call(892, &[base + 0x5a4, b"\0".as_ptr() as usize]);
+    api.call(892, &[base + 0x55c, c"".as_ptr() as usize]);
+    api.call(892, &[base + 0x5a4, c"".as_ptr() as usize]);
     record[0x5ec..0x5f2].copy_from_slice(b"46.49\0");
     api.call(846, &[base]);
 }

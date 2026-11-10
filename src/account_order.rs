@@ -1,5 +1,3 @@
-use crate::Message;
-use iced::{event, mouse, window, Event};
 use std::collections::HashMap;
 
 #[derive(Default)]
@@ -16,15 +14,6 @@ pub(crate) fn apply<T>(items: &mut [T], order: &[String], key: impl Fn(&T) -> &s
         positions.entry(value.as_str()).or_insert(index);
     }
     items.sort_by_key(|item| positions.get(key(item)).copied().unwrap_or(usize::MAX));
-}
-
-/// Releases outside the grip or account list must finish the drag too.
-pub(crate) fn input(event: Event, _: event::Status, _: window::Id) -> Option<Message> {
-    match event {
-        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => Some(Message::AccountDragFinish),
-        Event::Window(window::Event::Unfocused) => Some(Message::AccountDragCancel),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

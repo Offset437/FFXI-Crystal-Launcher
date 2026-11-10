@@ -1,4 +1,4 @@
-//! Finding Ashita v4, Windower 4 and crystal-loader, generating Ashita's per-account boot
+//! Finding Ashita v4, Windower 4 and the game host (pol.exe), generating Ashita's per-account boot
 //! ini, and building the injector command lines. Nothing here carries a secret: the pipe
 //! name and launcher PID are the only per-launch values, and both are public by design.
 
@@ -13,8 +13,6 @@ use std::{
 /// EliteAPI tools, bots) look for. It lives in a `crystal` subfolder of the launcher's folder so
 /// it never collides with a real PlayOnline install.
 pub(crate) const LOADER_EXE: &str = r"crystal\pol.exe";
-/// Where earlier builds put the loader: next to the launcher. Still found, after `LOADER_EXE`.
-pub(crate) const LEGACY_LOADER_EXE: &str = "crystal-loader.exe";
 /// The boot ini the user's base defaults to, when Ashita has one.
 pub(crate) const DEFAULT_BOOT_INI: &str = "default.ini";
 
@@ -50,15 +48,6 @@ impl Tool {
     }
 }
 
-/// Valid local paths discovered on this PC, most likely first.
-pub(crate) fn candidates(tool: Tool) -> Vec<PathBuf> {
-    tool.product().map(crate::discovery::candidates).unwrap_or_default()
-}
-
-pub(crate) fn is_install(tool: Tool, folder: &Path) -> bool {
-    tool.product().is_some_and(|product| crate::discovery::is_install(product, folder))
-}
-
 /// Validate a discovered hint without starting a new inventory scan.
 pub(crate) fn validated_folder(tool: Tool, folder: &Path) -> Option<PathBuf> {
     crate::discovery::validated_folder(tool.product()?, folder)
@@ -73,31 +62,37 @@ pub(crate) fn detect(tool: Tool, configured: &str) -> Option<PathBuf> {
 #[path = "embedded.rs"]
 pub(crate) mod embedded;
 
-/// The loader: the override when set, else the copy embedded in this exe (extracted to the data
-/// folder's `crystal\pol.exe`), then `crystal\pol.exe` and the older `crystal-loader.exe` next to
-/// the launcher. The returned path is the one the pipe handshake verifies the client against.
+/// Prefer the installed host when it matches this launcher's embedded copy. Portable launches
+/// and updates with an older installed host fall back to extracting the matching embedded one.
+/// The returned path is the one the pipe handshake verifies the client against.
 pub(crate) fn loader_path(configured: &str) -> Option<PathBuf> {
-    let configured = configured.trim();
-    if !configured.is_empty() {
-        return resolve_loader(configured, None, None);
-    }
-    let extracted = embedded::extracted();
     let launcher = std::env::current_exe().ok();
-    resolve_loader(configured, extracted, launcher.as_deref().and_then(Path::parent))
+    resolve_loader(
+        configured.trim(),
+        launcher.as_deref().and_then(Path::parent),
+        embedded::expected_hash(),
+        embedded::extracted,
+    )
 }
 
-/// The resolution order: override, then the extracted embedded loader, then the launcher folder.
-fn resolve_loader(configured: &str, extracted: Option<PathBuf>, launcher_dir: Option<&Path>) -> Option<PathBuf> {
+fn resolve_loader(
+    configured: &str,
+    launcher_dir: Option<&Path>,
+    expected_hash: Option<&str>,
+    extract: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
     if !configured.is_empty() {
         let path = PathBuf::from(configured);
         return path.is_file().then_some(path);
     }
-    extracted.filter(|p| p.is_file()).or_else(|| loader_in(launcher_dir?))
+    launcher_dir.and_then(|dir| loader_in(dir, expected_hash)).or_else(|| extract().filter(|p| p.is_file()))
 }
 
-/// The loader under a launcher folder, in lookup order.
-fn loader_in(launcher_dir: &Path) -> Option<PathBuf> {
-    [LOADER_EXE, LEGACY_LOADER_EXE].into_iter().map(|name| launcher_dir.join(name)).find(|p| p.is_file())
+/// An installed host must match the embedded host, so replacing only the GUI during a portable
+/// self-update cannot accidentally pair it with the previous installation's native code.
+fn loader_in(launcher_dir: &Path, expected_hash: Option<&str>) -> Option<PathBuf> {
+    let path = launcher_dir.join(LOADER_EXE);
+    (path.is_file() && expected_hash.is_none_or(|hash| embedded::has_hash(&path, hash))).then_some(path)
 }
 
 /// Boot inis the user can base the generated one on (Ashita's own config\boot, minus ours).
@@ -137,23 +132,25 @@ pub(crate) fn windower_profiles(windower: &Path) -> Vec<String> {
     let mut reader = quick_xml::Reader::from_reader(bytes.as_slice());
     let mut names = Vec::new();
     let mut buffer = Vec::new();
+    // Exactly the profiles a launch can select (`ffxi_settings::windower_profile`).
+    let mut depth = 0usize;
     loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) if e.name().as_ref().eq_ignore_ascii_case(b"profile") => {
-                if let Some(name) = e
-                    .attributes()
-                    .flatten()
-                    .find(|a| a.key.as_ref() == b"name")
-                    .and_then(|a| a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok().map(|v| v.into_owned()))
-                {
-                    // The unnamed profile is Windower's default, which "no profile" already means.
-                    if !name.is_empty() && valid_profile(&name) && !names.contains(&name) {
-                        names.push(name);
-                    }
-                }
+        let profile = match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(e)) => {
+                depth += 1;
+                super::ffxi_settings::is_root_profile(depth, &e).then(|| super::ffxi_settings::profile_name(&e))
+            }
+            Ok(Event::Empty(e)) => super::ffxi_settings::is_root_profile(depth + 1, &e).then(|| super::ffxi_settings::profile_name(&e)),
+            Ok(Event::End(_)) => {
+                depth = depth.saturating_sub(1);
+                None
             }
             Ok(Event::Eof) | Err(_) => break,
-            _ => {}
+            _ => None,
+        };
+        // The unnamed profile is Windower's default, which "no profile" already means.
+        if let Some(name) = profile.filter(|name| !name.is_empty() && valid_profile(name) && !names.contains(name)) {
+            names.push(name);
         }
         buffer.clear();
     }
@@ -174,15 +171,6 @@ pub(crate) fn boot_ini_name(account_key: &str) -> String {
     format!("crystal-{account_key}.ini")
 }
 
-/// `[ashita.language] playonline`: 1 JP, 2 EN (US), 3 EU.
-fn playonline_language(region: &str) -> &'static str {
-    match region {
-        "JP" => "1",
-        "EU" => "3",
-        _ => "2",
-    }
-}
-
 struct Edit<'a> {
     section: &'a str,
     key: &'a str,
@@ -193,35 +181,21 @@ struct Edit<'a> {
 
 /// The per-account Ashita boot ini (`file =` is the resolved loader path, whatever its name): the user's base with the boot keys pointed at the loader.
 /// Comments, other sections, `[ashita.launcher]`, `script` and `[ffxi.registry]` come over as
-/// the user had them; `registry` overrides individual `[ffxi.registry]` values.
-pub(crate) fn ashita_boot_ini(
-    base: Option<&[u8]>,
-    loader: &Path,
-    pipe: &str,
-    launcher_pid: u32,
-    region: &str,
-    registry: &[(String, String)],
-) -> Result<Vec<u8>, String> {
+/// the user had them. Retail is US only (`launch`): `--lang US`, `playonline = 2` (EN).
+pub(crate) fn ashita_boot_ini(base: Option<&[u8]>, loader: &Path, pipe: &str, launcher_pid: u32) -> Result<Vec<u8>, String> {
     // GetPrivateProfileStringA reads the file in the ANSI code page.
     let loader = loader.to_str().filter(|s| s.is_ascii()).ok_or(
         t("Ashita reads its boot file as ANSI text, so the loader (pol.exe) must be in a folder whose path uses only plain (ASCII) characters."),
     )?;
-    let command = format!("{} --lang {region}", loader_args(pipe, launcher_pid));
-    let mut edits = vec![
+    let command = format!("{} --lang US", loader_args(pipe, launcher_pid));
+    let edits = [
         Edit { section: "ashita.boot", key: "file", value: loader.to_owned(), only_if_missing: false },
         Edit { section: "ashita.boot", key: "command", value: command, only_if_missing: false },
         Edit { section: "ashita.boot", key: "gamemodule", value: "ffximain.dll".into(), only_if_missing: false },
         Edit { section: "ashita.boot", key: "script", value: "default.txt".into(), only_if_missing: true },
-        Edit { section: "ashita.language", key: "playonline", value: playonline_language(region).into(), only_if_missing: true },
+        Edit { section: "ashita.language", key: "playonline", value: "2".into(), only_if_missing: true },
         Edit { section: "ashita.polplugins", key: "sandbox", value: "0".into(), only_if_missing: false },
     ];
-    for (key, value) in registry {
-        let ok = |s: &str| !s.is_empty() && s.is_ascii() && !s.chars().any(|c| c.is_control() || c == '=' || c == '[');
-        if !ok(key) || !value.is_ascii() || value.chars().any(char::is_control) {
-            return Err(t("A game setting for Ashita's [ffxi.registry] is not valid.").into());
-        }
-        edits.push(Edit { section: "ffxi.registry", key, value: value.clone(), only_if_missing: false });
-    }
     let base = base.unwrap_or(MINIMAL_BOOT_INI.as_bytes());
     let mut ini = edit_ini(base, &edits);
     if !ini_has_section(&ini, "ffxi.registry") {
@@ -362,20 +336,37 @@ fn key_of(line: &str) -> Option<&str> {
     (!key.is_empty()).then_some(key)
 }
 
-/// `Ashita-cli.exe crystal-<id>.ini`, run from Ashita's folder.
+/// `Ashita-cli.exe crystal-<id>.ini`, run from Ashita's folder with no console window.
 pub(crate) fn ashita_command(ashita: &Path, ini_name: &str) -> Command {
     let mut command = Command::new(ashita.join(Tool::Ashita.exe()));
-    command.arg(ini_name).current_dir(ashita).stdin(Stdio::null());
+    command.arg(ini_name).current_dir(ashita);
+    private_stdio(&mut command);
+    no_window(&mut command);
     command
 }
 
-/// Run the game host itself. Credentials are supplied later over its verified pipe.
+/// No std handle of the spawning worker reaches the child: std's `Command` would otherwise
+/// duplicate the worker's stdout pipe into it, and the window would never see the worker's
+/// EOF while the game runs. Callers may still redirect stdout/stderr to a log file.
+fn private_stdio(command: &mut Command) {
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+}
+
+/// Run the game host itself, with no console window. Credentials are supplied later over
+/// its verified pipe.
 pub(crate) fn vanilla_command(loader: &Path, install: &Path, pipe: &str, launcher_pid: u32) -> Command {
     let mut command = Command::new(loader);
     command.arg("--crystal-pipe").arg(pipe)
         .arg("--crystal-launcher-pid").arg(launcher_pid.to_string())
-        .current_dir(install).stdin(Stdio::null());
+        .current_dir(install);
+    private_stdio(&mut command);
+    no_window(&mut command);
     command
+}
+
+fn no_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
 }
 
 /// `Windower.exe --hide --profile=<p> --executable=<loader> --args=<loader args>`, run from
@@ -400,10 +391,8 @@ pub(crate) fn windower_command(
     command
         .arg(format!("--executable={}", loader.display()))
         .arg(format!("--args={}", loader_args(pipe, launcher_pid)))
-        .current_dir(windower)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .current_dir(windower);
+    private_stdio(&mut command);
     Ok(command)
 }
 
@@ -472,7 +461,7 @@ mod tests {
         let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(args, ["--crystal-pipe", PIPE, "--crystal-launcher-pid", "127"]);
         assert_eq!(command.get_envs().count(), 0, "no credential environment variables");
-        assert!(!is_install(Tool::Vanilla, loader.parent().unwrap()));
+        assert!(Tool::Vanilla.product().is_none(), "Vanilla has no install of its own");
     }
 
     fn text(bytes: &[u8]) -> String {
@@ -504,7 +493,7 @@ mod tests {
     #[test]
     fn ashita_ini_rewrites_only_the_boot_keys() {
         let loader = Path::new(r"C:\Program Files\Crystal Launcher\crystal\pol.exe");
-        let ini = text(&ashita_boot_ini(Some(BASE.as_bytes()), loader, PIPE, 4242, "US", &[]).unwrap());
+        let ini = text(&ashita_boot_ini(Some(BASE.as_bytes()), loader, PIPE, 4242).unwrap());
         assert_eq!(value(&ini, "ashita.boot", "file"), [loader.to_str().unwrap()]);
         assert_eq!(
             value(&ini, "ashita.boot", "command"),
@@ -531,7 +520,7 @@ mod tests {
 
     #[test]
     fn ashita_ini_without_a_base_is_complete() {
-        let ini = text(&ashita_boot_ini(None, Path::new(r"C:\L\pol.exe"), PIPE, 7, "US", &[]).unwrap());
+        let ini = text(&ashita_boot_ini(None, Path::new(r"C:\L\pol.exe"), PIPE, 7).unwrap());
         assert_eq!(value(&ini, "ashita.boot", "file"), [r"C:\L\pol.exe"]);
         assert_eq!(value(&ini, "ashita.boot", "script"), ["default.txt"]);
         assert_eq!(value(&ini, "ashita.polplugins", "sandbox"), ["0"]);
@@ -539,32 +528,30 @@ mod tests {
     }
 
     #[test]
-    fn ashita_ini_adds_missing_sections_and_registry_overrides() {
+    fn ashita_ini_adds_missing_sections() {
         let base = b"[ashita.boot]\nfile = x\n[ashita.input]\nmouse.unhook = 1";
-        let registry = vec![("0001".to_owned(), "1920".to_owned())];
-        let ini = text(&ashita_boot_ini(Some(base), Path::new(r"C:\L\pol.exe"), PIPE, 7, "US", &registry).unwrap());
+        let ini = text(&ashita_boot_ini(Some(base), Path::new(r"C:\L\pol.exe"), PIPE, 7).unwrap());
         assert_eq!(value(&ini, "ashita.boot", "file"), [r"C:\L\pol.exe"]);
         assert_eq!(value(&ini, "ashita.boot", "command").len(), 1);
         assert_eq!(value(&ini, "ashita.input", "mouse.unhook"), ["1"]);
         assert_eq!(value(&ini, "ashita.polplugins", "sandbox"), ["0"]);
-        assert_eq!(value(&ini, "ffxi.registry", "0001"), ["1920"]);
+        assert_eq!(value(&ini, "ashita.language", "playonline"), ["2"]);
+        assert!(ini_has_section(ini.as_bytes(), "ffxi.registry"));
         assert!(!ini.contains('\r'), "an LF base stays LF");
-        let bad = vec![("0001\n[x]".to_owned(), "1".to_owned())];
-        assert!(ashita_boot_ini(Some(base), Path::new(r"C:\L\pol.exe"), PIPE, 7, "US", &bad).is_err());
     }
 
     #[test]
-    fn loader_lookup_prefers_the_crystal_folder_then_the_old_name() {
+    fn loader_lookup_finds_the_crystal_folder() {
         let dir = std::env::temp_dir().join(format!("crystal-loader-lookup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("crystal")).unwrap();
-        assert_eq!(loader_in(&dir), None);
-        let legacy = dir.join(LEGACY_LOADER_EXE);
-        std::fs::write(&legacy, b"").unwrap();
-        assert_eq!(loader_in(&dir), Some(legacy));
+        assert_eq!(loader_in(&dir, None), None);
+        // The name earlier builds used beside the launcher is no longer looked for.
+        std::fs::write(dir.join("crystal-loader.exe"), b"").unwrap();
+        assert_eq!(loader_in(&dir, None), None);
         let pol = dir.join("crystal").join("pol.exe");
         std::fs::write(&pol, b"").unwrap();
-        assert_eq!(loader_in(&dir), Some(pol));
+        assert_eq!(loader_in(&dir, None), Some(pol));
         assert!(LOADER_EXE.ends_with("pol.exe"));
         // An explicit override is used as given, whatever its file name.
         let custom = dir.join("anything.bin");
@@ -574,38 +561,40 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
-    fn loader_resolution_order_is_override_then_extracted_then_launcher_folder() {
+    fn loader_resolution_uses_matching_installed_host_without_extracting() {
         let dir = std::env::temp_dir().join(format!("crystal-loader-order-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let launcher = dir.join("launcher");
         std::fs::create_dir_all(launcher.join("crystal")).unwrap();
-        let legacy = launcher.join(LEGACY_LOADER_EXE);
         let beside = launcher.join("crystal").join("pol.exe");
         let extracted = dir.join("data").join("crystal").join("pol.exe");
         let custom = dir.join("custom.exe");
         std::fs::create_dir_all(extracted.parent().unwrap()).unwrap();
-        for p in [&legacy, &beside, &extracted, &custom] {
+        for p in [&beside, &extracted, &custom] {
             std::fs::write(p, b"x").unwrap();
         }
+        let hash = embedded::sha256_hex(b"x");
+        let unexpected_extract = || panic!("an installed or explicitly configured host must not be extracted");
         let custom_str = custom.to_str().unwrap();
-        assert_eq!(resolve_loader(custom_str, Some(extracted.clone()), Some(&launcher)), Some(custom.clone()));
+        assert_eq!(resolve_loader(custom_str, Some(&launcher), Some(&hash), unexpected_extract), Some(custom.clone()));
         // A set but missing override is never replaced silently.
-        assert_eq!(resolve_loader(dir.join("gone.exe").to_str().unwrap(), Some(extracted.clone()), Some(&launcher)), None);
-        assert_eq!(resolve_loader("", Some(extracted.clone()), Some(&launcher)), Some(extracted.clone()));
+        assert_eq!(resolve_loader(dir.join("gone.exe").to_str().unwrap(), Some(&launcher), Some(&hash), unexpected_extract), None);
+        assert_eq!(resolve_loader("", Some(&launcher), Some(&hash), unexpected_extract), Some(beside.clone()));
+        // A portable GUI update must ignore a host from the previous release.
+        std::fs::write(&beside, b"older host").unwrap();
+        assert_eq!(resolve_loader("", Some(&launcher), Some(&hash), || Some(extracted.clone())), Some(extracted.clone()));
+        assert_eq!(resolve_loader("", Some(&launcher), Some(&hash), || None), None);
+        assert_eq!(resolve_loader("", None, Some(&hash), || Some(extracted.clone())), Some(extracted.clone()));
         std::fs::remove_file(&extracted).unwrap();
-        assert_eq!(resolve_loader("", Some(extracted.clone()), Some(&launcher)), Some(beside.clone()));
-        assert_eq!(resolve_loader("", None, Some(&launcher)), Some(beside.clone()));
-        std::fs::remove_file(&beside).unwrap();
-        assert_eq!(resolve_loader("", None, Some(&launcher)), Some(legacy));
-        assert_eq!(resolve_loader("", None, None), None);
+        assert_eq!(resolve_loader("", None, Some(&hash), || Some(extracted.clone())), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
     fn ashita_ini_keeps_ansi_bytes_and_refuses_non_ascii_loader_paths() {
         let base = b"[ashita.launcher]\r\nname = Caf\xe9\r\n[ashita.boot]\r\nfile =\r\n";
-        let ini = ashita_boot_ini(Some(base), Path::new(r"C:\L\pol.exe"), PIPE, 7, "US", &[]).unwrap();
+        let ini = ashita_boot_ini(Some(base), Path::new(r"C:\L\pol.exe"), PIPE, 7).unwrap();
         assert!(ini.windows(5).any(|w| w == b"Caf\xe9\r"));
-        assert!(ashita_boot_ini(None, Path::new("C:\\Usu\u{e1}rio\\pol.exe"), PIPE, 7, "US", &[]).is_err());
+        assert!(ashita_boot_ini(None, Path::new("C:\\Usu\u{e1}rio\\pol.exe"), PIPE, 7).is_err());
     }
 
     #[test]
@@ -659,8 +648,9 @@ mod tests {
         assert_eq!(detect(Tool::Windower, ashita.to_str().unwrap()), detect(Tool::Windower, ""));
         assert_eq!(detect(Tool::Ashita, root.join("missing").to_str().unwrap()), detect(Tool::Ashita, ""));
         assert_eq!(boot_inis(&ashita), ["default.ini", "Main.ini"]);
-        assert!(candidates(Tool::Ashita).iter().all(|folder| is_install(Tool::Ashita, folder)));
-        assert!(candidates(Tool::Windower).iter().all(|folder| is_install(Tool::Windower, folder)));
+        use crate::discovery::{find, is_install, Product};
+        assert!(find(Product::Ashita, None).iter().all(|folder| is_install(Product::Ashita, folder)));
+        assert!(find(Product::Windower, None).iter().all(|folder| is_install(Product::Windower, folder)));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -681,6 +671,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(windower_profiles(&root), ["Box 2"]);
+        // Finding: only what a launch can select is listed; a nested or differently cased
+        // profile used to be listed and then refused at launch.
+        let xml = br#"<settings><x><profile name="Nested"/></x><Profile name="Cased"/><profile name=" Main "/></settings>"#;
+        std::fs::write(root.join("settings.xml"), xml).unwrap();
+        assert_eq!(windower_profiles(&root), ["Main"]);
+        for name in ["Nested", "Cased"] { assert!(super::super::ffxi_settings::windower_profile(Some(xml), name).is_err()); }
+        assert!(super::super::ffxi_settings::windower_profile(Some(xml), "Main").is_ok());
         std::fs::remove_file(root.join("settings.xml")).unwrap();
         assert!(windower_profiles(&root).is_empty(), "no settings.xml, no profiles");
         std::fs::remove_dir_all(root).unwrap();

@@ -1,0 +1,220 @@
+// The side sheets' shared parts (the sheet and the form widgets in it): the sheet frame
+// (dimmed page, sliding panel, header, scrolling body, footer) and the form pieces both the
+// account sheet and the features sheet are built from.
+import { Theme } from "theme.slint";
+import { Check, IconButton, Glyph, Rule, Field, FormLabel } from "widgets.slint";
+
+export { FormLabel }
+
+/// A field for a saved value that applies on Return (`commit`). It always comes back to what is
+/// saved: after Return (the saved, possibly normalised value), when the saved value changes, and
+/// when the focus leaves with a draft that was never applied.
+export component SavedField inherits Field {
+    in property <string> saved;
+    callback commit(string);
+    text: root.saved;
+    changed saved => { root.text = root.saved; }
+    changed focused => {
+        if !root.focused { root.text = root.saved; }
+    }
+    accepted => {
+        root.commit(root.text);
+        root.text = root.saved;
+    }
+}
+
+/// A quiet line under a control.
+export component Note inherits Text {
+    font-size: Theme.type-caption;
+    color: Theme.sub;
+    wrap: word-wrap;
+}
+
+/// Why a typed value was not used.
+export component ErrorNote inherits Text {
+    font-size: Theme.type-caption;
+    color: Theme.danger;
+    wrap: word-wrap;
+}
+
+/// A sheet fieldset: its uppercase caption legend, then the fields SP_L apart.
+export component Fieldset inherits VerticalLayout {
+    in property <string> legend;
+    spacing: Theme.sp-m;
+    Text { text: root.legend; font-size: Theme.type-caption; font-weight: 600; color: Theme.sub; }
+    VerticalLayout {
+        spacing: Theme.sp-l;
+        @children
+    }
+}
+
+/// A label over its control (and any notes after it).
+export component Labelled inherits VerticalLayout {
+    in property <string> caption;
+    spacing: Theme.label-gap;
+    FormLabel { text: root.caption; }
+    @children
+}
+
+/// A checkbox with its label and, under it, an indented note. `modal` as on Pressable.
+export component CheckNote inherits VerticalLayout {
+    in property <bool> modal;
+    in property <string> text;
+    in property <string> note;
+    in property <bool> checked;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+    spacing: Theme.sp-xs;
+    Check {
+        modal: root.modal;
+        text: root.text;
+        checked: root.checked;
+        enabled: root.enabled;
+        toggled(on) => { root.toggled(on); }
+    }
+    if root.note != "": HorizontalLayout {
+        padding-left: 26px;
+        Note { text: root.note; }
+    }
+}
+
+/// A bordered card; its rows (CardRow) are separated by hairlines.
+export component Card inherits Rectangle {
+    background: Theme.card;
+    border-width: 1px;
+    border-color: Theme.hairline;
+    border-radius: Theme.radius-mid;
+    VerticalLayout {
+        padding-left: Theme.card-pad-x;
+        padding-right: Theme.card-pad-x;
+        padding-top: Theme.sp-xs;
+        padding-bottom: Theme.sp-xs;
+        @children
+    }
+}
+
+/// One row of a Card.
+export component CardRow inherits HorizontalLayout {
+    padding-top: Theme.card-row-y;
+    padding-bottom: Theme.card-row-y;
+    spacing: Theme.sp-m;
+}
+
+/// A side sheet over the dimmed page: the panel slides in from the right edge as the dim fades
+/// in. A click on the dimmed page, the close button or Escape calls `close`. The panel is a
+/// groupbox, which the controller walker (src/slint_host/pad.rs) treats as modal: only its
+/// controls can be reached while it shows. Children follow the header: a SheetBody and a
+/// SheetFooter, with anything between them (tabs).
+export component SideSheet inherits Rectangle {
+    /// Its controls are `modal` (Pressable): set where Nav.modal holds the focus inside it.
+    in property <bool> modal;
+    in property <length> panel-width: Theme.sheet-w;
+    in property <string> caption;
+    in property <string> title;
+    in property <string> close-label;
+    in property <length> header-pad-bottom: Theme.sp-xl;
+    callback close();
+    private property <length> panel-w: min(root.panel-width, root.width - 48px);
+    private property <bool> shown;
+    init => {
+        root.shown = true;
+        keys.focus();
+    }
+    Rectangle {
+        background: Theme.scrim;
+        opacity: root.shown ? 1 : 0;
+        animate opacity { duration: Theme.calm; }
+    }
+    TouchArea { clicked => { root.close(); } }
+    Rectangle {
+        x: root.width - root.panel-w + (root.shown ? 0px : root.panel-w);
+        animate x { duration: Theme.calm; easing: ease-out; }
+        width: root.panel-w;
+        background: Theme.chrome;
+        border-width: 1px;
+        border-color: Theme.hairline;
+        drop-shadow-offset-x: -28px;
+        drop-shadow-blur: 56px;
+        drop-shadow-color: Theme.light ? #14213038 : #00000080;
+        accessible-role: groupbox;
+        accessible-label: root.title;
+        // The panel takes its own clicks; only the dimmed page closes the sheet.
+        TouchArea { }
+        // Escape from anywhere in the panel closes it (keys bubble up from the focused control).
+        keys := FocusScope {
+            focus-on-click: false;
+            focus-on-tab-navigation: false;
+            key-pressed(event) => {
+                if event.text == Key.Escape {
+                    root.close();
+                    return accept;
+                }
+                return reject;
+            }
+            VerticalLayout {
+                // One inset for header, body and footer; the ghost close button's glyph edge
+                // meets the fields' right edge.
+                HorizontalLayout {
+                    padding-top: Theme.sp-xl;
+                    padding-bottom: root.header-pad-bottom;
+                    padding-left: Theme.sheet-pad-x;
+                    padding-right: Theme.sheet-pad-x - 10.5px;
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 3px;
+                        Text { text: root.caption; font-size: Theme.type-caption; font-weight: 600; color: Theme.sub; }
+                        Text { text: root.title; font-size: Theme.type-title; font-weight: 600; color: Theme.ink; overflow: elide; }
+                    }
+                    VerticalLayout {
+                        alignment: start;
+                        IconButton { modal: root.modal; label: root.close-label; glyph: Glyph.close; clicked => { root.close(); } }
+                    }
+                }
+                @children
+            }
+        }
+    }
+}
+
+/// A side sheet's scrolling body: a hairline, then the form, its fieldsets SP_2XL apart.
+/// `scroll-to` sets where it scrolls to (previews).
+export component SheetBody inherits VerticalLayout {
+    in property <length> scroll-to: 0px;
+    vertical-stretch: 1;
+    Rule { tint: Theme.chrome-line; }
+    Rectangle {
+        vertical-stretch: 1;
+        body := Flickable {
+            content-width: self.width;
+            content-height: form.preferred-height;
+            content-y: -min(root.scroll-to, max(0px, form.preferred-height - self.height));
+            form := VerticalLayout {
+                width: body.width;
+                padding-top: Theme.sp-3;
+                padding-bottom: Theme.sp-3;
+                padding-left: Theme.sheet-pad-x;
+                padding-right: Theme.sheet-pad-x;
+                spacing: Theme.sp-2xl;
+                alignment: start;
+                @children
+            }
+        }
+    }
+}
+
+/// A side sheet's footer under a hairline. `lead` is its left inset: a footer that starts with
+/// a quiet text button (Delete account) sets it 10 px short, so the label lines up with the
+/// fields rather than its hover box.
+export component SheetFooter inherits VerticalLayout {
+    in property <length> lead: Theme.sheet-pad-x;
+    in property <length> gap: Theme.sp-s;
+    Rule { tint: Theme.chrome-line; }
+    HorizontalLayout {
+        padding-top: Theme.sp-l;
+        padding-bottom: Theme.sp-l;
+        padding-left: root.lead;
+        padding-right: Theme.sheet-pad-x;
+        spacing: root.gap;
+        @children
+    }
+}

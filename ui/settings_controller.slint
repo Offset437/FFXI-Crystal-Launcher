@@ -1,0 +1,325 @@
+// Settings → Controller: the connected controller, its live test, FFXI's
+// button bindings (press a row, then the controller's button for it) and FFXI's controller
+// options. Edits save on their own.
+import { Theme } from "theme.slint";
+import { SettingsView, PadBinding } from "settings_state.slint";
+import { Pressable, Toggle, QuietButton } from "widgets.slint";
+import { Card } from "settings_kit.slint";
+
+/// gamepad::card: a section card with the other Settings cards' inset, so the edges line up
+/// across tabs.
+component PadCard inherits Card { }
+
+/// A card's heading (15 px semibold), in a row as tall as a quiet button, so headings with and
+/// without one beside them sit on one line across the cards.
+component PadHeading inherits Text {
+    min-height: 30px * Theme.scale;
+    vertical-alignment: center;
+    font-size: 15px * Theme.scale;
+    font-weight: 600;
+    color: Theme.ink;
+}
+
+/// A small bordered label, like the keycaps in the bindings list; accent-filled while held.
+component Keycap inherits Rectangle {
+    in property <string> text;
+    in property <bool> lit;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    width: caption.preferred-width + 16px * Theme.scale;
+    height: caption.preferred-height + 4px * Theme.scale;
+    border-radius: 5px;
+    border-width: 1px;
+    background: root.lit ? Theme.accent : Theme.field;
+    border-color: root.lit ? Theme.accent : Theme.line;
+    caption := Text {
+        text: root.text;
+        font-size: Theme.type-caption * Theme.scale;
+        font-weight: 600;
+        color: root.lit ? Theme.play-text : Theme.ink;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+/// A trigger's pull: its name and a 64 px bar.
+component Meter inherits HorizontalLayout {
+    in property <string> label;
+    in property <float> value;
+    spacing: 6px * Theme.scale;
+    Text { width: 22px * Theme.scale; text: root.label; font-size: Theme.type-fine * Theme.scale; font-weight: 600; color: Theme.sub; vertical-alignment: center; }
+    Rectangle {
+        cross-axis-self-alignment: center;
+        width: 64px * Theme.scale;
+        height: 6px * Theme.scale;
+        border-radius: 3px;
+        border-width: 1px;
+        border-color: Theme.line;
+        background: Theme.field;
+        Rectangle {
+            x: 0;
+            width: parent.width * clamp(root.value, 0, 1);
+            height: parent.height;
+            border-radius: 3px;
+            background: Theme.accent;
+        }
+    }
+}
+
+/// A stick's position, as two signed numbers.
+component StickReadout inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    spacing: 6px * Theme.scale;
+    Text { text: root.label; font-size: Theme.type-fine * Theme.scale; font-weight: 600; color: Theme.sub; vertical-alignment: center; }
+    Text { text: root.value; font-family: Theme.mono; font-size: Theme.type-fine * Theme.scale; color: Theme.ink; vertical-alignment: center; }
+}
+
+/// The connected controller (or the lack of one), the others to pick from, and the save state.
+component DeviceBar inherits PadCard {
+    private property <float> s: Theme.scale;
+    pad-top: 12px * root.s;
+    pad-bottom: 12px * root.s;
+    HorizontalLayout {
+        spacing: 14px * root.s;
+        Rectangle {
+            cross-axis-self-alignment: center;
+            width: 44px * root.s;
+            height: 44px * root.s;
+            border-radius: 10px * root.s;
+            background: Theme.select;
+            Image {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 26px * root.s;
+                height: 26px * root.s;
+                source: SettingsView.pad.badge;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px * root.s;
+            Text { text: SettingsView.pad.title; font-size: Theme.type-heading * root.s; font-weight: 600; color: Theme.ink; }
+            Text { text: SettingsView.pad.sub; font-size: Theme.type-detail * root.s; color: Theme.sub; }
+        }
+        HorizontalLayout {
+            spacing: 6px * root.s;
+            alignment: start;
+            for choice in SettingsView.pad-choices: Pressable {
+                cross-axis-self-alignment: center;
+                label: choice.name;
+                min-width: name.preferred-width + 20px * root.s;
+                min-height: name.preferred-height + 10px * root.s;
+                horizontal-stretch: 0;
+                border-radius: Theme.radius-inner;
+                border-width: 1px;
+                border-color: Theme.line;
+                background: choice.active || self.hot ? Theme.select : transparent;
+                clicked => { SettingsView.pad-select(choice.id); }
+                name := Text {
+                    text: choice.name;
+                    font-size: Theme.type-caption * root.s;
+                    color: Theme.ink;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Rectangle { horizontal-stretch: 1; }
+        HorizontalLayout {
+            spacing: 10px * root.s;
+            Text { text: SettingsView.pad.status; font-size: Theme.type-detail * root.s; color: Theme.sub; vertical-alignment: center; }
+            if SettingsView.pad.retry: QuietButton {
+                cross-axis-self-alignment: center;
+                text: SettingsView.strings.pad-retry;
+                pad-y: 6px * root.s;
+                clicked => { SettingsView.pad-retry(); }
+            }
+        }
+    }
+}
+
+/// The controller drawn with what is held right now, the triggers and sticks, Test vibration.
+component LiveCard inherits PadCard {
+    private property <float> s: Theme.scale;
+    gap: 10px * root.s;
+    HorizontalLayout {
+        PadHeading { text: SettingsView.strings.pad-live; vertical-alignment: center; }
+        Rectangle { horizontal-stretch: 1; }
+        Text { text: SettingsView.pad.caption; font-size: Theme.type-caption * root.s; color: Theme.sub; vertical-alignment: center; }
+    }
+    Image {
+        height: 318px * root.s;
+        source: SettingsView.pad.picture;
+        image-fit: contain;
+        opacity: SettingsView.pad.connected ? 1 : 0.35;
+    }
+    HorizontalLayout {
+        spacing: 18px * root.s;
+        Meter { label: SettingsView.pad.lt-label; value: SettingsView.pad.lt; }
+        Meter { label: SettingsView.pad.rt-label; value: SettingsView.pad.rt; }
+        StickReadout { label: "L"; value: SettingsView.pad.left-stick; }
+        StickReadout { label: "R"; value: SettingsView.pad.right-stick; }
+        Rectangle { horizontal-stretch: 1; }
+        if SettingsView.pad.rumble: QuietButton {
+            cross-axis-self-alignment: center;
+            text: SettingsView.strings.pad-vibrate;
+            font-size: Theme.type-detail * root.s;
+            pad-x: 10px * root.s;
+            pad-y: 6px * root.s;
+            clicked => { SettingsView.pad-rumble(); }
+        }
+    }
+    if SettingsView.pad-keys.length > 0: HorizontalLayout {
+        spacing: 10px * root.s;
+        alignment: start;
+        for key in SettingsView.pad-keys: Keycap { text: key.label; lit: key.lit; }
+    }
+    // Spare height (beside a taller bindings card) goes under the content, so the heading stays
+    // on the bindings heading's line.
+    Rectangle { vertical-stretch: 1; }
+}
+
+/// One FFXI action and the control bound to it; pressed, it waits for the controller's button.
+component BindingRow inherits Pressable {
+    in property <PadBinding> entry;
+    private property <float> s: Theme.scale;
+    label: root.entry.label;
+    height: 36px * root.s;
+    border-radius: Theme.radius-inner;
+    border-width: root.entry.capturing ? 1px : 0px;
+    border-color: root.entry.capturing ? Theme.accent : Theme.line;
+    background: root.entry.capturing || root.entry.live ? Theme.select : root.hot ? Theme.field : transparent;
+    clicked => { SettingsView.pad-press(root.entry.id); }
+    HorizontalLayout {
+        padding-left: 10px * root.s;
+        padding-right: 10px * root.s;
+        spacing: 6px * root.s;
+        Text { text: root.entry.label; font-size: Theme.type-small * root.s; color: Theme.ink; vertical-alignment: center; }
+        if root.entry.changed: Rectangle {
+            cross-axis-self-alignment: center;
+            width: 6px * root.s;
+            height: 6px * root.s;
+            border-radius: self.width / 2;
+            background: Theme.accent;
+        }
+        Rectangle { horizontal-stretch: 1; }
+        if root.entry.capturing: HorizontalLayout {
+            cross-axis-self-alignment: center;
+            spacing: 4px * root.s;
+            Text { text: root.entry.prompt; font-size: Theme.type-detail * root.s; font-weight: 600; color: Theme.accent; vertical-alignment: center; }
+            QuietButton {
+                cross-axis-self-alignment: center;
+                text: SettingsView.strings.pad-unbind;
+                font-size: Theme.type-caption * root.s;
+                pad-x: 8px * root.s;
+                pad-y: 3px * root.s;
+                clicked => { SettingsView.pad-unbind(root.entry.id); }
+            }
+        }
+        if !root.entry.capturing && root.entry.kind == 0: Text {
+            text: root.entry.text;
+            font-size: Theme.type-detail * root.s;
+            color: Theme.sub;
+            vertical-alignment: center;
+        }
+        if !root.entry.capturing && root.entry.kind == 1: Keycap {
+            cross-axis-self-alignment: center;
+            text: root.entry.text;
+            lit: root.entry.lit;
+        }
+        if !root.entry.capturing && root.entry.kind == 2: HorizontalLayout {
+            cross-axis-self-alignment: center;
+            spacing: 6px * root.s;
+            Image {
+                cross-axis-self-alignment: center;
+                width: 22px * root.s;
+                height: 22px * root.s;
+                source: root.entry.picture;
+            }
+            if root.entry.text != "": Text { text: root.entry.text; font-size: Theme.type-detail * root.s; color: Theme.ink; vertical-alignment: center; }
+        }
+    }
+}
+
+/// FFXI's button bindings in two columns, with Reset to default.
+component BindingsCard inherits PadCard {
+    private property <float> s: Theme.scale;
+    gap: 10px * root.s;
+    VerticalLayout {
+        spacing: 2px * root.s;
+        // Reset to default on the heading's line.
+        HorizontalLayout {
+            PadHeading { horizontal-stretch: 1; text: SettingsView.strings.pad-bindings; vertical-alignment: center; }
+            QuietButton {
+                cross-axis-self-alignment: center;
+                text: SettingsView.strings.pad-reset;
+                font-size: Theme.type-detail * root.s;
+                pad-x: 10px * root.s;
+                // The heading row's height (PadHeading), so the row is as tall as Live test's.
+                height: 30px * root.s;
+                clicked => { SettingsView.pad-reset(); }
+            }
+        }
+        Text { text: SettingsView.pad.bindings-sub; font-size: Theme.type-caption * root.s; color: Theme.sub; wrap: word-wrap; }
+    }
+    HorizontalLayout {
+        spacing: 12px * root.s;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            min-width: 0px;
+            preferred-width: 0px;
+            spacing: 2px * root.s;
+            alignment: start;
+            for entry in SettingsView.pad-left: BindingRow { entry: entry; }
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            min-width: 0px;
+            preferred-width: 0px;
+            spacing: 2px * root.s;
+            alignment: start;
+            for entry in SettingsView.pad-right: BindingRow { entry: entry; }
+        }
+    }
+}
+
+/// FFXI's own controller switches and the notes under them.
+component OptionsCard inherits PadCard {
+    private property <float> s: Theme.scale;
+    PadHeading { text: SettingsView.strings.pad-options; }
+    HorizontalLayout {
+        spacing: 28px * root.s;
+        alignment: start;
+        for switch[i] in SettingsView.pad-switches: Toggle {
+            horizontal-stretch: 0;
+            font-size: Theme.type-small * root.s;
+            text: switch.label;
+            on: switch.on;
+            enabled: switch.enabled;
+            toggled(on) => { SettingsView.pad-switch(i, on); }
+        }
+    }
+    VerticalLayout {
+        spacing: 4px * root.s;
+        for note in SettingsView.pad-notes: Text {
+            text: note.text;
+            font-size: Theme.type-caption * root.s;
+            color: SettingsView.shade(note.shade);
+            wrap: word-wrap;
+        }
+    }
+}
+
+export component ControllerTab inherits VerticalLayout {
+    private property <float> s: Theme.scale;
+    spacing: 14px * root.s;
+    padding-bottom: 8px * root.s;
+    DeviceBar { }
+    HorizontalLayout {
+        spacing: 14px * root.s;
+        LiveCard { horizontal-stretch: 11; min-width: 0px; preferred-width: 0px; }
+        BindingsCard { horizontal-stretch: 12; min-width: 0px; preferred-width: 0px; }
+    }
+    OptionsCard { }
+}

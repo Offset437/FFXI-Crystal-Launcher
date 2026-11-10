@@ -1,16 +1,31 @@
 [package]
 name = "xi-launcher"
-version = "1.0.10"
+version = "1.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
 publish = false
 
 [features]
 elevated-ui = []
+# Installer builds: run the installed crystal\pol.exe (checked against the loader's hash
+# recorded at build time) and carry no embedded copy to extract.
+installed-host = []
 launcher-startup-diagnostics = []
+# Slint renderers. software ships: measured 2026-11-09 against femtovg (release, --preview),
+# it reaches the first frame in 132 ms (femtovg 324 ms: the OpenGL probe and context), holds
+# 23 MB private with the window open (femtovg 254 MB, the GL driver's) and 11 MB in the tray
+# (186 MB), and needs no OpenGL driver. The exe is 0.4 MB larger. Slint 1.18's software
+# renderer draws no drop shadows (dialogs, the account sheet, dropdowns) and clips rounded
+# corners square. A femtovg build should also enable software: on Windows Slint probes for
+# OpenGL 2.0 before it opens the window and falls back to the next compiled-in renderer.
+# With several, CRYSTAL_RENDERER or SLINT_BACKEND (winit-software, winit-femtovg, winit-skia)
+# chooses at start.
+default = ["software"]
+skia = ["slint/renderer-skia"]
+femtovg = ["slint/renderer-femtovg"]
+software = ["slint/renderer-software"]
 
 [dependencies]
-iced = { version = "=0.14.0", default-features = false, features = ["wgpu", "tiny-skia", "tokio", "advanced-shaping", "image-without-codecs", "svg", "advanced"] }
 imagecrate = { package = "image", version = "=0.25.8", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 crystal-pol = { path = "crates/pol-auth" }
 sha1 = "=0.10.7"
@@ -26,35 +41,47 @@ scraper = "=0.24.0"
 chrono = { version = "=0.4.45", features = ["clock"] }
 md5 = "=0.7.0"
 flate2 = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros"] }
-png = "=0.17.16"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+futures-channel = { version = "0.3", default-features = false, features = ["std", "sink"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros", "sync"] }
 rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] } # native folder/file pickers
 gilrs = { version = "0.11", default-features = false, features = ["wgi"] }
-unicode-script = "0.5" # the Script type cosmic-text's font Fallback trait takes (already in the tree via cosmic-text)
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation", "Win32_Security", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm",
     "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Registry",
     "Win32_System_Diagnostics_ToolHelp", "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Shell",
-    "Win32_UI_Input_KeyboardAndMouse", "Win32_Security_Cryptography", "Win32_Security_WinTrust",
+    "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Accessibility", "Win32_Security_Cryptography", "Win32_Security_WinTrust",
     "Win32_Storage_FileSystem",
     "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", # signer lookup
     "Win32_System_Pipes", "Win32_System_IO", # session pipe
+    "Win32_System_Memory", # Windower startup snapshot capture
+    "Win32_System_ProcessStatus", # idle footprint readings (footprint.rs)
     "Win32_Globalization",
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_WinSock", # stock-shaped version-check sockets (stock_socket.rs)
     "Win32_NetworkManagement_Dns", # DnsQuery_W(DNS_QUERY_BYPASS_CACHE) for W2U retries (dns.rs)
     "Win32_Devices_DeviceAndDriverInstallation", "Win32_Devices_Properties",
+    "Win32_System_Performance", "Win32_System_Power", "Win32_System_SystemInformation", # launch timing, prefetch gates
+    "Win32_Security_Authorization", # admin-only scratch folder for elevated component setup
+    "Win32_System_Com", # CoTaskMemFree for SHGetKnownFolderPath (that scratch folder's root)
 ] }
 windows = { version = "=0.58.0", features = ["Devices_Power", "Gaming_Input", "Foundation_Collections", "System_Power"] }
+slint = { version = "=1.18.1", default-features = false, features = ["std", "backend-winit", "accessibility", "compat-1-2", "unstable-winit-030", "raw-window-handle-06"] }
+raw-window-handle = "0.6" # the Slint window's HWND, for window_chrome
+# Slint's own core at Slint's exact version: the controller walker reads its item tree for where
+# each focusable control is and moves the focus there (Slint has no spatial focus).
+i-slint-core = { version = "=1.18.1", default-features = false, features = ["std"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] } # read the pinned release zip (inflate only, no zopfli)
 
 [build-dependencies]
 sha2 = "0.10"
 embed-resource = "3"
+slint-build = "=1.18.1"
 
 [dev-dependencies]
-iced_tiny_skia = { version = "=0.14.1", default-features = false }
+# The headless test window (slint_host::sync::headless) draws with the software renderer.
+slint = { version = "=1.18.1", default-features = false, features = ["renderer-software"] }
 
 [workspace]
 exclude = ["crystal-loader", "crates/pol-auth"]

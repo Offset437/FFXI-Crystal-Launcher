@@ -13,25 +13,35 @@ use crate::native_auth::Api;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-// Verified against polcore 73b1864b (preferred base 10000000).
-pub const ENTRY_RVAS: &[(usize, usize)] = &[(1107, 0x19520), (337, 0x1fc30)];
-
 /// One Crystal owner frame (07b decision 2: keep 20 ms). Not the stock period:
 /// app.dll's ticker sleeps SleepEx(max(.., 20)) on the default 15.625 ms timer,
 /// so a cold stock Viewer frame is 31.25 ms, and ≈21.4 ms only after FFXI has
 /// run in the same pol.exe (FFXiMain leaks timeBeginPeriod(1)); pol-spec 08 §2.
 pub(crate) const FRAME: Duration = Duration::from_millis(20);
-/// The stock Viewer's cold frame period, in µs (08 §2, measured 2026-10-12).
-const STOCK_FRAME_US: u64 = 31_250;
-/// Crystal frames covering the wall time of `stock` cold stock frames, so a
-/// frame-counted Viewer timer keeps its stock period at FRAME (07d §6 S1 D):
-/// 3600 stock frames = 112.5 s = 5625 frames of 20 ms.
-pub(crate) const fn stock_frames(stock: u32) -> u32 {
-    (STOCK_FRAME_US * stock as u64 / FRAME.as_micros() as u64) as u32
+/// The 1.18.15e Viewer's cold frame period, in µs (08 §2, measured 2026-10-12).
+pub(crate) const LEGACY_STOCK_FRAME_US: u64 = 31_250;
+/// The 1.18.15f Viewer (2026-11-09) raises the timer resolution to 1 ms
+/// (timeBeginPeriod(1) at start) and its ticker sleeps 16 ms minus the message
+/// pump, at least 1 ms (the old floor was 20 ms). Its frame is 16 ms plus the
+/// frame's work and the sleep overshoot: about 17 ms on an idle Viewer (static
+/// reading of app.dll; to be confirmed by a live measurement).
+pub(crate) const FAST_STOCK_FRAME_US: u64 = 17_000;
+/// The installed Viewer's frame period; the host sets it once at startup from
+/// the installed app.dll (`pol_core::viewer_ticker`).
+static STOCK_FRAME_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(LEGACY_STOCK_FRAME_US);
+pub(crate) fn set_stock_frame_us(us: u64) { STOCK_FRAME_US.store(us, std::sync::atomic::Ordering::Release); }
+pub(crate) fn stock_frame_us() -> u64 { STOCK_FRAME_US.load(std::sync::atomic::Ordering::Acquire) }
+/// Crystal frames covering the wall time of `stock` frames of `frame_us`, so
+/// a frame-counted Viewer timer keeps its stock period at FRAME (07d §6 S1 D):
+/// 3600 frames of 31.25 ms = 112.5 s = 5625 frames of 20 ms.
+pub(crate) const fn frames_for(frame_us: u64, stock: u32) -> u32 {
+    (frame_us * stock as u64 / FRAME.as_micros() as u64) as u32
 }
+/// [`frames_for`] the installed Viewer.
+pub(crate) fn stock_frames(stock: u32) -> u32 { frames_for(stock_frame_us(), stock) }
 /// The Viewer's mail timers (pending limit, retry wait): 3600 stock frames.
-pub(crate) const MAIL_FRAMES: u32 = stock_frames(3600);
-const MAIL_PERIOD: Duration = Duration::from_micros(STOCK_FRAME_US * 3600);
+pub(crate) fn mail_frames() -> u32 { stock_frames(3600) }
+fn mail_period() -> Duration { Duration::from_micros(stock_frame_us() * 3600) }
 /// Slot 1107: nonzero when a native error is worth retrying.
 const RETRYABLE: usize = 1107;
 /// Slot 337: the core's request cancel (199 and 328 call the same code).
@@ -42,6 +52,10 @@ pub(crate) const TIMED_OUT: i32 = -2046;
 pub(crate) const ABORTED: i32 = -1025;
 const SLOTS_FULL: i32 = -256;
 const MAX_RETRIES: u32 = 3;
+
+/// A request the Viewer treats as done: a result (> 0), or -261 (completed
+/// without one).
+pub(crate) fn succeeded(code: i32) -> bool { code > 0 || code == -261 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Policy {
@@ -60,13 +74,13 @@ impl Policy {
         match self {
             Policy::Login => None,
             Policy::Normal => Some(Duration::from_secs(60)),
-            Policy::Mail => Some(MAIL_PERIOD),
+            Policy::Mail => Some(mail_period()),
         }
     }
     fn backoff(self) -> Duration {
         match self {
             Policy::Login | Policy::Normal => Duration::from_secs(30),
-            Policy::Mail => MAIL_PERIOD,
+            Policy::Mail => mail_period(),
         }
     }
 }
@@ -158,20 +172,22 @@ pub(crate) struct Request<'a> {
 /// Returns the native completion (> 0), -261 (completed without a result, as
 /// the Viewer treats it), or the final native error / `TIMED_OUT` / `ABORTED`.
 pub(crate) fn run(api: &Api, request: Request<'_>, frame: &mut dyn FnMut() -> bool) -> i32 {
-    run_all(api, &mut [request], frame, &mut |_, _| {})[0]
+    run_all(api, &mut [request], frame)[0]
 }
 
 /// Queue related Viewer jobs together. Every job gets one state step per
 /// frame, its own timeout and retries, and its own completion notification.
 /// A slow or failed job cannot delay starting or completing another one.
-pub(crate) fn run_all(
-    api: &Api,
-    requests: &mut [Request<'_>],
-    frame: &mut dyn FnMut() -> bool,
-    completed: &mut dyn FnMut(usize, i32),
-) -> Vec<i32> {
+pub(crate) fn run_all(api: &Api, requests: &mut [Request<'_>], frame: &mut dyn FnMut() -> bool) -> Vec<i32> {
     run_all_with(requests, frame, &mut |slot, argument| api.one(slot, argument),
-        &mut || api.zero(838) == 3, Instant::now, completed)
+        &mut || may_start(api), Instant::now, &mut |_, _| {})
+}
+
+/// A new request may start: a signed-in member (838 == 3, app 1001cf90) and an
+/// owner that is not stopping. A Viewer that is closing or cancelled sends no
+/// new request just to cancel it with 337 (and its 10 s request freeze).
+fn may_start(api: &Api) -> bool {
+    api.zero(838) == 3 && !crate::native_auth::owner_stopping(api)
 }
 
 #[derive(Clone, Copy)]
@@ -196,7 +212,7 @@ impl Job {
     pub(crate) fn advance(&mut self, api: &Api, request: &mut Request<'_>) -> Option<i32> {
         if matches!(self.state, State::Done(_)) { return None; }
         self.step(request, &mut |slot, argument| api.one(slot, argument),
-            &mut || api.zero(838) == 3, Instant::now());
+            &mut || may_start(api), Instant::now());
         self.done()
     }
 
@@ -206,7 +222,10 @@ impl Job {
 
     /// The Viewer job destructor/replacement cancels only its pending ticket.
     pub(crate) fn cancel(&mut self, api: &Api) {
-        if let State::Poll { ticket, .. } = self.state { api.one(CANCEL, ticket as usize); }
+        self.cancel_with(&mut |slot, argument| api.one(slot, argument));
+    }
+    fn cancel_with(&mut self, call: &mut dyn FnMut(usize, usize) -> i32) {
+        if let State::Poll { ticket, .. } = self.state { call(CANCEL, ticket as usize); }
         self.state = State::Done(ABORTED);
         self.done();
     }
@@ -235,24 +254,24 @@ impl Job {
         &mut self,
         request: &mut Request<'_>,
         call: &mut dyn FnMut(usize, usize) -> i32,
-        signed_in: &mut dyn FnMut() -> bool,
+        may_start: &mut dyn FnMut() -> bool,
         now: Instant,
     ) {
         match self.state {
-            State::Start if !signed_in() => self.state = State::Done(ABORTED),
-            State::Start => match {
+            State::Start if !may_start() => self.state = State::Done(ABORTED),
+            State::Start => {
                 self.log.get_or_insert_with(|| RequestLog::start(request.name)).attempts += 1;
-                (request.start)()
-            } {
-                ticket if ticket >= 0 => self.state = State::Poll { ticket, since: now },
-                SLOTS_FULL => {}, // allocation failed: try next frame without a retry
-                code @ (-261 | -263) => self.state = State::Done(code),
-                error => self.retry(request.policy, error, now),
-            },
+                match (request.start)() {
+                    ticket if ticket >= 0 => self.state = State::Poll { ticket, since: now },
+                    SLOTS_FULL => {}, // allocation failed: try next frame without a retry
+                    code @ (-261 | -263) => self.state = State::Done(code),
+                    error => self.retry(request.policy, error, now),
+                }
+            }
             State::Poll { ticket, since } => {
                 if let Some(log) = self.log.as_mut() { log.polls += 1; }
                 let result = call(request.poll, ticket as usize);
-                if result > 0 || result == -261 {
+                if succeeded(result) {
                     self.state = State::Done(result);
                 } else if result < 0 {
                     // A failed native poll has already released its ticket.
@@ -287,7 +306,7 @@ fn run_all_with(
     requests: &mut [Request<'_>],
     frame: &mut dyn FnMut() -> bool,
     call: &mut dyn FnMut(usize, usize) -> i32,
-    signed_in: &mut dyn FnMut() -> bool,
+    may_start: &mut dyn FnMut() -> bool,
     mut now: impl FnMut() -> Instant,
     completed: &mut dyn FnMut(usize, i32),
 ) -> Vec<i32> {
@@ -295,16 +314,14 @@ fn run_all_with(
     loop {
         for (index, (job, request)) in jobs.iter_mut().zip(requests.iter_mut()).enumerate() {
             if matches!(job.state, State::Done(_)) { continue; }
-            job.step(request, call, signed_in, now());
+            job.step(request, call, may_start, now());
             if let Some(code) = job.done() { completed(index, code); }
         }
         if jobs.iter().all(|job| matches!(job.state, State::Done(_))) { break; }
         if !frame() {
             for (index, job) in jobs.iter_mut().enumerate() {
                 if matches!(job.state, State::Done(_)) { continue; }
-                if let State::Poll { ticket, .. } = job.state { call(CANCEL, ticket as usize); }
-                job.state = State::Done(ABORTED);
-                job.done();
+                job.cancel_with(call);
                 completed(index, ABORTED);
             }
             break;
@@ -358,6 +375,20 @@ mod tests {
         let f = fake(&[3], &[-5326], false);
         assert_eq!(drive(&f, Policy::Normal, None), -5326);
         assert!(f.borrow().cancels.is_empty());
+    }
+
+    #[test]
+    fn a_stopping_owner_starts_no_request_and_cancels_nothing() {
+        let started = Cell::new(0);
+        let mut start = || { started.set(started.get() + 1); 7 };
+        let mut cancels = Vec::new();
+        let results = run_all_with(&mut [Request { name: "test", start: &mut start, poll: 377, policy: Policy::Normal }],
+            &mut || panic!("no frame runs once every job is done"),
+            &mut |slot, ticket| { if slot == CANCEL { cancels.push(ticket); } 0 },
+            &mut || false, Instant::now, &mut |_, _| {});
+        assert_eq!(results, [ABORTED]);
+        assert_eq!(started.get(), 0, "no 376 is sent only to be cancelled");
+        assert!(cancels.is_empty(), "no 337 and no request freeze");
     }
 
     #[test]
@@ -459,11 +490,20 @@ mod tests {
     }
 
     /// 07d §6 S1 D: the Viewer's 3600-frame mail timers keep their cold stock
+    /// The 1.18.15f Viewer's ~17 ms frame: its 3600-frame timers last about
+    /// 61 s, which Crystal's 20 ms frames cover with 3060 frames.
+    #[test]
+    fn the_installed_viewers_frame_sets_the_frame_counted_timers() {
+        assert_eq!(frames_for(LEGACY_STOCK_FRAME_US, 3600), 5625);
+        assert_eq!(frames_for(FAST_STOCK_FRAME_US, 3600), 3060);
+        assert_eq!(FRAME * frames_for(FAST_STOCK_FRAME_US, 3600), Duration::from_millis(61_200));
+    }
+
     /// wall time (3600 × 31.25 ms = 112.5 s), not 3600 × 20 ms = 72 s.
     #[test]
     fn mail_policy_cancels_and_retries_at_the_stock_cold_period() {
-        assert_eq!((MAIL_PERIOD, MAIL_FRAMES, stock_frames(3600)), (Duration::from_millis(112_500), 5625, 5625));
-        assert_eq!(FRAME * MAIL_FRAMES, MAIL_PERIOD);
+        assert_eq!((mail_period(), mail_frames(), stock_frames(3600)), (Duration::from_millis(112_500), 5625, 5625));
+        assert_eq!(FRAME * mail_frames(), mail_period());
         let start = Instant::now();
         let clock = Cell::new(start);
         let starts = RefCell::new(Vec::new());
@@ -484,7 +524,7 @@ mod tests {
         assert_eq!(starts.len(), 4, "the first attempt and three retries");
         // Each retry waits more than 112.5 s after its timeout.
         for (cancel, restart) in cancels.iter().zip(&starts[1..]) {
-            assert!(*restart - *cancel > MAIL_PERIOD && *restart - *cancel <= MAIL_PERIOD + Duration::from_secs(1), "{cancel:?} → {restart:?}");
+            assert!(*restart - *cancel > mail_period() && *restart - *cancel <= mail_period() + Duration::from_secs(1), "{cancel:?} → {restart:?}");
         }
     }
 

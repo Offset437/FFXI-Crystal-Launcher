@@ -1,0 +1,348 @@
+// The view model the title bar, Home and the account sheet draw from. src/slint_host/view.rs
+// fills it from the core (`App`) after every batch of messages, setting only what changed, and
+// turns its callbacks into core messages. Colours are named (`Ink`), never passed from Rust, so
+// a theme switch recolours everything without a sync.
+import { Theme } from "theme.slint";
+
+/// A named palette colour.
+export enum Ink { ink, sub, faint, accent, ok, info, warn, danger, play-text, ok-tone, warn-tone, danger-tone }
+
+/// The words that change only with the language.
+export struct Strings {
+    home: string,
+    friends: string,
+    downloads: string,
+    settings: string,
+    privacy: string,
+    privacy-on-tip: string,
+    privacy-off-tip: string,
+    light-theme: string,
+    dark-theme: string,
+    greeting: string,
+    news: string,
+    refresh-news: string,
+    view-all-news: string,
+    more-news: string,
+    accounts: string,
+    shut-down-all: string,
+    play-all: string,
+    import: string,
+    add-account: string,
+    no-accounts: string,
+    no-accounts-body: string,
+    code: string,
+    sign-in: string,
+    look-up: string,
+    open-website: string,
+    wiki-title: string,
+    wiki-placeholder: string,
+    find-item: string,
+    install-repair: string,
+    help-support: string,
+    launch-with: string,
+    character-select: string,
+}
+
+/// One news card.
+export struct NewsCard {
+    title: string,
+    teaser: string,
+    kind: string,
+    kind-ink: Ink,
+    date: string,
+    image: image,
+    has-image: bool,
+    /// A maintenance notice (wrench placeholder) rather than an article (feed placeholder).
+    notice: bool,
+}
+
+/// One account row.
+export struct AccountLine {
+    name: string,
+    checked: bool,
+    editing: bool,
+    name-enabled: bool,
+    ink: Ink,
+    label: string,
+    detail: string,
+    /// The update's progress 0..1, or -1 for none.
+    progress: float,
+    percent: string,
+    working: bool,
+    otp: bool,
+    otp-text: string,
+    action: string,
+    action-soft: bool,
+    action-enabled: bool,
+    /// This row is being dragged to a new place.
+    dragging: bool,
+}
+
+/// The footer play bar.
+export struct Footer {
+    status: string,
+    detail: string,
+    /// 0 ready (check), 1 attention, 2 busy, 3 unchecked (question mark).
+    badge: int,
+    shutdown: bool,
+    shutdown-busy: bool,
+    shutdown-enabled: bool,
+    shutdown-label: string,
+    picks: bool,
+    launch-current: int,
+    select-current: int,
+    play-label: string,
+    /// 0 triangle, 1 check, 2 busy, 3 download, 4 wrench, 5 alert.
+    play-glyph: int,
+    play-ink: Ink,
+    /// 0 the Play fill, 1 the attention fill, 2 tint, 3 the ok fill.
+    play-fill: int,
+    play-enabled: bool,
+    names: string,
+}
+
+/// The account sheet's words that change only with the language.
+export struct SheetStrings {
+    account: string,
+    launch: string,
+    status: string,
+    after-adding: string,
+    display-name: string,
+    display-placeholder: string,
+    private-note: string,
+    server: string,
+    server-placeholder: string,
+    show: string,
+    hide: string,
+    change: string,
+    se-id: string,
+    se-id-placeholder: string,
+    se-password: string,
+    password-placeholder: string,
+    pol-password-placeholder: string,
+    region: string,
+    region-note: string,
+    uses-otp: string,
+    handles: string,
+    handles-placeholder: string,
+    handles-note: string,
+    saved-note: string,
+    launch-with: string,
+    auto-login: string,
+    slot: string,
+    slot-note: string,
+    folder: string,
+    folder-placeholder: string,
+    folder-note: string,
+    active-note: string,
+    last-play: string,
+    view-log: string,
+    open-logs: string,
+    sign-out: string,
+    sign-in-now: string,
+    delete: string,
+    cancel: string,
+    edit-profiles: string,
+    close: string,
+}
+
+/// The account sheet's state.
+export struct Sheet {
+    editing: bool,
+    caption: string,
+    title: string,
+    retail: bool,
+    active: bool,
+    label-masked: bool,
+    id-label: string,
+    id-placeholder: string,
+    id-masked: bool,
+    id-button: string,
+    password-label: string,
+    password-masked: bool,
+    password-enabled: bool,
+    password-button: string,
+    se-id-masked: bool,
+    handles-masked: bool,
+    region: int,
+    uses-otp: bool,
+    launch-index: int,
+    launch-hint: string,
+    /// 0 no tool field, 1 Ashita boot config, 2 Windower profile.
+    tool: int,
+    tool-label: string,
+    tool-current: int,
+    tool-note: string,
+    edit-profiles-enabled: bool,
+    auto-login: bool,
+    slot: int,
+    folder-masked: bool,
+    folder-enabled: bool,
+    browse-enabled: bool,
+    has-status: bool,
+    status-ink: Ink,
+    status-label: string,
+    status-detail: string,
+    sign-out-enabled: bool,
+    timing: string,
+    has-log: bool,
+    log-enabled: bool,
+    after-adding: bool,
+    sign-in-now: bool,
+    sign-in-now-enabled: bool,
+    sign-in-note: string,
+    app-status: string,
+    delete-enabled: bool,
+    save-label: string,
+    save-enabled: bool,
+}
+
+export global View {
+    // ---- shell ----
+    in property <Strings> strings;
+    /// 0 Home, 1 Friends, 2 Downloads, 3 Settings.
+    in property <int> page;
+    /// The window is narrower than 1180 px: the title bar's buttons show glyphs only.
+    in property <bool> compact;
+    in property <bool> privacy;
+    callback navigate(int);
+    callback toggle-privacy();
+    callback toggle-theme();
+
+    // ---- hero ----
+    in property <string> signed-in;
+    in property <bool> any-signed-in;
+    /// Japanese keeps the interface face upright (Source Serif has no Japanese).
+    in property <bool> serif-greeting: true;
+
+    // ---- Windows components banner ----
+    in property <bool> banner;
+    in property <string> banner-lead;
+    in property <string> banner-rest;
+    in property <string> banner-action;
+    in property <bool> banner-restart;
+    callback banner-clicked();
+
+    // ---- news ----
+    in property <string> news-note;
+    in property <[string]> news-tabs;
+    in property <int> news-tab;
+    in property <[NewsCard]> news;
+    in property <int> news-cols: 4;
+    /// One card's width, from the window width.
+    in property <length> news-card-w: 300px;
+    in property <bool> news-thumbs: true;
+    in property <bool> news-more;
+    /// 0 cards, 1 loading, 2 unavailable, 3 nothing in this tab.
+    in property <int> news-state;
+    in property <string> news-empty-title;
+    in property <string> news-empty-body;
+    callback news-picked(int);
+    callback refresh-news();
+    callback view-all-news();
+    callback open-news(int);
+
+    // ---- accounts ----
+    in property <string> accounts-note;
+    in property <bool> show-shut-down-all;
+    in property <bool> show-play-all;
+    in property <bool> can-add;
+    in property <[AccountLine]> accounts;
+    in property <bool> wide: true;
+    callback toggle-account(int, bool);
+    callback edit-account(int);
+    callback otp-edited(int, string);
+    callback row-action(int);
+    callback shut-down-all();
+    callback play-all();
+    callback import-accounts();
+    callback add-account();
+
+    // ---- look up ----
+    in-out property <string> wiki-query;
+    in-out property <string> ah-query;
+    in property <[string]> ah-servers;
+    in property <int> ah-server;
+    callback wiki-edited(string);
+    callback wiki-search();
+    callback ah-edited(string);
+    callback ah-search();
+    callback ah-server-picked(int);
+    callback open-wiki();
+    callback open-ffxiah();
+
+    // ---- footer ----
+    in property <Footer> footer;
+    in property <[string]> launch-items;
+    in property <[string]> select-items;
+    in property <string> mixed;
+    in property <bool> show-names;
+    callback toggle-details();
+    callback install-repair();
+    callback help-support();
+    callback launch-picked(int);
+    callback select-picked(int);
+    callback shut-down-selected();
+    callback main-action();
+
+    // ---- account order ----
+    /// A row is being dragged (app.account_drag).
+    in property <bool> dragging;
+    /// The pointer's window y while a row is dragged (the grip holds the pointer, so the rows
+    /// see no hover of their own).
+    in-out property <length> drag-y;
+    /// A row's grip was pressed / the dragged pointer is over a row.
+    callback drag-start(int);
+    callback drag-over(int);
+
+    // ---- account sheet ----
+    in property <bool> sheet-open;
+    in property <SheetStrings> sheet-strings;
+    in property <Sheet> sheet;
+    in property <[string]> regions;
+    in property <[string]> launch-choices;
+    in property <[string]> tool-items;
+    in property <[string]> slot-items;
+    in-out property <string> sheet-label;
+    in-out property <string> sheet-server;
+    in-out property <string> sheet-pol-id;
+    in-out property <string> sheet-pol-password;
+    in-out property <string> sheet-se-id;
+    in-out property <string> sheet-se-password;
+    in-out property <string> sheet-handles;
+    in-out property <string> sheet-folder;
+    callback close-sheet();
+    callback save-sheet();
+    /// A field changed: 0 label, 1 server, 2 PlayOnline ID, 3 password, 4 Square Enix ID,
+    /// 5 Square Enix password, 6 handle names (crate::Field's order).
+    callback sheet-edited(int, string);
+    callback sheet-folder-edited(string);
+    callback sheet-region(int);
+    callback sheet-launch(int);
+    /// crate::EditorFlag's order: uses OTP, sign in now, show ID, show password, change password.
+    callback sheet-flag(int, bool);
+    callback sheet-auto-login(bool);
+    callback sheet-slot(int);
+    callback sheet-tool(int);
+    callback edit-profiles();
+    callback browse-folder();
+    callback sign-out();
+    callback view-log();
+    callback open-logs();
+    callback delete-account();
+
+    public pure function tone(which: Ink) -> color {
+        which == Ink.ink ? Theme.ink
+            : which == Ink.sub ? Theme.sub
+            : which == Ink.faint ? Theme.faint
+            : which == Ink.accent ? Theme.accent
+            : which == Ink.ok ? Theme.ok
+            : which == Ink.info ? Theme.info
+            : which == Ink.warn ? Theme.warn
+            : which == Ink.danger ? Theme.danger
+            : which == Ink.ok-tone ? Theme.ok-tone
+            : which == Ink.warn-tone ? Theme.warn-tone
+            : which == Ink.danger-tone ? Theme.danger-tone
+            : Theme.play-text
+    }
+}

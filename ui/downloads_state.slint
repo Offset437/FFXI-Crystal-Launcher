@@ -1,0 +1,262 @@
+// The Downloads page's view model, the launcher settings dialog, the launcher-update strip (self_update::banner) and the Settings → System
+// cards this screen owns (self_update::view, prereqs::view). src/slint_host/downloads.rs fills it
+// from the core after every batch of messages, setting only what changed, and turns its callbacks
+// into core messages. Every string comes from Rust.
+import { Ink } from "state.slint";
+import { Glyph } from "widgets.slint";
+
+/// The words that change only with the language.
+export struct DlStrings {
+    title: string,
+    description: string,
+    installation: string,
+    game-folder: string,
+    change-in-settings: string,
+    confirmed: string,
+    confirm-first: string,
+    ffxi: string,
+    playonline: string,
+    installed-version: string,
+    latest-version: string,
+    version-status: string,
+    troubleshooting: string,
+    check-files: string,
+    repair-files: string,
+    close-clients: string,
+    close-games: string,
+    activity: string,
+    overall-update: string,
+    no-operation: string,
+    last-result: string,
+    working: string,
+    official-step: string,
+    installer-folder: string,
+    installer-placeholder: string,
+    browse: string,
+    install-title: string,
+    step1-title: string,
+    step1-body: string,
+    download: string,
+    step2-title: string,
+    extract: string,
+    step3-title: string,
+    step3-body: string,
+    run-setup: string,
+    installer-files: string,
+    parts: string,
+    installer-note: string,
+    // ---- the launcher settings dialog ----
+    settings-title: string,
+    settings-subtitle: string,
+    install-label: string,
+    install-placeholder: string,
+    install-repair: string,
+    install-repair-body: string,
+    open-downloads: string,
+    close: string,
+    save-settings: string,
+    // ---- Settings → System: launcher updates ----
+    launcher-updates: string,
+    version: string,
+    auto-check: string,
+    auto-check-note: string,
+}
+
+/// The Installation card.
+export struct DlInstall {
+    folder: string,
+    /// A path (monospaced) rather than "Not selected".
+    folder-mono: bool,
+    confirmed: bool,
+    installed: string,
+    installed-mono: bool,
+    latest: string,
+    latest-mono: bool,
+    state-glyph: Glyph,
+    state-ink: Ink,
+    state-text: string,
+    patch-detail: string,
+    viewer-folder: string,
+    viewer-installed: string,
+    viewer-installed-mono: bool,
+    viewer-latest: string,
+    viewer-latest-mono: bool,
+    viewer-state-glyph: Glyph,
+    viewer-state-ink: Ink,
+    viewer-state: string,
+    viewer-detail: string,
+    viewer-error: string,
+    troubleshooting-open: bool,
+    can-check: bool,
+    can-repair: bool,
+    close-clients: bool,
+}
+
+/// The Activity card: the running operation, then the last result.
+export struct DlActivity {
+    running: bool,
+    cancellable: bool,
+    cancel-label: string,
+    cancel-enabled: bool,
+    has-overall: bool,
+    overall-fraction: float,
+    overall-line: string,
+    /// The overall percent is known (semibold ink), else the muted "Calculating…".
+    overall-known: bool,
+    estimate: string,
+    step: string,
+    kind: string,
+    /// The step has a total: its bar, detail and amount; else "Working…".
+    has-total: bool,
+    fraction: float,
+    detail: string,
+    amount: string,
+    remaining: string,
+    official-note: bool,
+    result: string,
+    result-glyph: Glyph,
+    result-ink: Ink,
+    status: string,
+}
+
+/// The official installer card.
+export struct DlInstaller {
+    editable: bool,
+    browse-enabled: bool,
+    error: string,
+    can-install: bool,
+    can-setup: bool,
+    show-parts: bool,
+}
+
+/// One installer volume's line.
+export struct DlPart {
+    name: string,
+    state: string,
+    fraction: float,
+    done: bool,
+}
+
+/// The launcher settings dialog.
+export struct DlSettings {
+    find-label: string,
+    find-enabled: bool,
+    browse-enabled: bool,
+    editable: bool,
+    confirmed: bool,
+    status: string,
+}
+
+/// A status line with an optional button ("" for none).
+export struct UpdateLine {
+    text: string,
+    action: string,
+}
+
+/// A Windows components card button.
+export struct PrereqButton {
+    show: bool,
+    label: string,
+    glyph: Glyph,
+    emphasis: bool,
+    enabled: bool,
+}
+
+/// The Windows components header card. Tones are sub, ok-tone, warn-tone, accent, danger-tone.
+export struct PrereqSummary {
+    title: string,
+    glyph: Glyph,
+    tone: Ink,
+    summary: string,
+    when: string,
+    intro: string,
+    check-again: PrereqButton,
+}
+
+/// One component's card (prereqs::component_card).
+export struct PrereqCard {
+    name: string,
+    why: string,
+    badge-glyph: Glyph,
+    tone: Ink,
+    chip: string,
+    version: string,
+    evidence: string,
+    button: PrereqButton,
+    confirm: bool,
+    heading: string,
+    /// The plan's steps, one bullet per line.
+    steps: string,
+    will-run: string,
+    command: string,
+    permission: string,
+    dismiss: PrereqButton,
+    install: PrereqButton,
+    running: bool,
+    progress-head: string,
+    progress-detail: string,
+    /// Known progress 0..1, or -1 for the full faint bar.
+    progress: float,
+    cancel: PrereqButton,
+    has-result: bool,
+    result-glyph: Glyph,
+    result-tone: Ink,
+    result: string,
+    manual: bool,
+    manual-open: bool,
+    manual-toggle: string,
+    /// The manual route's numbered steps, one per line.
+    manual-steps: string,
+    open-features: PrereqButton,
+}
+
+export global Downloads {
+    in property <DlStrings> strings;
+    /// Wide enough for the side column (the window is 1150 px or wider).
+    in property <bool> wide: true;
+    in property <DlInstall> install;
+    in property <DlActivity> activity;
+    in property <DlInstaller> installer;
+    in property <[DlPart]> parts;
+    in-out property <string> installer-path;
+    callback change-in-settings();
+    callback toggle-troubleshooting();
+    callback check-files();
+    callback repair-files();
+    callback cancel();
+    callback installer-edited(string);
+    callback installer-accepted();
+    callback browse-installer();
+    callback download();
+    callback extract();
+    callback run-setup();
+
+    // ---- the launcher settings dialog ----
+    in property <bool> settings-open;
+    in property <DlSettings> settings;
+    in-out property <string> install-path;
+    callback close-settings();
+    callback install-edited(string);
+    callback install-accepted();
+    callback find-game();
+    callback browse-game();
+    callback open-downloads();
+    callback save-settings();
+
+    // ---- launcher updates: the strip under the title bar, the Settings → System card ----
+    in property <bool> update-banner;
+    in property <UpdateLine> update-strip;
+    in property <UpdateLine> update-card;
+    in property <bool> auto-check;
+    callback update-strip-clicked();
+    callback update-card-clicked();
+    callback auto-check-toggled(bool);
+
+    // ---- Windows components (Settings → System) ----
+    in property <PrereqSummary> prereq-summary;
+    in property <[PrereqCard]> prereq-cards;
+    callback prereq-check-again();
+    /// A card's control: 0 its button, 1 Not now, 2 install, 3 Cancel, 4 the manual toggle,
+    /// 5 Open Windows Features.
+    callback prereq-act(int, int);
+}

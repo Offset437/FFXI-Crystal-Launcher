@@ -1,12 +1,11 @@
 //! Shared PlayOnline credential codecs, record formats, and protocol fixtures.
-//! The retained Rust sign-in driver supports comparisons; Crystal's retail
-//! launches authenticate through the installed native POL core instead.
+//! Crystal's retail launches authenticate through the installed native POL
+//! core; nothing here opens a connection.
 
 #[allow(dead_code)]
 mod assembly;
 pub mod catalog;
 pub mod friends;
-mod friend_presence;
 pub mod chat;
 pub mod chat_transport;
 pub mod credential;
@@ -14,15 +13,20 @@ pub mod credential;
 mod crypto;
 pub mod entropy;
 pub mod identity;
-pub mod keepalive;
-pub mod loader;
 pub mod lobby_selection;
 pub mod pol_records;
 pub mod profile;
-pub mod retail;
 pub mod rsa;
 pub mod session;
 pub mod transport;
+
+// The launcher <-> loader wire contract, shared with crystal-loader source.
+#[path = "../../../crystal-loader/src/b64.rs"]
+#[allow(dead_code)]
+mod b64;
+#[path = "../../../crystal-loader/src/wire.rs"]
+#[allow(dead_code)]
+mod wire;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {

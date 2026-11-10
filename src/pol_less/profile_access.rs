@@ -22,6 +22,14 @@ pub(super) fn retain_observer(observer: JoinHandle<()>) {
     LAUNCH_OBSERVERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(observer);
 }
 
+/// Guards kept for the rest of the worker's session: a Windower.exe that relaunched
+/// itself and could not be verified may still save settings.xml at any time.
+static SESSION_GUARDS: Mutex<Vec<Guard>> = Mutex::new(Vec::new());
+
+pub(super) fn hold_for_session(guard: Guard) {
+    SESSION_GUARDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(guard);
+}
+
 /// Call after the worker's last session ends and before process::exit. Never
 /// terminate a launcher during this wait: it may be writing settings.xml.
 pub(crate) fn finish_pending_launchers() {
@@ -29,6 +37,7 @@ pub(crate) fn finish_pending_launchers() {
     for observer in observers {
         let _ = observer.join();
     }
+    SESSION_GUARDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
 }
 
 pub(crate) struct Guard {
@@ -61,7 +70,6 @@ fn lock_path(root: &Path, folder: &Path) -> Result<PathBuf, String> {
     Ok(root.join("locks").join(format!("windower-profile-{hash}.lock")))
 }
 
-#[cfg(windows)]
 fn open(path: &Path, access: Access) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
@@ -70,11 +78,6 @@ fn open(path: &Path, access: Access) -> io::Result<File> {
     OpenOptions::new().read(true).write(true).create(true).truncate(false)
         .share_mode(match access { Access::Launch => FILE_SHARE_READ | FILE_SHARE_WRITE, Access::Edit => 0 })
         .open(path)
-}
-
-#[cfg(not(windows))]
-fn open(_path: &Path, _access: Access) -> io::Result<File> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "Windower profile access requires Windows"))
 }
 
 fn acquire(root: &Path, folder: &Path, access: Access, timeout: Duration, progress: &mut dyn FnMut(&str)) -> Result<Guard, String> {
@@ -107,7 +110,13 @@ fn acquire(root: &Path, folder: &Path, access: Access, timeout: Duration, progre
     }
 }
 
-#[cfg(all(test, windows))]
+/// A launch guard under a test's own data root.
+#[cfg(test)]
+pub(super) fn launching_at(root: &Path, folder: &Path) -> Result<Guard, String> {
+    acquire(root, folder, Access::Launch, Duration::ZERO, &mut |_| {})
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

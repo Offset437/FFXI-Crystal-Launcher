@@ -1,4 +1,4 @@
-//! Window shutdown owns cleanup independently of iced's executor. Start it
+//! Window shutdown owns cleanup independently of the UI event loop. Start it
 //! before destroying the last window, then join it after the UI runtime ends.
 
 use std::{io, sync::Mutex, thread::{self, JoinHandle}};
@@ -33,12 +33,12 @@ impl Coordinator {
 static CLOSE: Coordinator = Coordinator::new();
 
 /// Returns as soon as the cleanup thread is owned; closing the window does not
-/// depend on that thread or on an iced task being polled.
+/// depend on that thread or on a UI task being polled.
 pub(crate) fn start(cleanup: impl FnOnce() -> CloseResult + Send + 'static) -> io::Result<()> {
     CLOSE.start(cleanup)
 }
 
-/// Called after iced returns, keeping this process alive through graceful
+/// Called after the event loop returns, keeping this process alive through graceful
 /// native sign-out and the session workers' final Windower profile saves.
 pub(crate) fn finish() -> CloseResult { CLOSE.finish() }
 

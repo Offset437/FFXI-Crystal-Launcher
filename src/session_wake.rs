@@ -5,18 +5,15 @@ use super::Identity;
 use std::io;
 
 pub(crate) struct CommandWake {
-    #[cfg(windows)]
     handle: std::os::windows::io::OwnedHandle,
 }
 
-#[cfg(windows)]
 fn name(worker: Identity) -> Vec<u16> {
-    format!("Local\\Crystal-command-{}-{:016x}", worker.pid, worker.created)
-        .encode_utf16().chain(Some(0)).collect()
+    crate::win::wide(&format!("Local\\Crystal-command-{}-{:016x}", worker.pid, worker.created))
 }
 
 impl CommandWake {
-    #[cfg(all(test, windows))]
+    #[cfg(test)]
     pub(crate) fn test_listener() -> (Self, impl Fn() + Send + 'static) {
         let worker = Identity { pid: std::process::id(), created: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64 };
@@ -24,13 +21,9 @@ impl CommandWake {
     }
 
     pub(super) fn listen(worker: Identity) -> io::Result<Self> {
-        #[cfg(windows)]
-        { Self::listen_named(&name(worker)) }
-        #[cfg(not(windows))]
-        { let _ = worker; Err(io::ErrorKind::Unsupported.into()) }
+        Self::listen_named(&name(worker))
     }
 
-    #[cfg(windows)]
     fn listen_named(name: &[u16]) -> io::Result<Self> {
         use std::os::windows::io::FromRawHandle;
         use windows_sys::Win32::System::Threading::CreateEventW;
@@ -40,7 +33,6 @@ impl CommandWake {
         Ok(Self { handle: unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle as _) } })
     }
 
-    #[cfg(windows)]
     pub(crate) fn raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
         use std::os::windows::io::AsRawHandle;
         self.handle.as_raw_handle() as _
@@ -48,13 +40,9 @@ impl CommandWake {
 }
 
 pub(super) fn signal(worker: Identity) {
-    #[cfg(windows)]
     signal_named(&name(worker));
-    #[cfg(not(windows))]
-    let _ = worker;
 }
 
-#[cfg(windows)]
 fn signal_named(name: &[u16]) {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
@@ -65,7 +53,7 @@ fn signal_named(name: &[u16]) {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use windows_sys::Win32::{Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT}, System::Threading::WaitForSingleObject};

@@ -7,12 +7,7 @@
 //! RVAs; nothing here dereferences game memory in Rust, writes, hooks or calls
 //! game code. Callers decide what a resolved value may be used for.
 
-use std::ffi::c_void;
-use windows_sys::Win32::System::{
-    Diagnostics::Debug::ReadProcessMemory,
-    LibraryLoader::{GetModuleHandleW, GetProcAddress},
-    Threading::GetCurrentProcess,
-};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
 pub(crate) const SCN_EXECUTE: u32 = 0x2000_0000;
 const HEADER_PAGE: usize = 0x1000;
@@ -116,6 +111,13 @@ pub(crate) fn scan(haystack: &[u8], patterns: &[Pattern]) -> Vec<Vec<usize>> {
     hits
 }
 
+/// `bytes[at..at + 4]` is the absolute address of RVA `rva` in a module
+/// loaded at `base` (a relocated operand, checked live).
+pub(crate) fn operand_at(base: usize, bytes: &[u8], at: usize, rva: usize) -> bool {
+    base.checked_add(rva).and_then(|v| u32::try_from(v).ok())
+        .is_some_and(|v| at.checked_add(4).and_then(|end| bytes.get(at..end)) == Some(&v.to_le_bytes()[..]))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Section {
     pub name: [u8; 8],
@@ -155,6 +157,8 @@ pub(crate) struct Headers {
     pub iat: (usize, usize),
     /// Debug directory (rva, size); its CodeView entry repeats the link stamp.
     pub debug: (usize, usize),
+    /// Import directory (rva, size): names for IAT slots, see [`Image::import_name`].
+    pub imports: (usize, usize),
     /// Index of `.text` in `sections`.
     pub text: usize,
 }
@@ -216,7 +220,7 @@ pub(crate) fn parse_headers(page: &[u8]) -> Result<Headers, &'static str> {
     }
     let text = sections.iter().position(|s| s.named(".text") && s.flags & SCN_EXECUTE != 0 && s.size > 0)
         .ok_or("no executable .text section")?;
-    Ok(Headers { timestamp, size, image_base, sections, iat: directory(12), debug: directory(6), text })
+    Ok(Headers { timestamp, size, image_base, sections, iat: directory(12), debug: directory(6), imports: directory(1), text })
 }
 
 /// The copied parts of one loaded module; byte `n` of a region is RVA
@@ -237,14 +241,7 @@ pub(crate) enum CaptureError {
     Invalid(&'static str),
 }
 
-fn read_live(at: usize, out: &mut [u8]) -> bool {
-    let mut done = 0;
-    // SAFETY: reads this process; Windows rejects unmapped or partial ranges.
-    unsafe {
-        ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out.as_mut_ptr().cast(), out.len(), &mut done) != 0
-            && done == out.len()
-    }
-}
+use crate::mem::read_into as read_live;
 
 /// Holding the loader lock excludes every DLL entry point, including the stub
 /// that unpacks and relocates FFXiMain's `.text` on attach. Try-only: this
@@ -268,8 +265,8 @@ impl LoaderLock {
             if ntdll.is_null() {
                 return None;
             }
-            let lock: Lock = std::mem::transmute(GetProcAddress(ntdll, b"LdrLockLoaderLock\0".as_ptr())?);
-            let unlock: Unlock = std::mem::transmute(GetProcAddress(ntdll, b"LdrUnlockLoaderLock\0".as_ptr())?);
+            let lock: Lock = std::mem::transmute(GetProcAddress(ntdll, c"LdrLockLoaderLock".as_ptr().cast())?);
+            let unlock: Unlock = std::mem::transmute(GetProcAddress(ntdll, c"LdrUnlockLoaderLock".as_ptr().cast())?);
             let (mut disposition, mut cookie) = (0u32, 0usize);
             (lock(TRY_ONLY, &mut disposition, &mut cookie) >= 0 && disposition == ACQUIRED)
                 .then_some(Self { unlock, cookie })
@@ -385,6 +382,15 @@ impl Image {
         self.relative(rva, 0xE8)
     }
 
+    /// Every direct `call rel32` in `.text` to `target`.
+    pub(crate) fn callers(&self, target: usize) -> Vec<usize> {
+        let (start, text) = self.text();
+        (0..text.len().saturating_sub(4))
+            .filter(|&at| text[at] == 0xE8 && self.call(start + at) == Some(target))
+            .map(|at| start + at)
+            .collect()
+    }
+
     /// Target of `jmp rel32` at `rva`.
     pub(crate) fn jump(&self, rva: usize) -> Option<usize> {
         self.relative(rva, 0xE9)
@@ -451,7 +457,50 @@ impl Image {
             }
         }
         (relocated, stale)
-    }}
+    }
+
+    /// The NUL-terminated string at `rva`, at most `max` bytes before the NUL.
+    fn c_str(&self, rva: usize, max: usize) -> Option<&[u8]> {
+        (1..=max + 1).find_map(|len| self.bytes(rva, len).filter(|b| b[len - 1] == 0).map(|b| &b[..len - 1]))
+    }
+
+    /// The (DLL, function) an IAT slot at `slot` imports by name, read from
+    /// the import directory's name table, which the loader never rewrites.
+    /// `None` for ordinal imports, slots outside every descriptor, or a
+    /// directory outside the copied sections.
+    pub(crate) fn import_name(&self, slot: usize) -> Option<(&[u8], &[u8])> {
+        let (directory, size) = self.headers.imports;
+        for index in 0..size / 20 {
+            let at = directory + index * 20;
+            let (names, dll, first) = (self.u32(at)?, self.u32(at + 12)?, self.u32(at + 16)?);
+            if dll == 0 || first == 0 {
+                break;
+            }
+            if names == 0 || slot < first || !(slot - first).is_multiple_of(4) {
+                continue;
+            }
+            let entry_index = (slot - first) / 4;
+            // The slot must lie before this descriptor's terminating entry.
+            if (0..=entry_index).any(|i| self.u32(names + i * 4) == Some(0)) {
+                continue;
+            }
+            let entry = self.u32(names + entry_index * 4)?;
+            if entry & 0x8000_0000 != 0 {
+                return None;
+            }
+            return Some((self.c_str(dll, 64)?, self.c_str(entry + 2, 128)?));
+        }
+        None
+    }
+
+    /// The absolute operand at `rva` is the IAT slot of `dll!function`.
+    pub(crate) fn imports(&self, rva: usize, dll: &str, function: &str) -> bool {
+        let Some(slot) = self.abs(rva) else { return false };
+        let (iat, len) = self.headers.iat;
+        slot >= iat && slot + 4 <= iat + len
+            && self.import_name(slot).is_some_and(|(d, f)| d.eq_ignore_ascii_case(dll.as_bytes()) && f == function.as_bytes())
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod tests {

@@ -1,0 +1,275 @@
+// The close confirmation and the import dialog: one
+// dialog frame over the dimmed window. The dim takes clicks without closing anything; while a dialog shows, only its controls
+// take the focus (the controller walker stops at the dim, Tab cycles inside the dialog).
+import { Theme } from "theme.slint";
+import { SettingsView } from "settings_state.slint";
+import { Glyph, Icon, Control, Tone, IconButton, Field, Select, Check, Rule, ScrollThumb, FormLabel } from "widgets.slint";
+
+/// The dim behind a dialog and the dialog's frame, centred; it fades in while focused.
+export component DialogFrame inherits Rectangle {
+    in property <length> dialog-width;
+    in property <length> dialog-height;
+    private property <bool> shown;
+    init => { root.shown = true; }
+    Rectangle {
+        background: Theme.scrim;
+        opacity: root.shown ? 1 : 0;
+        animate opacity { duration: Theme.calm; }
+    }
+    TouchArea { }
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: min(root.dialog-width, parent.width - 48px * Theme.scale);
+        height: min(root.dialog-height, parent.height - 48px * Theme.scale);
+        opacity: root.shown ? 1 : 0;
+        animate opacity { duration: Theme.calm; }
+        background: Theme.chrome;
+        border-width: 1px;
+        border-color: Theme.hairline;
+        border-radius: Theme.radius;
+        drop-shadow-offset-y: 16px;
+        drop-shadow-blur: 48px;
+        drop-shadow-color: Theme.light ? #00000029 : #00000080;
+        accessible-role: groupbox;
+        clip: true;
+        TouchArea { }
+        // Tab and Shift+Tab stay inside the dialog (the window's own Tab would reach the page).
+        FocusScope {
+            focus-on-click: false;
+            focus-on-tab-navigation: false;
+            key-pressed(event) => {
+                if event.text == Key.Tab && !event.modifiers.control && !event.modifiers.alt {
+                    SettingsView.dialog-tab(!event.modifiers.shift);
+                    return accept;
+                }
+                if event.text == Key.Backtab {
+                    SettingsView.dialog-tab(false);
+                    return accept;
+                }
+                return reject;
+            }
+            @children
+        }
+    }
+}
+
+/// "Close the launcher?" while account changes are still being saved.
+export component CloseDialog inherits DialogFrame {
+    private property <float> s: Theme.scale;
+    dialog-width: 500px * root.s;
+    dialog-height: layout.preferred-height;
+    // The safe choice takes the focus, so Return and the controller start inside the dialog.
+    init => { keep.focus(); }
+    layout := VerticalLayout {
+        HorizontalLayout {
+            padding-top: 24px * root.s;
+            padding-left: 24px * root.s;
+            padding-right: (24px - 10.5px) * root.s;
+            padding-bottom: 8px * root.s;
+            spacing: 16px * root.s;
+            // Centred on the title and body together.
+            Rectangle {
+                cross-axis-self-alignment: center;
+                width: 40px * root.s;
+                height: 40px * root.s;
+                border-radius: self.width / 2;
+                background: Theme.danger.with-alpha(0.14);
+                Icon { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; glyph: Glyph.alert-circle; size: 20px * root.s; tint: Theme.danger; }
+            }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 4px * root.s;
+                Text { text: SettingsView.strings.close-title; font-size: Theme.type-dialog * root.s; font-weight: 600; color: Theme.ink; wrap: word-wrap; }
+                Text { text: SettingsView.strings.close-body; font-size: Theme.type-small * root.s; color: Theme.sub; wrap: word-wrap; }
+            }
+        }
+        HorizontalLayout {
+            padding-top: 16px * root.s;
+            padding-left: 24px * root.s;
+            padding-right: 24px * root.s;
+            padding-bottom: 24px * root.s;
+            spacing: 8px * root.s;
+            Rectangle { horizontal-stretch: 1; }
+            keep := Control { scale: root.s; text: SettingsView.strings.close-keep; clicked => { SettingsView.close-keep(); } }
+            Control { scale: root.s; tone: Tone.danger; text: SettingsView.strings.close-now; clicked => { SettingsView.close-now(); } }
+        }
+    }
+}
+
+component SubText inherits Text {
+    font-size: Theme.type-small * Theme.scale;
+    color: Theme.sub;
+    wrap: word-wrap;
+}
+
+/// An account file's field and its Browse button.
+component FileField inherits HorizontalLayout {
+    in property <string> label;
+    in-out property <string> text;
+    callback edited(string);
+    callback browse();
+    spacing: 8px * Theme.scale;
+    Field {
+        height: Theme.control-h * Theme.scale;
+        pad-x: 11px * Theme.scale;
+        label: root.label;
+        placeholder: SettingsView.strings.import-file-placeholder;
+        text <=> root.text;
+        enabled: SettingsView.import.editable;
+        font-size: Theme.type-caption * Theme.scale;
+        edited(value) => { root.edited(value); }
+    }
+    Control {
+        scale: Theme.scale;
+        text: SettingsView.strings.browse;
+        glyph: Glyph.folder;
+        enabled: !SettingsView.import.busy;
+        clicked => { root.browse(); }
+    }
+}
+
+/// Import accounts from PlayOnline's member list or Forest.
+export component ImportDialog inherits DialogFrame {
+    private property <float> s: Theme.scale;
+    dialog-width: 680px * root.s;
+    dialog-height: 760px * root.s;
+    init => { close.focus(); }
+    VerticalLayout {
+        HorizontalLayout {
+            padding-top: 24px * root.s;
+            padding-left: 24px * root.s;
+            padding-right: (24px - 10.5px) * root.s;
+            padding-bottom: 20px * root.s;
+            spacing: 16px * root.s;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 4px * root.s;
+                Text { text: SettingsView.strings.import-title; font-size: Theme.type-title * root.s; font-weight: 600; color: Theme.ink; }
+                SubText { text: SettingsView.strings.import-sub; }
+            }
+            VerticalLayout {
+                alignment: start;
+                close := IconButton {
+                    side: Theme.control-h * root.s;
+                    glyph-size: 15px * root.s;
+                    label: SettingsView.strings.close;
+                    glyph: Glyph.close;
+                    clicked => { SettingsView.import-close(); }
+                }
+            }
+        }
+        Rule { }
+        Rectangle {
+            vertical-stretch: 1;
+            body := Flickable {
+                content-width: self.width;
+                content-height: form.preferred-height;
+                form := VerticalLayout {
+                    width: body.width;
+                    padding: 24px * root.s;
+                    spacing: 16px * root.s;
+                    alignment: start;
+                    SubText { text: SettingsView.strings.import-intro; font-size: Theme.type-body * root.s; }
+                    SubText { text: SettingsView.strings.import-note; font-size: Theme.type-caption * root.s; }
+                    if SettingsView.import.show-sources: VerticalLayout {
+                        spacing: 8px * root.s;
+                        FormLabel { scale: root.s; text: SettingsView.strings.import-detected; }
+                        Select {
+                            scale: root.s;
+                            label: SettingsView.strings.import-detected;
+                            items: SettingsView.import-sources;
+                            current: SettingsView.import.source-current;
+                            picked(index) => { SettingsView.import-source(index); }
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 8px * root.s;
+                        FormLabel { scale: root.s; text: SettingsView.strings.import-file; }
+                        FileField {
+                            label: SettingsView.strings.import-file;
+                            text <=> SettingsView.import-path;
+                            edited(value) => { SettingsView.import-path-edited(value); }
+                            browse => { SettingsView.import-browse(false); }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px * root.s;
+                        alignment: start;
+                        FormLabel { scale: root.s; text: SettingsView.strings.region; vertical-alignment: center; }
+                        for region[i] in SettingsView.regions: Control {
+                            scale: root.s;
+                            text: region;
+                            tone: i == SettingsView.import.region ? Tone.primary : Tone.secondary;
+                            enabled: !SettingsView.import.busy;
+                            clicked => { SettingsView.import-region(i); }
+                        }
+                    }
+                    Check {
+                        box: 18px * root.s;
+                        text: SettingsView.strings.import-companion;
+                        checked: SettingsView.import.use-companion;
+                        enabled: !SettingsView.import.busy;
+                        toggled(on) => { SettingsView.import-use-companion(on); }
+                    }
+                    if SettingsView.import.use-companion: VerticalLayout {
+                        spacing: 8px * root.s;
+                        FormLabel { scale: root.s; text: SettingsView.strings.import-companion-file; }
+                        FileField {
+                            label: SettingsView.strings.import-companion-file;
+                            text <=> SettingsView.import-companion;
+                            edited(value) => { SettingsView.import-companion-edited(value); }
+                            browse => { SettingsView.import-browse(true); }
+                        }
+                    }
+                    if SettingsView.import.error != "": SubText { text: SettingsView.import.error; }
+                    for warning in SettingsView.import-warnings: SubText { text: warning; font-size: Theme.type-caption * root.s; }
+                    if SettingsView.import.no-drafts: SubText { text: SettingsView.strings.import-empty; }
+                    for draft[i] in SettingsView.import-drafts: HorizontalLayout {
+                        spacing: 12px * root.s;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 6px * root.s;
+                            alignment: center;
+                            Text { text: draft.label; font-size: 15px * root.s; font-weight: 600; color: Theme.ink; wrap: word-wrap; }
+                            SubText { text: draft.detail; font-size: Theme.type-caption * root.s; }
+                            for note in draft.notes: SubText { text: note; font-size: Theme.type-caption * root.s; }
+                        }
+                        Control {
+                            cross-axis-self-alignment: center;
+                            scale: root.s;
+                            text: SettingsView.strings.import-review;
+                            enabled: !SettingsView.import.busy;
+                            clicked => { SettingsView.import-review(i); }
+                        }
+                    }
+                }
+            }
+            ScrollThumb {
+                x: parent.width - 8px;
+                height: parent.height;
+                content-y: body.content-y;
+                content-height: body.content-height;
+                visible-height: body.height;
+            }
+        }
+        Rule { }
+        HorizontalLayout {
+            padding-top: 16px * root.s;
+            padding-bottom: 16px * root.s;
+            padding-left: 24px * root.s;
+            padding-right: 24px * root.s;
+            spacing: 8px * root.s;
+            Rectangle { horizontal-stretch: 1; }
+            Control { scale: root.s; text: SettingsView.strings.close; clicked => { SettingsView.import-close(); } }
+            Control {
+                scale: root.s;
+                tone: Tone.primary;
+                glyph: Glyph.download;
+                text: SettingsView.import.read-label;
+                enabled: SettingsView.import.read-enabled;
+                clicked => { SettingsView.import-read(); }
+            }
+        }
+    }
+}

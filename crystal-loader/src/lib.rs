@@ -8,8 +8,14 @@
 
 pub mod args;
 mod auto_login;
+mod boot_timing;
+mod controller_catalog;
 mod controller_settings;
+mod feature_check;
+mod game_modules;
+mod game_shutdown;
 pub mod b64;
+pub mod wire;
 pub mod events;
 pub mod ffxi_settings;
 mod friend_locations;
@@ -19,9 +25,11 @@ pub mod json;
 pub mod lobby;
 pub mod native_auth;
 mod native_jobs;
+mod native_handles;
 mod native_profile;
 mod native_social;
 mod park;
+mod pol_core;
 mod start_gate;
 #[cfg(any(test, feature = "native-backup-diagnostics"))]
 mod native_backup;
@@ -29,14 +37,19 @@ mod native_backup;
 mod native_socket_trace;
 #[macro_use]
 pub mod log;
+pub mod windower_parallel;
+mod windower_threads;
+pub mod windower_bootstrap_contract;
 pub mod pipe;
 pub mod proto;
 pub mod registry;
 mod sigscan;
-pub mod slots;
-pub mod trace;
+mod mem;
+mod iat;
+mod pe;
+mod win;
 #[cfg(target_arch = "x86")]
-mod windower_exit;
+mod hook_layout;
 #[cfg(target_arch = "x86")]
 mod windower_start;
 #[cfg(target_arch = "x86")]
@@ -88,6 +101,9 @@ pub(crate) mod startup_timing {
             Self { instant, host_us: valid.then(|| host_micros(ticks, frequency)).flatten() }
         }
     }
+
+    /// The host QPC clock in µs (the launcher's clock); a local diagnostic only.
+    pub(crate) fn host_micros_now() -> Option<u64> { Stamp::capture().host_us }
 
     fn filetime_ticks(time: FILETIME) -> u64 {
         (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
@@ -200,11 +216,9 @@ pub const EXIT_ARGS: i32 = 2;
 pub const EXIT_PIPE: i32 = 3;
 pub const EXIT_PROTOCOL: i32 = 4;
 pub const EXIT_GAME_START: i32 = 5;
-pub const EXIT_SELFTEST_WATCHDOG: i32 = 9;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
-const SELFTEST_WATCHDOG: Duration = Duration::from_secs(120);
 const GAME_THREAD_STACK: usize = 4 << 20;
 
 /// The whole loader. Returns the process exit code.
@@ -216,6 +230,7 @@ pub fn run() -> i32 {
     entry.report();
     startup_timing::report("log-init", log_started, log_ready);
     log!("crystal-loader {} starting{}", env!("CARGO_PKG_VERSION"), log_path.map(|p| format!(" (log {})", p.display())).unwrap_or_default());
+    log!("4 GB memory: {}", if pe::this_process_large_address_aware() { "on" } else { "off (host built without /LARGEADDRESSAWARE)" });
 
     let args = match args::parse(std::env::args().skip(1)) {
         Ok(a) => a,
@@ -224,7 +239,7 @@ pub fn run() -> i32 {
             return EXIT_ARGS;
         }
     };
-    log!("stage: args ok (pipe {}, launcher pid {}{})", args.pipe, args.launcher_pid, if args.selftest_offline { ", SELFTEST OFFLINE" } else { "" });
+    log!("stage: args ok (pipe {}, launcher pid {})", args.pipe, args.launcher_pid);
 
     let connect_started = startup_timing::Stamp::capture();
     let connected = Pipe::connect(&args.pipe, args.launcher_pid, CONNECT_TIMEOUT);
@@ -250,22 +265,44 @@ pub fn run() -> i32 {
         log!("error: sending hello: {e}");
         return EXIT_PIPE;
     }
+    #[cfg(target_arch = "x86")]
+    let _windower_exit_save = windower_start::ExitGuard;
     // A session and its first command can arrive in the same pipe read. Keep
     // this reader through the handoff; only consumed credential bytes are wiped.
     let mut reader = LineReader::default();
-    let first = {
-        let parsed = match reader.read_parsed(&pipe, Some(SESSION_TIMEOUT), proto::parse_first_line) {
-            Ok(parsed) => parsed,
-            Err(e) => return fail(&pipe, EXIT_PIPE, format!("reading the session: {e}")),
+    // At most one private Windower startup comes first; it carries no
+    // credentials, and the session or park line follows once Hook is ready.
+    let mut windower_started = false;
+    loop {
+        let first = {
+            let parsed = match reader.read_parsed(&pipe, Some(SESSION_TIMEOUT), proto::parse_first_line) {
+                Ok(parsed) => parsed,
+                Err(e) => return fail(&pipe, EXIT_PIPE, format!("reading the session: {e}")),
+            };
+            match parsed {
+                Ok(first) => first,
+                Err(e) => return fail(&pipe, EXIT_PROTOCOL, format!("session rejected: {e}")),
+            }
         };
-        match parsed {
-            Ok(first) => first,
-            Err(e) => return fail(&pipe, EXIT_PROTOCOL, format!("session rejected: {e}")),
+        match first {
+            proto::FirstLine::Session(session) => return run_session(pipe, reader, session),
+            proto::FirstLine::Park(park) => return run_parked(pipe, reader, park),
+            proto::FirstLine::WindowerStartup(startup) => {
+                if windower_started {
+                    return fail(&pipe, EXIT_PROTOCOL, "Unexpected Windower startup request.".into());
+                }
+                windower_started = true;
+                match windower_parallel::initialize(std::path::Path::new(&startup.hook), &startup.data, &startup.nonce) {
+                    Ok(elapsed) => {
+                        log!("Private Windower startup completed in {:.3}s; no authentication has started.", elapsed.as_secs_f64());
+                        if pipe.write_all(b"{\"type\":\"windower_ready\"}\n").is_err() {
+                            return EXIT_PIPE;
+                        }
+                    }
+                    Err(error) => return fail(&pipe, EXIT_PROTOCOL, error),
+                }
+            }
         }
-    };
-    match first {
-        proto::FirstLine::Session(session) => run_session(pipe, reader, session, &args),
-        proto::FirstLine::Park(park) => run_parked(pipe, reader, park, &args),
     }
 }
 
@@ -278,15 +315,8 @@ fn fail(pipe: &Pipe, code: i32, msg: String) -> i32 {
 fn log_session(session: &proto::Session) {
     #[cfg(feature = "native-login-diagnostics")]
     startup_timing::mark("session-accepted");
-    log!(
-        "stage: session ok (v{}, region {}, lang {}, install_dir {}, pol_records {}, {} content ids)",
-        session.version,
-        session.region.name(),
-        session.lang,
-        session.install_dir.as_deref().unwrap_or("(none)"),
-        session.pol_records.as_ref().map(|r| format!("{} valid handles/{} FFXI characters", r.valid_handles(), r.valid_chars())).unwrap_or_else(|| "none (records from FFXiMain's table)".into()),
-        session.content_ids.len()
-    );
+    log!("stage: session ok (v{}, region {}, install_dir {})", proto::PROTOCOL_VERSION, session.region.name(),
+        session.install_dir.as_deref().unwrap_or("(none)"));
 }
 
 fn log_ffxi_settings(settings: Option<&ffxi_settings::FfxiSettings>) {
@@ -296,30 +326,12 @@ fn log_ffxi_settings(settings: Option<&ffxi_settings::FfxiSettings>) {
 }
 
 /// The cold path: a direct `session` line.
-fn run_session(pipe: Pipe, reader: LineReader, session: proto::Session, args: &args::Args) -> i32 {
+fn run_session(pipe: Pipe, reader: LineReader, session: proto::Session) -> i32 {
     log_session(&session);
     log_ffxi_settings(session.ffxi_settings.as_ref());
-    if args.selftest_offline && session.native_auth.is_some() {
-        return fail(&pipe, EXIT_PROTOCOL, "Offline self-test cannot request a native account login.".into());
-    }
     ffxi_settings::install(session.ffxi_settings);
-    if session.native_auth.is_none() { slots::install_session(session.secrets, session.pol_records); }
-    if session.invisible_login {
-        log!("note: invisible_login ignored; the Viewer sends no status at sign-in");
-    }
-    let cfg = game::GameConfig { region: session.region, install_dir: session.install_dir, pol_install_dir: session.pol_install_dir, native_auth: session.native_auth, start_game: session.start_game, keep_session: session.keep_session, viewer_gaps: session.viewer_gaps, auto_away_minutes: session.auto_away_minutes, auto_login: session.auto_login, selftest: args.selftest_offline, trace_slots: args.trace_slots };
+    let cfg = game::GameConfig { region: session.region, install_dir: session.install_dir, pol_install_dir: session.pol_install_dir, native_auth: Some(session.native_auth), start_game: session.start_game, keep_session: session.keep_session, viewer_gaps: session.viewer_gaps, auto_away_minutes: session.auto_away_minutes, auto_login: session.auto_login };
     events::start(pipe, reader);
-
-    if args.selftest_offline {
-        std::thread::spawn(|| {
-            std::thread::sleep(SELFTEST_WATCHDOG);
-            log!("selftest: watchdog expired after {}s; ending the process", SELFTEST_WATCHDOG.as_secs());
-            // GameStart may still be using the session allocation. End the process
-            // without freeing it underneath an active game callback.
-            std::process::exit(EXIT_SELFTEST_WATCHDOG);
-        });
-    }
-
     let game = spawn_game(move || game::run(cfg));
     finish(game.and_then(join_game))
 }
@@ -341,19 +353,16 @@ fn join_game(game: std::thread::JoinHandle<GameResult>) -> GameResult {
 /// A parked host (pol-spec 07d §1.3): polcore up to its validated table on
 /// the game thread, `parked`, then the credentials with no timeout, then
 /// exactly the cold path (`Park::into_session` rebuilds its session).
-fn run_parked(pipe: Pipe, mut reader: LineReader, mut park: proto::Park, args: &args::Args) -> i32 {
+fn run_parked(pipe: Pipe, mut reader: LineReader, mut park: proto::Park) -> i32 {
     let park_started = std::time::Instant::now();
-    log!("stage: park ok (v{}, region {}, lang {}, install_dir {}, ffxi_settings {}, auto_login {})",
-        park.version, park.region.name(), park.lang, park.install_dir.as_deref().unwrap_or("(none)"),
+    log!("stage: park ok (v{}, region {}, install_dir {}, ffxi_settings {}, auto_login {})",
+        proto::PROTOCOL_VERSION, park.region.name(), park.install_dir.as_deref().unwrap_or("(none)"),
         park.ffxi_settings.as_ref().map_or(0, |fx| fx.len()), if park.auto_login.enabled { "on" } else { "off" });
-    if args.selftest_offline {
-        return fail(&pipe, EXIT_PROTOCOL, "Offline self-test cannot park a native account host.".into());
-    }
     log_ffxi_settings(park.ffxi_settings.as_ref());
     ffxi_settings::install(park.ffxi_settings.take());
     let cfg = game::GameConfig { region: park.region, install_dir: park.install_dir.clone(), pol_install_dir: park.pol_install_dir.clone(),
         native_auth: None, start_game: false, keep_session: false, viewer_gaps: false, auto_away_minutes: 0,
-        auto_login: park.auto_login, selftest: false, trace_slots: args.trace_slots };
+        auto_login: park.auto_login };
     let (ready_tx, ready) = std::sync::mpsc::channel();
     let (play, play_rx) = std::sync::mpsc::channel();
     let game = match spawn_game(move || game::run_parked(cfg, ready_tx, play_rx)) {
@@ -384,11 +393,7 @@ fn run_parked(pipe: Pipe, mut reader: LineReader, mut park: proto::Park, args: &
     };
     let session = park.into_session(unpark);
     log_session(&session);
-    if session.invisible_login {
-        log!("note: invisible_login ignored; the Viewer sends no status at sign-in");
-    }
     let proto::Session { native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, .. } = session;
-    let Some(native_auth) = native_auth else { return fail(&pipe, EXIT_PROTOCOL, "credentials rejected: no native credentials".into()) };
     events::start(pipe, reader);
     // The game thread is parked waiting for exactly this; its sign-in follows.
     let sent = play.send(game::Play { native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes });
@@ -411,7 +416,6 @@ fn game_failed(pipe: &Pipe, error: String) -> i32 {
 
 /// The game thread's result as the launcher's `error`/`exit` lines.
 fn finish(result: GameResult) -> i32 {
-    slots::wipe_session();
     let code = match result {
         Ok(outcome) => {
             log!("stage: game exited with code {}{}", outcome.code, if outcome.message.is_empty() { String::new() } else { format!(": {}", outcome.message) });

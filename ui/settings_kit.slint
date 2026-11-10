@@ -1,0 +1,72 @@
+// The Settings page's own building blocks, in the Refined tokens at the page's layout scale.
+import { Theme } from "theme.slint";
+import { Act } from "settings_state.slint";
+import { Control, Tone, Toggle, Rule } from "widgets.slint";
+
+/// A Settings section's card: card fill, hairline, 20/24 px inset (each
+/// side can be set; the controller page's cards use a tighter inset).
+export component Card inherits Rectangle {
+    in property <length> gap: 12px * Theme.scale;
+    in property <length> pad-top: 20px * Theme.scale;
+    in property <length> pad-bottom: 20px * Theme.scale;
+    in property <length> pad-x: 24px * Theme.scale;
+    background: Theme.card;
+    border-width: 1px;
+    border-color: Theme.hairline;
+    border-radius: Theme.radius;
+    VerticalLayout {
+        padding-top: root.pad-top;
+        padding-bottom: root.pad-bottom;
+        padding-left: root.pad-x;
+        padding-right: root.pad-x;
+        spacing: root.gap;
+        @children
+    }
+}
+
+/// A one-pixel rule across a card.
+export component Divider inherits Rule { }
+
+/// A card's heading (18 px semibold, as the System cards set it).
+export component CardTitle inherits Text {
+    font-size: Theme.type-card * Theme.scale;
+    font-weight: 600;
+    color: Theme.ink;
+    wrap: word-wrap;
+}
+
+/// A labelled switch with its notes under the label, indented so they start where the label
+/// starts.
+export component SwitchNotes inherits VerticalLayout {
+    in property <bool> on;
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <string> note-1;
+    in property <string> note-2;
+    callback toggled(bool);
+    spacing: 4px * Theme.scale;
+    switch := Toggle {
+        text: root.text;
+        on: root.on;
+        enabled: root.enabled;
+        toggled(on) => { root.toggled(on); }
+    }
+    if root.note-1 != "": HorizontalLayout {
+        padding-left: switch.label-x;
+        Text { text: root.note-1; font-size: Theme.type-caption * Theme.scale; color: Theme.sub; wrap: word-wrap; }
+    }
+    if root.note-2 != "": HorizontalLayout {
+        padding-left: switch.label-x;
+        Text { text: root.note-2; font-size: Theme.type-caption * Theme.scale; color: Theme.sub; wrap: word-wrap; }
+    }
+}
+
+/// A settings card's button: primary when emphasised, secondary otherwise.
+export component ActButton inherits Control {
+    in property <Act> act;
+    scale: Theme.scale;
+    text: root.act.text;
+    glyph: root.act.glyph;
+    tone: root.act.primary ? Tone.primary : Tone.secondary;
+    enabled: root.act.enabled;
+}

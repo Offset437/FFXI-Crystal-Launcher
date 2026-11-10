@@ -65,11 +65,11 @@ fn answer(product: Product, conn: usize, mut stream: TcpStream, log: &Mutex<Vec<
                 body.extend((version.len() as u32 + 1).to_le_bytes());
                 body.extend(version.as_bytes());
                 body.push(0);
-                (What::Request { kind: 7, path: String::new(), offset: 0, count: 0 }, polp::seal(8, &body))
+                (What::Request { kind: 7, path: String::new(), offset: 0, count: 0 }, polp::seal(polp::kind::VERSION_REPLY, &body))
             }
             polp::kind::HELLO => {
                 if packet != polp::hello(&tags) { push(What::Wrong("hello".into())); }
-                (What::Request { kind: 1, path: String::new(), offset: 0, count: 0 }, polp::seal(2, &[&[1u8][..], list].concat()))
+                (What::Request { kind: 1, path: String::new(), offset: 0, count: 0 }, polp::seal(polp::kind::MANIFEST_REPLY, &[&[1u8][..], list].concat()))
             }
             polp::kind::FILE_REQUEST => {
                 let body = frame.body;
@@ -86,7 +86,7 @@ fn answer(product: Product, conn: usize, mut stream: TcpStream, log: &Mutex<Vec<
                 reply.extend(path.as_bytes());
                 reply.push(0);
                 reply.extend(data);
-                (What::Request { kind: 3, path, offset, count }, polp::seal(4, &reply))
+                (What::Request { kind: 3, path, offset, count }, polp::seal(polp::kind::FILE_REPLY, &reply))
             }
             other => { push(What::Wrong(format!("kind {other}"))); return; }
         };
@@ -192,22 +192,29 @@ async fn fake_update(root: &Path) -> (Vec<Seen>, Vec<Ready>) {
     assert_eq!(planned, [("delta.DAT", Action::Deltas(1)), ("ROM/1/big.DAT", Action::Direct), ("small.DAT", Action::Direct)]);
     let staged = root.join(".xi-updater/staged");
     fs::create_dir_all(&staged).unwrap();
-    let downloads = Downloads::new(op.clone(), stage_groups(Product::Ffxi, &prepared.manifest, &prepared.planned).iter()
+    let groups = stage_groups(Product::Ffxi, &prepared.manifest, &prepared.planned);
+    let downloads = Downloads::new(op.clone(), groups.iter()
         .map(|g| download_size(&prepared.manifest.files[g.source.index], &g.source.action)).collect());
     let (ready, _) = stage_plan_shared(Product::Ffxi, &server.addr, &prepared.root, &staged, &prepared.manifest,
-        &prepared.planned, &op, downloads, 0).await.unwrap();
+        &groups, &op, &downloads, 0).await.unwrap();
     // The download connection's close is ~0.1 s after its last reply.
     let deadline = Instant::now() + Duration::from_secs(5);
     while server.seen().iter().filter(|s| s.what == What::Close).count() < 3 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // Resuming over the same verified cache stages nothing new and opens no connection.
+    let again = Downloads::new(op.clone(), groups.iter()
+        .map(|g| download_size(&prepared.manifest.files[g.source.index], &g.source.action)).collect());
+    let (resumed, bytes) = stage_plan_shared(Product::Ffxi, &server.addr, &prepared.root, &staged, &prepared.manifest,
+        &groups, &op, &again, 0).await.unwrap();
+    assert_eq!((bytes, resumed.len()), (0, ready.len()));
     drop(prepared); // the updater lock
     (server.seen(), ready)
 }
 
 /// When the server saw `what` last on connection `conn`.
 fn seen_at(seen: &[Seen], conn: usize, what: &What) -> Instant {
-    seen.iter().filter(|s| s.conn == conn && &s.what == what).map(|s| s.at).last().unwrap()
+    seen.iter().filter(|s| s.conn == conn && &s.what == what).map(|s| s.at).next_back().unwrap()
 }
 
 /// Reply → FIN of each connection, and FIN → SYN between consecutive ones.
@@ -306,7 +313,7 @@ async fn a_combined_update_finishes_playonline_before_ffxis_patch_service_hears_
     };
     assert!(combined.viewer.as_ref().is_some_and(|r| r.verified) && combined.game.as_ref().is_some_and(|r| r.verified));
     assert_eq!(fs::read(pol.join(path)).unwrap(), app_new);
-    assert_eq!(crate::patch::installed_for_request_for(&pol, "1000"), VIEWER_NEW);
+    assert_eq!(crate::patch::installed_for_request_for(&pol, crate::updater::Product::Viewer), VIEWER_NEW);
     assert_eq!(crate::patch::installed_for_request(&game), NEW);
     assert!(op.snapshot().overall.unwrap().complete);
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -508,4 +515,213 @@ fn crystal_requests_match_a_stock_capture() {
         }
     }
     assert_eq!(stock.len(), crystal.len());
+}
+
+/// Play is the update (proposal 09 phase 2), against stock-update-20261013-004932: the update a
+/// Play's W20 asked for sends no version request of its own. Its first connection opens
+/// `NEXT_CONNECTION_GAP` after that W20's FIN and stays idle for the prompt's hold, the file
+/// list opens a gap after that FIN, then one stop-and-wait download connection; nothing
+/// follows the install (no version re-check before the game starts).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_play_update_reuses_the_w20_holds_the_prompt_then_lists_and_downloads() {
+    let root = root("after-play");
+    let (m, files) = update_fixture(&root);
+    let server = serve(NEW, manifest_text(&m).as_bytes(), files);
+    let op = Operation::new();
+    // The Play's W20 closed just now (patch.rs notes its FIN for the update).
+    let w20_fin = Instant::now();
+    note_server_closed(&server.addr, w20_fin);
+    let hold = Duration::from_millis(400);
+    let staged = stage_after_play_at(root.clone(), AfterPlay { official: NEW.into(), prompt: hold }, &op, &server.addr, |_| Ok(())).await.unwrap();
+    assert_eq!(staged.root(), fs::canonicalize(&root).unwrap());
+    // Downloaded while "a game" could still run: only the install needs the folder free.
+    let report = install_staged_with(staged, &op, |_| Ok(())).await.unwrap();
+    assert!(report.verified && report.version == NEW, "{report:?}");
+    assert_eq!(crate::patch::installed_for_request(&root), NEW);
+    assert!(op.snapshot().overall.unwrap().complete);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while server.seen().iter().filter(|s| s.what == What::Close).count() < 3 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Nothing else comes: no version check after the update.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let seen = server.seen();
+    assert!(!seen.iter().any(|s| matches!(s.what, What::Overlap | What::Wrong(_))), "{seen:#?}");
+    assert_eq!(seen.iter().filter(|s| s.what == What::Connect).count(), 3, "prompt, list, downloads: {seen:#?}");
+    assert!(!seen.iter().any(|s| matches!(s.what, What::Request { kind: 7, .. })), "the Play's W20 is reused");
+    let requests = |conn: usize| seen.iter().filter_map(|s| match &s.what {
+        What::Request { kind, path, offset, count } if s.conn == conn => Some((*kind, path.clone(), *offset, *count)),
+        _ => None }).collect::<Vec<_>>();
+    assert!(requests(0).is_empty(), "the prompt connection carries nothing");
+    assert_eq!(requests(1), [(1, String::new(), 0, 0)]);
+    let big = format!("{NEW}/Direct/ROM/1/big.DAT.slc");
+    assert_eq!(requests(2), [
+        (3, format!("{NEW}/Indirect/delta.DAT.olc"), 0, delta_stream(200, b"!!").len() as u32),
+        (3, big.clone(), 0, 65536), (3, big.clone(), 65536, 65536), (3, big, 131072, 150_001 - 131072),
+        (3, format!("{NEW}/Direct/small.DAT.slc"), 0, 20),
+    ]);
+    // W20 FIN → prompt SYN, the prompt held open, its FIN → list SYN: never within 100 ms.
+    let prompt_syn = seen_at(&seen, 0, &What::Connect);
+    let prompt_fin = seen_at(&seen, 0, &What::Close);
+    let list_syn = seen_at(&seen, 1, &What::Connect);
+    eprintln!("W20 FIN → prompt SYN {:?}, prompt held {:?}, prompt FIN → list SYN {:?}",
+        prompt_syn - w20_fin, prompt_fin - prompt_syn, list_syn - prompt_fin);
+    assert!(prompt_syn - w20_fin >= NEXT_CONNECTION_GAP.0, "{:?}", prompt_syn - w20_fin);
+    assert!(prompt_fin - prompt_syn >= hold, "{:?}", prompt_fin - prompt_syn);
+    assert!(list_syn - prompt_fin >= Duration::from_millis(100), "{:?}", list_syn - prompt_fin);
+    // The list and download connections close like stock after their last reply.
+    for conn in [1, 2] {
+        let quiet = seen_at(&seen, conn, &What::Close) - seen_at(&seen, conn, &What::Replied);
+        assert!(quiet >= crate::stock_socket::CLOSE_AFTER_REPLY.0, "reply → FIN {quiet:?}");
+    }
+    assert!(seen_at(&seen, 2, &What::Connect) - seen_at(&seen, 1, &What::Close) >= Duration::from_millis(100));
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// The prompt's hold is a plausible quick human confirmation (stock: 1.0 s and 5.5 s), never
+/// one constant; the W20 Play's check closes and the updater's first connection are keyed to
+/// the same server.
+#[test]
+fn the_prompt_hold_is_a_jittered_human_confirmation() {
+    assert_eq!(PROMPT_HOLD, (Duration::from_secs(1), Duration::from_secs(3)));
+    let holds: Vec<Duration> = (0..50).map(|_| crate::stock_socket::uniform(PROMPT_HOLD)).collect();
+    assert!(holds.iter().all(|hold| *hold >= PROMPT_HOLD.0 && *hold <= PROMPT_HOLD.1));
+    assert_eq!(format!("{}:53001", crate::dns::GAME_PATCH_HOST), Product::Ffxi.server());
+}
+
+/// Cancel during the prompt: its connection closes at once, nothing else is sent, and the next
+/// Play starts again from the W20 (the verified cache keeps any finished download).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_during_the_prompt_closes_it_and_sends_nothing_more() {
+    let root = root("after-play-cancel");
+    let (m, files) = update_fixture(&root);
+    let server = serve(NEW, manifest_text(&m).as_bytes(), files);
+    let op = Operation::new();
+    let cancel = op.clone();
+    tokio::spawn(async move { tokio::time::sleep(Duration::from_millis(400)).await; cancel.cancel(); });
+    let started = Instant::now();
+    let failed = stage_after_play_at(root.clone(), AfterPlay { official: NEW.into(), prompt: Duration::from_secs(20) }, &op, &server.addr, |_| Ok(())).await;
+    assert!(failed.is_err() && started.elapsed() < Duration::from_secs(5));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let seen = server.seen();
+    assert_eq!(seen.iter().filter(|s| s.what == What::Connect).count(), 1, "{seen:#?}");
+    assert!(seen.iter().any(|s| s.what == What::Close) && !seen.iter().any(|s| matches!(s.what, What::Request { .. })));
+    assert!(!root.join("patch.ver").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// One file request (`polp::file_request`) read off `stream`: (offset, count), `None` at EOF.
+fn read_file_request(stream: &mut TcpStream) -> Option<(u32, u32)> {
+    let mut head = [0u8; 4];
+    stream.read_exact(&mut head).ok()?;
+    let mut packet = vec![0u8; u32::from_le_bytes(head) as usize];
+    packet[..4].copy_from_slice(&head);
+    stream.read_exact(&mut packet[4..]).ok()?;
+    let body = polp::parse(&packet).ok()?.body.to_vec();
+    Some((u32::from_le_bytes(body[0..4].try_into().unwrap()), u32::from_le_bytes(body[4..8].try_into().unwrap())))
+}
+
+fn chunk_reply(path: &str, data: &[u8], offset: u32, count: u32) -> Vec<u8> {
+    let mut reply = Vec::new();
+    for value in [offset, count, path.len() as u32 + 1] { reply.extend(value.to_le_bytes()); }
+    reply.extend(path.as_bytes());
+    reply.push(0);
+    reply.extend(&data[offset as usize..(offset + count) as usize]);
+    polp::seal(polp::kind::FILE_REPLY, &reply)
+}
+
+/// A chunk reply that breaks off: the old connection closes like stock (FIN well after its last
+/// reply byte, not at once), the new one's SYN keeps `NEXT_CONNECTION_GAP` from that FIN, and
+/// the new connection asks for the broken chunk again at the same offset. Nothing more is sent
+/// on the broken connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broken_chunk_reply_closes_like_stock_and_resumes_the_chunk_on_a_new_connection() {
+    let path = "30261006_0/Direct/ROM/1/big.DAT.slc";
+    let data: Vec<u8> = (0..150_000u32).map(|i| (i % 251) as u8).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let served = data.clone();
+    // Per connection: accepted, the requests (offset, count), and when the client's FIN arrived.
+    let server = std::thread::spawn(move || (0..2).map(|conn| {
+        let (mut stream, _) = listener.accept().unwrap();
+        let accepted = Instant::now();
+        let mut requests = Vec::new();
+        while let Some((offset, count)) = read_file_request(&mut stream) {
+            requests.push((offset, count));
+            let reply = chunk_reply(path, &served, offset, count);
+            if conn == 0 && offset > 0 {
+                // The second chunk's reply breaks off partway.
+                stream.write_all(&reply[..reply.len() / 3]).unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+                let mut rest = Vec::new();
+                let _ = stream.read_to_end(&mut rest);
+                assert!(rest.is_empty(), "nothing is sent on a broken connection");
+                break;
+            }
+            stream.write_all(&reply).unwrap();
+        }
+        (accepted, requests, Instant::now())
+    }).collect::<Vec<_>>());
+    let op = Operation::new();
+    let mut session = Session::connect_to(Product::Ffxi, &addr, &op).await.unwrap();
+    let fetched = session.fetch(path, data.len() as u64, &op).await.unwrap();
+    assert_eq!(fetched, data);
+    session.close().await;
+    let seen = tokio::task::spawn_blocking(move || server.join().unwrap()).await.unwrap();
+    let (first, second) = (&seen[0], &seen[1]);
+    assert_eq!(first.1, [(0, 0x10000), (0x10000, 0x10000)]);
+    assert_eq!(second.1, [(0x10000, 0x10000), (0x20000, 150_000 - 0x20000)], "the broken chunk again, at its offset");
+    let gap = second.0.saturating_duration_since(first.2);
+    assert!(gap >= NEXT_CONNECTION_GAP.0 - Duration::from_millis(10), "SYN {gap:?} after the broken connection's FIN");
+}
+
+/// A session dropped on an error or cancel path still closes like stock: a FIN (not a reset),
+/// timed from its last reply byte, and recorded for the next connection's gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_session_still_closes_like_stock() {
+    let path = "30261006_0/Direct/small.DAT.slc";
+    let data = b"small official file".to_vec();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let served = data.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let (offset, count) = read_file_request(&mut stream).unwrap();
+        stream.write_all(&chunk_reply(path, &served, offset, count)).unwrap();
+        let replied = Instant::now();
+        let mut rest = Vec::new();
+        // A reset is an error here; a FIN is a clean EOF.
+        stream.read_to_end(&mut rest).map(|_| replied.elapsed())
+    });
+    let op = Operation::new();
+    let mut session = Session::connect_to(Product::Ffxi, &addr, &op).await.unwrap();
+    assert_eq!(session.fetch(path, data.len() as u64, &op).await.unwrap(), data);
+    drop(session);
+    let after = tokio::task::spawn_blocking(move || server.join().unwrap()).await.unwrap().expect("a FIN, not a reset");
+    let (low, _) = crate::stock_socket::CLOSE_AFTER_REPLY;
+    assert!(after >= low - Duration::from_millis(10), "FIN {after:?} after the reply");
+    // A next connection waits for the close thread, then spaces itself from the FIN.
+    wait_closing(&addr, Duration::from_secs(2));
+    assert!(connect_gap(&addr) > Duration::ZERO, "the close counts for the next connection's gap");
+}
+
+/// A file another handle holds open counts as held (so the install waits for it); a closed,
+/// missing or read-only one does not.
+#[test]
+fn an_open_file_is_held_and_a_closed_or_read_only_one_is_not() {
+    let root = root("held");
+    let path = root.join("FFXiMain.dll");
+    fs::write(&path, b"image").unwrap();
+    let open = fs::File::open(&path).unwrap();
+    assert!(held(&path));
+    drop(open);
+    assert!(!held(&path) && !held(&root.join("missing.DAT")));
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&path, permissions.clone()).unwrap();
+    assert!(!held(&path));
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(&path, permissions).unwrap();
+    fs::remove_dir_all(root).unwrap();
 }

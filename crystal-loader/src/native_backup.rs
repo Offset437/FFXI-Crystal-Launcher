@@ -15,10 +15,9 @@ macro_rules! backup_log {
     }};
 }
 
-const ENTRIES: [(usize, usize); 5] = [
-    (463, 0x48020), (464, 0x48240), (465, 0x482a0),
-    (1535, 0x48060), (1536, 0x481d0),
-];
+/// Cancel, query, poll, upload, download. The table and these services were
+/// checked by `pol_core` before any trace is installed.
+const ENTRIES: [usize; 5] = [463, 464, 465, 1535, 1536];
 static ORIGINAL: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
 static PROGRESS: AtomicI32 = AtomicI32::new(-1);
 static STATE: AtomicUsize = AtomicUsize::new(0);
@@ -32,24 +31,26 @@ pub struct BackupTrace {
 impl BackupTrace {
     /// Install before GameStart; keep the verified COM core alive until Drop,
     /// and finish/release the game's callers before restoring the table.
-    pub unsafe fn install(table: &mut [usize], base: usize) -> Result<Self, String> {
-        for (slot, rva) in ENTRIES {
-            if table.get(slot).copied() != base.checked_add(rva) {
-                return Err(format!("Native POL backup entry {slot} is unsupported."));
-            }
+    pub unsafe fn install(table: &mut [usize], layout: &crate::pol_core::Layout) -> Result<Self, String> {
+        if ENTRIES.iter().chain([&1074]).any(|&slot| table.get(slot).is_none_or(|&entry| !layout.code(entry))) {
+            return Err("Native POL backup entries are not in the core's code.".into());
         }
-        if table.get(1074).copied() != base.checked_add(0x19560) {
-            return Err("Native POL backup policy getter is unsupported.".into());
+        // The core's one backup context, with its state word at +0, found by
+        // the shape of service 463. Only that scalar is read; the retained
+        // module owns it through Drop.
+        let mut code = [0u8; 48];
+        if !crate::mem::read_into(table[463], &mut code) {
+            return Err("Native POL backup trace unavailable: service 463 is unreadable".into());
         }
+        let state = crate::pol_core::backup_state(layout, &code)
+            .map_err(|error| format!("Native POL backup trace unavailable: {error}"))?;
         let trace = Self::forward(table)?;
-        // This exact core has one backup context, with its state word at +0.
-        // Only read that scalar; the retained module owns it through Drop.
-        STATE.store(base + 0x9aab8, Ordering::Release);
+        STATE.store(state, Ordering::Release);
         MISSING_FILE_POLICY.store(table[1074], Ordering::Release);
         Ok(trace)
     }
     unsafe fn forward(table: &mut [usize]) -> Result<Self, String> {
-        let originals = ENTRIES.map(|(slot, _)| table[slot]);
+        let originals = ENTRIES.map(|slot| table[slot]);
         if originals.contains(&0)
             || ORIGINAL[0].compare_exchange(0, originals[0], Ordering::AcqRel, Ordering::Acquire).is_err()
         {
@@ -60,7 +61,7 @@ impl BackupTrace {
         }
         PROGRESS.store(-1, Ordering::Relaxed);
         PHASE.store(-1, Ordering::Relaxed);
-        for ((slot, _), wrapper) in ENTRIES.into_iter().zip([
+        for (slot, wrapper) in ENTRIES.into_iter().zip([
             cancel as *const () as usize, query as *const () as usize,
             poll as *const () as usize, upload as *const () as usize,
             download as *const () as usize,
@@ -73,7 +74,7 @@ impl BackupTrace {
 }
 impl Drop for BackupTrace {
     fn drop(&mut self) {
-        for ((slot, _), original) in ENTRIES.into_iter().zip(self.originals) {
+        for (slot, original) in ENTRIES.into_iter().zip(self.originals) {
             // SAFETY: the install contract retains the core/table through Drop;
             // all game callers have finished before restoration.
             unsafe { *self.table.add(slot) = original };
@@ -108,7 +109,7 @@ unsafe extern "C" fn poll(ticket: i32) -> i32 {
     let result = original::<unsafe extern "C" fn(i32) -> i32>(2)(ticket);
     let after = state();
     // Log transitions, not the native UI's tight progress-poll loop.
-    let bucket = if result < 0 || result >= 100 { result } else { result / 25 };
+    let bucket = if !(0..100).contains(&result) { result } else { result / 25 };
     let progress_changed = PROGRESS.swap(bucket, Ordering::Relaxed) != bucket;
     let phase_changed = PHASE.swap(after, Ordering::Relaxed) != after;
     if progress_changed || phase_changed {
@@ -135,7 +136,7 @@ unsafe extern "C" fn download(data: *mut u8, size: u32, metadata: *mut u32) -> i
 }
 
 #[cfg(test)]
-pub unsafe fn smoke_entrypoints(table: &mut [usize], base: usize) {
+pub unsafe fn smoke_entrypoints(table: &mut [usize], layout: &crate::pol_core::Layout) {
     let before = table.to_vec();
     let rejected = |table: &[usize]| {
         let query: unsafe extern "C" fn(*mut u32) -> i32 = std::mem::transmute(table[464]);
@@ -151,7 +152,7 @@ pub unsafe fn smoke_entrypoints(table: &mut [usize], base: usize) {
     };
     let expected = rejected(table);
     assert_eq!(expected, [-5120, -5136, -7199, -5120, -5120]);
-    let trace = BackupTrace::install(table, base).unwrap();
+    let trace = BackupTrace::install(table, layout).unwrap();
     assert_eq!(state(), 0, "parameter failures must not allocate a backup context");
     assert_eq!(rejected(table), expected);
     assert_eq!(state(), 0);
@@ -192,10 +193,10 @@ mod tests {
         let pointers = [mock_cancel as *const () as usize, mock_query as *const () as usize,
             mock_poll as *const () as usize, mock_upload as *const () as usize,
             mock_download as *const () as usize];
-        for ((slot, _), pointer) in ENTRIES.into_iter().zip(pointers) { table[slot] = pointer; }
+        for (slot, pointer) in ENTRIES.into_iter().zip(pointers) { table[slot] = pointer; }
         let before = table.clone();
         // The production installer must refuse these mock addresses.
-        assert!(unsafe { BackupTrace::install(&mut table, 0x10000000) }.is_err());
+        assert!(unsafe { BackupTrace::install(&mut table, &crate::pol_core::tests::layout(0x10000000)) }.is_err());
         assert_eq!(table, before);
         let trace = unsafe { BackupTrace::forward(&mut table) }.unwrap();
         let mut output = 0;

@@ -2,7 +2,7 @@
 //! pressed buttons, stick positions and trigger pulls can be lit up live.
 //! All artwork here is original: simple paths on a 600x400 canvas.
 use super::detect::{Btn, Family, Input};
-use iced::Color;
+use crate::palette::Color;
 use std::fmt::Write;
 
 pub(crate) fn hex(c: Color) -> String {
@@ -15,9 +15,7 @@ fn mix(a: Color, b: Color, t: f32) -> Color {
     Color::from_rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t)
 }
 
-fn rgb(v: u32) -> Color {
-    Color::from_rgb8((v >> 16) as u8, (v >> 8) as u8, v as u8)
-}
+use crate::palette::rgb;
 
 /// Face-button colours: the Xbox letter colours and the classic PlayStation
 /// symbol colours.
@@ -364,11 +362,10 @@ impl Ctx<'_> {
     fn cross_dpad(&mut self, (cx, cy): (f32, f32)) {
         let _ = write!(
             self.s,
-            r#"<circle cx="{cx}" cy="{cy}" r="31" fill="{}" stroke="{}" stroke-width="1.5"/><g transform="translate({cx} {cy})"><path d="M-8.5 -25 H8.5 V-8.5 H25 V8.5 H8.5 V25 H-8.5 V8.5 H-25 V-8.5 H-8.5 Z" transform="translate(0 2.5)" fill="black" opacity="0.35"/><path d="M-8.5 -25 H8.5 V-8.5 H25 V8.5 H8.5 V25 H-8.5 V8.5 H-25 V-8.5 H-8.5 Z" fill="{}" stroke="{}" stroke-width="1.2" stroke-linejoin="round"/>"#,
+            r##"<circle cx="{cx}" cy="{cy}" r="31" fill="{}" stroke="{}" stroke-width="1.5"/><g transform="translate({cx} {cy})"><path d="M-8.5 -25 H8.5 V-8.5 H25 V8.5 H8.5 V25 H-8.5 V8.5 H-25 V-8.5 H-8.5 Z" transform="translate(0 2.5)" fill="black" opacity="0.35"/><path d="M-8.5 -25 H8.5 V-8.5 H25 V8.5 H8.5 V25 H-8.5 V8.5 H-25 V-8.5 H-8.5 Z" fill="{}" stroke="#000000" stroke-width="1.2" stroke-linejoin="round"/>"##,
             self.p.well,
             self.p.edge,
             hex(self.p.button),
-            "#000000"
         );
         for (b, x, y, w, h) in [
             (Btn::DUp, -8.5, -25.0, 17.0, 16.0),
@@ -660,9 +657,8 @@ mod tests {
                     assert!(!svg.contains("NaN"));
                     let mut reader = quick_xml::Reader::from_str(&svg);
                     loop {
-                        match reader.read_event().expect("valid controller SVG") {
-                            quick_xml::events::Event::Eof => break,
-                            _ => (),
+                        if reader.read_event().expect("valid controller SVG") == quick_xml::events::Event::Eof {
+                            break;
                         }
                     }
                 }

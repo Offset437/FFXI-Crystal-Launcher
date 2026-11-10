@@ -8,10 +8,15 @@ pub const CHUNK_LEN: u32 = 0x10000;
 pub const VERSION_BLOCK_LEN: usize = 0x40;
 
 pub mod kind {
+    // Requests.
     pub const HELLO: u32 = 1;
-    pub const MANIFEST: u32 = 2;
     pub const FILE_REQUEST: u32 = 3;
     pub const VERSION: u32 = 7;
+    // Replies.
+    pub const MANIFEST_REPLY: u32 = 2;
+    pub const FILE_REPLY: u32 = 4;
+    pub const VERSION_REJECTED: u32 = 5;
+    pub const VERSION_REPLY: u32 = 8;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,7 +194,7 @@ mod tests {
 
     fn bytes(hex: &str) -> Vec<u8> {
         hex.as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|pair| {
                 let text = std::str::from_utf8(pair).unwrap();
                 u8::from_str_radix(text, 16).unwrap()

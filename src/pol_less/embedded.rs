@@ -1,10 +1,13 @@
 //! The 32-bit loader (`pol.exe`) travels inside the launcher exe (`build.rs` embeds it) and is
-//! written to `<data dir>\crystal\pol.exe` before a POL-less launch. The loader writes its own
-//! log beside itself, so the folder stays user-writable.
+//! written to `<data dir>\crystal\pol.exe` when a matching installed host is unavailable.
+//! The loader writes its own log beside itself, so both locations stay user-writable.
 //!
-//! The file is rewritten only when its SHA-256 differs from the embedded one, through a temp file
-//! and a rename. A running game keeps the old `pol.exe` mapped, so a rename onto it fails; the new
-//! build then goes to `crystal\<hash8>\pol.exe` and the old one stays until nothing runs it.
+//! The file is rewritten only when its SHA-256 differs from the embedded one, in place under its
+//! own name (no temp file renamed into an executable: that drop-then-rename pattern is what
+//! antivirus heuristics flag). Nothing runs it until its hash is checked again, so a write cut
+//! short is just rewritten on the next launch. A running game keeps the old `pol.exe` open, so
+//! it cannot be rewritten; the new build then goes to `crystal\<hash8>\pol.exe` and the old one
+//! stays until nothing runs it.
 
 use sha2::{Digest, Sha256};
 use std::{
@@ -15,13 +18,32 @@ use std::{
 static BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/embedded-pol.exe"));
 static SHA256: &str = include_str!(concat!(env!("OUT_DIR"), "/embedded-pol.sha256"));
 
-/// The embedded loader and its SHA-256 (lower-case hex), or `None` for a build without one.
+/// The embedded loader and its SHA-256 (lower-case hex), or `None` for a build without one
+/// (a debug build without a loader, or an `installed-host` build, which runs the installed copy).
 pub(crate) fn embedded() -> Option<(&'static [u8], &'static str)> {
     (!BYTES.is_empty() && !SHA256.is_empty()).then_some((BYTES, SHA256.trim()))
 }
 
+/// The SHA-256 of the loader this launcher was built with, embedded or not: an installed
+/// `crystal\pol.exe` must match it.
+pub(crate) fn expected_hash() -> Option<&'static str> {
+    (!SHA256.trim().is_empty()).then(|| SHA256.trim())
+}
+
+/// Lower-case hex SHA-256 of `bytes`.
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Lower-case hex of `bytes`.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        text.push(char::from(DIGITS[usize::from(b >> 4)]));
+        text.push(char::from(DIGITS[usize::from(b & 15)]));
+    }
+    text
 }
 
 /// The launcher's per-user data folder, where `crystal\` lives.
@@ -40,18 +62,21 @@ pub(crate) fn extracted() -> Option<PathBuf> {
     extract_into(&data_dir(), bytes, hash).ok()
 }
 
-fn has_hash(path: &Path, hash: &str) -> bool {
+pub(super) fn has_hash(path: &Path, hash: &str) -> bool {
     fs::read(path).map(|b| sha256_hex(&b) == hash).unwrap_or(false)
 }
 
-/// Writes `bytes` to `path` through a temp file and a rename, so a reader never sees half a file.
+/// Writes `bytes` to `path` under its final name. Callers check the hash before running it,
+/// and a failed write leaves no partial file behind.
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| io::Error::other("no parent folder"))?;
     fs::create_dir_all(dir)?;
-    let temp = dir.join(format!("pol.exe.{}.tmp", std::process::id()));
-    let result = fs::write(&temp, bytes).and_then(|()| fs::rename(&temp, path));
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
+    let result = fs::write(path, bytes);
+    if result.is_err() && !has_hash(path, &sha256_hex(bytes)) {
+        // A file another process holds open fails before writing anything; leave it be.
+        if fs::metadata(path).is_ok_and(|m| m.len() != bytes.len() as u64) {
+            let _ = fs::remove_file(path);
+        }
     }
     result
 }
@@ -94,34 +119,18 @@ mod tests {
         assert_eq!(path, root.join("crystal").join("pol.exe"));
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(fs::read_dir(root.join("crystal")).unwrap().count(), 1, "no temp file is left");
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn unchanged_hash_is_not_rewritten() {
-        let root = temp("same");
-        let bytes = b"loader one";
-        let hash = sha256_hex(bytes);
-        let path = extract_into(&root, bytes, &hash).unwrap();
+        // The same hash is not rewritten.
         let before = fs::metadata(&path).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(extract_into(&root, bytes, &hash).unwrap(), path);
+        assert_eq!(extract_into(&root, bytes, &sha256_hex(bytes)).unwrap(), path);
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn changed_hash_replaces_the_file() {
-        let root = temp("changed");
-        let old = b"loader one";
+        // A changed hash replaces the file.
         let new = b"loader two, newer";
-        let path = extract_into(&root, old, &sha256_hex(old)).unwrap();
         assert_eq!(extract_into(&root, new, &sha256_hex(new)).unwrap(), path);
         assert_eq!(fs::read(&path).unwrap(), new);
         fs::remove_dir_all(&root).unwrap();
     }
 
-    #[cfg(windows)]
     #[test]
     fn a_locked_loader_gets_a_versioned_copy_and_stays_untouched() {
         use std::os::windows::fs::OpenOptionsExt;

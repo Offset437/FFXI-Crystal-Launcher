@@ -70,7 +70,7 @@ fn parse_with_password_keys(
     let prepared_key = key.map(prepare_key).transpose()?;
     let mut records = Vec::with_capacity(capacity);
     let mut restored_sum = byte_sum(&data[..HEADER]);
-    for encrypted in data[HEADER..].chunks_exact(RECORD) {
+    for encrypted in data[HEADER..].as_chunks::<RECORD>().0 {
         let mut record = Zeroizing::new(encrypted.to_vec());
         match &prepared_key {
             Some(key) => decode_record(&mut record, key),
@@ -191,9 +191,7 @@ fn recover_password(record: &[u8], keys: &[[u8; 8]]) -> Option<Zeroizing<String>
             continue;
         }
         let mut field = Zeroizing::new(<[u8; 16]>::try_from(&record[0x10..0x20]).ok()?);
-        for (i, byte) in field.iter_mut().enumerate() {
-            *byte = byte.wrapping_sub(key[i % 8] ^ i as u8) ^ key[i % 8];
-        }
+        unmask(field.as_mut(), key);
         // Check every protected byte, including unused field bytes. A matching
         // sum alone is insufficient: also require its exact NUL-terminated field.
         if byte_sum(field.as_ref()) != word(record, PASSWORD_SUM) {
@@ -301,7 +299,7 @@ fn decode_key_path(raw: &[u8]) -> Option<Zeroizing<String>> {
     }
     let wide = Zeroizing::new(
         payload
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect::<Vec<_>>(),
     );
@@ -328,7 +326,7 @@ fn decode_password_key(raw: &[u8], path: &str) -> Option<Zeroizing<[u8; 8]>> {
         return None;
     }
     let mut decoded = Zeroizing::new([0u8; 15]);
-    for (group, input) in raw[..24].chunks_exact(8).enumerate() {
+    for (group, input) in raw[..24].as_chunks::<8>().0.iter().enumerate() {
         let mut bits = 0u64;
         for byte in input {
             bits = (bits << 5) | KEY_ALPHABET.iter().position(|v| v == byte)? as u64;
@@ -370,72 +368,20 @@ fn password_key_registry_root(region: u8) -> Option<&'static str> {
     }
 }
 
-#[cfg(windows)]
 fn saved_key_path(region: u8) -> Option<Zeroizing<String>> {
-    use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE,
-        KEY_WOW64_32KEY, REG_BINARY,
-    };
-    let root: Vec<u16> = password_key_registry_root(region)?
-        .encode_utf16()
-        .chain(Some(0))
-        .collect();
-    let name: Vec<u16> = "SPS000".encode_utf16().chain(Some(0)).collect();
-    let mut handle = std::ptr::null_mut();
-    if unsafe {
-        RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            root.as_ptr(),
-            0,
-            KEY_QUERY_VALUE | KEY_WOW64_32KEY,
-            &mut handle,
-        )
-    } != 0
-    {
+    use crate::win::reg::{self, HKEY_LOCAL_MACHINE, RRF_RT_REG_BINARY, RRF_SUBKEY_WOW6432KEY};
+    let root = password_key_registry_root(region)?;
+    // A larger value fails with ERROR_MORE_DATA, a shorter one reports its
+    // size, and any other type fails the RRF_RT_REG_BINARY filter. The buffer
+    // holds secret material (and is undefined after a failure): keep it zeroized.
+    let mut blob = Zeroizing::new([0u8; KEY_PATH_BYTES]);
+    let size = reg::get_bytes(HKEY_LOCAL_MACHINE, root, "SPS000", RRF_RT_REG_BINARY | RRF_SUBKEY_WOW6432KEY, &mut blob[..]).ok()?;
+    if size != KEY_PATH_BYTES {
         return None;
     }
-    let result = (|| {
-        let (mut kind, mut size) = (0, 0);
-        if unsafe {
-            RegQueryValueExW(
-                handle,
-                name.as_ptr(),
-                std::ptr::null(),
-                &mut kind,
-                std::ptr::null_mut(),
-                &mut size,
-            )
-        } != 0
-            || kind != REG_BINARY
-            || size as usize != KEY_PATH_BYTES
-        {
-            return None;
-        }
-        let mut blob = Zeroizing::new(vec![0; KEY_PATH_BYTES]);
-        if unsafe {
-            RegQueryValueExW(
-                handle,
-                name.as_ptr(),
-                std::ptr::null(),
-                &mut kind,
-                blob.as_mut_ptr(),
-                &mut size,
-            )
-        } != 0
-            || kind != REG_BINARY
-            || size as usize != KEY_PATH_BYTES
-        {
-            return None;
-        }
-        decode_key_path(&blob)
-    })();
-    unsafe {
-        RegCloseKey(handle);
-    }
-    result
+    decode_key_path(&blob[..])
 }
 
-#[cfg(windows)]
 fn adapter_password_keys() -> Zeroizing<Vec<[u8; 8]>> {
     use windows_sys::Win32::{
         Foundation::ERROR_BUFFER_OVERFLOW,
@@ -473,7 +419,7 @@ fn adapter_password_keys() -> Zeroizing<Vec<[u8; 8]>> {
                 || address
                     .checked_add(std::mem::size_of::<IP_ADAPTER_INFO>())
                     .is_none_or(|last| last > end)
-                || address % std::mem::align_of::<IP_ADAPTER_INFO>() != 0
+                || !address.is_multiple_of(std::mem::align_of::<IP_ADAPTER_INFO>())
                 || visited.contains(&address)
             {
                 break;
@@ -493,7 +439,6 @@ fn adapter_password_keys() -> Zeroizing<Vec<[u8; 8]>> {
     keys
 }
 
-#[cfg(windows)]
 fn machine_password_keys(region: u8) -> Zeroizing<Vec<[u8; 8]>> {
     if password_key_registry_root(region).is_none() {
         return Zeroizing::new(Vec::new());
@@ -510,11 +455,6 @@ fn machine_password_keys(region: u8) -> Zeroizing<Vec<[u8; 8]>> {
         }
     }
     keys
-}
-
-#[cfg(not(windows))]
-fn machine_password_keys(_region: u8) -> Zeroizing<Vec<[u8; 8]>> {
-    Zeroizing::new(Vec::new())
 }
 
 fn prepare_key(raw: &[u8]) -> Result<Zeroizing<[u8; 512]>, String> {
@@ -561,8 +501,13 @@ fn decode_legacy_record(record: &mut [u8]) {
     // Native fallback used only when there is no noramim.bin. This is a fixed file
     // format constant from the Viewer, not a user key or an account password.
     const KEY: [u8; 8] = 0x8324_a3d9_4ff1_377bu64.to_le_bytes();
-    for (i, byte) in record.iter_mut().enumerate() {
-        *byte = byte.wrapping_sub(KEY[i % 8] ^ i as u8) ^ KEY[i % 8];
+    unmask(record, &KEY);
+}
+
+/// The member file's byte mask, shared by the legacy record and the saved password.
+fn unmask(bytes: &mut [u8], key: &[u8; 8]) {
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = byte.wrapping_sub(key[i % 8] ^ i as u8) ^ key[i % 8];
     }
 }
 
@@ -596,7 +541,6 @@ fn display_name(bytes: &[u8]) -> Result<String, String> {
             .map_err(|_| invalid())?
             .to_owned());
     }
-    #[cfg(windows)]
     {
         use windows_sys::Win32::Globalization::{MultiByteToWideChar, MB_ERR_INVALID_CHARS};
         let mut wide = Zeroizing::new([0u16; 64]);
@@ -618,10 +562,6 @@ fn display_name(bytes: &[u8]) -> Result<String, String> {
             return Err(invalid());
         }
         Ok(label)
-    }
-    #[cfg(not(windows))]
-    {
-        Err(t("This PlayOnline account name requires Windows text decoding.").into())
     }
 }
 
@@ -754,7 +694,7 @@ mod tests {
             seed = seed.rotate_left(1).wrapping_add(8);
         }
         let mut result = Vec::new();
-        for block in envelope.chunks_exact(5) {
+        for block in envelope.as_chunks::<5>().0 {
             let bits = block
                 .iter()
                 .fold(0u64, |value, byte| (value << 8) | u64::from(*byte));
@@ -990,101 +930,6 @@ mod tests {
             assert!(decode_password_key(&bad, path).is_none());
         }
         assert!(decode_password_key(&file[..25], path).is_none());
-    }
-
-    /// Explicit local verification only. Paths are supplied by the caller; never
-    /// print a draft, account, key, identifier, password, or recovered key path.
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "requires explicitly selected local POL files and a current-user Crystal vault"]
-    fn local_password_comparison_reports_only_counts_and_preserves_sources() {
-        use std::path::PathBuf;
-        let source = PathBuf::from(
-            std::env::var_os("CRYSTAL_POL_IMPORT_SOURCE")
-                .expect("explicit local member file required"),
-        );
-        let root = PathBuf::from(
-            std::env::var_os("CRYSTAL_POL_IMPORT_COMPARE_ROOT")
-                .expect("explicit comparison vault root required"),
-        );
-        let region: u8 = std::env::var("CRYSTAL_POL_IMPORT_REGION")
-            .expect("explicit source region required")
-            .parse()
-            .expect("invalid region");
-        assert!(region <= 2);
-        let config = crate::backend::Config {
-            experiment: root.clone(),
-            repository: PathBuf::new(),
-            game_install: None,
-            dat_overlays: Vec::new(),
-        };
-        let vault = root.join("iced-launcher/accounts.dpapi");
-        let key_path = saved_key_path(region);
-        let mut paths = vec![source.clone(), vault];
-        let noramim = source.with_file_name("noramim.bin");
-        if noramim.is_file() {
-            paths.push(noramim);
-        }
-        if let Some(path) = &key_path {
-            paths.push(PathBuf::from(path.as_str()));
-        }
-        let before: Vec<_> = paths
-            .iter()
-            .map(|path| {
-                read_bounded(path, 4 * 1024 * 1024)
-                    .unwrap_or_else(|_| panic!("could not snapshot a selected source"))
-            })
-            .collect();
-        let batch = import(&source, &before[0], region)
-            .unwrap_or_else(|_| panic!("local member validation failed"));
-        let accounts = crate::backend::load_accounts(&config)
-            .unwrap_or_else(|_| panic!("comparison vault could not be read"));
-        let recovered = batch
-            .drafts
-            .iter()
-            .filter(|draft| !draft.pol_password.is_empty())
-            .count();
-        let (mut compared, mut matched, mut ambiguous) = (0, 0, 0);
-        for draft in &batch.drafts {
-            if draft.pol_password.is_empty() {
-                continue;
-            }
-            let mut candidates = accounts.iter().filter(|account| {
-                account.pol_id == draft.pol_id && !account.pol_password.is_empty()
-            });
-            let Some(account) = candidates.next() else {
-                continue;
-            };
-            if candidates.next().is_some() {
-                ambiguous += 1;
-                continue;
-            }
-            compared += 1;
-            matched += usize::from(account.pol_password == draft.pol_password);
-        }
-        let unchanged = paths.iter().zip(before.iter()).all(|(path, original)| {
-            read_bounded(path, 4 * 1024 * 1024)
-                .is_ok_and(|now| now.as_slice() == original.as_slice())
-        });
-        let se_passwords_missing = batch
-            .drafts
-            .iter()
-            .all(|draft| draft.se_password.is_empty());
-        eprintln!("local_POL_check imported={} recovered={} compared={} matched={} ambiguous={} sources_unchanged={} SE_passwords_missing={}",
-            batch.drafts.len(), recovered, compared, matched, ambiguous, unchanged, se_passwords_missing);
-        assert!(
-            recovered > 0 && compared > 0,
-            "no saved password comparison was possible"
-        );
-        assert!(
-            compared == matched,
-            "a recovered password differs from the comparison vault"
-        );
-        assert!(
-            unchanged,
-            "a selected source changed during this read-only check"
-        );
-        assert!(se_passwords_missing);
     }
 
     #[test]

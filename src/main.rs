@@ -1,45 +1,74 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(not(windows))]
+compile_error!("Crystal Launcher is Windows-only");
+
 mod backend;
 mod account_import;
+// The launcher <-> loader wire contract, shared with crystal-loader source.
+#[path = "../crystal-loader/src/b64.rs"]
+#[allow(dead_code)]
+mod b64;
+#[path = "../crystal-loader/src/wire.rs"]
+#[allow(dead_code)]
+mod wire;
 mod account_import_ui;
 mod account_order;
+mod account_row;
 mod discovery;
 mod dns;
+mod effect;
 mod controller_nav;
 mod dgvoodoo;
+mod feature_check;
+#[allow(dead_code)] // the Slint screens bind to most of this API
+mod features;
 mod reshade;
 mod friends;
 mod social;
 mod game_config;
 mod ffxiah;
+mod footprint;
+mod fsutil;
 mod gamepad;
 mod i18n;
-mod icons;
 mod installer;
 mod launch_log;
 mod launch_timing;
 mod launch_tools;
+mod open_with_game;
 mod launcher_close;
 mod prereqs;
 mod settings_page;
+mod official_versions;
 mod operation;
+mod palette;
 mod patch;
+mod patch_watch;
 mod play_flag;
+mod play_update;
 mod pol_less;
+mod preview;
 mod privacy;
 mod services;
 mod self_update;
 mod session_worker;
+mod startup_prefetch;
+mod startup_task;
 mod stock_socket;
-mod ui;
+mod tick_gate;
+mod tray;
+mod runtime;
+mod slint_host;
 mod updater;
 mod viewer;
+mod win;
 mod window_chrome;
 
 use backend::{account_key, Account, AccountMode, Config, LaunchResult};
 use i18n::{t, tf};
-use iced::{window, Font, Subscription, Task};
+
+use effect::{Edge, Effect, Screenshot, Size, WindowId, WindowOp};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashMap},
@@ -60,12 +89,12 @@ pub(crate) enum Field {
     PolPassword,
     SeId,
     SePassword,
+    PolHandleNames,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Page {
     Home,
-    Accounts,
     Friends,
     Maintenance,
     Settings,
@@ -84,7 +113,6 @@ pub(crate) enum MaintenanceKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MainAction {
     Play,
-    Update,
     Maintenance,
     Offline,
     Working,
@@ -135,10 +163,13 @@ pub(crate) struct Settings {
     selected_accounts: Option<BTreeSet<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub account_order: Vec<String>,
+    /// Public setup names; account credentials stay in the unchanged DPAPI vault.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub account_pol_handles: HashMap<String, String>,
     // The default launcher (Settings → System → Launch tools), for accounts whose own
     // launch_with is None. Home's Launch with edits the shown account's own choice.
     #[serde(default)]
-    pub launch_with: ui::LaunchWith,
+    pub launch_with: crate::backend::LaunchWith,
     // Settings → System → Launch tools. Empty means detect / default.
     #[serde(default)]
     pub ashita_path: String,
@@ -177,8 +208,8 @@ pub(crate) struct Settings {
     /// Sign known accounts in when the launcher opens.
     #[serde(default = "default_true")]
     pub auto_sign_in: bool,
-    /// Reopening POL after FFXI exits is separate from startup sign-in. Older
-    /// settings files leave this off so closing a game actually closes its host.
+    /// Retain native POL after a clean game exit; older hosts can sign back in.
+    /// Older settings leave this off so closing a game also closes its host.
     #[serde(default)]
     pub sign_in_after_game: bool,
     /// The launcher's own UI language (Settings page). Absent = follow the
@@ -199,6 +230,17 @@ pub(crate) struct Settings {
     pub launcher_auto_updates: bool,
     #[serde(default = "default_true")]
     pub controller_navigation: bool,
+    /// Settings → System: the window's close button keeps Crystal running in the
+    /// notification area (sessions stay signed in). Off: closing quits, as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub close_to_tray: bool,
+    /// Settings → System: a logon scheduled task starts Crystal with `--background`
+    /// (`startup_task`). Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub start_with_windows: bool,
+    /// Settings → System → Open with the game: programs started once per Play batch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_with_game: Vec<open_with_game::Program>,
 }
 fn default_true() -> bool {
     true
@@ -213,7 +255,8 @@ impl Default for Settings {
             installer_selected: false,
             selected_accounts: None,
             account_order: Vec::new(),
-            launch_with: ui::LaunchWith::default(),
+            account_pol_handles: HashMap::new(),
+            launch_with: crate::backend::LaunchWith::default(),
             ashita_path: String::new(),
             windower_path: String::new(),
             ashita_boot_ini: String::new(),
@@ -234,6 +277,9 @@ impl Default for Settings {
             reshade: reshade::Preferences::default(),
             launcher_auto_updates: true,
             controller_navigation: true,
+            close_to_tray: false,
+            start_with_windows: false,
+            open_with_game: Vec::new(),
         }
     }
 }
@@ -245,8 +291,12 @@ pub(crate) struct AccountRow {
     pub otp: String,
     pub busy: bool,
     signing_out: bool,
+    pub shutting_down: bool,
     /// Background sign-in can accept Play without starting another login.
     preparing_session: bool,
+    /// The current sign-in thread's completion flag, set just before its Complete is sent:
+    /// launcher close stops waiting for a sign-in that ended before any worker was seen.
+    sign_in_done: Option<Arc<AtomicBool>>,
     queued_play: Option<Instant>,
     /// A coordinated Play owns this row even if an older startup sign-in finishes.
     batch_pending: bool,
@@ -254,7 +304,12 @@ pub(crate) struct AccountRow {
     batch_requested: bool,
     launch_generation: u64,
     pub status: String,
+    /// The note shown after `status` while `status` is still `note_on` (`status_text`).
+    note: Option<RowNote>,
+    note_on: String,
     pub pid: Option<u32>,
+    /// `pid`'s creation time, read when the session's result arrived (`HostId`).
+    host_created: Option<u64>,
     alive: Option<Arc<AtomicBool>>,
     game_running: Option<Arc<AtomicBool>>,
     /// Launch diagnostics: the client's stderr log, how it ended, and whether that was a problem.
@@ -296,6 +351,9 @@ pub(crate) struct AccountRow {
     resign: Option<Resign>,
 }
 
+/// A session whose game ran has ended: its row's key, how the game ended, and its host.
+type GameEnd = (String, Option<launch_log::ExitKind>, Option<HostId>);
+
 /// An optional fresh sign-in after the game and its previous POL host close.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Resign {
@@ -307,16 +365,15 @@ struct Resign {
     free_since: Option<Instant>,
     /// An unclean end: the connectivity probe must see the network first.
     network: bool,
-    /// The ended session's host (loader) PID. Its worker's record closing is not enough: a
+    /// The ended session's host (loader). Its worker's record closing is not enough: a
     /// pipe failure ends the session while a hung loader may still hold its polcore session.
-    host: Option<u32>,
+    host: Option<HostId>,
 }
 
-/// How long the row stays free after the previous session ended before the sign-in after a
-/// game starts. A stock user who quits FFXI has to reopen the PlayOnline Viewer, wait for it
-/// to load and click through to sign in, which takes seconds; an instant sign-in would be
-/// traffic no stock Viewer produces. At least 3 s (owner, 2026-10-12); 5 s here.
-const RESIGN_DELAY: Duration = Duration::from_secs(5);
+/// Cooldown after both the previous worker and host have ended. Keep the
+/// three-second minimum for automatic re-sign-in; explicit Play starts through
+/// its ordinary launch path. Native authentication has its own pacing.
+const RESIGN_DELAY: Duration = Duration::from_secs(3);
 
 /// What a row does when its connectivity probe succeeds (pol-spec 07d §5.4-5.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,18 +424,6 @@ struct WaitingPlay {
 /// How long a one-time code typed for a Play that then waits stays usable for that Play.
 const OTP_KEEP: Duration = Duration::from_secs(20);
 
-/// The Update that Plays released from a wait asked for (their version check said one is
-/// required). Crystal starts it by itself; the Round 5 re-issue starts the Plays when it succeeds.
-struct WaitUpdate {
-    keys: Vec<String>,
-    /// The Update has started: its end starts the Plays again, or their rows say why not.
-    started: bool,
-    /// The account game folder it updates (`None`: the Settings one). A Play it starts again
-    /// whose own folder is another one may ask for (and start) another Update; one in this
-    /// folder may not, so a folder that keeps refusing never loops.
-    folder: Option<PathBuf>,
-}
-
 /// How long a startup sign-in waits for a still-running session of its account to end
 /// before it is skipped (07d §5.5: the previous game's host may take seconds to close).
 const STARTUP_WAIT_LIMIT: Duration = Duration::from_secs(60);
@@ -392,7 +437,7 @@ impl AccountRow {
         self.pid.is_some() && self.game_running.as_ref().is_none_or(|g| g.load(Ordering::Acquire))
     }
     pub(crate) fn can_play(&self) -> bool {
-        !self.signing_out && !self.batch_pending && !self.is_playing() && self.queued_play.is_none() && (!self.busy || self.preparing_session)
+        !self.shutting_down && !self.signing_out && !self.batch_pending && !self.is_playing() && self.queued_play.is_none() && (!self.busy || self.preparing_session)
     }
     fn queued_signin_play(&self) -> bool {
         self.busy && self.preparing_session && self.queued_play.is_some() && !self.batch_pending && !self.is_playing()
@@ -401,17 +446,31 @@ impl AccountRow {
         !self.signing_out && (self.batch_pending || self.queued_play.is_some() || self.busy && !self.preparing_session)
     }
     pub(crate) fn can_sign_out(&self) -> bool {
-        self.pid.is_some() && !self.signing_out && !self.busy && !self.is_playing()
+        self.pid.is_some() && !self.shutting_down && !self.signing_out && !self.busy && !self.is_playing()
             && !self.batch_pending && self.queued_play.is_none()
     }
-    /// The status line to show. A client's exit report is worded in the
-    /// current language here; any later status replaces it.
+    /// The status line to show. A client's exit report and the row's note are worded in the
+    /// current language here; any later status replaces both.
     pub(crate) fn status_text(&self) -> std::borrow::Cow<'_, str> {
+        if self.shutting_down { return t("Shutting down FFXI…").into(); }
         if self.signing_out { return t("Signing out of PlayOnline…").into(); }
-        match &self.exit {
+        let status: std::borrow::Cow<'_, str> = match &self.exit {
             Some(report) if report.summary == self.status => report.message().into(),
             _ => self.status.as_str().into(),
+        };
+        match self.shown_note() {
+            Some(note) => format!("{status} · {}", note.text()).into(),
+            None => status,
         }
+    }
+    /// The note after the status, while the status it was added to still shows.
+    fn shown_note(&self) -> Option<&RowNote> {
+        self.note.as_ref().filter(|_| self.note_on == self.status)
+    }
+    /// Put `note` after the current status (`None`: none).
+    fn set_note(&mut self, note: Option<RowNote>) {
+        self.note_on.clone_from(&self.status);
+        self.note = note;
     }
     /// Show how the client ended.
     fn set_exit(&mut self, report: launch_log::ExitReport) {
@@ -431,51 +490,159 @@ impl AccountRow {
         if self.network_wait == Some(NetworkWait::AfterGame) { self.network_wait = None; }
         if self.network_wait == Some(NetworkWait::AfterGameRetry) {
             self.network_wait = None;
-            let promise = format!(" · {}", t("Crystal will try again when the network is back."));
-            if let Some(shown) = self.status.strip_suffix(&promise).map(str::to_owned) { self.status = shown; }
+            if self.shown_note() == Some(&RowNote::NetworkRetry) { self.note = None; }
         }
-        if let Some(shown) = self.status.strip_suffix(&resign_note()).map(str::to_owned) { self.status = shown; }
+        if self.shown_note() == Some(&RowNote::ResignAfterGame) { self.note = None; }
     }
 }
 
-/// The row's note while it signs back in after a game.
-fn resign_note() -> String {
-    format!(" · {}", t("Signing back in after the game closed."))
+/// A short line after a row's status, kept apart from it so it follows the language and is
+/// removed by what it is, not by matching words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RowNote {
+    /// A Play waits for the sign-in in flight.
+    QueuedPlay,
+    /// The row signs back in after its game closed.
+    ResignAfterGame,
+    /// A sign-in that failed on the network starts again once DNS answers.
+    NetworkRetry,
+    /// That retry gave up.
+    NetworkGone,
+    /// The one-time code was spent by a sign-in that did not finish.
+    OtpSpent,
+    /// A sign-in Crystal started by itself without a code was refused.
+    MayNeedOtp,
+    /// No sign-in after the game during a maintenance or outage (with the service's note).
+    ResignRefused(String),
 }
+
+impl RowNote {
+    fn text(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::QueuedPlay => t("FFXI will start when sign-in finishes.").into(),
+            Self::ResignAfterGame => t("Signing back in after the game closed.").into(),
+            Self::NetworkRetry => t("Crystal will try again when the network is back.").into(),
+            Self::NetworkGone => t("The network did not come back. Sign in again once it is.").into(),
+            Self::OtpSpent => t("That one-time code was used. Enter a new one, then press Play.").into(),
+            Self::MayNeedOtp => t("This account may need a one-time password now: Crystal signs it in only when you press Play.").into(),
+            Self::ResignRefused(note) => note.as_str().into(),
+        }
+    }
+}
+
+/// A session's host (loader) process: its PID and, when it could be read while the host ran,
+/// its creation time, so a PID Windows has since reused is never taken for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HostId {
+    pid: u32,
+    created: Option<u64>,
+}
+
+/// `pid`'s creation time, read while it is known to run (the session's start).
+#[cfg(not(test))]
+fn process_created(pid: u32) -> Option<u64> {
+    win::process::open_with_created(pid, win::process::PROCESS_QUERY_LIMITED_INFORMATION).map(|(_, created)| created)
+}
+#[cfg(test)]
+fn process_created(_pid: u32) -> Option<u64> { None }
+
+/// The loader a signed-in session runs: its host process's own file (a ReShade session runs a
+/// copy in its own host folder, where the game reads dgVoodoo's files), else the configured one.
+fn session_loader(host: Option<HostId>, loader_setting: &str) -> Option<PathBuf> {
+    let configured = pol_less::tools::loader_path(loader_setting);
+    let running = host.and_then(process_image).filter(|image| {
+        let name = |path: &Path| path.file_name().map(|name| name.to_ascii_lowercase());
+        configured.as_deref().is_some_and(|configured| name(image) == name(configured))
+    });
+    running.or(configured)
+}
+
+/// The host's image file, unless its PID now names a later process (creation time differs).
+#[cfg(not(test))]
+fn process_image(host: HostId) -> Option<PathBuf> {
+    let process = win::process::open(host.pid, win::process::PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
+    let same = host.created.is_none_or(|created| win::process::created(&process) == Some(created));
+    if !same { return None; }
+    win::process::image_path_of(&process).ok()
+}
+#[cfg(test)]
+fn process_image(_host: HostId) -> Option<PathBuf> { None }
 
 /// Whether the ended session's host process still runs. One this process may not open (an
-/// elevated host) counts as running: a sign-in after the game then waits for its limit.
+/// elevated host) counts as running, unless it was opened before (then the PID is another
+/// process's now): a sign-in after the game then waits for its limit.
 #[cfg(not(test))]
-fn host_running(pid: u32) -> bool {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::{Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, WAIT_TIMEOUT},
-            System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE}};
-        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
-        if raw.is_null() { return unsafe { GetLastError() } == ERROR_ACCESS_DENIED; }
-        let running = unsafe { WaitForSingleObject(raw, 0) } == WAIT_TIMEOUT;
-        unsafe { CloseHandle(raw) };
-        running
-    }
-    #[cfg(not(windows))]
-    { let _ = pid; false }
+fn host_running(host: HostId) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use win::process::{PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE};
+    use windows_sys::Win32::{Foundation::{ERROR_ACCESS_DENIED, WAIT_TIMEOUT}, System::Threading::WaitForSingleObject};
+    let process = match win::process::open(host.pid, PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION) {
+        Ok(process) => process,
+        Err(error) => return host.created.is_none() && error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32),
+    };
+    let waiting = unsafe { WaitForSingleObject(process.as_raw_handle() as _, 0) };
+    waiting == WAIT_TIMEOUT && host.created.is_none_or(|created| win::process::created(&process) == Some(created))
 }
 #[cfg(test)]
 thread_local! { static RUNNING_HOSTS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) }; }
 #[cfg(test)]
-fn host_running(pid: u32) -> bool { RUNNING_HOSTS.with(|hosts| hosts.borrow().contains(&pid)) }
+fn host_running(host: HostId) -> bool { RUNNING_HOSTS.with(|hosts| hosts.borrow().contains(&host.pid)) }
 pub(crate) struct Editor {
     pub key: Option<String>,
     pub account: Account,
     pub game_install: String,
     pub dat_overlays: Vec<String>,
     pub auto_login: pol_less::AutoLogin,
+    pub flags: EditorFlags,
+}
+
+/// The account sheet's switches that are not account fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EditorFlags {
+    /// "Uses a one-time password": saved as what Crystal knows about the login
+    /// (`Settings::account_otp`), so it is never signed in by itself.
+    pub uses_otp: bool,
+    /// New accounts: sign in to PlayOnline in the background once saved.
+    pub sign_in_now: bool,
+    pub show_id: bool,
+    pub show_password: bool,
+    /// A saved account's password field is read-only until Change.
+    pub change_password: bool,
+}
+
+/// Which of `EditorFlags` an `EditorFlag` message sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EditorFlag {
+    UsesOtp,
+    SignInNow,
+    ShowId,
+    ShowPassword,
+    ChangePassword,
+}
+
+impl Editor {
+    /// A fresh sheet for a new account: background sign-in on by default.
+    fn blank() -> Self {
+        Editor {
+            key: None,
+            account: blank_account(),
+            game_install: String::new(),
+            dat_overlays: Vec::new(),
+            auto_login: pol_less::AutoLogin::default(),
+            flags: EditorFlags { sign_in_now: true, ..Default::default() },
+        }
+    }
 }
 
 /// The Viewer refreshes its last-input stamp from window input (app 10060039)
 /// for Auto-Away; Crystal forwards window input at most this often.
 const ACTIVITY_INTERVAL: Duration = Duration::from_secs(5);
 static LAST_ACTIVITY: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// How long a Friends request may go without a result before the page says so. Shorter than
+/// the loader's mail deadlines (MAIL_FRAMES per attempt, up to 3 attempts for a send): a result
+/// after it still counts (`App::friends_expired`).
+const FRIENDS_REQUEST_LIMIT: Duration = Duration::from_secs(45);
 
 fn activity_due(last: &mut Option<Instant>, now: Instant) -> bool {
     if last.is_some_and(|at| now.saturating_duration_since(at) < ACTIVITY_INTERVAL) {
@@ -485,16 +652,17 @@ fn activity_due(last: &mut Option<Instant>, now: Instant) -> bool {
     true
 }
 
-fn user_input(event: iced::Event, status: iced::event::Status, _: window::Id) -> Option<Message> {
-    use iced::{keyboard, mouse};
-    if status == iced::event::Status::Ignored && matches!(&event,
-        iced::Event::Keyboard(keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Escape), repeat: false, .. })) {
-        return Some(Message::ControllerBack);
-    }
-    let input = matches!(event,
-        iced::Event::Keyboard(keyboard::Event::KeyPressed { .. })
-            | iced::Event::Mouse(mouse::Event::ButtonPressed(_) | mouse::Event::WheelScrolled { .. } | mouse::Event::CursorMoved { .. }));
-    (input && activity_due(&mut LAST_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner()), Instant::now())).then_some(Message::UserInput)
+/// `--preview-idle`: the preview's sample data with the live window's idle behaviour (its
+/// own tick rate, the controller thread, no capture), for measuring the idle footprint
+/// without accounts, sign-ins or network traffic.
+pub(crate) fn preview_idle() -> bool {
+    preview::has("--preview-idle")
+}
+
+/// Keyboard or pointer input reached the window: a `Message::UserInput`, at most once per
+/// ACTIVITY_INTERVAL (every front end reports input through this one throttle).
+pub(crate) fn user_activity() -> Option<Message> {
+    activity_due(&mut LAST_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner()), Instant::now()).then_some(Message::UserInput)
 }
 
 #[derive(Clone)]
@@ -506,8 +674,6 @@ enum WorkerEvent {
     /// A news update, tagged with its request and the language its feeds were read in.
     Services(u64, i18n::Lang, services::Update),
     Friends(u64, String, bool, Option<friends::Snapshot>),
-    /// The stock FFXI version check ran before starting the game from a signed-in session:
-    /// what it found, then whether the start request went out.
     /// A signed-in session's Play: W20's report (absent when it never ran) and the outcome.
     StartGame(String, Option<patch::PatchReport>, Result<String, String>),
     /// A row's connectivity probe (07d §5.5): the patch server resolves again (`true`), or
@@ -520,6 +686,13 @@ enum WorkerEvent {
     /// An interrupted update found at a Play was finished or undone (`Ok`), or could not
     /// be: the held launch then starts, or its rows say why.
     InterruptedUpdate(Box<Recovered>),
+    /// A Play-driven update's thread (its job generation), proposal 09 phase 2.
+    PlayUpdate(u64, play_update::Event),
+    /// A maintenance version check of a game folder from this account's session (patch_watch):
+    /// the W20's report, whether it said "current", and its phases; `Err` when none was sent.
+    PatchCheck(PathBuf, String, Result<(patch::PatchReport, bool, Option<String>), String>),
+    /// Window layouts, hotkeys, recovery, notifications (`features::Runtime`).
+    Features(features::Event),
 }
 /// A launch waiting for something local (an interrupted update's recovery) before it starts.
 #[derive(Clone, Debug)]
@@ -548,6 +721,45 @@ impl WorkerEvent {
     }
 }
 
+/// Sends one launch's events, tagged with its row and launch generation (`for_launch`): a
+/// newer launch of the row makes them stale.
+#[derive(Clone)]
+struct LaunchTx {
+    tx: tick_gate::EventSender,
+    key: String,
+    generation: u64,
+    /// A sign-in's `AccountRow::sign_in_done`, set before its Complete goes out.
+    done: Option<Arc<AtomicBool>>,
+}
+impl LaunchTx {
+    fn new(tx: tick_gate::EventSender, key: String, generation: u64) -> Self {
+        Self { tx, key, generation, done: None }
+    }
+    fn send(&self, event: WorkerEvent) {
+        let _ = self.tx.send(event.for_launch(&self.key, self.generation));
+    }
+    fn progress(&self, line: &str) {
+        self.send(WorkerEvent::Progress(self.key.clone(), line.to_owned()));
+    }
+    fn complete(&self, result: Result<LaunchResult, String>) {
+        if let Some(done) = &self.done { done.store(true, Ordering::Release); }
+        self.send(WorkerEvent::Complete(self.key.clone(), result));
+    }
+}
+
+/// The window's timers and listeners for the current state (`App::schedule`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Schedule {
+    /// The logic Tick's rate (`tick_gate` drops the ones that would change nothing).
+    pub tick: Duration,
+    /// Poll the controller thread.
+    pub gamepad: bool,
+    /// An account row is being dragged: raw pointer input goes to `account_order`.
+    pub account_drag: bool,
+    /// A held controller direction repeats (`Message::ControllerTick` every 50 ms).
+    pub controller_repeat: bool,
+}
+
 #[derive(Clone)]
 pub(crate) enum Message {
     Tick,
@@ -557,22 +769,36 @@ pub(crate) enum Message {
     ControllerPlay,
     ControllerNavigation(bool),
     SelfUpdate(self_update::Msg),
-    WindowResized(iced::Size),
+    WindowResized(Size),
     MinimizeWindow,
     MaximizeWindow,
     // native chrome, title double-click and edge resizing.
-    WindowOpened(window::Id),
+    WindowOpened(WindowId),
+    WindowClosed(WindowId),
+    /// The notification-area icon (or a second Crystal start) asked for something.
+    Tray(tray::Command),
+    /// After hiding: give the freed renderer's pages back to Windows.
+    TrimMemory,
+    /// Settings → System: closing the window keeps Crystal in the notification area.
+    CloseToTray(bool),
+    /// Settings → System: start Crystal in the background when Windows starts.
+    StartWithWindows(bool),
+    /// The scheduled task was registered (`true`) or removed, or why not.
+    StartupTaskSet(bool, Result<(), String>),
     NativeWindow(isize),
     WindowMaximized(bool),
     TitlePressed,
     TitleMoved,
     TitleReleased,
-    ResizeWindow(window::Direction),
+    ResizeWindow(Edge),
     Navigate(Page),
     FriendsAccount(String),
     FriendsConnect,
     FriendsPlay,
     FriendsSignOut,
+    ShutdownSelected,
+    ShutdownAll,
+    GameShutdownFinished(String, u64, Result<(), String>),
     AccountSignOut(String),
     AccountSignedOut(String, u64, Result<(), String>),
     FriendsStatus(session_worker::NativeControl),
@@ -591,7 +817,7 @@ pub(crate) enum Message {
     FriendsRemove(friends::Friend),
     FriendsRemoveConfirm,
     FriendsSubject(String),
-    FriendsMessageEdit(iced::widget::text_editor::Action),
+    FriendsMessageEdit(String),
     FriendsSend,
     FriendsDraftClose,
     ToggleDetails,
@@ -603,17 +829,21 @@ pub(crate) enum Message {
     EditWindowerProfiles,
     WindowerProfilesClosed(Result<(), String>),
     Launch(String),
-    LaunchSelected,
     MainAction,
     LaunchAll,
+    /// Sign this account in to PlayOnline in the background (no game), with its typed code.
+    SignIn(String),
+    /// Home's Character select: automatic character login on (true) or off for Play's accounts.
+    SetCharacterSelect(bool),
     OtpChanged(String, String),
     NewAccount,
     EditAccount(String),
     EditorChanged(Field, String),
     EditorRegion(u8),
     // the editor's Launch section (None = use the default).
-    EditorLaunchWith(Option<ui::LaunchWith>),
+    EditorLaunchWith(Option<crate::backend::LaunchWith>),
     EditorAutoLogin(bool),
+    EditorFlag(EditorFlag, bool),
     EditorCharacterSlot(u8),
     AccountImport(account_import_ui::Msg),
     EditorBootIni(Option<String>),
@@ -630,8 +860,7 @@ pub(crate) enum Message {
     /// Settings → System: "Sign accounts in when Crystal opens".
     AutoSignIn(bool),
     SignInAfterGame(bool),
-    ChooseProfile(String),
-    SetLaunchWith(ui::LaunchWith),
+    SetLaunchWith(crate::backend::LaunchWith),
     WikiQueryChanged(String),
     AhQueryChanged(String),
     SearchWiki,
@@ -639,7 +868,7 @@ pub(crate) enum Message {
     AhResults(u64, Result<ffxiah::Results, String>),
     CloseAh,
     AhServerChanged(&'static str),
-    NewsFilter(u8),
+    NewsFilter(crate::services::NewsTab),
     InstallPathChanged(String),
     SelectInstallPath,
     FindInstallation,
@@ -671,12 +900,18 @@ pub(crate) enum Message {
     PlayFlagLoaded(play_flag::Reading),
     /// Cancel these accounts' "Wait and play".
     CancelWait(Vec<String>),
+    /// Pause the Play-driven update with this generation (its downloads are kept).
+    CancelPlayUpdate(u64),
+    /// A Play's PlayOnline update may sign the idle accounts out (the row asked once).
+    ConfirmViewerUpdate,
     PatchLoaded(u64, patch::PatchReport),
     ViewerLoaded(u64, viewer::Status),
     CloseRequested,
     ConfirmClose,
     CancelClose,
-    PreviewReady(window::Screenshot),
+    PreviewReady(Screenshot),
+    /// The launcher features' screens (`features::ui`).
+    Feature(features::ui::Msg),
     // The Settings page features own their state and messages in their modules.
     SettingsTab(settings_page::Tab),
     GameConfig(game_config::Msg),
@@ -684,6 +919,10 @@ pub(crate) enum Message {
     Gamepad(gamepad::Msg),
     OpenSettingsTab(settings_page::Tab), // banner Fix → Settings tab
     LaunchTools(launch_tools::Msg),
+    LaunchToolsScanned(launch_tools::Scan),
+    OpenWithGame(open_with_game::Msg),
+    /// The programs a game start opened: what failed.
+    OpenWithGameDone(open_with_game::Report),
     Dgvoodoo(dgvoodoo::Msg),
     Reshade(reshade::Msg),
 }
@@ -698,9 +937,11 @@ pub(crate) enum PickTarget {
     WindowerFolder,
     /// A file, not a folder: the loader's pol.exe.
     LoaderFile,
+    /// A file: the program at this index in Open with the game.
+    ProgramFile(usize),
 }
 
-// iced requires Debug, but input messages can contain account passwords.
+// Debug for logs and tests, but input messages can contain account passwords.
 impl std::fmt::Debug for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("LauncherMessage (payload redacted)")
@@ -708,7 +949,7 @@ impl std::fmt::Debug for Message {
 }
 
 pub(crate) struct App {
-    pub viewport: iced::Size,
+    pub viewport: Size,
     pub maximized: bool,
     pub title_held: bool, // title pressed, drag not yet started
     pub page: Page,
@@ -724,6 +965,9 @@ pub(crate) struct App {
     news_generation: u64,
     pub news_error: String,
     startup_warning: Option<String>,
+    /// settings.json could not be read at start: nothing Crystal saves by itself replaces it
+    /// (the warning above is shown once; this stays until the user saves settings).
+    settings_damaged: bool,
     pub patch: Option<patch::PatchReport>,
     pub patch_loading: bool,
     pub installation_loading: bool,
@@ -752,16 +996,20 @@ pub(crate) struct App {
     held_plays: Vec<HeldPlay>,
     /// Plays waiting for FFXI to come back ("Wait and play").
     waiting_plays: Vec<WaitingPlay>,
-    /// The last read of FFXI's play flag, and when the next is due (only while a Play waits).
+    /// The last read of FFXI's play flag, and when the next is due (only while a Play waits or
+    /// FFXI is in maintenance).
     play_flag: play_flag::Known,
     flag_schedule: play_flag::Schedule,
-    /// Accounts released from a wait whose Play is still starting: an update it asks for
-    /// starts by itself (`wait_update`).
-    released: Vec<String>,
-    wait_update: Option<WaitUpdate>,
+    /// Play is the update (proposal 09 phase 2): one update job per game folder.
+    pub(crate) play_updates: play_update::Jobs,
+    /// The update as soon as it is out: maintenance's version checks (patch_watch.rs).
+    patch_watch: patch_watch::Watch,
     /// Tests: record `start_launch` calls instead of starting workers.
     #[cfg(test)]
     launches: Option<Vec<(Vec<String>, bool, Instant, Option<launch_timing::LaunchTrigger>)>>,
+    /// Tests: recorded starts that went without a W20 (`skip_w20`).
+    #[cfg(test)]
+    w20_skipped: Vec<String>,
     /// Parked warm hosts for cold Plays, one per account, tool and profile (07d §1.5).
     parks: pol_less::park::Pool<session_worker::ParkWorker>,
     /// Each wanted park key's last fingerprint; re-read every FINGERPRINT_EVERY.
@@ -778,7 +1026,7 @@ pub(crate) struct App {
     pub ah_query: String,
     pub ah_lookup: ffxiah::Lookup,
     pub ah_server: &'static str,
-    pub news_filter: u8,
+    pub news_filter: crate::services::NewsTab,
     pub maintenance: Option<MaintenanceKind>,
     pub maintenance_progress: operation::Progress,
     pub maintenance_result: String,
@@ -795,14 +1043,25 @@ pub(crate) struct App {
     /// The game folder `patch` describes when it is not the Settings one: an account's own
     /// folder whose W20 refused a Play. The main button's Update updates that folder.
     patch_folder: Option<PathBuf>,
+    /// The official versions real version checks last told (`official_versions`), read again
+    /// whenever a check's outcome reaches the window.
+    official: official_versions::Store,
     /// Plays a version check refused for an update (account key, click), and those an
     /// Update started from them: started again when that Update succeeds (proposal 09).
     refused_plays: Vec<(String, Instant)>,
     reissue_after_update: Vec<(String, Instant)>,
     active_operation: Option<operation::Operation>,
     config: Config,
-    sender: mpsc::Sender<WorkerEvent>,
+    sender: tick_gate::EventSender,
     receiver: mpsc::Receiver<WorkerEvent>,
+    /// The launcher window; `None` while Crystal runs in the background (notification area
+    /// icon only, no surface or renderer).
+    window: Option<WindowId>,
+    /// The last park tend found every wanted park parked (or none wanted): nothing for the
+    /// next Tick to start (`tick_gate`).
+    parks_settled: bool,
+    /// Start with Windows: the scheduled task's registration is being changed.
+    startup_task_busy: bool,
     vault_saving: bool,
     patch_generation: u64,
     refreshed: Instant,
@@ -813,20 +1072,157 @@ pub(crate) struct App {
     pub prereqs: prereqs::State,
     pub gamepad: gamepad::State,
     pub launch_tools: launch_tools::State,
+    open_gate: open_with_game::BatchGate,
     pub windower_editor_open: bool,
     pub friends: friends::State,
+    /// The Friends request whose time limit passed without a result, still matched against
+    /// later reads: the loader's own deadlines are longer (a send retries for minutes).
+    friends_expired: Option<String>,
     friends_generation: u64,
     friends_checked: Instant,
     pub dgvoodoo: dgvoodoo::State,
     pub reshade: reshade::State,
     pub self_update: self_update::State,
     pub controller_nav: controller_nav::State,
+    /// The launcher features beside Play (`features`); `None` in previews and tests.
+    pub(crate) features: Option<features::Runtime>,
+    /// The signed-in accounts the features last heard of (notifications follow them).
+    features_sessions: Vec<String>,
+    /// The features' screens' own state (`features::ui`).
+    pub(crate) features_view: features::ui::State,
 }
 
 impl App {
-    fn new() -> (Self, Task<Message>) {
+    /// The daemon's boot: the state, then its window, unless Crystal starts in the background
+    /// (`--background`, Start with Windows), where only the notification-area icon shows.
+    fn new() -> (Self, Effect<Message>) {
+        let (mut app, task) = Self::boot();
+        // `--preview-idle` measures the background too: its close button hides the window.
+        if preview_idle() { app.settings.close_to_tray = true; }
+        let live = !app.preview || preview_idle();
+        let background = live && std::env::args().any(|a| a == startup_task::BACKGROUND_ARG);
+        if live { tray::start(); }
+        // `--preview-idle` too, so the idle footprint is measured with the features' threads.
+        if live { app.start_features(); }
+        if background {
+            tray::set_icon(true);
+            launch_log::append_history(&app.config.history_path(), "Crystal", &format!(
+                "background start: pid {}, no window", std::process::id()), None);
+            // Once the startup sign-ins and checks have run.
+            return (app, Effect::batch([task, App::trim_later(Duration::from_secs(30))]));
+        }
+        let open = app.open_window();
+        (app, Effect::batch([task, open]))
+    }
+
+    /// The one field list: inert values, no disk or network reads. `boot` sets what a real
+    /// start differs in; tests use it as it is (sample data, `preview` as the no-I/O switch).
+    fn base(config: Config, settings: Settings, sender: tick_gate::EventSender, receiver: mpsc::Receiver<WorkerEvent>, dgvoodoo: dgvoodoo::State) -> Self {
+        Self {
+            viewport: Size::new(1200.0, 820.0),
+            maximized: false,
+            title_held: false,
+            page: Page::Home,
+            show_details: false,
+            accounts: Vec::new(),
+            account_drag: account_order::Drag::default(),
+            windower_editor_open: false,
+            editor: None,
+            account_import: account_import_ui::State::default(),
+            services: None,
+            news_loading: false,
+            news_lang: i18n::Lang::En,
+            news_generation: 0,
+            news_error: String::new(),
+            startup_warning: None,
+            settings_damaged: false,
+            patch: None,
+            patch_loading: false,
+            installation_loading: false,
+            installation_generation: 0,
+            viewer: None,
+            viewer_loading: false,
+            viewer_generation: 0,
+            settings,
+            show_settings: false,
+            status: String::new(),
+            vault_ready: true,
+            startup_signin_pending: false,
+            startup_waiting: Vec::new(),
+            startup_issued: None,
+            launcher_start_logged: false,
+            status_read_done: true,
+            status_hold_spent: false,
+            held_plays: Vec::new(),
+            waiting_plays: Vec::new(),
+            play_flag: play_flag::Known::default(),
+            flag_schedule: play_flag::Schedule::default(),
+            play_updates: play_update::Jobs::default(),
+            patch_watch: patch_watch::Watch::default(),
+            #[cfg(test)]
+            launches: None,
+            #[cfg(test)]
+            w20_skipped: Vec::new(),
+            parks: Default::default(),
+            park_prints: Default::default(),
+            park_checked: None,
+            park_tended: None,
+            confirm_close: false,
+            closing: false,
+            pending_delete: None,
+            wiki_query: String::new(),
+            ah_query: String::new(),
+            ah_lookup: ffxiah::Lookup::default(),
+            ah_server: crate::ffxiah::DEFAULT_AH_SERVER,
+            news_filter: crate::services::NewsTab::Latest,
+            maintenance: None,
+            maintenance_progress: operation::Progress::default(),
+            maintenance_result: String::new(),
+            installer_error: None,
+            maintenance_tone: ResultTone::default(),
+            maintenance_cancelled: false,
+            update_scope: (true, true),
+            troubleshooting_open: false,
+            recovering: None,
+            patch_folder: None,
+            official: official_versions::Store::default(),
+            refused_plays: Vec::new(),
+            reissue_after_update: Vec::new(),
+            active_operation: None,
+            config,
+            sender,
+            receiver,
+            window: None,
+            parks_settled: true,
+            startup_task_busy: false,
+            vault_saving: false,
+            patch_generation: 0,
+            refreshed: Instant::now(),
+            preview: true,
+            preview_capture_sent: false,
+            settings_tab: settings_page::Tab::default(),
+            game_config: game_config::State::default(),
+            prereqs: prereqs::State::default(),
+            gamepad: gamepad::State::default(),
+            launch_tools: launch_tools::State::default(),
+            open_gate: Default::default(),
+            friends: friends::State::default(),
+            friends_expired: None,
+            friends_generation: 0,
+            friends_checked: Instant::now(),
+            dgvoodoo,
+            reshade: reshade::State::default(),
+            self_update: self_update::State::default(),
+            controller_nav: controller_nav::State::default(),
+            features: None,
+            features_sessions: Vec::new(),
+            features_view: features::ui::State::default(),
+        }
+    }
+
+    fn boot() -> (Self, Effect<Message>) {
         let config = Config::default();
-        let preview = std::env::args().any(|a| a.starts_with("--preview"));
+        let preview = preview::flags().is_some();
         let (settings, startup_warning) = if preview {
             (Settings::default(), None)
         } else {
@@ -840,287 +1236,38 @@ impl App {
         };
         // Previews are English unless --preview-ja, whatever Windows is set to.
         i18n::set(if preview {
-            if std::env::args().any(|a| a == "--preview-ja") { i18n::Lang::Ja } else { i18n::Lang::En }
+            if preview::has("--preview-ja") { i18n::Lang::Ja } else { i18n::Lang::En }
         } else {
             settings.language.unwrap_or_else(i18n::system_default)
         });
-        privacy::set(if preview { std::env::args().any(|a| a == "--preview-private") } else { settings.privacy });
+        privacy::set(if preview { preview::has("--preview-private") } else { settings.privacy });
         let (sender, receiver) = mpsc::channel();
         // With dgVoodoo on and not yet installed, its download starts in the background now,
         // so the first Play doesn't wait for it.
         let dgvoodoo = dgvoodoo::State::new(settings.dgvoodoo);
-        let mut app = Self {
-            viewport: initial_window_size(),
-            maximized: false,
-            title_held: false,
-            page: Page::Home,
-            show_details: false,
-            accounts: Vec::new(),
-            account_drag: account_order::Drag::default(),
-            windower_editor_open: false,
-            editor: None,
-            account_import: account_import_ui::State::default(),
-            services: if preview { None } else { services::cached(&news_cache_path(&config, i18n::current()), i18n::current()) },
-            news_loading: false,
-            news_lang: i18n::current(),
-            news_generation: 0,
-            news_error: String::new(),
-            startup_warning,
-            patch: None,
-            patch_loading: false,
-            installation_loading: false,
-            installation_generation: 0,
-            viewer: None,
-            viewer_loading: false,
-            viewer_generation: 0,
-            settings,
-            show_settings: false,
-            status: t("Loading saved accounts…").into(),
-            vault_ready: false,
-            startup_signin_pending: !preview,
-            startup_waiting: Vec::new(),
-            startup_issued: None,
-            launcher_start_logged: false,
-            status_read_done: preview,
-            status_hold_spent: false,
-            held_plays: Vec::new(),
-            waiting_plays: Vec::new(),
-            play_flag: play_flag::Known::default(),
-            flag_schedule: play_flag::Schedule::default(),
-            released: Vec::new(),
-            wait_update: None,
-            #[cfg(test)]
-            launches: None,
-            parks: Default::default(),
-            park_prints: Default::default(),
-            park_checked: None,
-            park_tended: None,
-            confirm_close: false,
-            closing: false,
-            pending_delete: None,
-            wiki_query: String::new(),
-            ah_query: String::new(),
-            ah_lookup: ffxiah::Lookup::default(),
-            ah_server: ui::DEFAULT_AH_SERVER,
-            news_filter: 0,
-            maintenance: None,
-            maintenance_progress: operation::Progress::default(),
-            maintenance_result: t("Files have not been checked. Version availability alone does not verify file integrity.").into(),
-            installer_error: None,
-            maintenance_tone: ResultTone::Unverified,
-            maintenance_cancelled: false,
-            update_scope: (true, true),
-            troubleshooting_open: false,
-            recovering: None,
-            patch_folder: None,
-            refused_plays: Vec::new(),
-            reissue_after_update: Vec::new(),
-            active_operation: None,
-            config: config.clone(),
-            sender,
-            receiver,
-            vault_saving: false,
-            patch_generation: 0,
-            refreshed: Instant::now(),
-            preview,
-            preview_capture_sent: false,
-            settings_tab: settings_page::Tab::default(),
-            game_config: game_config::State::default(),
-            prereqs: prereqs::State::default(),
-            gamepad: gamepad::State::default(),
-            launch_tools: launch_tools::State::default(),
-            friends: friends::State::default(),
-            friends_generation: 0,
-            friends_checked: Instant::now(),
-            dgvoodoo,
-            reshade: reshade::State::default(),
-            self_update: self_update::initial(&config),
-            controller_nav: controller_nav::State::default(),
-        };
-        app.launch_tools.refresh(&app.settings);
+        let mut app = Self::base(config.clone(), settings, tick_gate::EventSender::new(sender), receiver, dgvoodoo);
+        app.viewport = initial_window_size();
+        app.preview = preview;
+        app.settings_damaged = startup_warning.is_some();
+        app.startup_warning = startup_warning;
+        app.services = if preview { None } else { services::cached(&news_cache_path(&config, i18n::current()), i18n::current()) };
+        app.news_lang = i18n::current();
+        app.status = t("Loading saved accounts…").into();
+        app.vault_ready = false;
+        app.startup_signin_pending = !preview;
+        app.status_read_done = preview;
+        app.maintenance_result = t("Files have not been checked. Version availability alone does not verify file integrity.").into();
+        app.maintenance_tone = ResultTone::Unverified;
+        if !preview { app.official = official_versions::load(&official_versions::path_for(&config)); }
+        app.self_update = self_update::initial(&config);
+        let tools = app.launch_tools.refresh(&app.settings);
+        // The game's settings are read once, as soon as the app runs (a few registry values).
+        let game_config = Effect::done(Message::GameConfig(game_config::Msg::Load));
         if preview {
-            app.settings.light_theme = std::env::args().any(|a| a == "--preview-light");
-            app.settings.privacy = privacy::on();
-            app.load_preview();
-            if std::env::args().any(|a| a == "--preview-vanilla") {
-                app.settings.launch_with = ui::LaunchWith::Vanilla;
-                for row in &mut app.accounts {
-                    if row.account.mode == AccountMode::Retail { row.account.launch_with = Some(ui::LaunchWith::Vanilla); }
-                }
-            }
-            if std::env::args().any(|a| a == "--preview-ffxiah") { app.load_ah_preview(); }
-            if std::env::args().any(|a| a == "--preview-news-events") { app.news_filter = 2; }
-            if std::env::args().any(|a| a == "--preview-news-maintenance") { app.news_filter = 3; }
-            if std::env::args().any(|a| a == "--preview-news-empty") { app.news_filter = 1; }
-            if std::env::args().any(|a| matches!(a.as_str(), "--preview-friends" | "--preview-friends-ingame" | "--preview-inbox" | "--preview-compose")) {
-                let flag = |f: &str| std::env::args().any(|a| a == f);
-                app.load_friends_preview(flag("--preview-inbox"), flag("--preview-friends-ingame"), flag("--preview-compose"), flag("--preview-new-mail"));
-            }
-            // --preview-settings-<tab> opens a Settings tab (graphics, sound, controller, system).
-            if let Some(tab) = std::env::args().find_map(|a| {
-                a.strip_prefix("--preview-settings-").and_then(settings_page::Tab::from_flag)
-            }) {
-                app.page = Page::Settings;
-                app.settings_tab = tab;
-            }
-            if std::env::args().any(|a| a == "--preview-accounts") {
-                app.page = Page::Accounts;
-                // a client that crashed, with its log actions.
-                let crashed = launch_log::classify_exit(
-                    "[recomp] xinput: pad 0 polled, nothing connected\n\n[recomp] FATAL at 102dbbc4: indirect call/jump to an address with no translation\n",
-                    Some(1),
-                    Some(Duration::from_secs(8)),
-                );
-                if let Some(row) = app.accounts.get_mut(0) {
-                    row.set_exit(crashed);
-                    row.log = Some(PathBuf::from("preview.stderr.log"));
-                }
-                // show every row state in the accounts preview.
-                if let Some(row) = app.accounts.get_mut(1) {
-                    row.busy = true;
-                    row.status = t("Signing in to PlayOnline…").into();
-                }
-                if let Some(row) = app.accounts.get_mut(2) {
-                    row.account.mode = backend::AccountMode::Private;
-                    row.account.server = "play.example-server.net".into();
-                    row.selected = false;
-                }
-                if std::env::args().any(|a| a == "--preview-empty") {
-                    app.accounts.clear();
-                }
-            }
-            // The Play button with the launch profile's game running / starting.
-            if std::env::args().any(|a| a == "--preview-playing") {
-                for row in app.accounts.iter_mut().skip(1) {
-                    row.selected = false;
-                }
-                if let Some(row) = app.accounts.get_mut(0) {
-                    row.selected = true;
-                    row.pid = Some(4242);
-                }
-            }
-            if std::env::args().any(|a| a == "--preview-starting") {
-                for row in app.accounts.iter_mut().skip(1) {
-                    row.selected = false;
-                }
-                if let Some(row) = app.accounts.get_mut(0) {
-                    row.selected = true;
-                    row.busy = true;
-                    row.status = t("Signing in to PlayOnline…").into();
-                }
-            }
-            // close-confirmation preview.
-            if std::env::args().any(|a| a == "--preview-close") {
-                app.confirm_close = true;
-            }
-            if std::env::args().any(|a| a == "--preview-delete") {
-                app.pending_delete = Some(app.accounts[0].key.clone());
-            }
-            if std::env::args().any(|a| a == "--preview-maintenance") {
-                app.page = Page::Maintenance;
-                app.viewer = Some(viewer::Status {
-                    folder: Some(PathBuf::from(r"C:\Games\PlayOnlineViewer")),
-                    version: patch::PatchReport {
-                        state: patch::PatchState::Required,
-                        local_version: t("Not initialized").into(),
-                        remote_version: "20110829_E".into(),
-                        detail: t("PlayOnline has not completed its initial update. Press Update to finish it.").into(),
-                        source_url: None, files_verified: None,
-                    },
-                    core_error: None,
-                });
-                if std::env::args().any(|a| a == "--preview-fresh") {
-                    app.patch = Some(patch::PatchReport {
-                        state: patch::PatchState::Required,
-                        local_version: t("Not initialized").into(), remote_version: "30260904_1".into(),
-                        detail: t("FFXI has not completed its initial update. Choose Update to finish and create its installed-version record.").into(),
-                        source_url: None, files_verified: None,
-                    });
-                }
-            }
-            // a synthetic mid-download state for the Downloads preview.
-            if std::env::args().any(|a| a == "--preview-busy") {
-                app.settings.install_selected = true;
-                app.settings.installer_selected = true;
-                app.maintenance = Some(MaintenanceKind::Download);
-                let part = operation::Part {
-                    number: 3,
-                    name: "FFXIFullSetup_US.part3.rar",
-                    state: operation::PartState::Downloading { done: 678_760_000, expected: 1_610_612_736 },
-                };
-                app.maintenance_progress = operation::Progress {
-                    stage: "installer-download".into(),
-                    done: 3_900_000_000,
-                    total: 7_734_210_712,
-                    detail: part.english(),
-                    part: Some(part),
-                    bytes: true,
-                    remaining: Some(Duration::from_secs(115)),
-                    overall: None,
-                };
-            }
-            if std::env::args().any(|a| a == "--preview-update") {
-                app.page = Page::Maintenance;
-                app.settings.install_selected = true;
-                app.maintenance = Some(MaintenanceKind::Update);
-                app.maintenance_progress = operation::Progress {
-                    stage: "Download".into(), done: 42_000_000, total: 120_000_000,
-                    detail: "ROM/285/40.DAT".into(), bytes: true,
-                    remaining: Some(Duration::from_secs(115)),
-                    overall: Some(operation::OverallProgress {
-                        fraction: Some(0.28), remaining: Some(Duration::from_secs(265)), complete: false,
-                    }),
-                    ..operation::Progress::default()
-                };
-            }
-            if std::env::args().any(|a| a == "--preview-controller-nav") {
-                app.controller_nav.preview_focus();
-            }
-            if std::env::args().any(|a| a == "--preview-details") {
-                app.show_details = true;
-            }
-            if std::env::args().any(|a| a == "--preview-server-maintenance") {
-                if let Some(snapshot) = &mut app.services {
-                    snapshot.availability = services::Availability::Maintenance;
-                    snapshot.availability_note = tf("Official scheduled all-world maintenance window is active: {title}. Completion may change.",
-                        &[("title", &"All Worlds Maintenance (Preview)")]);
-                }
-            }
-            if std::env::args().any(|a| a == "--preview-servers-offline") {
-                if let Some(snapshot) = &mut app.services {
-                    snapshot.availability = services::Availability::Outage;
-                    snapshot.availability_note = t("Official status page reports all 16 production worlds down.").into();
-                }
-            }
-            if std::env::args().any(|a| a == "--preview-update-ready") {
-                if let Some(report) = &mut app.patch { report.state = patch::PatchState::Required; }
-            }
-            if std::env::args().any(|a| a == "--preview-modal") {
-                let mut account = app.accounts[0].account.clone();
-                account.launch_with = Some(if std::env::args().any(|a| a == "--preview-vanilla") {
-                    ui::LaunchWith::Vanilla
-                } else { ui::LaunchWith::Windower });
-                app.editor = Some(Editor {
-                    key: Some(app.accounts[0].key.clone()),
-                    account,
-                    game_install: String::new(),
-                    dat_overlays: Vec::new(),
-                    auto_login: pol_less::AutoLogin::default(),
-                });
-            }
-            if std::env::args().any(|a| a == "--preview-live-news") {
-                app.news_loading = true;
-                app.news_generation += 1;
-                let generation = app.news_generation;
-                let lang = i18n::current();
-                return (
-                    app,
-                    Task::perform(services::refresh(), move |result| Message::ServicesLoaded(generation, lang, result)),
-                );
-            }
-            return (app, Task::none());
+            let (app, task) = preview::boot(app);
+            return (app, Effect::batch([tools, game_config, task]));
         }
-        let accounts = Task::perform(
+        let accounts = Effect::perform(
             async move {
                 tokio::task::spawn_blocking(move || backend::load_or_import_accounts(&config))
                     .await
@@ -1131,14 +1278,18 @@ impl App {
         let checks = app.refresh();
         let installation = app.find_installation(true);
         let viewer = app.start_viewer_check();
-        let launcher = if app.settings.launcher_auto_updates && !matches!(app.self_update, self_update::State::Error(_)) { Task::done(Message::SelfUpdate(self_update::Msg::Check)) } else { Task::none() };
-        (app, Task::batch([accounts, checks, viewer, launcher, installation]))
+        let launcher = if app.settings.launcher_auto_updates && !matches!(app.self_update, self_update::State::Error(_)) { Effect::done(Message::SelfUpdate(self_update::Msg::Check)) } else { Effect::none() };
+        // Start with Windows on: its task still starts this exe (it may have moved).
+        let startup = if app.settings.start_with_windows { app.startup_task_busy = true; app.startup_task(None) } else { Effect::none() };
+        (app, Effect::batch([accounts, checks, viewer, launcher, installation, startup, tools, game_config]))
     }
 
-    fn subscription(&self) -> Subscription<Message> {
+    /// What the window's timers and listeners should be after this update, in no toolkit's
+    /// terms; the host (`slint_host`) runs them to match.
+    pub(crate) fn schedule(&self) -> Schedule {
         // Every tick rebuilds and redraws the whole view, so poll fast only while
         // work is in flight and idle along at 1 Hz otherwise.
-        let busy = self.preview
+        let busy = self.preview && !preview_idle()
             || self.maintenance.is_some()
             || self.active_operation.is_some()
             || self.vault_saving
@@ -1148,22 +1299,22 @@ impl App {
             || self.viewer_loading
             || self.friends.pending.is_some()
             || !self.held_plays.is_empty()
+            || !self.play_updates.jobs.is_empty()
             || self.accounts.iter().any(|a| a.busy || a.batch_pending);
         let tick = Duration::from_millis(if busy { 100 } else { 1000 });
-        Subscription::batch([
-            iced::time::every(tick).map(|_| Message::Tick),
-            window::close_requests().map(|_| Message::CloseRequested),
-            window::resize_events().map(|(_, size)| Message::WindowResized(size)),
-            window::open_events().map(Message::WindowOpened),
-            game_config::subscription(&self.game_config).map(Message::GameConfig),
-            prereqs::subscription(&self.prereqs).map(Message::Prereqs),
-            gamepad::subscription(&self.gamepad).map(Message::Gamepad),
-            dgvoodoo::subscription(&self.dgvoodoo),
-            iced::event::listen_with(user_input),
-            if self.account_drag.source.is_some() { iced::event::listen_raw(account_order::input) } else { Subscription::none() },
-            if self.controller_nav.repeating() { iced::time::every(Duration::from_millis(50)).map(|_| Message::ControllerTick) } else { Subscription::none() },
-        ])
+        // Ticks that would change nothing are not sent (each message redraws the window).
+        tick_gate::set_quiet(!busy && self.tick_quiet(), self.watched_flags(), self.next_timed_work());
+        Schedule {
+            tick,
+            // The controller thread polls only while there is a window to drive.
+            gamepad: self.window.is_some(),
+            account_drag: self.account_drag.source.is_some(),
+            controller_repeat: self.controller_nav.repeating(),
+        }
     }
+
+    /// The Start with Windows task is being registered or removed (its switch waits).
+    pub(crate) fn startup_task_busy(&self) -> bool { self.startup_task_busy }
 
     pub fn launchable_count(&self) -> usize {
         self.launch_keys(false).len()
@@ -1175,36 +1326,39 @@ impl App {
         if self.launch_blocked() {
             return Vec::new();
         }
-        let mut seen = BTreeSet::new();
+        // Row keys are unique (`replace_accounts`).
         self.accounts
             .iter()
             .filter(|r| r.account.mode == AccountMode::Retail && r.can_play() && (!selected_only || r.selected))
-            .filter_map(|r| seen.insert(r.key.clone()).then(|| r.key.clone()))
+            .map(|r| r.key.clone())
             .collect()
     }
     /// Whether `key`'s Play waits for FFXI to come back.
     pub(crate) fn is_waiting(&self, key: &str) -> bool {
         self.waiting_plays.iter().any(|wait| wait.keys.iter().any(|waiting| waiting == key))
     }
-    /// Whether `key`'s Play, released from its wait, is held for the Update it asked for, which
-    /// is running.
-    pub(crate) fn waited_update_running(&self, key: &str) -> bool {
-        self.maintenance == Some(MaintenanceKind::Update)
-            && self.wait_update.as_ref().is_some_and(|update| update.started && update.keys.iter().any(|known| known == key))
+    /// The Play-driven update `key` takes part in: its Play asked for it, or waits for it
+    /// (`true`: it is one of the job's waiters; `false`: its Play waits for the folder).
+    pub(crate) fn play_update_of(&self, key: &str) -> Option<(&play_update::Job, bool)> {
+        if self.play_updates.jobs.is_empty() { return None; }
+        if let Some(job) = self.play_updates.for_key(key) { return Some((job, true)); }
+        let row = self.accounts.iter().find(|row| row.key == key && row.queued_play.is_some())?;
+        let folder = self.play_folder(row)?;
+        self.play_updates.for_folder(&folder).map(|job| (job, false))
     }
     /// The selected accounts "Wait and play" would set waiting: launchable, not waiting yet.
     pub(crate) fn wait_keys(&self) -> Vec<String> {
         self.launch_keys(true).into_iter().filter(|key| !self.is_waiting(key)).collect()
     }
     fn has_sessions(&self) -> bool {
-        self.accounts.iter().any(|r| r.signing_out || r.busy || r.batch_pending || r.pid.is_some()
+        self.accounts.iter().any(|r| r.shutting_down || r.signing_out || r.busy || r.batch_pending || r.pid.is_some()
             || !self.preview && session_worker::find(&self.config, &r.account).is_some())
     }
 
     fn update_sessions(&self) -> Option<Vec<session_worker::BackgroundSession>> {
         let mut sessions = Vec::new();
         for row in &self.accounts {
-            if row.signing_out || row.batch_pending || row.queued_play.is_some() || row.is_playing()
+            if row.shutting_down || row.signing_out || row.batch_pending || row.queued_play.is_some() || row.is_playing()
                 || row.busy && !row.preparing_session { return None; }
             let session = (!self.preview).then(|| session_worker::find(&self.config, &row.account)).flatten();
             if let Some(session) = session {
@@ -1277,10 +1431,8 @@ impl App {
 
     pub fn main_action(&self) -> MainAction {
         if self.maintenance.is_some() || self.reshade.busy || matches!(self.self_update, self_update::State::Applying) { return MainAction::Working; }
-        if self.viewer.as_ref().is_some_and(viewer::Status::requires_update)
-            || self.patch.as_ref().is_some_and(|report| report.state == patch::PatchState::Required) {
-            return MainAction::Update;
-        }
+        // An update FFXI or PlayOnline needs no longer turns the button into Update: Play is
+        // the update (proposal 09 phase 2).
         match self.service_availability() {
             services::Availability::Maintenance => MainAction::Maintenance,
             services::Availability::Outage => MainAction::Offline,
@@ -1288,54 +1440,50 @@ impl App {
         }
     }
 
-    fn run_main_action(&mut self) -> Task<Message> {
+    fn run_main_action(&mut self) -> Effect<Message> {
         if self.reshade.busy {
             self.page = Page::Settings;
             self.settings_tab = settings_page::Tab::Graphics;
-            return Task::none();
+            return Effect::none();
         }
         // Resolve again on click: a status refresh may have changed the action.
         let action = self.main_action();
         match action {
-            MainAction::Play => self.start(self.launch_keys(true)),
-            MainAction::Update | MainAction::Working => {
-                let task = if action == MainAction::Update {
-                    self.start_maintenance(MaintenanceKind::Update)
-                } else { Task::none() };
+            MainAction::Play => self.play(self.launch_keys(true)),
+            MainAction::Working => {
                 self.page = Page::Maintenance;
                 self.show_settings = false;
                 self.show_details = false;
-                return task;
             }
             // "Wait and play": the selected accounts wait for FFXI (`wait_for_service`). With
             // nothing left to set waiting, the button explains the downtime.
             MainAction::Maintenance | MainAction::Offline => {
                 let keys = self.wait_keys();
-                if self.preview || keys.is_empty() { self.show_details = true; } else { self.start(keys); }
+                if self.preview || keys.is_empty() { self.show_details = true; } else { self.play(keys); }
             }
         }
-        Task::none()
+        Effect::none()
     }
 
     /// Open the native dialog off the UI thread, starting from what the field holds.
-    fn browse(&mut self, target: PickTarget) -> Task<Message> {
+    fn browse(&mut self, target: PickTarget) -> Effect<Message> {
         let blocked = match target {
             PickTarget::GameFolder | PickTarget::InstallerFolder => self.maintenance.is_some(),
             _ => false,
         };
         if self.preview || blocked {
-            return Task::none();
+            return Effect::none();
         }
         if target == PickTarget::AccountGameFolder || target == PickTarget::AccountDatFolder {
-            let Some(editor) = &self.editor else { return Task::none(); };
-            if self.vault_saving { return Task::none(); }
-            if target == PickTarget::AccountDatFolder && editor.dat_overlays.len() >= 8 { return Task::none(); }
+            let Some(editor) = &self.editor else { return Effect::none(); };
+            if self.vault_saving { return Effect::none(); }
+            if target == PickTarget::AccountDatFolder && editor.dat_overlays.len() >= 8 { return Effect::none(); }
             let current = if target == PickTarget::AccountDatFolder {
                 editor.dat_overlays.last().unwrap_or(&editor.game_install)
             } else { &editor.game_install };
             let start = dialog_start(current, false);
             let key = account_key(&editor.account);
-            return Task::perform(pick_path(target, start), move |picked| {
+            return Effect::perform(pick_path(target, start), move |picked| {
                 if target == PickTarget::AccountDatFolder { Message::PickedAccountOverlay(key.clone(), picked) }
                 else { Message::PickedAccountFolder(key.clone(), picked) }
             });
@@ -1346,23 +1494,25 @@ impl App {
             PickTarget::AshitaFolder => &self.settings.ashita_path,
             PickTarget::WindowerFolder => &self.settings.windower_path,
             PickTarget::LoaderFile => &self.settings.loader_path,
+            PickTarget::ProgramFile(i) => self.settings.open_with_game.get(i).map_or(&EMPTY, |p| &p.path),
             PickTarget::AccountGameFolder | PickTarget::AccountDatFolder => unreachable!(),
         };
-        let start = dialog_start(current, target == PickTarget::LoaderFile);
-        Task::perform(pick_path(target, start), move |picked| {
+        static EMPTY: String = String::new();
+        let start = dialog_start(current, matches!(target, PickTarget::LoaderFile | PickTarget::ProgramFile(_)));
+        Effect::perform(pick_path(target, start), move |picked| {
             Message::Picked(target, picked)
         })
     }
 
     /// A dialog answer: put the chosen path in its field. The game and installer
     /// folders then go through the same validation and confirmation as before.
-    fn picked(&mut self, target: PickTarget, picked: Option<PathBuf>) {
-        let Some(picked) = picked else { return };
+    fn picked(&mut self, target: PickTarget, picked: Option<PathBuf>) -> Effect<Message> {
+        let Some(picked) = picked else { return Effect::none() };
         let text = backend::plain_windows_path(&picked).to_string_lossy().into_owned();
         match target {
             PickTarget::GameFolder | PickTarget::InstallerFolder => {
                 if self.maintenance.is_some() {
-                    return;
+                    return Effect::none();
                 }
                 let installer = target == PickTarget::InstallerFolder;
                 if installer {
@@ -1373,17 +1523,15 @@ impl App {
                 }
                 self.select_path(installer);
             }
-            PickTarget::AshitaFolder => {
-                let _ = self.update(Message::LaunchTools(launch_tools::Msg::AshitaPath(text)));
-            }
-            PickTarget::WindowerFolder => {
-                let _ = self.update(Message::LaunchTools(launch_tools::Msg::WindowerPath(text)));
-            }
-            PickTarget::LoaderFile => {
-                let _ = self.update(Message::LaunchTools(launch_tools::Msg::LoaderPath(text)));
+            PickTarget::AshitaFolder => return self.update(Message::LaunchTools(launch_tools::Msg::AshitaPath(text))),
+            PickTarget::WindowerFolder => return self.update(Message::LaunchTools(launch_tools::Msg::WindowerPath(text))),
+            PickTarget::LoaderFile => return self.update(Message::LaunchTools(launch_tools::Msg::LoaderPath(text))),
+            PickTarget::ProgramFile(i) => {
+                let _ = self.update(Message::OpenWithGame(open_with_game::Msg::Path(i, text)));
             }
             PickTarget::AccountGameFolder | PickTarget::AccountDatFolder => {}
         }
+        Effect::none()
     }
 
     fn select_path(&mut self, installer: bool) {
@@ -1440,26 +1588,39 @@ impl App {
         }
     }
 
-    fn start_maintenance(&mut self, kind: MaintenanceKind) -> Task<Message> {
+    fn start_maintenance(&mut self, kind: MaintenanceKind) -> Effect<Message> {
+        self.start_maintenance_scoped(kind, false)
+    }
+
+    /// `viewer_only`: a Play's PlayOnline update, PlayOnline's alone (`run_combined(Some(viewer), None, ..)`): the
+    /// game's own update follows that Play in its session. Passed, never stored, so an Update
+    /// refused here cannot leave a later Downloads Update PlayOnline-only.
+    fn start_maintenance_scoped(&mut self, kind: MaintenanceKind, viewer_only: bool) -> Effect<Message> {
         if self.preview || self.maintenance.is_some() {
-            return Task::none();
+            return Effect::none();
         }
         let game_operation = matches!(
             kind,
             MaintenanceKind::Check | MaintenanceKind::Update | MaintenanceKind::Repair
         );
-        if game_operation && self.installation_loading { return Task::none(); }
+        if game_operation && self.installation_loading { return Effect::none(); }
+        // A Play-driven update holds its folder's updater lock and its accounts' sessions.
+        if kind.blocks_launch() && !self.play_updates.jobs.is_empty() {
+            self.status = t("Wait for the FINAL FANTASY XI update to finish.").into();
+            if !game_operation { self.installer_error = Some(self.status.clone()); }
+            return Effect::none();
+        }
         let account_folder = self.update_account_folder(kind);
         if !game_operation {
             // Pressing an installer step selects its current folder. The old
             // extra confirmation left all three buttons disabled on first use.
             self.settings.installer_selected = false;
             self.select_path(true);
-            if !self.settings.installer_selected { return Task::none(); }
-        } else if game_operation && !self.settings.install_selected && account_folder.is_none() {
+            if !self.settings.installer_selected { return Effect::none(); }
+        } else if !self.settings.install_selected && account_folder.is_none() {
             self.status =
                 t("Select the target folder explicitly before starting this operation.").into();
-            return Task::none();
+            return Effect::none();
         }
         let idle_sessions = if matches!(kind, MaintenanceKind::Update | MaintenanceKind::Repair) {
             self.update_sessions()
@@ -1468,35 +1629,37 @@ impl App {
             || !matches!(kind, MaintenanceKind::Update | MaintenanceKind::Repair) && self.has_sessions()) {
             self.status = t("Close all games and sign out PlayOnline sessions before updating, repairing, or running official setup. Existing sessions were kept.").into();
             if !game_operation { self.installer_error = Some(self.status.clone()); }
-            return Task::none();
+            return Effect::none();
         }
         if kind.blocks_launch() && !self.vault_ready {
             self.status = t("Wait for saved accounts and running sessions to be checked before changing game files.").into();
             if !game_operation { self.installer_error = Some(self.status.clone()); }
-            return Task::none();
+            return Effect::none();
         }
-        // A parked pol.exe has polcore.dll loaded: close every park before files change (07d §1.5).
-        if kind.blocks_launch() { self.close_parks(); }
+        // A parked pol.exe has polcore.dll loaded: close every park before files change (07d §1.5),
+        // off the interface thread, as the operation's first step.
+        let parks = if kind.blocks_launch() { self.parks.drain(None) } else { Vec::new() };
         // The Plays refused for this update start again when it succeeds (those released from a
         // wait too, whoever started it).
         if kind == MaintenanceKind::Update {
             self.reissue_after_update = std::mem::take(&mut self.refused_plays);
-            if let Some(update) = &mut self.wait_update {
-                update.started = true;
-                update.folder = account_folder.clone();
-            }
+            // The row's "Sign out and update" asked for this Update.
+            self.play_updates.viewer_confirm = None;
         }
         let install = account_folder.unwrap_or_else(|| PathBuf::from(&self.settings.install_path));
         let dir = PathBuf::from(&self.settings.installer_path);
         let op = operation::Operation::default();
+        // The update or repair reads and writes the game folder: its I/O, not ours.
+        startup_prefetch::cancel();
         if matches!(kind, MaintenanceKind::Update | MaintenanceKind::Repair) { op.begin_update(); }
         let idle_sessions = idle_sessions.unwrap_or_default();
         if !idle_sessions.is_empty() {
-            op.progress("SignOut", 0, idle_sessions.len() as u64,
+            op.progress(crate::operation::Stage::SignOut, 0, idle_sessions.len() as u64,
                 t("Signing out idle PlayOnline sessions before updating"));
         }
         // Check and Repair cover both components; an Update what needs it.
-        let (update_viewer, update_game) = if kind == MaintenanceKind::Update { self.update_scope() } else { (true, true) };
+        let (update_viewer, update_game) = if kind != MaintenanceKind::Update { (true, true) }
+            else if viewer_only { (true, false) } else { self.update_scope() };
         self.update_scope = (update_viewer, update_game);
         self.active_operation = Some(op.clone());
         self.maintenance = Some(kind);
@@ -1510,8 +1673,13 @@ impl App {
         let previous_viewer_version = self.viewer.as_ref().map(|v| v.version.remote_version.clone())
             .filter(|version| patch::valid_viewer_version(version));
         let sender = self.sender.clone();
-        Task::perform(
+        let (official_path, preview) = (official_versions::path_for(&self.config), self.preview);
+        let backup_config = self.config.clone();
+        Effect::perform(
             async move {
+                if let Err(error) = close_parks_now(parks).await {
+                    return (Err(error), None);
+                }
                 if !idle_sessions.is_empty() {
                     if let Err(error) = session_worker::sign_out_for_update(idle_sessions, &op).await {
                         return (Err(error), None);
@@ -1527,7 +1695,13 @@ impl App {
                     // An Update asked the official server for its version; the interface shows
                     // that answer instead of sending a request of its own. Check is offline.
                     let folder = install.clone();
-                    let pol_folder = if update_viewer { patch::registry_install_folder("1000") } else { None };
+                    // USER data first, before any file changes (features::backups).
+                    if mode != updater::Mode::Check && update_game && !preview {
+                        let (config, install) = (backup_config.clone(), install.clone());
+                        let kind = if mode == updater::Mode::Update { features::backups::Maintenance::Update } else { features::backups::Maintenance::Repair };
+                        let _ = tokio::task::spawn_blocking(move || features::runtime::backup_before_maintenance_logged(&config, &install, kind)).await;
+                    }
+                    let pol_folder = if update_viewer { patch::install_folder(updater::Product::Viewer) } else { None };
                     let result = match (pol_folder.clone(), update_viewer) {
                         (None, true) => Err(updater::CombinedFailure::from(t("PlayOnline Viewer is not installed. Run official setup and select PlayOnline Viewer.").to_owned())),
                         (pol, _) => updater::run_combined(pol, update_game.then_some(install), mode, op).await,
@@ -1539,6 +1713,10 @@ impl App {
                             Ok(report) => report.viewer.as_ref().map(|viewer| viewer.version.clone()),
                             Err(error) => error.viewer_version.clone().or(previous_viewer_version) } };
                         let _ = tokio::task::spawn_blocking(move || {
+                            // An Update or Repair asked the server (Check sent nothing): remember it.
+                            if let Some(version) = remote.as_deref().filter(|_| mode != updater::Mode::Check && !preview) {
+                                official_versions::learn_playonline_at(&official_path, version, official_versions::now());
+                            }
                             let _ = sender.send(WorkerEvent::Viewer(viewer_generation, viewer::after_check(pol, remote.as_deref())));
                         }).await;
                     } else if update_viewer {
@@ -1557,12 +1735,12 @@ impl App {
                         Err(error) => (Err(error.message), None),
                     };
                 }
-                MaintenanceKind::Download => installer::download(dir, op).await.map(|report| report.summary),
+                MaintenanceKind::Download => installer::download(dir, op).await,
                 MaintenanceKind::Extract | MaintenanceKind::Setup => {
                     tokio::task::spawn_blocking(move || {
                         op.check_cancelled()?;
-                        // No stage id: the page names the step from `kind`.
-                        op.progress("", 0, 0, dir.display().to_string());
+                        // No stage: the page names the step from `kind`.
+                        op.progress(crate::operation::Stage::None, 0, 0, dir.display().to_string());
                         if kind == MaintenanceKind::Extract {
                             installer::extract(&dir)?;
                             Ok(t("Extractor finished. Choose Run setup. If you extracted elsewhere, browse to that FFXIFullSetup_US folder first.").into())
@@ -1583,10 +1761,10 @@ impl App {
     /// read for that language is already running. A read for the other language
     /// (the user just switched) is left to finish unheard: its updates carry its
     /// language and are dropped.
-    fn start_news(&mut self) -> Task<Message> {
+    fn start_news(&mut self) -> Effect<Message> {
         let lang = i18n::current();
         if self.news_loading && self.news_lang == lang {
-            return Task::none();
+            return Effect::none();
         }
         self.news_loading = true;
         self.news_lang = lang;
@@ -1595,7 +1773,7 @@ impl App {
         self.refreshed = Instant::now();
         let sender = self.sender.clone();
         let cache = news_cache_path(&self.config, lang);
-        Task::perform(
+        Effect::perform(
             services::refresh_with_progress(lang, Some(cache), move |update| {
                 let _ = sender.send(WorkerEvent::Services(generation, lang, update));
             }),
@@ -1603,11 +1781,15 @@ impl App {
         )
     }
 
-    fn poll_service_status(&mut self) -> Task<Message> {
-        let downtime = matches!(self.service_availability(), services::Availability::Maintenance | services::Availability::Outage);
-        let interval = Duration::from_secs(if downtime { 60 } else { 300 });
+    /// How often the official status is read again: each minute while FFXI is down.
+    fn status_interval(&self) -> Duration {
+        Duration::from_secs(if self.service_down() { 60 } else { 300 })
+    }
+
+    fn poll_service_status(&mut self) -> Effect<Message> {
+        let interval = self.status_interval();
         if self.preview || self.news_loading || self.refreshed.elapsed() < interval {
-            return Task::none();
+            return Effect::none();
         }
         let lang = i18n::current();
         self.news_loading = true;
@@ -1615,40 +1797,40 @@ impl App {
         self.news_generation = self.news_generation.wrapping_add(1);
         let generation = self.news_generation;
         self.refreshed = Instant::now();
-        Task::perform(services::refresh_status(lang), move |result| Message::ServiceStatusLoaded(generation, lang, result))
+        Effect::perform(services::refresh_status(lang), move |result| Message::ServiceStatusLoaded(generation, lang, result))
     }
 
-    fn refresh(&mut self) -> Task<Message> {
+    fn refresh(&mut self) -> Effect<Message> {
         if self.preview {
-            return Task::none();
+            return Effect::none();
         }
         self.refreshed = Instant::now();
-        Task::batch([self.start_news(), self.read_installed_version()])
+        Effect::batch([self.start_news(), self.read_installed_version()])
     }
 
-    fn find_installation(&mut self, automatic: bool) -> Task<Message> {
+    fn find_installation(&mut self, automatic: bool) -> Effect<Message> {
         if self.preview || self.maintenance.is_some() || self.installation_loading {
-            return Task::none();
+            return Effect::none();
         }
         self.installation_generation = self.installation_generation.wrapping_add(1);
         let generation = self.installation_generation;
         self.installation_loading = true;
         let preferred = automatic.then(|| PathBuf::from(&self.settings.install_path));
         if !automatic { self.status = t("Finding FINAL FANTASY XI…").into(); }
-        Task::perform(async move {
+        Effect::perform(async move {
             tokio::task::spawn_blocking(move || patch::find_game_installation(preferred.as_deref()))
                 .await.ok().flatten()
         }, move |folder| Message::InstallationFound(generation, automatic, folder))
     }
 
-    fn read_installed_version(&mut self) -> Task<Message> {
-        if self.preview { return Task::none(); }
+    fn read_installed_version(&mut self) -> Effect<Message> {
+        if self.preview { return Effect::none(); }
         self.patch_loading = true;
         self.patch_generation += 1;
         let generation = self.patch_generation;
         let install = PathBuf::from(&self.settings.install_path);
         // Reads the installed record only. The server is asked when Play is pressed.
-        Task::perform(
+        Effect::perform(
             async move {
                 tokio::task::spawn_blocking(move || patch::local_report(&install))
                     .await
@@ -1657,7 +1839,7 @@ impl App {
                         local_version: t("Unavailable").into(),
                         remote_version: t("Not checked").into(),
                         detail: tf("Could not read local patch metadata: {error}", &[("error", &e)]),
-                        source_url: None, files_verified: None,
+                        files_verified: None,
                     })
             },
             move |r| Message::PatchLoaded(generation, r),
@@ -1687,6 +1869,7 @@ impl App {
         }
         self.settings = settings;
         self.status = t("Account order saved.").into();
+        self.features_order_changed();
     }
 
     fn replace_accounts(&mut self, values: Vec<Account>) {
@@ -1696,8 +1879,11 @@ impl App {
             .map(|r| (r.key.clone(), r))
             .collect();
         let mut seen = BTreeSet::new();
-        for account in values {
+        for mut account in values {
             let key = account_key(&account);
+            if let Some(names) = self.settings.account_pol_handles.get(&key) {
+                account.pol_handle_names = names.clone();
+            }
             if !seen.insert(key.clone()) {
                 continue;
             }
@@ -1710,19 +1896,24 @@ impl App {
                         .settings
                         .selected_accounts
                         .as_ref()
-                        .map_or(true, |s| s.contains(&key)),
+                        .is_none_or(|s| s.contains(&key)),
                     key,
                     status: if account.mode == AccountMode::Retail { t("Ready to launch") } else { t("Private-server client temporarily unavailable") }.into(),
                     account,
                     otp: String::new(),
                     busy: false,
                     signing_out: false,
+                    shutting_down: false,
                     preparing_session: false,
+                    sign_in_done: None,
                     queued_play: None,
                     batch_pending: false,
                     batch_requested: false,
                     launch_generation: 0,
+                    note: None,
+                    note_on: String::new(),
                     pid: None,
+                    host_created: None,
                     alive: None,
                     game_running: None,
                     log: None,
@@ -1745,7 +1936,7 @@ impl App {
             if !row.batch_requested {
                 row.batch_pending = session_worker::batch_pending(&self.config, &row.account);
             }
-            let reconnect = if row.pid.is_none() && !row.busy {
+            let reconnect = if row.pid.is_none() && !row.busy && !row.shutting_down {
                 session_worker::find(&self.config, &row.account)
             } else {
                 None
@@ -1754,6 +1945,7 @@ impl App {
             if let Some(session) = reconnect {
                 row.busy = true;
                 row.preparing_session = session.preparing_social();
+                row.sign_in_done = None;
                 // A code spent in an earlier window is still spent (no sign-in after its game).
                 // An older worker's record does not say; its "no code" teaches nothing.
                 let used = session.otp_used();
@@ -1765,13 +1957,10 @@ impl App {
                 row.launch_generation = row.launch_generation.wrapping_add(1);
                 let generation = row.launch_generation;
                 row.status = t("Reconnecting to the background session…").into();
-                let sender = self.sender.clone();
-                let worker_key = key.clone();
+                let tx = LaunchTx::new(self.sender.clone(), key.clone(), generation);
                 let spawned = std::thread::Builder::new().name("session-reconnect".into()).spawn(move || {
-                    let result = session.reconnect(|message| {
-                        let _ = sender.send(WorkerEvent::Progress(worker_key.clone(), message.to_owned()).for_launch(&worker_key, generation));
-                    });
-                    let _ = sender.send(WorkerEvent::Complete(worker_key.clone(), result).for_launch(&worker_key, generation));
+                    let result = session.reconnect(|message| tx.progress(message));
+                    tx.complete(result);
                 });
                 if spawned.is_err() {
                     row.busy = false;
@@ -1784,14 +1973,14 @@ impl App {
         self.reset_missing_friends_account();
     }
 
-    fn save_accounts(&mut self, values: Vec<Account>) -> Task<Message> {
+    fn save_accounts(&mut self, values: Vec<Account>) -> Effect<Message> {
         if !self.vault_ready || self.vault_saving || self.preview {
-            return Task::none();
+            return Effect::none();
         }
         self.vault_saving = true;
         self.status = t("Saving account…").into();
         let config = self.config.clone();
-        Task::perform(
+        Effect::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
                     backend::save_accounts(&config, &values)?;
@@ -1804,22 +1993,24 @@ impl App {
         )
     }
 
-    fn start(&mut self, keys: Vec<String>) {
-        self.start_mode(keys, false);
+    /// A Play clicked now.
+    fn play(&mut self, keys: Vec<String>) {
+        self.start_launch(keys, false, Instant::now(), None);
     }
 
-    fn start_mode(&mut self, keys: Vec<String>, social_only: bool) {
-        self.start_mode_at(keys, social_only, Instant::now());
+    /// A sign-in only (Connect, a new account's "Sign in now") clicked now.
+    fn connect(&mut self, keys: Vec<String>) {
+        self.start_launch(keys, true, Instant::now(), None);
     }
 
     /// Local Viewer readiness for the UI. Stock sends no W2U (:54000) without a Connect, so
     /// launcher start and setup never query the server; each sign-in asks once (07c §3).
-    fn start_viewer_check(&mut self) -> Task<Message> {
-        if self.preview || self.viewer_loading { return Task::none(); }
+    fn start_viewer_check(&mut self) -> Effect<Message> {
+        if self.preview || self.viewer_loading { return Effect::none(); }
         self.viewer_loading = true;
         self.viewer_generation += 1;
         let generation = self.viewer_generation;
-        Task::perform(async move {
+        Effect::perform(async move {
             tokio::task::spawn_blocking(viewer::local_status).await
                 .unwrap_or_else(|e| viewer::unavailable(e.to_string()))
         }, move |report| Message::ViewerLoaded(generation, report))
@@ -1827,6 +2018,7 @@ impl App {
 
     fn set_viewer_status(&mut self, generation: u64, report: viewer::Status) {
         if generation == self.viewer_generation { self.viewer_loading = false; self.viewer = Some(report); }
+        self.reload_official();
     }
 
     fn coordinated_keys(&self, keys: &[String]) -> Vec<String> {
@@ -1848,6 +2040,7 @@ impl App {
     }
 
     fn start_together(&mut self, keys: Vec<(String, Option<session_worker::BackgroundSession>)>, clicked: Instant, trigger: launch_timing::LaunchTrigger) {
+        self.prefetch_startup_files(&keys.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>());
         let mut jobs = Vec::new();
         let mut generations = HashMap::new();
         for (key, session) in keys {
@@ -1879,12 +2072,15 @@ impl App {
             };
             jobs.push(job);
             row.signed_out = false;
+            row.game_seen = false;
+            row.resign_declined = false;
             row.launch_generation = row.launch_generation.wrapping_add(1);
             generations.insert(key, row.launch_generation);
             row.batch_pending = true;
             row.batch_requested = true;
             row.busy = true;
             row.preparing_session = false;
+            row.sign_in_done = None;
             row.queued_play = None;
             row.problem = false;
             row.exit = None;
@@ -1938,10 +2134,6 @@ impl App {
         }
     }
 
-    fn start_mode_at(&mut self, keys: Vec<String>, social_only: bool, clicked: Instant) {
-        self.start_launch(keys, social_only, clicked, None);
-    }
-
     /// `trigger`: what started this launch, for its log (07d §4.2); `None` names it by the
     /// path it takes (Play, Connect, pre-signed, queued or batch Play).
     /// Every Play path (single, pre-signed, queued behind a pre-sign-in, batch, a reissue)
@@ -1949,23 +2141,30 @@ impl App {
     /// A sign-in only (startup, Connect) is never gated: PlayOnline is up during FFXI
     /// maintenance and a stock user can sign in then.
     fn start_launch(&mut self, keys: Vec<String>, social_only: bool, clicked: Instant, trigger: Option<launch_timing::LaunchTrigger>) {
+        self.prefetch_startup_files(&keys);
         // A new Play replaces a refused one an Update would have started again.
-        if !social_only { self.refused_plays.retain(|(key, _)| !keys.contains(key)); }
+        if !social_only {
+            self.refused_plays.retain(|(key, _)| !keys.contains(key));
+            // and the "Sign out and update" that refused Play left on its row.
+            if self.play_updates.viewer_confirm.as_ref().is_some_and(|(key, _)| keys.contains(key)) { self.play_updates.viewer_confirm = None; }
+        }
+        // A Play on a session with a maintenance check out waits for its answer
+        // (`start_queued_plays`): one W20 at a time.
+        let (held, keys): (Vec<String>, Vec<String>) = keys.into_iter().partition(|key| !social_only && self.patch_watch.in_flight(key));
+        for row in self.accounts.iter_mut().filter(|row| held.contains(&row.key)) {
+            row.queued_play = Some(clicked);
+            row.status = t("Waiting for the update…").into();
+        }
+        if keys.is_empty() { return; }
         if !social_only && self.hold_for_status(&keys, clicked, trigger) { return; }
-        self.start_launch_now(keys, social_only, clicked, trigger);
+        self.start_launch_now(keys, social_only, clicked, trigger, false);
     }
 
-    /// A Play of `key` was refused because an update is required: an Update started while
-    /// this stands starts that Play again when it succeeds (proposal 09 phase 1).
+    /// A Play of `key` was refused because PlayOnline needs an update: the Update that Play
+    /// starts (`begin_viewer_update`) starts it again when it succeeds.
     fn note_refused_play(&mut self, key: &str, clicked: Instant) {
         self.refused_plays.retain(|(known, _)| known != key);
         self.refused_plays.push((key.to_owned(), clicked));
-        // A Play released from a wait has nobody to press Update: it starts by itself.
-        if let Some(at) = self.released.iter().position(|released| released == key) {
-            self.released.remove(at);
-            let update = self.wait_update.get_or_insert(WaitUpdate { keys: Vec::new(), started: false, folder: None });
-            if !update.started && !update.keys.iter().any(|known| known == key) { update.keys.push(key.to_owned()); }
-        }
     }
 
     /// Whether `key`'s sign-ins take a one-time code, as its last successful one did (or as a
@@ -1998,19 +2197,286 @@ impl App {
 
     /// A W20 verdict for `key`'s game folder becomes the window's FFXI report.
     fn set_patch_from_row(&mut self, key: &str, report: patch::PatchReport) {
+        self.patch_folder = self.account_game_folder(key);
+        self.show_patch(report);
+        self.reload_official();
+    }
+
+    /// `report` becomes the window's FFXI report; a read still in flight no longer replaces it.
+    fn show_patch(&mut self, report: patch::PatchReport) {
         self.patch_generation += 1;
         self.patch_loading = false;
-        self.patch_folder = self.account_game_folder(key);
         self.patch = Some(report);
+    }
+
+    /// `status` becomes the window's PlayOnline report; a read still in flight no longer replaces it.
+    fn show_viewer(&mut self, status: viewer::Status) {
+        self.viewer_generation += 1;
+        self.viewer_loading = false;
+        self.viewer = Some(status);
+    }
+
+    /// The game folder `row`'s Play uses (its own, else the Settings one), when it is one.
+    fn play_folder(&self, row: &AccountRow) -> Option<PathBuf> {
+        pol_less::install_directory(&self.settings.config_for(&self.config, &row.account)).ok()
+    }
+
+    /// `row`'s game folder is being updated for a Play (its own or another account's).
+    fn folder_updating(&self, row: &AccountRow) -> bool {
+        !self.play_updates.jobs.is_empty()
+            && self.play_folder(row).is_some_and(|folder| self.play_updates.for_folder(&folder).is_some())
+    }
+
+    /// Every signed-in account of `folder`, for an update's wait before installing.
+    fn update_members(&self, folder: &Path) -> Vec<play_update::Member> {
+        self.accounts.iter().filter(|row| row.pid.is_some())
+            .filter(|row| self.play_folder(row).is_some_and(|own| play_update::same_folder(&own, folder)))
+            .map(|row| {
+                let config = self.settings.config_for(&self.config, &row.account);
+                play_update::Member { key: row.key.clone(), label: row.account.label.clone(), host: row.pid,
+                    session: (!self.preview).then(|| session_worker::find(&config, &row.account)).flatten(),
+                    playing: row.is_playing() }
+            }).collect()
+    }
+
+    /// Play is the update (proposal 09 phase 2): the W20 of `key`'s Play said its game folder
+    /// needs an update (`report`). Its session stays signed in at the main menu while the
+    /// folder updates (one job per folder: another account's refusal joins it), then the game
+    /// starts with no second version check. `false` when no in-session update applies (no
+    /// session, no official version, a file operation running): the row keeps the refusal.
+    /// `batch`: a batch's refusal, which every account of the batch was told; one whose own
+    /// folder is already that version starts on its own instead. `probe`: maintenance's version
+    /// check asked (patch_watch): the same update runs with no Play waiting on it, so no game
+    /// starts after it.
+    fn begin_play_update(&mut self, key: &str, report: &patch::PatchReport, clicked: Instant, batch: bool, probe: bool) -> bool {
+        if self.preview || self.closing { return false; }
+        let Some(row) = self.accounts.iter().find(|row| row.key == key && row.pid.is_some()) else { return false };
+        let Some(folder) = self.play_folder(row) else { return false };
+        let Some(official) = patch::in_session_update(&folder, report) else {
+            // A batch account whose own folder is current was refused for another's update.
+            let current = !probe && batch && report.state == patch::PatchState::Required && !row.is_playing()
+                && patch::installed_for_request(&folder) == report.remote_version;
+            if current { self.start_launch_now(vec![key.to_owned()], false, clicked, Some(launch_timing::LaunchTrigger::ReissuedPlay), false); }
+            return current;
+        };
+        let directory = self.settings.config_for(&self.config, &row.account).account_directory(&row.account);
+        // The W20 ran in a session worker or the batch coordinator: its FIN spaces the update's
+        // first connection (one in this window noted its own).
+        let closed = if self.preview { None } else { patch::take_update_close(&directory) };
+        let members = self.update_members(&folder);
+        if let Some(job) = self.play_updates.for_folder_mut(&folder) {
+            if !probe && !job.has(key) { job.waiters.push(play_update::Waiter { key: key.to_owned(), clicked, fallback: false }); }
+            *job.members.lock().unwrap_or_else(|e| e.into_inner()) = members;
+            if let Some(at) = closed { updater::note_patch_closed(updater::Product::Ffxi, at); }
+        } else {
+            // A Downloads operation holds the folder (or PlayOnline's): the refusal stands.
+            if self.maintenance.is_some() || self.recovering.is_some() { return false; }
+            let job = self.play_updates.begin(folder.clone(), key, official.clone(), clicked, members, probe);
+            let (generation, op, shared) = (job.generation, job.op.clone(), job.members.clone());
+            // The update reads and writes the game folder: its I/O, not the start-up pre-read's.
+            startup_prefetch::cancel();
+            #[cfg(test)]
+            { let _ = (op, shared); self.play_updates.spawned.push((folder.clone(), official.clone(), closed)); }
+            #[cfg(not(test))]
+            if let Err(error) = play_update::spawn(generation, folder.clone(), official.clone(), closed, op, shared, self.sender.clone()) {
+                self.play_updates.take(generation);
+                self.status = error;
+                return false;
+            }
+            #[cfg(test)]
+            let _ = generation;
+            if probe {
+                launch_log::append_history(&self.config.history_path(), "Crystal",
+                    &format!("maintenance update: started, official {official}"), None);
+            }
+        }
+        if probe {
+            self.status = t("Downloading the FFXI update").into();
+            return true;
+        }
+        if let Some(row) = self.accounts.iter_mut().find(|row| row.key == key) {
+            row.busy = true;
+            row.preparing_session = false;
+            row.problem = false;
+            row.status = t("Updating FINAL FANTASY XI…").into();
+        }
+        self.status = tf("{account}: FINAL FANTASY XI needs an update to {version}. Updating it now; you stay signed in.",
+            &[("account", &self.accounts.iter().find(|row| row.key == key).map_or("", |row| row.account.label.as_str())), ("version", &official)]);
+        true
+    }
+
+    /// A Play of `key` while its folder updates for another account: it waits at the main
+    /// menu (a cold Play signs in first) and `start_queued_plays` releases it afterwards.
+    fn wait_for_folder_update(&mut self, key: &str, clicked: Instant) {
+        let cold = self.accounts.iter().any(|row| row.key == key && row.pid.is_none() && !row.busy);
+        if cold { self.start_launch_now(vec![key.to_owned()], true, clicked, None, false); }
+        if let Some(row) = self.accounts.iter_mut().find(|row| row.key == key && (row.pid.is_some() || row.busy)) {
+            row.queued_play = Some(clicked);
+            row.problem = false;
+            row.status = t("Waiting for the update…").into();
+        }
+    }
+
+    /// What a Play-driven update's thread reported.
+    fn play_update_event(&mut self, generation: u64, event: play_update::Event) {
+        use play_update::Event;
+        let Some(job) = self.play_updates.get_mut(generation) else { return };
+        match event {
+            Event::Waiting(on) => job.blocked = Some(on),
+            Event::Installing => { job.blocked = None; job.installing = true; }
+            Event::SignedOut(key) => {
+                match job.waiters.iter_mut().find(|waiter| waiter.key == key) {
+                    Some(waiter) => waiter.fallback = true,
+                    None => job.signed_out.push(key),
+                }
+            }
+            Event::Finished(result) => {
+                if let Some(job) = self.play_updates.take(generation) { self.finish_play_update(job, result); }
+            }
+        }
+    }
+
+    fn finish_play_update(&mut self, job: play_update::Job, result: Result<play_update::Done, String>) {
+        // Installed, or cancelled: nothing more until the next flip. Failed (a network drop, a
+        // full disk): checked again on the schedule, resuming from the verified downloads.
+        if result.is_err() && !job.cancelled { self.patch_watch.checked(&job.folder, false, Instant::now(), patch_watch::jitter()); }
+        else { self.patch_watch.updated(&job.folder, result.is_ok()); }
+        if job.probe {
+            let line = match &result {
+                Ok(done) => format!("maintenance update: installed {}: {}", job.official, done.summary),
+                Err(error) => format!("maintenance update: stopped: {error}"),
+            };
+            launch_log::append_history(&self.config.history_path(), "Crystal", &line, None);
+        }
+        match result {
+            Ok(done) => {
+                if let Some(report) = done.report {
+                    self.patch_folder = self.account_game_folder(&job.owner);
+                    self.show_patch(report);
+                }
+                self.learn_from_update(&job.folder, Some(&job.official), None);
+                self.status = if self.patch_watch.installed(&job.folder) { t("Update installed · waiting for servers").into() }
+                    else { tf("FINAL FANTASY XI updated: {summary}", &[("summary", &done.summary)]) };
+                for key in &job.signed_out {
+                    if let Some(row) = self.accounts.iter_mut().find(|row| row.key == *key && !row.busy) {
+                        row.status = t("Signed out of PlayOnline so the update could install.").into();
+                    }
+                    // Held at the main menu again for the worlds' opening (maintenance_sign_ins).
+                    self.patch_watch.forget_signed(key);
+                }
+                for waiter in job.waiters {
+                    let otp_account = self.settings.account_otp.contains(&waiter.key);
+                    let Some(row) = self.accounts.iter_mut().find(|row| row.key == waiter.key) else { continue };
+                    row.busy = false;
+                    let signed_in = row.pid.is_some() && !waiter.fallback;
+                    if !signed_in && (row.otp_spent || otp_account) && row.otp.is_empty() {
+                        // Its host was signed out for the install: a new sign-in needs a new code.
+                        row.status = t("FINAL FANTASY XI is updated. Enter a new one-time code, then press Play.").into();
+                        row.problem = true;
+                        continue;
+                    }
+                    // Still signed in: the game starts through the signed-in path with no second
+                    // W20 (`skip_w20`). Signed out (the fallback): one new sign-in, as a Play.
+                    // The skip is this start's only: one that waits, pauses or is refused here
+                    // runs its own W20 when it goes ahead later.
+                    self.start_launch_now(vec![waiter.key], false, waiter.clicked, Some(launch_timing::LaunchTrigger::ReissuedPlay), signed_in);
+                }
+            }
+            Err(error) => {
+                // Cancel, a network drop, or anything else: the verified downloads stay, and the
+                // next Play continues from them.
+                let paused = t("Update paused. Press Play to continue.");
+                for waiter in &job.waiters {
+                    if let Some(row) = self.accounts.iter_mut().find(|row| row.key == waiter.key) {
+                        row.busy = false;
+                        row.problem = !job.cancelled;
+                        row.play_timing = None;
+                        row.status = paused.into();
+                    }
+                }
+                // Plays that waited for it would only ask for it again: they wait for the user.
+                // Not after maintenance's update, which no one asked for: their own W20 runs.
+                for row in self.accounts.iter_mut().filter(|row| !job.probe && row.queued_play.is_some() && !job.has(&row.key)) {
+                    let folder = pol_less::install_directory(&self.settings.config_for(&self.config, &row.account)).ok();
+                    if folder.is_some_and(|folder| play_update::same_folder(&folder, &job.folder)) {
+                        row.queued_play = None;
+                        row.status = paused.into();
+                    }
+                }
+                self.status = if job.cancelled { paused.into() } else { tf("Update paused: {error}", &[("error", &error)]) };
+            }
+        }
+    }
+
+    /// Cancel pauses a Play-driven update: what was downloaded stays verified for the next Play.
+    fn cancel_play_update(&mut self, generation: u64) {
+        let Some(job) = self.play_updates.get_mut(generation) else { return };
+        job.op.cancel();
+        job.cancelled = true;
+        self.status = t("Pausing the update…").into();
+    }
+
+    /// A Play refused because PlayOnline is out of date: PlayOnline updates now (its own
+    /// update, `run_combined(Some(viewer), None, ..)`), then the same Play starts again (`reissue_after_update`).
+    /// Idle accounts must be signed out for it (their hosts load PlayOnline's files): the row
+    /// asks once. A running game can't be closed for it: the row says so.
+    fn begin_viewer_update(&mut self, key: &str) {
+        if self.preview || self.maintenance.is_some() || !self.play_updates.jobs.is_empty() { return; }
+        let shown = match self.update_sessions() {
+            None => Some(t("PlayOnline needs an update. Close FINAL FANTASY XI on every account, then press Play.").to_owned()),
+            Some(sessions) if !sessions.is_empty() => {
+                self.play_updates.viewer_confirm = Some((key.to_owned(), sessions.len()));
+                Some(tf("PlayOnline must sign out {count} accounts to update.", &[("count", &sessions.len())]))
+            }
+            Some(_) => {
+                let task = self.start_maintenance_scoped(MaintenanceKind::Update, true);
+                self.play_updates.tasks.push(task);
+                (self.maintenance != Some(MaintenanceKind::Update)).then(|| self.status.clone())
+            }
+        };
+        if let (Some(shown), Some(row)) = (shown, self.accounts.iter_mut().find(|row| row.key == key)) {
+            row.status = shown;
+            row.problem = true;
+        }
+    }
+
+    /// The game folder the window's FFXI report describes.
+    pub(crate) fn shown_game_folder(&self) -> PathBuf {
+        self.patch_folder.clone().unwrap_or_else(|| PathBuf::from(&self.settings.install_path))
+    }
+
+    /// The official versions real checks have told, read again: the W20 and W2U run on
+    /// other threads and in session workers, which write them where `official_versions` says.
+    fn reload_official(&mut self) {
+        if !self.preview { self.official = official_versions::load(&official_versions::path_for(&self.config)); }
+    }
+
+    /// An Update or Repair asked the server for its version (the updater's own request):
+    /// remembered like a Play's check. Nothing is sent for this.
+    fn learn_from_update(&mut self, folder: &Path, game: Option<&str>, playonline: Option<&str>) {
+        if self.preview { return; }
+        let path = official_versions::path_for(&self.config);
+        let now = official_versions::now();
+        if let Some(version) = game { official_versions::learn_game_at(&path, folder, version, now); }
+        if let Some(version) = playonline { official_versions::learn_playonline_at(&path, version, now); }
+        self.reload_official();
+    }
+
+    /// The remembered official version for the FFXI folder on screen.
+    pub(crate) fn learned_game(&self) -> Option<&official_versions::Learned> {
+        self.official.game(&self.shown_game_folder())
     }
 
     /// Holds a Play clicked before the first status read (in flight, or not yet started)
     /// instead of gating it on a missing or cached status. Off the interface thread: the read
     /// is async, and `release_held_plays` runs when it lands or at STATUS_HOLD_LIMIT.
-    fn hold_for_status(&mut self, keys: &[String], clicked: Instant, trigger: Option<launch_timing::LaunchTrigger>) -> bool {
+    fn hold_for_status(&mut self, incoming: &[String], clicked: Instant, trigger: Option<launch_timing::LaunchTrigger>) -> bool {
         if self.preview || self.status_read_done || self.status_hold_spent { return false; }
         let held: BTreeSet<&String> = self.held_plays.iter().flat_map(|play| &play.keys).collect();
-        let keys: Vec<String> = keys.iter().filter(|key| !held.contains(key)).cloned().collect();
+        let keys: Vec<String> = incoming.iter().filter(|key| !held.contains(key)).cloned().collect();
+        // Nothing new to hold: a repeat click on held keys stays held; nothing at all goes on to
+        // the normal refusal instead of a "checking" line nothing will clear.
+        if keys.is_empty() { return incoming.iter().any(|key| held.contains(key)); }
         let checking = t("Checking whether FINAL FANTASY XI is up…");
         let mut rows = Vec::new();
         for row in self.accounts.iter_mut().filter(|row| keys.contains(&row.key)) {
@@ -2019,9 +2485,7 @@ impl App {
         }
         let before = std::mem::replace(&mut self.status, checking.into());
         let status = if before == checking { self.held_plays.first().map(|play| play.status.clone()).unwrap_or_default() } else { before };
-        if !keys.is_empty() {
-            self.held_plays.push(HeldPlay { keys, clicked, trigger, since: Instant::now(), rows, status });
-        }
+        self.held_plays.push(HeldPlay { keys, clicked, trigger, since: Instant::now(), rows, status });
         true
     }
 
@@ -2045,7 +2509,7 @@ impl App {
             }
             if self.status == checking { self.status = play.status; }
             let keys: Vec<String> = play.keys.into_iter().filter(|key| self.accounts.iter().any(|row| row.key == *key)).collect();
-            if !keys.is_empty() { self.start_launch_now(keys, false, play.clicked, play.trigger); }
+            if !keys.is_empty() { self.start_launch_now(keys, false, play.clicked, play.trigger, false); }
         }
     }
 
@@ -2086,8 +2550,8 @@ impl App {
         let install = (!self.preview && self.settings.install_selected && !self.settings.install_path.trim().is_empty())
             .then(|| PathBuf::from(&self.settings.install_path));
         let spawned = std::thread::Builder::new().name("finish-update".into()).spawn(move || {
-            pol_less::park::close_workers(parks);
-            let result = folders.iter().try_for_each(|folder| updater::recover_interrupted(folder).map(|_| ()));
+            let result = pol_less::park::close_workers_and_wait(parks, pol_less::park::EXIT_WAIT)
+                .and_then(|()| folders.iter().try_for_each(|folder| updater::recover_interrupted(folder).map(|_| ())));
             // The window's reports said "interrupted": read them again.
             let (game, viewer) = if result.is_ok() {
                 (install.map(|install| patch::local_report(&install)), Some(viewer::local_status()))
@@ -2116,14 +2580,10 @@ impl App {
         // Only a report that said "interrupted" is replaced: a server verdict stays.
         let interrupted = |state: patch::PatchState| state == patch::PatchState::Interrupted;
         if let Some(report) = game.filter(|_| self.patch_folder.is_none() && self.patch.as_ref().is_none_or(|p| interrupted(p.state))) {
-            self.patch_generation += 1;
-            self.patch_loading = false;
-            self.patch = Some(report);
+            self.show_patch(report);
         }
         if let Some(status) = viewer.filter(|_| self.viewer.as_ref().is_none_or(|v| interrupted(v.version.state))) {
-            self.viewer_generation += 1;
-            self.viewer_loading = false;
-            self.viewer = Some(status);
+            self.show_viewer(status);
         }
         match result {
             // Never a loop: a journal that came back is reported, not finished again.
@@ -2131,7 +2591,7 @@ impl App {
                 self.refuse_interrupted(&held.keys, t("Another update started meanwhile.").into()),
             Ok(()) => {
                 let keys: Vec<String> = held.keys.into_iter().filter(|key| self.accounts.iter().any(|row| row.key == *key)).collect();
-                if !keys.is_empty() { self.start_launch_now(keys, held.social_only, held.clicked, held.trigger); }
+                if !keys.is_empty() { self.start_launch_now(keys, held.social_only, held.clicked, held.trigger, false); }
             }
             // A parked host (an elevated one cannot be inspected) may be what kept the
             // liveness check from passing: once more with the parks closed.
@@ -2148,9 +2608,10 @@ impl App {
 
     /// A Play that finds FFXI down for maintenance (or every world down) waits for it instead of
     /// being refused (owner decision 2026-10-13, "Wait and play"): at a click, at a held Play's
-    /// release and at a queued Play's release alike. Nothing signs in, and nothing goes to
-    /// PlayOnline or the game servers, because of a wait: the only traffic is one read of the
-    /// play flag a minute (`read_play_flag`). An account already waiting is not added again. A
+    /// release and at a queued Play's release alike. The wait itself sends nothing but one read
+    /// of the play flag a minute (`read_play_flag`); only while that flag's `$patch_enable` is 1
+    /// does a waiting account that needs no code sign in, for the version check
+    /// (`tend_patch_watch`). An account already waiting is not added again. A
     /// one-time code typed for the Play goes with it (`WaitingPlay::codes`).
     fn wait_for_service(&mut self, keys: &[String]) {
         let headline = self.wait_headline();
@@ -2233,11 +2694,157 @@ impl App {
 
     /// One read of FFXI's play flag when one is due: only while a Play waits, one at a time,
     /// every minute, and at once when the first wait starts or the PC wakes (`play_flag::Schedule`).
-    fn read_play_flag(&mut self) -> Task<Message> {
+    fn read_play_flag(&mut self) -> Effect<Message> {
         let now = Instant::now();
-        if self.preview || !self.flag_schedule.due(!self.waiting_plays.is_empty(), now) { return Task::none(); }
+        if self.preview || !self.flag_schedule.due(self.flag_wanted(), now) { return Effect::none(); }
         self.flag_schedule.begin(now);
-        Task::perform(play_flag::read(), Message::PlayFlagLoaded)
+        Effect::perform(play_flag::read(), Message::PlayFlagLoaded)
+    }
+
+    /// The play flag is read while a Play waits or FFXI is in maintenance: the official status
+    /// says so, or a fresh flag of 0 does. While the official status still shows maintenance
+    /// after a flag of 1, the reads keep that 1 fresh.
+    fn flag_wanted(&self) -> bool {
+        !self.waiting_plays.is_empty() || self.patch_watch.active()
+            || self.service_availability() == services::Availability::Maintenance
+            || self.services.as_ref().is_some_and(|snapshot|
+                snapshot.recent_status(chrono::Utc::now()).0 == services::Availability::Maintenance)
+    }
+
+    /// The update as soon as it is out (patch_watch.rs): while FFXI is in maintenance and the
+    /// play flag's `$patch_enable` is 1, accounts Crystal may sign in by itself (and those whose
+    /// Play waits, without a code) sign in and wait at the main menu, and each game folder's
+    /// version check runs from one of them on the watch's schedule. Nothing outside maintenance,
+    /// and only an affirmative end (a fresh flag of 1, or an official "up" that holds) ends it.
+    fn tend_patch_watch(&mut self) {
+        if self.preview { return; }
+        let now = chrono::Utc::now();
+        let seen = match (self.play_flag.fresh(now), self.service_availability()) {
+            (Some(play_flag::Flag::Up), _) => patch_watch::Seen::Open,
+            (_, services::Availability::Maintenance) => patch_watch::Seen::Closed,
+            (_, services::Availability::Operational | services::Availability::PartialOutage) => patch_watch::Seen::Up,
+            _ => patch_watch::Seen::Unknown,
+        };
+        let before = self.patch_watch.last_patch();
+        self.patch_watch.observe(seen, self.play_flag.patch(now), Instant::now());
+        if let (Some(now), true) = (self.patch_watch.last_patch(), self.patch_watch.last_patch() != before) {
+            let was = before.map_or("unknown", |was| if was { "1" } else { "0" });
+            launch_log::append_history(&self.config.history_path(), "Crystal",
+                &format!("play flag: $patch_enable {was} → {}", u8::from(now)), None);
+        }
+        if !self.patch_watch.ready() { return; }
+        self.maintenance_sign_ins();
+        self.start_patch_checks();
+    }
+
+    /// Maintenance sign-ins, held at the main menu for the version check: once per account per
+    /// trigger (the watch's cycle), through the startup sign-in's path (a refused login stops
+    /// Crystal signing that account in; no network retry). Never an account that takes a code.
+    fn maintenance_sign_ins(&mut self) {
+        if !self.vault_ready || self.vault_saving || self.launch_blocked() || self.confirm_close || self.startup_signin_pending { return; }
+        let candidates: Vec<String> = self.accounts.iter().filter(|row| {
+            if self.patch_watch.signed(&row.key) { return false; }
+            // Known to need no code, as Crystal's own sign-ins (`Settings::presigns`).
+            let waits_without_code = self.waiting_plays.iter().any(|wait| wait.keys.contains(&row.key) && !wait.otp.contains(&row.key))
+                && row.account.mode == AccountMode::Retail && !row.otp_spent && row.otp.is_empty()
+                && self.settings.account_no_otp.contains(&row.key) && !self.settings.account_otp.contains(&row.key);
+            (self.presigned_row(row) || waits_without_code)
+                && !self.startup_waiting.iter().any(|(key, _)| *key == row.key) && self.startup_row_free(&row.key)
+        }).map(|row| row.key.clone()).collect();
+        let keys: Vec<String> = candidates.into_iter().filter(|key| self.patch_watch.sign_in_once(key)).collect();
+        if keys.is_empty() { return; }
+        launch_log::append_history(&self.config.history_path(), "Crystal", &format!("maintenance sign-in: {} accounts", keys.len()), None);
+        self.start_launch(keys, true, Instant::now(), Some(launch_timing::LaunchTrigger::MaintenanceSignIn));
+    }
+
+    /// The version checks that are due: one per game folder, from an account signed in and idle
+    /// at the main menu that plays from it. Not while that folder updates or files change.
+    fn start_patch_checks(&mut self) {
+        if self.maintenance.is_some() || self.recovering.is_some() || self.launch_blocked() { return; }
+        let now = Instant::now();
+        let ready: Vec<(String, PathBuf)> = self.accounts.iter()
+            .filter(|row| row.account.mode == AccountMode::Retail && account_row::signed_in(row) && row.queued_play.is_none()
+                && !self.patch_watch.in_flight(&row.key))
+            .filter_map(|row| Some((row.key.clone(), self.play_folder(row)?)))
+            .collect();
+        for (key, folder) in ready {
+            if self.patch_watch.due(&folder, now) && self.play_updates.for_folder(&folder).is_none() {
+                self.spawn_patch_check(key, folder);
+            }
+        }
+    }
+
+    /// One version check (W20 only) of `folder` from `key`'s session at its idle main menu.
+    fn spawn_patch_check(&mut self, key: String, folder: PathBuf) {
+        let Some(row) = self.accounts.iter().find(|row| row.key == key) else { return };
+        let (config, account, log) = (self.settings.config_for(&self.config, &row.account), row.account.clone(), row.log.clone());
+        self.patch_watch.begin_check(&folder, &key);
+        self.status = t("Checking for the FFXI update").into();
+        #[cfg(test)]
+        { let _ = (config, account, log); self.patch_watch.checks.push((folder, key)); }
+        #[cfg(not(test))]
+        {
+            let sender = self.sender.clone();
+            let install = folder.clone();
+            // Still ready after the wait for the main menu (maintenance, `$patch_enable` 1).
+            let gate = self.patch_watch.gate();
+            let thread_key = key.clone();
+            let spawned = std::thread::Builder::new().name("xi-patch-check".into()).spawn(move || {
+                let key = thread_key;
+                let still_ready = || gate.load(std::sync::atomic::Ordering::SeqCst);
+                let result = session_worker::check_at_main_menu(&config, &account, still_ready, || patch::check_before_launch_timed(&install))
+                    .map(|(check, timing)| {
+                        if let Some(log) = &log {
+                            launch_log::append_launcher_lines(log, &launch_timing::check_lines("FFXI check (W20) in maintenance, no game start", &timing));
+                        }
+                        let current = matches!(check, patch::LaunchCheck::Start(_));
+                        let (patch::LaunchCheck::Start(report) | patch::LaunchCheck::Update(report) | patch::LaunchCheck::Unverified(report)) = check;
+                        (report, current, timing.phases())
+                    });
+                let _ = sender.send(WorkerEvent::PatchCheck(install, key, result));
+            });
+            if spawned.is_err() {
+                self.patch_watch.answered(&key);
+                self.patch_watch.checked(&folder, false, Instant::now(), patch_watch::jitter());
+            }
+        }
+    }
+
+    /// A maintenance version check answered: "update required" starts the update Play's W20
+    /// would (no Play waits on it); anything else checks again on the watch's schedule.
+    fn patch_checked(&mut self, folder: PathBuf, key: String, result: Result<(patch::PatchReport, bool, Option<String>), String>) {
+        if self.preview { return; }
+        self.patch_watch.answered(&key);
+        let now = Instant::now();
+        let checking = self.status == t("Checking for the FFXI update");
+        let history = self.config.history_path();
+        let mut required = false;
+        let updating = match result {
+            Err(error) => {
+                launch_log::append_history(&history, "Crystal", &format!("maintenance update check (W20): not sent: {error}"), None);
+                false
+            }
+            Ok((report, current, phases)) => {
+                let verdict = if current { format!("current, {}", report.remote_version) }
+                    else if report.state == patch::PatchState::Required {
+                        format!("update required, installed {}, official {}", report.local_version, report.remote_version)
+                    } else { format!("no verdict: {}", report.detail) };
+                let phases = phases.map(|phases| format!(" ({phases})")).unwrap_or_default();
+                launch_log::append_history(&history, "Crystal", &format!("maintenance update check (W20): {verdict}{phases}"), None);
+                self.set_patch_from_row(&key, report.clone());
+                // An answer that comes once the update may no longer be checked for (maintenance
+                // over, `$patch_enable` 0) starts nothing: the next Play's own W20 does.
+                required = !current && report.state == patch::PatchState::Required && self.patch_watch.ready();
+                required && self.begin_play_update(&key, &report, now, false, true)
+            }
+        };
+        self.patch_watch.checked(&folder, updating, now, patch_watch::jitter());
+        if required && !updating {
+            // Told to update with no update possible: no more W20s until the next flip.
+            launch_log::append_history(&history, "Crystal", "maintenance update: not started; no more checks until $patch_enable flips", None);
+            self.patch_watch.updated(&folder, false);
+        }
+        if checking && !updating { self.status = self.service_note(); }
     }
 
     /// FFXI is known to be up: a fresh play flag of 1, or without one an official verdict of up.
@@ -2261,7 +2868,8 @@ impl App {
         for wait in std::mem::take(&mut self.waiting_plays) {
             // Checked for each group: starting one (an interrupted update it finishes first) can
             // pause launches, and the next group then keeps waiting.
-            if !self.vault_ready || self.vault_saving || self.launch_blocked() {
+            // A session with a maintenance check out waits for its answer: one W20 at a time.
+            if !self.vault_ready || self.vault_saving || self.launch_blocked() || wait.keys.iter().any(|key| self.patch_watch.in_flight(key)) {
                 self.waiting_plays.push(wait);
                 continue;
             }
@@ -2287,42 +2895,22 @@ impl App {
                 }
             }
             if keys.is_empty() { continue; }
-            self.start_launch(keys.clone(), false, Instant::now(), None);
-            self.released.retain(|key| !keys.contains(key));
-            self.released.extend(keys);
+            // An update one of them needs follows its Play in its session (phase 2).
+            self.start_launch(keys, false, Instant::now(), None);
         }
     }
 
-    /// The Update the released Plays asked for starts once none of them is still starting (it
-    /// signs their idle sessions out first); its end starts them again (the Round 5 re-issue in
-    /// `MaintenanceFinished`), or their rows say why it could not run.
-    fn start_waited_update(&mut self) -> Task<Message> {
-        if !self.wait_update.as_ref().is_some_and(|update| !update.started) || !self.released.is_empty()
-            || self.preview || self.maintenance.is_some() || self.launch_blocked() { return Task::none(); }
-        let task = self.start_maintenance(MaintenanceKind::Update);
-        if self.maintenance != Some(MaintenanceKind::Update) {
-            let keys = self.wait_update.take().map(|update| update.keys).unwrap_or_default();
-            let error = self.status.clone();
-            self.waited_update_failed(&keys, &error);
-        }
-        task
-    }
-
-    fn waited_update_failed(&mut self, keys: &[String], error: &str) {
-        if keys.is_empty() { return; }
-        let shown = tf("Could not update FFXI before it starts: {error}", &[("error", &error)]);
-        for row in self.accounts.iter_mut().filter(|row| keys.contains(&row.key) && !row.busy) {
-            row.status = shown.clone();
-            row.problem = true;
-        }
-        self.status = shown;
-    }
-
-    fn start_launch_now(&mut self, keys: Vec<String>, social_only: bool, clicked: Instant, trigger: Option<launch_timing::LaunchTrigger>) {
+    /// `skip_w20`: a signed-in start right after its session installed the update its W20 asked
+    /// for (stock checks nothing between that update and GameStart). A start this defers
+    /// (a wait, a pause, a held launch) runs its own W20 later.
+    fn start_launch_now(&mut self, keys: Vec<String>, social_only: bool, clicked: Instant, trigger: Option<launch_timing::LaunchTrigger>,
+        skip_w20: bool) {
         use launch_timing::LaunchTrigger;
         // A Play the downtime gate below sets waiting is not recorded: it waits, as it would.
         #[cfg(test)]
         if self.launches.is_some() && !self.windower_editor_open && (social_only || self.preview || !self.service_down()) {
+            // A recorded start skips the W20 as the signed-in start would.
+            if skip_w20 { self.w20_skipped.extend(keys.iter().cloned()); }
             if let Some(launches) = &mut self.launches { launches.push((keys, social_only, clicked, trigger)); }
             return;
         }
@@ -2351,6 +2939,17 @@ impl App {
             self.finish_interrupted_updates(interrupted, HeldLaunch { keys, social_only, clicked, trigger }, false);
             return;
         }
+        // A Play whose game folder is updating for another account waits for that update before
+        // its own version check: signed in at the main menu (a cold Play signs in first), then
+        // released by `start_queued_plays` once the update is done.
+        let keys = if social_only { keys } else {
+            let (waiting, keys): (Vec<String>, Vec<String>) = keys.into_iter().partition(|key|
+                self.accounts.iter().find(|row| row.key == *key && row.can_play())
+                    .and_then(|row| self.play_folder(row)).is_some_and(|folder| self.play_updates.for_folder(&folder).is_some()));
+            for key in waiting { self.wait_for_folder_update(&key, clicked); }
+            if keys.is_empty() { return; }
+            keys
+        };
         if !social_only {
             let together = self.coordinated_keys(&keys);
             if together.len() > 1 {
@@ -2388,7 +2987,8 @@ impl App {
         let mut tools: Vec<&'static str> = Vec::new();
         let mut all_native = true;
         // One worker per account: every sign-in starts now and runs in parallel; only the
-        // Ashita/Windower start inside each worker waits its turn (pol_less::turns).
+        // Ashita/Windower start inside each worker waits its turn (pol_less::TurnGate; for
+        // Windower, session_worker::windower_turn_at's machine-wide windower.lock).
         for key in keys {
             let Some(row) = self
                 .accounts
@@ -2420,7 +3020,7 @@ impl App {
             let config = self.settings.config_for(&self.config, &account);
             if let Some(plan) = self.settings.launch_plan(&account) {
                 if let Some(session) = session_worker::find(&config, &account) {
-                    if let Err(error) = session.ensure_launch_tool(plan.tool) {
+                    if let Err(error) = session.ensure_launch_plan(&plan) {
                         row.status = error;
                         row.problem = true;
                         continue;
@@ -2430,6 +3030,8 @@ impl App {
             row.launch_generation = row.launch_generation.wrapping_add(1);
             let generation = row.launch_generation;
             row.signed_out = false;
+            row.game_seen = false;
+            row.resign_declined = false;
             if row.pid.is_some() {
                 // The stock FFXI version check runs immediately before the game starts, here
                 // as well as in a Play that signs in: off the interface thread, once the
@@ -2443,29 +3045,34 @@ impl App {
                 row.timing.clear();
                 row.play_timing = Some(launch_timing::Timeline::begin_at(clicked));
                 row.status = t("Checking the game version…").into();
-                let sender = self.sender.clone();
-                let worker_key = key.clone();
+                let tx = LaunchTx::new(self.sender.clone(), key.clone(), generation);
                 // the signed-in session's loader starts the game; put the wrapper
                 // beside it (or take Crystal's copy away) before the start.
                 let dgvoodoo = self.settings.dgvoodoo;
                 let loader_setting = self.settings.loader_path.clone();
+                let host = row.pid.map(|pid| HostId { pid, created: row.host_created });
                 // The trigger and W20 lines go to the session's own log (07d §4.2, §5.3;
                 // 08 §4 item 6: they were dropped on this thread).
                 let log = row.log.clone();
                 let trigger = trigger.unwrap_or(LaunchTrigger::PreSignedPlay);
+                // This session's update just finished (phase 2): stock starts the game with no
+                // second version check, and no patch-host lookup either.
                 let spawned = std::thread::Builder::new().name("xi-start-game".into()).spawn(move || {
-                    crate::dns::warm(crate::dns::GAME_PATCH_HOST);
+                    if !skip_w20 { crate::dns::warm(crate::dns::GAME_PATCH_HOST); }
                     if let Some(log) = &log {
                         launch_log::append_launcher_lines(log, &pol_less::launch_clock_lines(&launch_timing::Timeline::begin_at(clicked), trigger));
                     }
-                    if let Some(loader) = pol_less::tools::loader_path(&loader_setting) {
+                    if let Some(loader) = session_loader(host, &loader_setting) {
                         let _ = dgvoodoo::sync_for_launch(&loader, dgvoodoo);
                     }
                     let mut report = None;
-                    let waiting = (sender.clone(), worker_key.clone());
-                    let result = session_worker::start_signed_in(&config, &account, &mut |line| {
-                        let _ = waiting.0.send(WorkerEvent::Progress(waiting.1.clone(), line.to_owned()).for_launch(&waiting.1, generation));
-                    }, || {
+                    let result = session_worker::start_signed_in(&config, &account, &mut |line| tx.progress(line), || {
+                        if skip_w20 {
+                            if let Some(log) = &log {
+                                launch_log::append_launcher_lines(log, &["FFXI check (W20): skipped; this session just installed the update the Play's W20 asked for.".to_owned()]);
+                            }
+                            return Ok(t("FINAL FANTASY XI was updated in this session; starting it.").into());
+                        }
                         let (check, timing) = patch::check_before_launch_timed(&install);
                         if let Some(log) = &log {
                             launch_log::append_launcher_lines(log, &launch_timing::check_lines("FFXI check (W20)", &timing));
@@ -2475,7 +3082,7 @@ impl App {
                         });
                         patch::gate(check)
                     });
-                    let _ = sender.send(WorkerEvent::StartGame(worker_key.clone(), report, result).for_launch(&worker_key, generation));
+                    tx.send(WorkerEvent::StartGame(tx.key.clone(), report, result));
                 });
                 if spawned.is_err() {
                     row.busy = false;
@@ -2520,7 +3127,8 @@ impl App {
                 tools.push(tool);
             }
             let viewer_generation = self.viewer_generation;
-            let otp = std::mem::take(&mut row.otp);
+            // Wiped wherever the sign-in thread drops it (a gate refusal, a spawn failure).
+            let mut otp = Zeroizing::new(std::mem::take(&mut row.otp));
             row.otp_spent = !otp.is_empty();
             (row.otp_unknown, row.presign_login) = (false, presign_login);
             row.busy = true;
@@ -2529,11 +3137,13 @@ impl App {
             row.timing.clear();
             row.play_timing = None;
             row.status = t("Starting sign-in…").into();
-            let sender = self.sender.clone();
-            let worker_key = key.clone();
+            let done = Arc::new(AtomicBool::new(false));
+            row.sign_in_done = Some(done.clone());
+            let tx = LaunchTx { done: Some(done), ..LaunchTx::new(self.sender.clone(), key.clone(), generation) };
             // installed here first when it isn't yet; the session worker then puts
             // it next to the loader it runs. A failed install never stops the launch.
             let dgvoodoo = self.settings.dgvoodoo && via.is_some();
+            let reshade = self.settings.reshade.enabled;
             let result = std::thread::Builder::new()
                 .name("xi-account-login".into())
                 .spawn(move || {
@@ -2542,62 +3152,52 @@ impl App {
                     // no server verdict and would erase the updater's.
                     let viewer = viewer::local_status();
                     if let Err(error) = viewer::gate(&viewer) {
-                        let _ = sender.send(WorkerEvent::Viewer(viewer_generation, viewer));
-                        let _ = sender.send(WorkerEvent::Complete(worker_key.clone(), Err(error)).for_launch(&worker_key, generation));
+                        let _ = tx.tx.send(WorkerEvent::Viewer(viewer_generation, viewer));
+                        tx.complete(Err(error));
                         return;
                     }
                     if dgvoodoo {
-                        let installing = (sender.clone(), worker_key.clone());
-                        let installed = dgvoodoo::ensure_installed_blocking(move |line| {
-                            let _ = installing.0.send(WorkerEvent::Progress(installing.1.clone(), line).for_launch(&installing.1, generation));
-                        });
+                        let installing = tx.clone();
+                        let installed = dgvoodoo::ensure_installed_blocking(move |line| installing.progress(&line));
+                        // ReShade cannot run without it: the launch stops here with one reason,
+                        // before any sign-in work.
+                        if let (Err(error), true) = (&installed, reshade) {
+                            let error = format!("{} {error}", t("dgVoodoo is not installed yet."));
+                            tx.complete(Err(error));
+                            return;
+                        }
                         if let Err(error) = installed {
-                            let _ = sender.send(WorkerEvent::Notice(tf(
+                            let _ = tx.tx.send(WorkerEvent::Notice(tf(
                                 "dgVoodoo could not be installed, so this launch uses the game's own DirectX 8. {error}",
                                 &[("error", &error)],
                             )));
                         }
                     }
-                    let progress_sender = sender.clone();
-                    let progress_key = worker_key.clone();
-                    let mut progress = move |s: &str| {
-                        let _ = progress_sender
-                            .send(WorkerEvent::Progress(progress_key.clone(), s.to_owned()).for_launch(&progress_key, generation));
-                    };
+                    let mut progress = |line: &str| tx.progress(line);
                     let result = match (parked, via) {
                         (Some(worker), Some(plan)) => {
                             // Parked deliveries from this window go ≥ 1.5 s (+ jitter) apart (07a
                             // parity condition 3): N member logins never start within milliseconds.
                             // The slot is taken once the host has parked, where the credentials leave.
-                            match worker.play(&config, account.clone(), otp, plan, clicked, &deliveries, &mut progress) {
+                            match worker.play(&config, account.clone(), std::mem::take(&mut *otp), plan, clicked, &deliveries, &mut progress) {
                                 Ok(result) => result,
                                 Err(otp) => session_worker::launch(&config, account, otp, cold, clicked, &mut progress),
                             }
                         }
-                        (_, via) => session_worker::launch(&config, account, otp, via, clicked, &mut progress),
+                        (_, via) => session_worker::launch(&config, account, std::mem::take(&mut *otp), via, clicked, &mut progress),
                     };
-                    let _ = sender.send(WorkerEvent::Complete(worker_key.clone(), result).for_launch(&worker_key, generation));
+                    tx.complete(result);
                 });
             if result.is_err() {
                 row.busy = false;
                 row.preparing_session = false;
+                row.sign_in_done = None;
+                // The code never left: none was spent (it was wiped with the thread's closure).
+                row.otp_spent = false;
                 row.status = t("Could not start the sign-in worker.").into();
             }
         }
-        self.status = if social_only {
-            t("Signing in to PlayOnline…").into()
-        } else { match (all_native, count == 1) {
-            (true, true) => t("Starting 1 account in parallel. Continue in each game window after sign-in.").into(),
-            (true, false) => tf("Starting {count} accounts in parallel. Continue in each game window after sign-in.", &[("count", &count)]),
-            (false, single) => {
-                let tools = join_and(&tools);
-                if single {
-                    tf("Starting 1 account through {tools}: sign-ins run in parallel, then each game starts as soon as its tool is free.", &[("tools", &tools)])
-                } else {
-                    tf("Starting {count} accounts through {tools}: sign-ins run in parallel, then each game starts as soon as its tool is free.", &[("count", &count), ("tools", &tools)])
-                }
-            }
-        } };
+        self.status = launch_status(social_only, all_native, count, &tools);
     }
 
     /// A capable worker can check the version during the rest of sign-in. Older
@@ -2607,9 +3207,10 @@ impl App {
     /// sign-in and waits for FFXI instead (`wait_for_service`), never left queued on it.
     fn start_queued_plays(&mut self) {
         if self.preview || !self.vault_ready || self.vault_saving || self.launch_blocked() { return; }
+        // A Play waiting for its folder's update stays queued until that update is done.
         let preparing: Vec<_> = self.accounts.iter().filter_map(|row| {
             if !row.queued_signin_play() || row.account.mode != AccountMode::Retail
-                || self.settings.launch_plan(&row.account).is_none() { return None; }
+                || self.settings.launch_plan(&row.account).is_none() || self.folder_updating(row) { return None; }
             let config = self.settings.config_for(&self.config, &row.account);
             let session = session_worker::find(&config, &row.account)?;
             if !session.supports_batch_start() { return None; }
@@ -2624,11 +3225,14 @@ impl App {
             return;
         }
         for (key, clicked, session) in preparing { self.start_together(vec![(key, Some(session))], clicked, launch_timing::LaunchTrigger::QueuedPlay); }
+        let held: Vec<String> = self.accounts.iter()
+            .filter(|row| row.queued_play.is_some() && (self.patch_watch.in_flight(&row.key) || self.folder_updating(row)))
+            .map(|row| row.key.clone()).collect();
         let queued: Vec<_> = self.accounts.iter_mut().filter_map(|row| {
-            if row.busy || row.pid.is_none() || row.is_playing() { return None; }
+            if row.busy || row.pid.is_none() || row.is_playing() || held.contains(&row.key) { return None; }
             row.queued_play.take().map(|clicked| (row.key.clone(), clicked))
         }).collect();
-        for (key, clicked) in queued { self.start_mode_at(vec![key], false, clicked); }
+        for (key, clicked) in queued { self.start_launch(vec![key], false, clicked, None); }
     }
 
     /// Consume the startup action once the vault and the installation are ready. Account
@@ -2665,6 +3269,27 @@ impl App {
         let exe = std::env::current_exe().ok().and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned())).unwrap_or_default();
         launch_log::append_history(&self.config.history_path(), "Crystal", &format!("launcher start: pid {}, {exe}, v{}, startup sign-in {startup}, parks {parks}",
             std::process::id(), env!("CARGO_PKG_VERSION")), None);
+        let keys: Vec<String> = self.accounts.iter().map(|row| row.key.clone()).collect();
+        self.prefetch_startup_files(&keys);
+    }
+
+    /// Warm the file cache with the startup files of these rows' game folders
+    /// (`startup_prefetch`): at Crystal's start and at every sign-in or Play. Not while any
+    /// game runs (its folder is warm, and its I/O comes first) or files are being changed.
+    fn prefetch_startup_files(&self, keys: &[String]) {
+        // Not in unit tests: the pre-read is a detached, process-wide thread that appends to
+        // the fixture's history log after the test has moved on (and removed its folder).
+        if cfg!(test) { return; }
+        if self.preview || self.launch_blocked() || self.maintenance.is_some() || self.accounts.iter().any(|row| row.is_playing()) { return; }
+        let mut games: Vec<PathBuf> = Vec::new();
+        for row in self.accounts.iter().filter(|row| keys.contains(&row.key)) {
+            let game = self.settings.config_for(&self.config, &row.account).game_directory();
+            if !games.contains(&game) { games.push(game); }
+        }
+        // One pre-read runs at a time; a second folder waits for the next sign-in.
+        if let Some(game) = games.first() {
+            let _ = startup_prefetch::start(game, &self.config.startup_prefetch_path(), &self.config.history_path());
+        }
     }
 
     /// The accounts a parked warm host would serve (07d §1.5 "Who"): retail with a tool plan,
@@ -2729,6 +3354,11 @@ impl App {
         if !keys.is_empty() { self.start_launch(keys, true, Instant::now(), Some(trigger)); }
     }
 
+    fn start_ready_startup_signins(&mut self) {
+        let keys = self.take_startup_signins();
+        self.start_startup(keys, launch_timing::LaunchTrigger::StartupSignIn);
+    }
+
     /// Whether Crystal may sign `key` in by itself now (owner decision 2026-10-13): a retail
     /// account it knows signs in without a one-time code, with the switch on (`Settings::presigns`),
     /// whose row's last sign-in took no code and that has none typed. A code typed on the row is
@@ -2757,18 +3387,15 @@ impl App {
     /// The row of a sign-in after a game that the maintenance or outage refused says so.
     fn note_resign_refused(&mut self, key: &str) {
         let note = tf("No sign-in after the game while the worlds are down. {note}", &[("note", &self.service_note())]);
-        if let Some(row) = self.accounts.iter_mut().find(|row| row.key == key) {
-            let shown = format!("{} · {note}", row.status_text());
-            row.status = shown;
-        }
+        if let Some(row) = self.accounts.iter_mut().find(|row| row.key == key) { row.set_note(Some(RowNote::ResignRefused(note))); }
     }
 
     /// A session whose game ran has ended. A pre-signed account signs back in once that
     /// session has fully ended (`take_resigns`). A normal quit or FFXI's usual -14 waits only for
     /// RESIGN_DELAY; a crash or error first has the connectivity probe check the network, so a
     /// connection loss waits for it to return (07d §5.5). A worker that vanished without a report
-    /// is left alone: its host may still be running. `host` is the ended session's loader PID.
-    fn note_game_end(&mut self, key: &str, kind: Option<launch_log::ExitKind>, host: Option<u32>) {
+    /// is left alone: its host may still be running. `host` is the ended session's loader.
+    fn note_game_end(&mut self, key: &str, kind: Option<launch_log::ExitKind>, host: Option<HostId>) {
         use launch_log::ExitKind;
         if !self.settings.sign_in_after_game {
             self.startup_waiting.retain(|(waiting, _)| waiting != key);
@@ -2794,8 +3421,7 @@ impl App {
         self.startup_waiting.retain(|(waiting, _)| waiting != key);
         let Some(row) = self.accounts.iter_mut().find(|row| row.key == key) else { return };
         row.resign = Some(Resign { generation: row.launch_generation, ended: Instant::now(), free_since: None, network: !clean, host });
-        let shown = format!("{}{}", row.status_text(), resign_note());
-        row.status = shown;
+        row.set_note(Some(RowNote::ResignAfterGame));
         if !clean {
             row.network_wait = Some(NetworkWait::AfterGame);
             let generation = row.launch_generation;
@@ -2855,7 +3481,7 @@ impl App {
         if keys.is_empty() { return; }
         self.start_startup(keys.clone(), trigger);
         for row in self.accounts.iter_mut().filter(|row| row.busy && keys.contains(&row.key)) {
-            row.status.push_str(&resign_note());
+            row.set_note(Some(RowNote::ResignAfterGame));
         }
     }
 
@@ -2883,6 +3509,8 @@ impl App {
                 launch_log::append_history(&self.config.history_path(), "Crystal", "warm hosts closed: game or Crystal files are changing", None);
             }
             close_parks_later(closing);
+            // Re-tended at the Tick rate once the files settle.
+            self.parks_settled = false;
             return;
         }
         // The profile editor needs the profile guard the Windower parks hold.
@@ -2893,7 +3521,7 @@ impl App {
         if !self.vault_ready || self.installation_loading || self.startup_signin_pending || self.recovering.is_some() { return; }
         // The startup sign-ins take the Windower turn first (§5.7).
         let Some(issued) = self.startup_issued else { return };
-        if now.saturating_duration_since(issued) < park::PARK_START_DELAY { return; }
+        if now.saturating_duration_since(issued) < park::PARK_START_DELAY { self.parks_settled = false; return; }
         let refresh = self.park_checked.is_none_or(|at| now.saturating_duration_since(at) >= park::FINGERPRINT_EVERY);
         if refresh { self.park_checked = Some(now); }
         let candidates: Vec<_> = self.park_keys().into_iter()
@@ -2931,6 +3559,7 @@ impl App {
                 Err(error) => self.park_note(&row, &error),
             }
         }
+        self.parks_settled = self.parks.settled(&wanted);
     }
 
     /// A non-blocking row note for a park that failed; Play still works, cold.
@@ -2957,15 +3586,15 @@ impl App {
             }).collect()
     }
 
-    fn apply_controller_settings(&self, revision: u64, values: std::collections::BTreeMap<String, String>) -> Task<Message> {
+    fn apply_controller_settings(&self, revision: u64, values: std::collections::BTreeMap<String, String>) -> Effect<Message> {
         let targets: Vec<_> = self.controller_settings_targets().into_iter().map(|(config, account)|
             session_worker::find(&config, &account).ok_or_else(||
                 t("The game session ended before controller settings could be sent.").to_owned())).collect();
         if targets.is_empty() {
-            return Task::done(Message::Gamepad(gamepad::Msg::LiveResult(revision,
+            return Effect::done(Message::Gamepad(gamepad::Msg::LiveResult(revision,
                 Ok(t("Saved. Changes apply when you launch FFXI.").into()))));
         }
-        Task::perform(async move {
+        Effect::perform(async move {
             tokio::task::spawn_blocking(move || {
                 let count = targets.len();
                 let results: Vec<_> = std::thread::scope(|scope| {
@@ -2993,13 +3622,51 @@ impl App {
         pol_less::park::close_workers(self.parks.drain(None));
     }
 
-    fn sign_out_account(&mut self, key: String) -> Task<Message> {
+    pub(crate) fn shutdown_count(&self, selected: bool) -> usize {
+        self.accounts.iter().filter(|row| (!selected || row.selected) && row.account.mode == AccountMode::Retail
+            && row.is_playing() && !row.shutting_down && !row.signing_out && !row.busy).count()
+    }
+
+    fn shutdown_games(&mut self, selected: bool) -> Effect<Message> {
+        if self.closing { return Effect::none(); }
+        let mut tasks = Vec::new();
+        for row in &mut self.accounts {
+            if (selected && !row.selected) || row.account.mode != AccountMode::Retail
+                || !row.is_playing() || row.shutting_down || row.signing_out || row.busy { continue; }
+            let key = row.key.clone();
+            let generation = row.launch_generation;
+            let config = self.settings.config_for(&self.config, &row.account);
+            let session = (!self.preview).then(|| session_worker::find(&config, &row.account)).flatten();
+            row.game_seen = true;
+            if !self.settings.sign_in_after_game {
+                row.decline_resign();
+                row.signed_out = true;
+            }
+            row.network_wait = None;
+            row.shutting_down = true;
+            row.problem = false;
+            row.status = t("Shutting down FFXI…").into();
+            if self.preview {
+                tasks.push(Effect::done(Message::GameShutdownFinished(key, generation, Ok(()))));
+            } else {
+                tasks.push(Effect::perform(async move {
+                    tokio::task::spawn_blocking(move || match session {
+                        Some(session) => session_worker::game_shutdown::request(&session),
+                        None => Err(t("The selected game session ended before shutdown could be requested.").into()),
+                    }).await.unwrap_or_else(|_| Err(t("Could not request game shutdown.").into()))
+                }, move |result| Message::GameShutdownFinished(key.clone(), generation, result)));
+            }
+        }
+        Effect::batch(tasks)
+    }
+
+    fn sign_out_account(&mut self, key: String) -> Effect<Message> {
         self.startup_waiting.retain(|(waiting, _)| *waiting != key);
-        let Some(row) = self.accounts.iter_mut().find(|row| row.key == key) else { return Task::none() };
+        let Some(row) = self.accounts.iter_mut().find(|row| row.key == key) else { return Effect::none() };
         row.decline_resign();
         row.signed_out = true;
         row.network_wait = None;
-        if !row.can_sign_out() { return Task::none(); }
+        if !row.can_sign_out() { return Effect::none(); }
         let generation = row.launch_generation;
         let config = self.settings.config_for(&self.config, &row.account);
         let session = (!self.preview).then(|| session_worker::find(&config, &row.account)).flatten();
@@ -3008,8 +3675,8 @@ impl App {
         row.preparing_session = false;
         row.problem = false;
         row.status = t("Signing out of PlayOnline…").into();
-        if self.preview { return Task::done(Message::AccountSignedOut(key, generation, Ok(()))); }
-        Task::perform(async move {
+        if self.preview { return Effect::done(Message::AccountSignedOut(key, generation, Ok(()))); }
+        Effect::perform(async move {
             tokio::task::spawn_blocking(move || match session {
                 Some(session) => session.sign_out(),
                 None => Ok(()),
@@ -3017,9 +3684,10 @@ impl App {
         }, move |result| Message::AccountSignedOut(key.clone(), generation, result))
     }
 
-    fn begin_close(&mut self) -> Task<Message> {
+    fn begin_close(&mut self) -> Effect<Message> {
         self.confirm_close = false;
         self.closing = true;
+        startup_prefetch::cancel();
         self.startup_signin_pending = false;
         self.startup_waiting.clear();
         let mut sessions = Vec::new();
@@ -3030,7 +3698,10 @@ impl App {
             if !self.preview {
                 let config = self.settings.config_for(&self.config, &row.account);
                 if let Some(session) = session_worker::IdleSessionClose::for_account(&config, &row.account, row.busy && row.preparing_session) {
-                    sessions.push(session);
+                    sessions.push(match &row.sign_in_done {
+                        Some(done) => session.with_sign_in_done(done.clone()),
+                        None => session,
+                    });
                 }
             }
         }
@@ -3053,12 +3724,139 @@ impl App {
             if let Err(error) = started {
                 self.closing = false;
                 self.status = tf("Could not start PlayOnline cleanup: {error}", &[("error", &error.to_string())]);
-                return Task::none();
+                return Effect::none();
             }
         }
+        tray::set_icon(false);
         // Destroy the window and release its renderer now. main() keeps the
         // cleanup owner alive until sign-out and final profile saves finish.
-        window::oldest().then(|id| id.map_or_else(iced::exit, window::close))
+        match self.window.take() {
+            Some(id) => Effect::window(id, WindowOp::Close).chain(Effect::Exit),
+            None => {
+                tray::wake_ui_thread_soon();
+                Effect::Exit
+            }
+        }
+    }
+
+    /// Open the window (at start, or back from the background) at its last size.
+    fn open_window(&mut self) -> Effect<Message> {
+        let id = WindowId::unique();
+        self.window = Some(id);
+        Effect::window(id, WindowOp::Open { size: self.viewport, maximized: self.maximized })
+    }
+
+    /// Close the window but keep everything else running: sessions stay signed in, parks,
+    /// waits and timers continue, and the renderer (with its GPU device) is released.
+    fn hide_window(&mut self) -> Effect<Message> {
+        let Some(id) = self.window.take() else { return Effect::none() };
+        self.cancel_account_drag();
+        self.title_held = false;
+        window_chrome::detach();
+        tray::set_icon(true);
+        if !self.preview {
+            launch_log::append_history(&self.config.history_path(), "Crystal", &format!(
+                "background: window closed, pid {}, {}", std::process::id(),
+                footprint::memory(None).map_or_else(|| "memory unknown".to_owned(), footprint::Memory::text)), None);
+        }
+        Effect::batch([Effect::window(id, WindowOp::Close), Self::trim_later(Duration::from_secs(3))])
+    }
+
+    /// Back from the background, or forward when the window is open.
+    fn show_window(&mut self) -> Effect<Message> {
+        tray::set_icon(false);
+        match self.window {
+            Some(id) => Effect::window(id, WindowOp::Minimize(false)).chain(Effect::window(id, WindowOp::Focus)),
+            None => self.open_window(),
+        }
+    }
+
+    /// Register (`Some(true)`) or remove the Start with Windows task off the UI thread, or
+    /// (`None`, at start with the switch on) check it still starts this exe.
+    fn startup_task(&self, on: Option<bool>) -> Effect<Message> {
+        let scratch = self.config.experiment.join("iced-launcher");
+        Effect::perform(async move {
+            tokio::task::spawn_blocking(move || {
+                let exe = std::env::current_exe().map_err(|_| t("Could not locate Crystal's program file.").to_owned())?;
+                let user = startup_task::current_user().ok_or_else(|| t("Could not identify the Windows user.").to_owned())?;
+                let mut run = startup_task_runner();
+                match on {
+                    Some(on) => startup_task::set(on, &exe, &user, &scratch, &mut run),
+                    None => startup_task::ensure(&exe, &user, &scratch, &mut run).map(|_| ()),
+                }
+            }).await.unwrap_or_else(|_| Err(t("Could not change Crystal's startup task.").into()))
+        }, move |result| Message::StartupTaskSet(on.unwrap_or(true), result))
+    }
+
+    /// The freed renderer's pages go back to Windows once the window is gone.
+    fn trim_later(after: Duration) -> Effect<Message> {
+        Effect::perform(async move { tokio::time::sleep(after).await }, |_| Message::TrimMemory)
+    }
+
+    /// The window's close button: to the notification area when Settings say so, else quit.
+    fn request_quit(&mut self) -> Effect<Message> {
+        if matches!(self.self_update, self_update::State::Applying) {
+            self.status = t("Waiting for the launcher update helper…").into();
+            return Effect::none();
+        }
+        if self.reshade.busy {
+            self.page = Page::Settings;
+            self.settings_tab = settings_page::Tab::Graphics;
+            self.status = t("Finish ReShade setup before closing Crystal.").into();
+            return Effect::none();
+        }
+        if self.prereqs.busy() {
+            self.page = Page::Settings;
+            self.settings_tab = settings_page::Tab::System;
+            self.status = t("Wait for Windows component setup to finish, or cancel its download, before closing.").into();
+            return Effect::none();
+        }
+        if self.maintenance.is_some() {
+            self.page = Page::Maintenance;
+            self.show_settings = false;
+            self.show_details = false;
+            self.status = t("Wait for the operation to finish, or request Cancel, before closing the launcher.").into();
+            return Effect::none();
+        }
+        if self.vault_saving {
+            self.confirm_close = true;
+            Effect::none()
+        } else {
+            self.begin_close()
+        }
+    }
+
+    /// The Tick has no timed work: nothing waits to start, retry or expire (`tick_gate`).
+    /// Busy states are checked by the caller.
+    fn tick_quiet(&self) -> bool {
+        self.page != Page::Friends
+            && !self.startup_signin_pending && self.startup_waiting.is_empty()
+            && self.waiting_plays.is_empty() && self.play_updates.jobs.is_empty()
+            && self.recovering.is_none() && !self.closing && self.parks_settled
+            && self.accounts.iter().all(|row| row.resign.is_none() && row.network_wait.is_none()
+                && row.queued_play.is_none() && !row.shutting_down && !row.signing_out && !row.batch_requested)
+    }
+
+    /// When a quiet window's next periodic Tick work is due: the official status read,
+    /// (with parked hosts) their fingerprint check, and in maintenance the play flag's read
+    /// and the next version check.
+    fn next_timed_work(&self) -> Option<Instant> {
+        let status = (!self.preview).then(|| self.refreshed + self.status_interval());
+        let parks = (!self.parks.is_empty()).then(|| self.park_checked.map_or_else(Instant::now, |at| at + pol_less::park::FINGERPRINT_EVERY));
+        let flag = (!self.preview && self.flag_wanted()).then(|| self.flag_schedule.next()).flatten();
+        status.into_iter().chain(parks).chain(flag).chain(self.patch_watch.next_due()).min()
+    }
+
+    /// The session flags whose change a quiet window must see at once: a session or game
+    /// that ends (or a game that starts inside a signed-in session).
+    fn watched_flags(&self) -> Vec<(Arc<AtomicBool>, bool)> {
+        let mut flags = Vec::new();
+        for row in &self.accounts {
+            for flag in [&row.alive, &row.game_running].into_iter().flatten() {
+                flags.push((flag.clone(), flag.load(Ordering::Acquire)));
+            }
+        }
+        flags
     }
 
     /// Close parked hosts for `keys` off the UI thread (a batch signs them in cold).
@@ -3076,64 +3874,46 @@ impl App {
     /// DNS only, off the UI thread. Unit tests deliver `NetworkBack` themselves.
     fn spawn_network_probe(&self, key: String, generation: u64) {
         if self.preview || cfg!(test) { return; }
-        let sender = self.sender.clone();
+        let tx = LaunchTx::new(self.sender.clone(), key, generation);
         let _ = std::thread::Builder::new().name("network-probe".into()).spawn(move || {
             let back = session_worker::wait_for_network(Instant::now() + session_worker::NETWORK_PROBE_LIMIT);
-            let _ = sender.send(WorkerEvent::NetworkBack(key.clone(), back).for_launch(&key, generation));
+            tx.send(WorkerEvent::NetworkBack(tx.key.clone(), back));
         });
     }
 
     /// What `account` launches with (its own choice, else the default).
-    pub fn launcher_for(&self, account: &Account) -> ui::LaunchWith {
+    pub fn launcher_for(&self, account: &Account) -> crate::backend::LaunchWith {
         self.settings.launch_with_for(account)
     }
 
-    /// The play bar's launcher line: one launcher, or "Mixed launchers" when the selected
-    /// accounts differ.
-    pub fn selected_launcher(&self, current: Option<&AccountRow>) -> String {
-        let selected: Vec<ui::LaunchWith> = self
-            .accounts
-            .iter()
-            .filter(|r| r.selected)
-            .map(|r| self.launcher_for(&r.account))
-            .collect();
-        match selected.split_first() {
-            Some((first, rest)) if selected.len() > 1 => {
-                if rest.iter().all(|l| l == first) {
-                    tf("Selected accounts · {launcher}", &[("launcher", first)])
-                } else {
-                    t("Selected accounts · Mixed launchers").into()
-                }
-            }
-            _ => current
-                .map(|row| self.launcher_for(&row.account))
-                .unwrap_or(self.settings.launch_with)
-                .to_string(),
-        }
+    /// The accounts Home's Play acts on: the selected ones, else the first.
+    pub(crate) fn play_target_keys(&self) -> Vec<String> {
+        let selected: Vec<String> = self.accounts.iter().filter(|r| r.selected).map(|r| r.key.clone()).collect();
+        if selected.is_empty() { self.accounts.first().map(|r| r.key.clone()).into_iter().collect() } else { selected }
     }
 
-    /// Set the account's own launcher (Home's Launch with) and save the vault.
-    fn set_account_launcher(&mut self, key: &str, choice: ui::LaunchWith) -> Task<Message> {
-        let Some(row) = self.accounts.iter_mut().find(|r| r.key == key) else {
-            return Task::none();
-        };
-        if choice == ui::LaunchWith::Native || row.account.mode == AccountMode::Private || row.account.launch_with == Some(choice) {
-            return Task::none();
+    /// Set these retail accounts' own launcher (Home's Launch with) and save the vault.
+    fn set_account_launcher(&mut self, keys: &[String], choice: crate::backend::LaunchWith) -> Effect<Message> {
+        let changes = |r: &AccountRow| keys.contains(&r.key) && r.account.mode == AccountMode::Retail && r.account.launch_with != Some(choice);
+        if choice == crate::backend::LaunchWith::Native || !self.accounts.iter().any(changes) {
+            return Effect::none();
         }
         if self.preview {
-            row.account.launch_with = Some(choice);
-            return Task::none();
+            for row in &mut self.accounts {
+                if changes(row) { row.account.launch_with = Some(choice); }
+            }
+            return Effect::none();
         }
         if !self.vault_ready || self.vault_saving {
             self.status = t("Wait for the accounts to finish saving, then choose again.").into();
-            return Task::none();
+            return Effect::none();
         }
         let values = self
             .accounts
             .iter()
             .map(|r| {
                 let mut account = r.account.clone();
-                if r.key == key {
+                if changes(r) {
                     account.launch_with = Some(choice);
                 }
                 account
@@ -3161,20 +3941,21 @@ impl App {
         }
     }
 
-    fn search_ah(&mut self) -> Task<Message> {
+    fn search_ah(&mut self) -> Effect<Message> {
         let generation = self.ah_lookup.begin(&self.ah_query, self.ah_server);
         if self.preview {
             self.ah_lookup.finish(generation, Ok(ffxiah::Results::default()));
-            return Task::none();
+            return Effect::none();
         }
         let query = self.ah_lookup.query.clone();
         let world = self.ah_lookup.world;
-        Task::perform(ffxiah::search(query, world), move |result| Message::AhResults(generation, result))
+        Effect::perform(ffxiah::search(query, world), move |result| Message::AhResults(generation, result))
     }
 
     fn reset_friends(&mut self, account: Option<String>) {
         self.friends_generation = self.friends_generation.wrapping_add(1);
         self.friends = friends::State { account, ..Default::default() };
+        self.friends_expired = None;
     }
 
     fn reset_missing_friends_account(&mut self) {
@@ -3192,9 +3973,7 @@ impl App {
             self.friends.account = self.accounts.iter().find(|a| a.pid.is_some() && a.account.mode == AccountMode::Retail)
                 .or_else(|| self.accounts.iter().find(|a| a.account.mode == AccountMode::Retail)).map(|a| a.key.clone());
         }
-        let Some(row) = self.accounts.iter().find(|a| self.friends.account.as_ref() == Some(&a.key)) else { return };
-        let (key, account) = (row.key.clone(), row.account.clone());
-        let config = self.settings.config_for(&self.config, &account);
+        let (Some((account, config)), Some(key)) = (self.friends_target(), self.friends.account.clone()) else { return };
         let sender = self.sender.clone();
         self.friends.loading = true;
         self.friends_generation = self.friends_generation.wrapping_add(1);
@@ -3210,15 +3989,17 @@ impl App {
     }
 
     /// Ask for the next message the open conversation needs, if any.
-    fn drive_sync(&mut self) -> Task<Message> {
+    fn drive_sync(&mut self) -> Effect<Message> {
         if self.preview {
-            return Task::none();
+            return Effect::none();
         }
         if let Some(request) = self.friends.next_sync() {
             let task = self.update(Message::FriendsSocial(request));
             if self.friends.pending.is_none() {
-                // Refused at once: stop until the user acts, not retry each poll.
-                self.friends.mail.stalled = true;
+                // A momentary collision with the session worker's own pass over the request
+                // files: the next poll asks again. Any other refusal stops until the user acts.
+                let transient = [t("Another PlayOnline request is being submitted."), t("Wait for the current PlayOnline request to finish.")];
+                if transient.contains(&self.friends.error.as_str()) { self.friends.error.clear(); } else { self.friends.mail.stalled = true; }
             }
             return task;
         }
@@ -3226,13 +4007,164 @@ impl App {
         if self.friends.pending.is_none() && self.friends.outgoing.as_ref().is_some_and(|o| o.sent) {
             self.friends.outgoing = None;
         }
-        Task::none()
+        Effect::none()
+    }
+
+    /// A read of the Friends account's session: the page's state, and the end of the request
+    /// in flight when the worker reports it done (or the session is gone).
+    fn friends_read(&mut self, connected: bool, snapshot: Option<friends::Snapshot>) {
+        self.friends.connected = connected;
+        let mut finished = None;
+        if let Some((id, _)) = &self.friends.pending {
+            let completed = snapshot.as_ref().is_some_and(|s| s.social.id.as_ref() == Some(id) && !s.social.busy);
+            if completed || !connected {
+                finished = completed.then(|| snapshot.clone()).flatten();
+                if !completed {
+                    self.friends.mail.reading = None;
+                    self.friends.outgoing = None;
+                }
+                self.friends.pending = None;
+            }
+        } else if let Some(id) = &self.friends_expired {
+            // A request reported late, after its time limit: what it did counts after all.
+            let completed = snapshot.as_ref().is_some_and(|s| s.social.id.as_ref() == Some(id) && !s.social.busy);
+            if completed || !connected {
+                if completed {
+                    finished = snapshot.clone();
+                    self.friends.mail.stalled = false;
+                    if self.friends.error == t("PlayOnline has not reported completion. Check messages or the friend list before repeating this request.") { self.friends.error.clear(); }
+                } else {
+                    self.friends.outgoing = None;
+                }
+                self.friends_expired = None;
+            }
+        }
+        self.friends.snapshot = snapshot;
+        if let Some(done) = finished {
+            self.friends.completed(&done);
+        }
+        // Off the page a read only follows the request in flight; the next
+        // conversation request waits until the page is open again.
+        if self.page == Page::Friends {
+            let _ = self.drive_sync();
+        }
+    }
+
+    /// A Friends request the session accepted is now the one in flight.
+    fn friends_request_started(&mut self, id: String, reading: Option<String>) {
+        self.friends.pending = Some((id, Instant::now()));
+        // The expired request can no longer be matched (the session now reports this one): a
+        // draft it was sending is dropped, not left marked as sending.
+        if self.friends_expired.take().is_some() && self.friends.outgoing.as_ref().is_some_and(|o| !o.sent) {
+            self.friends.outgoing = None;
+        }
+        self.friends.mail.reading = reading;
+        self.friends.error.clear();
+    }
+
+    /// The request in flight has had no result for FRIENDS_REQUEST_LIMIT. A late window (a Tick
+    /// held up, or the page left so nothing read the session) may simply not have looked: read
+    /// the session once now, and report a missing completion only if it is still missing.
+    fn expire_friends_request(&mut self) {
+        if !self.friends.pending.as_ref().is_some_and(|(_, started)| started.elapsed() >= FRIENDS_REQUEST_LIMIT) { return; }
+        if !self.preview {
+            if let Some((account, config)) = self.friends_target() {
+                let (connected, snapshot) = session_worker::friends_snapshot(&config, &account);
+                self.friends_read(connected, snapshot);
+            }
+        }
+        // A request the read just started is not the one that expired.
+        if self.friends.pending.as_ref().is_some_and(|(_, started)| started.elapsed() >= FRIENDS_REQUEST_LIMIT) {
+            // The loader may still finish it (a send retries for minutes): a later read that
+            // reports it done is reconciled (`friends_read`), and a send's draft stays matched.
+            self.friends_expired = self.friends.pending.take().map(|(id, _)| id);
+            self.friends.mail.stalled = true;
+            self.friends.mail.reading = None;
+            self.friends.error = t("PlayOnline has not reported completion. Check messages or the friend list before repeating this request.").into();
+        }
+    }
+
+    /// Each Tick: what the session flags say now. Rows whose game started are noted, and rows
+    /// whose session ended are cleared; returns the game ends (key, how it ended, its host) and
+    /// whether a game was newly seen.
+    fn observe_sessions(&mut self) -> (Vec<GameEnd>, bool) {
+        let mut game_ends = Vec::new();
+        let mut game_newly_seen = false;
+        // For `features`: games seen starting, and games ended (key, report, closed by Crystal).
+        let (mut started, mut ended) = (Vec::new(), Vec::new());
+        for row in &mut self.accounts {
+            if !row.batch_requested {
+                row.batch_pending = session_worker::batch_pending(&self.config, &row.account);
+            }
+            if row.pid.is_some() && row.alive.as_ref().is_some_and(|a| a.load(Ordering::Acquire)) {
+                // A sign-out or edit before this game (a pre-signed Play since) declines
+                // nothing about it.
+                if row.is_playing() && !std::mem::replace(&mut row.game_seen, true) {
+                    game_newly_seen = true;
+                    started.push(row.key.clone());
+                    row.resign_declined = false;
+                    row.signed_out = false;
+                    if !self.preview {
+                        startup_prefetch::game_started(&self.settings.config_for(&self.config, &row.account).game_directory(),
+                            &self.config.startup_prefetch_path());
+                    }
+                }
+                if row.is_playing() && !row.batch_pending {
+                    if let Some(mut timing) = row.play_timing.take() {
+                        timing.stage("game start observed by launcher");
+                        timing.mark(launch_timing::Milestone::GameStarted);
+                        row.timing = timing.row_summary();
+                        row.status = t("Client started · continue in game").into();
+                        if let Some(log) = &row.log { timing.append_to(&launch_timing::sibling_path(log)); }
+                    }
+                }
+                if row.busy && row.is_playing() && !row.batch_pending { row.busy = false; }
+                // A start the version check refused keeps its message on the row.
+                if !row.busy && !row.batch_pending && row.queued_play.is_none() && !row.is_playing() && !row.problem { row.status = t("Signed in to PlayOnline · FFXI is closed").into(); }
+            }
+            if row
+                .alive
+                .as_ref()
+                .is_some_and(|a| !a.load(Ordering::Acquire))
+            {
+                let host = row.pid.take().map(|pid| HostId { pid, created: row.host_created.take() });
+                row.alive = None;
+                row.game_running = None;
+                // An account whose host was signed out for its update still waits for it.
+                row.busy = row.batch_requested || self.play_updates.for_key(&row.key).is_some();
+                row.preparing_session = false;
+                row.queued_play = None;
+                row.timing.clear();
+                row.play_timing = None;
+                let report = row
+                    .outcome
+                    .take()
+                    .and_then(|slot| slot.lock().ok().and_then(|mut r| r.take()));
+                if row.game_seen { ended.push((row.key.clone(), report.clone(), row.shutting_down || row.signing_out)); }
+                if row.game_seen && !self.settings.sign_in_after_game { row.signed_out = true; }
+                if std::mem::take(&mut row.game_seen) && !std::mem::take(&mut row.resign_declined) {
+                    game_ends.push((row.key.clone(), report.as_ref().map(|r| r.kind.clone()), host));
+                }
+                row.resign_declined = false;
+                match report {
+                    Some(report) => row.set_exit(report),
+                    None => {
+                        row.problem = false;
+                        row.status = t("Client closed").into();
+                    }
+                }
+            }
+        }
+        self.features_observed(started, ended);
+        (game_ends, game_newly_seen)
     }
 
     fn worker_event(&mut self, event: WorkerEvent) {
         match event {
             WorkerEvent::Viewer(generation, report) => self.set_viewer_status(generation, report),
             WorkerEvent::InterruptedUpdate(done) => self.interrupted_update_finished(*done),
+            WorkerEvent::PlayUpdate(generation, event) => self.play_update_event(generation, event),
+            WorkerEvent::PatchCheck(folder, key, result) => self.patch_checked(folder, key, result),
             WorkerEvent::Launch(key, generation, event) => {
                 if self.accounts.iter().any(|row| row.key == key && row.launch_generation == generation) {
                     self.worker_event(*event);
@@ -3241,24 +4173,7 @@ impl App {
             WorkerEvent::Friends(generation, key, connected, snapshot) => {
                 if generation == self.friends_generation && self.friends.account.as_ref() == Some(&key) {
                     self.friends.loading = false;
-                    self.friends.connected = connected;
-                    let mut finished = None;
-                    if let Some((id, _)) = &self.friends.pending {
-                        let completed = snapshot.as_ref().is_some_and(|s| s.social.id.as_ref() == Some(id) && !s.social.busy);
-                        if completed || !connected {
-                            finished = completed.then(|| snapshot.clone()).flatten();
-                            if !completed {
-                                self.friends.mail.reading = None;
-                                self.friends.outgoing = None;
-                            }
-                            self.friends.pending = None;
-                        }
-                    }
-                    self.friends.snapshot = snapshot;
-                    if let Some(done) = finished {
-                        self.friends.completed(&done);
-                    }
-                    let _ = self.drive_sync();
+                    self.friends_read(connected, snapshot);
                 }
             }
             // A language switch can supersede a read even after switching back.
@@ -3270,12 +4185,10 @@ impl App {
                 }
             }
             WorkerEvent::StartGame(key, report, result) => {
-                // The W20 refused this Play for an update: the Update it asks for starts it again.
-                if result.is_err() && report.as_ref().is_some_and(|report| report.state == patch::PatchState::Required) {
-                    let clicked = self.accounts.iter().find(|r| r.key == key)
-                        .and_then(|row| row.play_timing.as_ref().map(launch_timing::Timeline::started)).unwrap_or_else(Instant::now);
-                    self.note_refused_play(&key, clicked);
-                }
+                // The W20 refused this Play for an update: it runs now, in this signed-in session.
+                let update = report.clone().filter(|report| result.is_err() && report.state == patch::PatchState::Required);
+                let clicked = self.accounts.iter().find(|r| r.key == key)
+                    .and_then(|row| row.play_timing.as_ref().map(launch_timing::Timeline::started)).unwrap_or_else(Instant::now);
                 // No report: the session never reached its idle main menu, so W20 never ran.
                 if let Some(report) = report { self.set_patch_from_row(&key, report); }
                 if let Some(row) = self.accounts.iter_mut().find(|r| r.key == key) {
@@ -3294,18 +4207,21 @@ impl App {
                         }
                     }
                 }
+                if let Some(report) = update { self.begin_play_update(&key, &report, clicked, false, false); }
             }
             WorkerEvent::Notice(message) => self.status = message,
+            WorkerEvent::Features(event) => self.features_event(event),
             WorkerEvent::WindowerProfileProgress(message) => {
                 if self.windower_editor_open { self.status = message; }
             }
             WorkerEvent::Progress(key, status) => {
                 if let Some(row) = self.accounts.iter_mut().find(|r| r.key == key) {
-                    row.status = if row.queued_play.is_some() {
-                        format!("{status} · {}", t("FFXI will start when sign-in finishes."))
+                    row.status = status;
+                    row.set_note(if row.queued_play.is_some() {
+                        Some(RowNote::QueuedPlay)
                     } else if matches!(row.launch_trigger, Some(launch_timing::LaunchTrigger::SignInAfterGame | launch_timing::LaunchTrigger::SignInAfterGameRetry)) {
-                        format!("{status}{}", resign_note())
-                    } else { status };
+                        Some(RowNote::ResignAfterGame)
+                    } else { None });
                 }
             }
             WorkerEvent::NetworkBack(key, back) => {
@@ -3320,18 +4236,12 @@ impl App {
                         return;
                     }
                     row.drop_resign();
-                    if !back && !row.busy && row.pid.is_none() {
-                        let shown = format!("{} · {}", row.status_text(), t("The network did not come back. Sign in again once it is."));
-                        row.status = shown;
-                    }
+                    if !back && !row.busy && row.pid.is_none() { row.set_note(Some(RowNote::NetworkGone)); }
                     return;
                 }
                 // No retry is coming after all: the row stops promising one.
-                let promise = format!(" · {}", t("Crystal will try again when the network is back."));
-                if let Some(message) = row.status.strip_suffix(&promise).map(str::to_owned) {
-                    if !back || row.busy || row.pid.is_some() || !row.can_play() {
-                        row.status = if back { message } else { format!("{message} · {}", t("The network did not come back. Sign in again once it is.")) };
-                    }
+                if row.shown_note() == Some(&RowNote::NetworkRetry) && (!back || row.busy || row.pid.is_some() || !row.can_play()) {
+                    row.set_note((!back).then_some(RowNote::NetworkGone));
                 }
                 // The user may have started something else meanwhile; that wins.
                 if !back || row.busy || row.pid.is_some() || !row.can_play() { return; }
@@ -3350,7 +4260,10 @@ impl App {
                 let mut viewer_outdated = None;
                 // A W20 verdict for this row's folder, and a Play an Update should start again.
                 let mut game_report = None;
+                // A PlayOnline refusal's Play, which its PlayOnline update starts again.
                 let mut refused_play = None;
+                // A W20 refusal whose update runs in the account's session: (report, click, batch).
+                let mut play_update = None;
                 // Whether the account's sign-in took a one-time code, learned from a session.
                 let mut uses_otp = None;
                 // A sign-in that reached a verdict on the account (no network or host failure that
@@ -3372,6 +4285,7 @@ impl App {
                             uses_otp = (row.otp_spent || trigger.is_some() && !row.otp_unknown).then_some(row.otp_spent);
                             // The signed-in session stays up; the stock check refused the game start.
                             let refused = patch::parse_update_required(&result.detail);
+                            if row.pid != Some(result.pid) { row.host_created = process_created(result.pid); }
                             row.pid = Some(result.pid);
                             row.alive = Some(result.alive);
                             row.game_running = Some(result.game_running);
@@ -3384,8 +4298,9 @@ impl App {
                             row.outcome = Some(result.outcome);
                             row.problem = refused.is_some();
                             row.status = if let Some(report) = refused {
-                                // Only a Play runs the W20.
-                                refused_play = Some(row.play_timing.as_ref().map_or_else(Instant::now, launch_timing::Timeline::started));
+                                // Only a Play runs the W20: its update runs in this session.
+                                let clicked = row.play_timing.as_ref().map_or_else(Instant::now, launch_timing::Timeline::started);
+                                play_update = Some((report.clone(), clicked, false));
                                 game_report = Some(report);
                                 result.detail.clone()
                             } else if !row.is_playing() {
@@ -3437,8 +4352,14 @@ impl App {
                                 | launch_timing::LaunchTrigger::ParkedPlay | launch_timing::LaunchTrigger::PreSignedPlay
                                 | launch_timing::LaunchTrigger::QueuedPlay | launch_timing::LaunchTrigger::BatchPlay
                                 | launch_timing::LaunchTrigger::ReissuedPlay));
-                            if play && (update.is_some() || viewer_outdated.is_some()) {
+                            // PlayOnline's update starts from this Play and starts it again; the
+                            // game's (a batch's W20) runs in the session the batch kept signed in.
+                            if play && viewer_outdated.is_some() {
                                 refused_play = Some(queued.unwrap_or_else(Instant::now));
+                            }
+                            if let Some(report) = update.as_ref().filter(|_| play || batch) {
+                                let clicked = row.play_timing.as_ref().map_or_else(|| queued.unwrap_or_else(Instant::now), launch_timing::Timeline::started);
+                                play_update = Some((report.clone(), clicked, batch));
                             }
                             game_report = update;
                             // Owner decision 2026-10-13: a sign-in Crystal started by itself without
@@ -3452,13 +4373,14 @@ impl App {
                                 && launch_log::sign_in_refused(message);
                             let stops_presigning = refused && self.settings.presigns(&key);
                             if refused { uses_otp = Some(true); }
-                            row.status = if row.network_wait.is_some() {
-                                format!("{message} · {}", t("Crystal will try again when the network is back."))
+                            row.status = message.to_owned();
+                            row.set_note(if row.network_wait.is_some() {
+                                Some(RowNote::NetworkRetry)
                             } else if wanted.is_some() && otp_spent {
-                                format!("{message} · {}", t("That one-time code was used. Enter a new one, then press Play."))
+                                Some(RowNote::OtpSpent)
                             } else if stops_presigning {
-                                format!("{message} · {}", t("This account may need a one-time password now: Crystal signs it in only when you press Play."))
-                            } else { message.to_owned() };
+                                Some(RowNote::MayNeedOtp)
+                            } else { None });
                             row.problem = true;
                             if log.is_some() {
                                 row.log = log;
@@ -3469,6 +4391,8 @@ impl App {
                     }
                 }
                 if let Some(report) = game_report { self.set_patch_from_row(&key, report); }
+                // The session worker's W20 and W2U wrote what the server said.
+                self.reload_official();
                 if let Some(clicked) = refused_play { self.note_refused_play(&key, clicked); }
                 if let Some(uses) = uses_otp { self.note_otp_account(&key, uses); }
                 // A waiting Play whose sign-in (startup, Connect) was refused keeps the refusal on
@@ -3476,10 +4400,11 @@ impl App {
                 // password, account or PlayOnline version never costs a second login.
                 if verdict && self.is_waiting(&key) { self.unwait(std::slice::from_ref(&key)); }
                 if let Some((local, remote)) = viewer_outdated {
-                    self.viewer_generation += 1;
-                    self.viewer_loading = false;
-                    self.viewer = Some(viewer::outdated(self.viewer.take(), local, remote));
+                    let outdated = viewer::outdated(self.viewer.take(), local, remote);
+                    self.show_viewer(outdated);
+                    if refused_play.is_some() { self.begin_viewer_update(&key); }
                 }
+                if let Some((report, clicked, batch)) = play_update { self.begin_play_update(&key, &report, clicked, batch, false); }
                 match follow_up {
                     Some((_, true)) => {
                         let generation = self.accounts.iter().find(|r| r.key == key).map_or(0, |row| row.launch_generation);
@@ -3497,11 +4422,12 @@ impl App {
         !self.closing && self.maintenance.is_none() && self.active_operation.is_none() && !self.prereqs.busy()
             && !self.dgvoodoo.busy() && !self.reshade.busy && self.friends.pending.is_none()
             && self.vault_ready && !self.startup_signin_pending && !self.vault_saving
+            && !self.startup_task_busy && !self.windower_editor_open
             && self.held_plays.is_empty()
-            // A waiting Play, one released from its wait and still starting, or the update it
-            // asked for, is pending launch work (waits are not saved across a restart).
-            && self.waiting_plays.is_empty() && self.released.is_empty() && self.wait_update.is_none()
-            && !self.accounts.iter().any(|a| a.signing_out || a.busy || a.batch_pending)
+            // A waiting Play, or the update a Play runs in its session, is pending launch work
+            // (neither is saved across a restart).
+            && self.waiting_plays.is_empty() && self.play_updates.jobs.is_empty()
+            && !self.accounts.iter().any(|a| a.shutting_down || a.signing_out || a.busy || a.batch_pending)
     }
 
     fn poll_controller(&mut self, capturing: bool) {
@@ -3513,38 +4439,78 @@ impl App {
         }
     }
 
-    fn controller_modal(&self) -> bool {
-        self.confirm_close || self.pending_delete.is_some() || self.editor.is_some()
-            || self.account_import.open || self.show_settings || self.show_details || self.ah_lookup.open
+    /// A dialog is over the page (the account sheet counts separately: `controller_modal`).
+    fn dialog_open(&self) -> bool {
+        self.confirm_close || self.pending_delete.is_some() || self.account_import.open
+            || self.show_settings || self.show_details || self.ah_lookup.open
     }
 
-    fn update(&mut self, message: Message) -> Task<Message> {
+    pub(crate) fn controller_modal(&self) -> bool {
+        self.dialog_open() || self.editor.is_some() || self.features_view.open
+    }
+
+    /// The open account sheet, unless the vault is being saved (edits wait for that).
+    fn editor_mut(&mut self) -> Option<&mut Editor> {
+        if self.vault_saving { None } else { self.editor.as_mut() }
+    }
+
+    /// The Friends page's account and its launch config, as owned values.
+    fn friends_target(&self) -> Option<(Account, Config)> {
+        let row = self.accounts.iter().find(|row| self.friends.account.as_ref() == Some(&row.key))?;
+        Some((row.account.clone(), self.settings.config_for(&self.config, &row.account)))
+    }
+
+    /// A command for the launcher window, when there is one.
+    fn on_window(&self, command: WindowOp<Message>) -> Effect<Message> {
+        self.window.map_or(Effect::none(), |id| Effect::window(id, command))
+    }
+
+    /// Save the settings as they are now (never in a preview); a failure shows on the status line.
+    fn persist_settings(&mut self) {
+        if self.preview { return; }
+        if let Err(error) = save_settings(&self.config, &self.settings) { self.status = error; }
+    }
+
+    fn update(&mut self, message: Message) -> Effect<Message> {
         if self.closing && !matches!(&message,
             Message::WindowResized(_) | Message::WindowMaximized(_)
             | Message::MinimizeWindow | Message::MaximizeWindow | Message::TitlePressed
             | Message::TitleMoved | Message::TitleReleased | Message::ResizeWindow(_)) {
-            return Task::none();
+            return Effect::none();
         }
         // The helper is preparing to replace this process. Do not start new
-        // writes or work between its readiness check and our exit.
+        // writes or work between its readiness check and our exit. Results of work already
+        // running still land (they clear busy flags and touch nothing the update replaces), so a
+        // helper that then fails leaves nothing stuck.
         if matches!(self.self_update, self_update::State::Applying)
-            && !matches!(&message, Message::SelfUpdate(self_update::Msg::Applied(_)) | Message::CloseRequested)
+            && !matches!(&message, Message::SelfUpdate(self_update::Msg::Applied(_)) | Message::CloseRequested
+                | Message::StartupTaskSet(..) | Message::WindowerProfilesClosed(_) | Message::ServicesLoaded(..)
+                | Message::ServiceStatusLoaded(..) | Message::PatchLoaded(..) | Message::ViewerLoaded(..) | Message::AhResults(..))
         {
-            return Task::none();
+            return Effect::none();
         }
         match message {
             Message::SelfUpdate(self_update::Msg::AutoCheck(on)) => {
                 self.settings.launcher_auto_updates = on;
-                if !self.preview { if let Err(error) = save_settings(&self.config, &self.settings) { self.status = error; } }
-                if on && !self.preview { return Task::done(Message::SelfUpdate(self_update::Msg::Check)); }
+                self.persist_settings();
+                if on && !self.preview { return Effect::done(Message::SelfUpdate(self_update::Msg::Check)); }
             }
-            Message::SelfUpdate(self_update::Msg::Applied(Ok(()))) => { self.close_parks(); return iced::exit(); }
+            Message::SelfUpdate(self_update::Msg::Applied(Ok(()))) => { self.close_parks(); tray::set_icon(false); tray::wake_ui_thread_soon(); return Effect::Exit; }
             Message::SelfUpdate(msg) => {
                 if !self.preview {
                     let can_restart = self.can_restart_launcher();
                     let task = self_update::update(&mut self.self_update, msg, &self.config, can_restart).map(Message::SelfUpdate);
                     // The update replaces this exe: no parked host may outlive it (07d §1.5).
-                    if matches!(self.self_update, self_update::State::Applying) { self.close_parks(); }
+                    // They close off the interface thread before the helper starts.
+                    if matches!(self.self_update, self_update::State::Applying) {
+                        let parks = self.parks.drain(None);
+                        return Effect::future(async move {
+                            match close_parks_now(parks).await {
+                                Ok(()) => task,
+                                Err(error) => Effect::done(Message::SelfUpdate(self_update::Msg::Applied(Err(error)))),
+                            }
+                        });
+                    }
                     return task;
                 }
             }
@@ -3552,7 +4518,7 @@ impl App {
             Message::ControllerNavigation(on) => {
                 self.settings.controller_navigation = on;
                 self.controller_nav.clear();
-                if !self.preview { if let Err(error) = save_settings(&self.config, &self.settings) { self.status = error; } }
+                self.persist_settings();
             }
             // Like the per-account choice it replaces: sessions already signed in stay, and a
             // sign-in in flight finishes; a startup sign-in still waiting for a closing session,
@@ -3562,29 +4528,30 @@ impl App {
             Message::AutoSignIn(on) => {
                 self.settings.auto_sign_in = on;
                 self.park_checked = None;
-                if !self.preview { if let Err(error) = save_settings(&self.config, &self.settings) { self.status = error; } }
+                self.persist_settings();
             }
             Message::SignInAfterGame(on) => {
                 self.settings.sign_in_after_game = on;
                 if !on { for row in &mut self.accounts { row.drop_resign(); } }
-                if !self.preview { if let Err(error) = save_settings(&self.config, &self.settings) { self.status = error; } }
+                self.persist_settings();
             }
             Message::ControllerPlay => {
                 if !self.controller_modal() { return self.update(Message::MainAction); }
             }
             Message::ControllerPage(step) => {
                 if !self.controller_modal() {
-                    let pages = [Page::Home, Page::Accounts, Page::Friends, Page::Maintenance, Page::Settings];
+                    let pages = [Page::Home, Page::Friends, Page::Maintenance, Page::Settings];
                     let index = pages.iter().position(|p| *p == self.page).unwrap_or(0);
                     self.controller_nav.clear();
-                    return self.update(Message::Navigate(pages[(index as i32 + step as i32).rem_euclid(5) as usize]));
+                    return self.update(Message::Navigate(pages[(index as i32 + step as i32).rem_euclid(pages.len() as i32) as usize]));
                 }
             }
             Message::ControllerBack => {
-                if self.account_drag.source.is_some() { self.cancel_account_drag(); return Task::none(); }
+                if self.account_drag.source.is_some() { self.cancel_account_drag(); return Effect::none(); }
                 if self.gamepad.capturing() { return self.update(Message::Gamepad(gamepad::Msg::CancelCapture)); }
                 if self.confirm_close { return self.update(Message::CancelClose); }
                 if self.pending_delete.is_some() { return self.update(Message::CancelDeleteAccount); }
+                if self.features_view.open { return self.update(Message::Feature(features::ui::Msg::Open(false))); }
                 if self.editor.is_some() { return self.update(Message::CloseEditor); }
                 if self.account_import.open { return self.import_update(account_import_ui::Msg::Close); }
                 if self.show_settings { return self.update(Message::ToggleSettings); }
@@ -3600,9 +4567,12 @@ impl App {
             }
             Message::FriendsQuery(query) => self.friends.query = query,
             Message::FriendsSelect(pane) => {
+                let opened = self.friends.pane != pane;
                 self.friends.select(pane.clone());
-                // The Mailbox lists Inbox page 1 when it has nothing current.
-                if pane == Some(friends::Pane::Mailbox) && self.friends.pending.is_none() && self.friends.snapshot.as_ref().is_some_and(|s| s.social.ready && !s.social.busy && s.game_running == Some(false) && (s.social.inbox_unread.is_none() || s.social.inbox_changed)) {
+                // The Mailbox lists Inbox page 1 when it has nothing current, or, as it opens, when
+                // the session last listed another folder or page (a conversation's sync ends on Sent).
+                if pane == Some(friends::Pane::Mailbox) && self.friends.pending.is_none() && self.friends.snapshot.as_ref().is_some_and(|s| s.social.ready && !s.social.busy && s.game_running == Some(false)
+                    && (s.social.inbox_unread.is_none() || s.social.inbox_changed || (opened && (s.social.folder != 0 || s.social.page != 0)))) {
                     return self.update(Message::FriendsSocial(social::Request::Inbox { folder:0, page:0 }));
                 }
                 return self.drive_sync();
@@ -3612,33 +4582,49 @@ impl App {
             Message::FriendsAddSubject(open) => { if let Some(draft) = &mut self.friends.composer { draft.show_subject = open; } }
             Message::FriendsRemove(friend) => self.friends.remove = Some(friend),
             Message::FriendsRemoveConfirm => {
-                if let Some(friend) = self.friends.remove.take() {
-                    if let Some(uid) = friend.uid { return self.update(Message::FriendsSocial(social::Request::Remove { alternate: friend.alternate, slot: friend.slot, uid })); }
+                let Some(friend) = self.friends.remove.clone() else { return Effect::none() };
+                let Some(uid) = friend.uid else { self.friends.remove = None; return Effect::none() };
+                // A request in flight (the bar pauses conversation sync, so it ends soon): the bar
+                // stays open to confirm again once it has.
+                if !self.preview && self.friends.pending.is_some() {
+                    self.friends.error = t("Wait for the current PlayOnline request to finish.").into();
+                    return Effect::none();
                 }
+                self.friends.error.clear();
+                let task = self.update(Message::FriendsSocial(social::Request::Remove { alternate: friend.alternate, slot: friend.slot, uid }));
+                // The bar closes once the request went out or was refused for good; a momentary
+                // collision with the session worker leaves it open to confirm again.
+                let collided = [t("Another PlayOnline request is being submitted."), t("Wait for the current PlayOnline request to finish.")]
+                    .contains(&self.friends.error.as_str());
+                if self.friends.pending.is_some() || !collided { self.friends.remove = None; }
+                return task;
             }
-            Message::FriendsDraftClose => self.friends.remove = None,
+            Message::FriendsDraftClose => {
+                self.friends.remove = None;
+                return self.drive_sync();
+            }
             Message::FriendsSubject(subject) => { if let Some(draft) = &mut self.friends.composer { draft.subject = subject.chars().take(512).collect(); } }
-            Message::FriendsMessageEdit(action) => { if let Some(draft) = &mut self.friends.composer { draft.text.perform(action); } }
+            Message::FriendsMessageEdit(text) => { if let Some(draft) = &mut self.friends.composer { draft.text = text; } }
             Message::FriendsSend => {
                 let ready = self.friends.connected && self.friends.pending.is_none()
                     && self.friends.snapshot.as_ref().is_some_and(|s| s.game_running == Some(false) && s.social.ready && !s.social.busy);
                 if let (true, Some(request)) = (ready, self.friends.send_request()) {
-                    if let social::Request::Send { uid, subject, message, .. } = &request {
-                        self.friends.outgoing = Some(friends::Outgoing { uid: *uid, subject: subject.clone(), message: message.clone(), sent: false });
-                    }
+                    let draft = if let social::Request::Send { uid, subject, message, .. } = &request {
+                        Some(friends::Outgoing { uid: *uid, subject: subject.clone(), message: message.clone(), sent: false })
+                    } else { None };
                     let task = self.update(Message::FriendsSocial(request));
-                    if self.friends.pending.is_none() { self.friends.outgoing = None; }
+                    // Set once the request went out (after FriendsSocial dropped any earlier draft).
+                    if self.friends.pending.is_some() { self.friends.outgoing = draft; }
                     return task;
                 }
             }
             Message::FriendsSocial(request) => {
                 if !self.preview && self.friends.pending.is_none() {
-                    if let Some(row) = self.accounts.iter().find(|a| self.friends.account.as_ref() == Some(&a.key)) {
-                        let config = self.settings.config_for(&self.config, &row.account);
+                    if let Some((account, config)) = self.friends_target() {
                         if matches!(request, social::Request::Check {}) { self.friends.mail.stalled = false; }
                         let reading = if let social::Request::Read { header } = &request { Some(social::message_key(header)) } else { None };
-                        match session_worker::request_social(&config, &row.account, request) {
-                            Ok(id) => { self.friends.pending = Some((id, Instant::now())); self.friends.mail.reading = reading; self.friends.error.clear(); }
+                        match session_worker::request_social(&config, &account, request) {
+                            Ok(id) => self.friends_request_started(id, reading),
                             Err(error) => self.friends.error = error,
                         }
                         self.load_friends();
@@ -3646,13 +4632,35 @@ impl App {
                 }
             }
             Message::FriendsConnect => {
-                if let Some(key) = self.friends.account.clone() { self.start_mode(vec![key], true); }
+                if let Some(key) = self.friends.account.clone() { self.connect(vec![key]); }
             }
             Message::FriendsPlay => {
-                if let Some(key) = self.friends.account.clone() { self.start(vec![key]); }
+                if let Some(key) = self.friends.account.clone() { self.play(vec![key]); }
             }
             Message::FriendsSignOut => {
                 if let Some(key) = self.friends.account.clone() { return self.sign_out_account(key); }
+            }
+            Message::ShutdownSelected => return self.shutdown_games(true),
+            Message::ShutdownAll => return self.shutdown_games(false),
+            Message::GameShutdownFinished(key, generation, result) => {
+                if let Some(row) = self.accounts.iter_mut().find(|row| row.key == key && row.launch_generation == generation) {
+                    row.shutting_down = false;
+                    if let Err(error) = result {
+                        row.problem = true;
+                        row.status = error;
+                    } else if row.game_seen {
+                        row.problem = false;
+                        row.status = if self.settings.sign_in_after_game {
+                            t("FFXI closed. Returning to PlayOnline…")
+                        } else { t("FFXI and PlayOnline closed.") }.into();
+                        // The monitor publishes the exit report before `alive = false`.
+                        // Let Tick consume both, whether it runs before or after this result,
+                        // so automatic sign-in is scheduled once with the actual exit reason.
+                        if self.preview {
+                            row.alive = Some(Arc::new(AtomicBool::new(false)));
+                        }
+                    }
+                }
             }
             Message::AccountSignOut(key) => return self.sign_out_account(key),
             Message::AccountSignedOut(key, generation, result) => {
@@ -3677,17 +4685,16 @@ impl App {
             }
             Message::FriendsStatus(action) => {
                 if !self.preview && matches!(action, session_worker::NativeControl::Visible | session_worker::NativeControl::Away | session_worker::NativeControl::Invisible) {
-                    if let Some(row) = self.accounts.iter().find(|a| self.friends.account.as_ref() == Some(&a.key)) {
-                        let config = self.settings.config_for(&self.config, &row.account);
-                        self.friends.error = session_worker::request_native_status(&config, &row.account, action, !self.friends.skip_groups).err().unwrap_or_default();
+                    if let Some((account, config)) = self.friends_target() {
+                        self.friends.error = session_worker::request_native_status(&config, &account, action, !self.friends.skip_groups).err().unwrap_or_default();
                     }
                 }
             }
             Message::FriendsStatusGroups(groups) => self.friends.skip_groups = !groups,
             Message::FriendsAutoAway(minutes) => {
                 if !self.preview && pol_less::AUTO_AWAY_CHOICES.contains(&minutes) {
-                    if let Some(row) = self.accounts.iter().find(|a| self.friends.account.as_ref() == Some(&a.key)) {
-                        self.settings.account_auto_away.insert(account_key(&row.account), minutes);
+                    if let Some((account, _)) = self.friends_target() {
+                        self.settings.account_auto_away.insert(account_key(&account), minutes);
                         if let Err(error) = save_settings(&self.config, &self.settings) { self.friends.error = error; }
                     }
                 }
@@ -3731,21 +4738,27 @@ impl App {
                     self.close_parks_in_background(None);
                 }
                 if let Some((revision, values)) = self.gamepad.take_live_update() {
-                    return Task::batch([task, self.apply_controller_settings(revision, values)]);
+                    return Effect::batch([task, self.apply_controller_settings(revision, values)]);
                 }
                 return task;
             },
             Message::LaunchTools(m) => {
                 self.park_checked = None;
-                if launch_tools::apply(&mut self.settings, m) && !self.preview {
-                    if let Err(error) = save_settings(&self.config, &self.settings) {
-                        self.status = error;
-                    }
+                if launch_tools::apply(&mut self.settings, m) { self.persist_settings(); }
+                return self.launch_tools.refresh(&self.settings);
+            }
+            Message::LaunchToolsScanned(scan) => return self.launch_tools.scanned(scan),
+            Message::OpenWithGame(m) => {
+                if open_with_game::apply(&mut self.settings, m) { self.persist_settings(); }
+            }
+            Message::OpenWithGameDone(report) => {
+                for line in open_with_game::log_lines(&report) {
+                    launch_log::append_history(&self.config.history_path(), "Crystal", &format!("open with game: {line}"), None);
                 }
-                self.launch_tools.refresh(&self.settings);
+                if let Some(notice) = open_with_game::notice(&report) { self.status = notice; }
             }
             Message::EditWindowerProfiles => {
-                if self.preview || self.windower_editor_open { return Task::none(); }
+                if self.preview ||self.windower_editor_open { return Effect::none(); }
                 self.windower_editor_open = true;
                 // Idle signed-in owners retain the same profile guard as parks.
                 // Let their native sign-out and final Windower save finish first.
@@ -3755,7 +4768,7 @@ impl App {
                 let sessions = self.accounts.iter().filter_map(|row|
                     session_worker::find(&self.settings.config_for(&self.config, &row.account), &row.account)).collect();
                 let sender = self.sender.clone();
-                return Task::perform(async move {
+                return Effect::perform(async move {
                     tokio::task::spawn_blocking(move || {
                         let folder = pol_less::tools::detect(pol_less::Tool::Windower, &preferred)
                             .ok_or_else(|| t("Windower was not found. Set its folder in Settings → System → Launch tools.").to_owned())?;
@@ -3772,31 +4785,23 @@ impl App {
                 self.windower_editor_open = false;
                 self.park_checked = None;
                 if let Err(error) = result { self.status = error; }
-                self.launch_tools.refresh(&self.settings);
+                return self.launch_tools.refresh(&self.settings);
             }
             Message::Tick => {
-                self.launch_tools.poll();
                 // A long gap since the last Tick is a resume from sleep: a waiting Play checks again.
                 self.flag_schedule.tick(chrono::Utc::now());
                 // No periodic patch-host lookups: stock looks pc001W2U.pol.com up only right
                 // before a W20 (the W20's own lookup, or xi-start-game's warm-up at Play).
                 if self.startup_signin_pending && self.vault_ready && !self.installation_loading {
-                    let keys = self.take_startup_signins();
-                    self.start_startup(keys, launch_timing::LaunchTrigger::StartupSignIn);
+                    self.start_ready_startup_signins();
                 }
                 let keys = self.take_waiting_startups(Instant::now());
                 self.start_startup(keys, launch_timing::LaunchTrigger::StartupSignIn);
-                if self.friends.pending.as_ref().is_some_and(|(_, started)| started.elapsed() >= Duration::from_secs(45)) {
-                    self.friends.pending = None;
-                    self.friends.mail.stalled = true;
-                    self.friends.mail.reading = None;
-                    self.friends.outgoing = None;
-                    self.friends.error = t("PlayOnline has not reported completion. Check messages or the friend list before repeating this request.").into();
-                }
                 // A request in flight is followed closely, so a conversation
-                // fills message by message; otherwise every two seconds.
+                // fills message by message; otherwise every two seconds. It is
+                // followed off the page too: its time limit runs on every page.
                 let every = if self.friends.pending.is_some() { Duration::from_millis(250) } else { Duration::from_secs(2) };
-                if self.page == Page::Friends && self.friends_checked.elapsed() >= every {
+                if (self.page == Page::Friends || self.friends.pending.is_some()) && self.friends_checked.elapsed() >= every {
                     self.load_friends();
                 }
                 if let Some(op) = &self.active_operation {
@@ -3805,83 +4810,38 @@ impl App {
                 while let Ok(event) = self.receiver.try_recv() {
                     self.worker_event(event);
                 }
+                // After the results that already arrived: a completion waiting in the queue
+                // is not a request PlayOnline never answered.
+                self.expire_friends_request();
                 self.release_held_plays(Instant::now());
-                let mut game_ends = Vec::new();
-                for row in &mut self.accounts {
-                    if !row.batch_requested {
-                        row.batch_pending = session_worker::batch_pending(&self.config, &row.account);
-                    }
-                    if row.pid.is_some() && row.alive.as_ref().is_some_and(|a| a.load(Ordering::Acquire)) {
-                        // A sign-out or edit before this game (a pre-signed Play since) declines
-                        // nothing about it.
-                        if row.is_playing() && !std::mem::replace(&mut row.game_seen, true) {
-                            row.resign_declined = false;
-                            row.signed_out = false;
-                        }
-                        if row.is_playing() && !row.batch_pending {
-                            if let Some(mut timing) = row.play_timing.take() {
-                                timing.stage("game start observed by launcher");
-                                timing.mark(launch_timing::Milestone::GameStarted);
-                                row.timing = timing.row_summary();
-                                row.status = t("Client started · continue in game").into();
-                                if let Some(log) = &row.log { timing.append_to(&launch_timing::sibling_path(log)); }
-                            }
-                        }
-                        if row.busy && row.is_playing() && !row.batch_pending { row.busy = false; }
-                        // A start the version check refused keeps its message on the row.
-                        if !row.busy && !row.batch_pending && row.queued_play.is_none() && !row.is_playing() && !row.problem { row.status = t("Signed in to PlayOnline · FFXI is closed").into(); }
-                    }
-                    if row
-                        .alive
-                        .as_ref()
-                        .is_some_and(|a| !a.load(Ordering::Acquire))
-                    {
-                        let host = row.pid.take();
-                        row.alive = None;
-                        row.game_running = None;
-                        row.busy = row.batch_requested;
-                        row.preparing_session = false;
-                        row.queued_play = None;
-                        row.timing.clear();
-                        row.play_timing = None;
-                        let report = row
-                            .outcome
-                            .take()
-                            .and_then(|slot| slot.lock().ok().and_then(|mut r| r.take()));
-                        if row.game_seen && !self.settings.sign_in_after_game { row.signed_out = true; }
-                        if std::mem::take(&mut row.game_seen) && !std::mem::take(&mut row.resign_declined) {
-                            game_ends.push((row.key.clone(), report.as_ref().map(|r| r.kind.clone()), host));
-                        }
-                        row.resign_declined = false;
-                        match report {
-                            Some(report) => row.set_exit(report),
-                            None => {
-                                row.problem = false;
-                                row.status = t("Client closed").into();
-                            }
-                        }
-                    }
-                }
+                let (game_ends, game_newly_seen) = self.observe_sessions();
                 for (key, kind, host) in game_ends { self.note_game_end(&key, kind, host); }
+                // Once per Play batch, after the first game reports started; off the UI thread,
+                // and never part of the launch itself.
+                let game_active = self.accounts.iter().any(|row| row.game_seen);
+                let open_programs = if self.open_gate.observe(game_active, game_newly_seen) && !self.preview
+                    && self.settings.open_with_game.iter().any(|p| p.enabled) {
+                    let programs = self.settings.open_with_game.clone();
+                    Effect::perform(async move { tokio::task::spawn_blocking(move || open_with_game::run(programs)).await.unwrap_or_default() },
+                        Message::OpenWithGameDone)
+                } else { Effect::none() };
                 let keys = self.take_resigns(Instant::now());
                 self.start_resigns(keys, launch_timing::LaunchTrigger::SignInAfterGame);
                 self.start_queued_plays();
-                // A released Play that started its game, or ended without asking for an update,
-                // is done; one whose interrupted update is being finished is still on its way.
-                let recovering = self.recovering.is_some();
                 let accounts = &self.accounts;
-                self.released.retain(|key| recovering
-                    || accounts.iter().any(|row| row.key == *key && row.game_start_pending() && !row.is_playing()));
                 // A deleted account no longer waits.
                 let deleted: Vec<String> = self.waiting_plays.iter().flat_map(|wait| &wait.keys)
                     .filter(|key| !accounts.iter().any(|row| row.key == **key)).cloned().collect();
                 self.unwait(&deleted);
                 self.expire_wait_codes();
                 self.release_waiting_plays(false);
-                let waited_update = self.start_waited_update();
+                self.tend_patch_watch();
+                // Work a worker event started (a Play's PlayOnline update).
+                let started = Effect::batch(std::mem::take(&mut self.play_updates.tasks));
                 let flag = self.read_play_flag();
                 self.tend_parks(Instant::now());
                 if self.preview
+                    && !preview_idle()
                     && !self.preview_capture_sent
                     && !self.news_loading
                     && self.refreshed.elapsed() > Duration::from_secs(
@@ -3889,22 +4849,25 @@ impl App {
                             .and_then(|value| value.parse::<u64>().ok()).unwrap_or(2).clamp(2, 30))
                 {
                     self.preview_capture_sent = true;
-                    return window::oldest().then(|id| {
-                        id.map_or(Task::none(), |id| {
-                            window::screenshot(id).map(Message::PreviewReady)
-                        })
-                    });
+                    return self.on_window(WindowOp::screenshot(Message::PreviewReady));
                 }
-                return Task::batch([waited_update, flag, self.poll_service_status()]);
+                return Effect::batch([started, flag, open_programs, self.poll_service_status()]);
             }
             Message::PlayFlagLoaded(reading) => {
                 self.flag_schedule.finish();
                 self.play_flag.note(reading);
                 self.release_waiting_plays(true);
+                self.tend_patch_watch();
             }
             Message::CancelWait(keys) => self.cancel_wait(&keys),
+            Message::CancelPlayUpdate(generation) => self.cancel_play_update(generation),
+            Message::ConfirmViewerUpdate => {
+                if self.play_updates.viewer_confirm.take().is_some() {
+                    return self.start_maintenance_scoped(MaintenanceKind::Update, true);
+                }
+            }
             Message::AccountDragStart(key) => {
-                if self.page == Page::Accounts && self.vault_ready && !self.vault_saving
+                if self.page == Page::Home && self.vault_ready && !self.vault_saving
                     && self.editor.is_none() && !self.account_import.open && !self.confirm_close && self.pending_delete.is_none()
                     && self.accounts.iter().any(|row| row.key == key) {
                     self.cancel_account_drag();
@@ -3936,55 +4899,32 @@ impl App {
                         .map(|r| r.key.clone())
                         .collect(),
                 );
-                if !self.preview {
-                    if let Err(error) = save_settings(&self.config, &self.settings) {
-                        self.status = error;
-                    }
-                }
+                self.persist_settings();
             }
             Message::WindowResized(size) => {
                 self.viewport = size;
                 // Maximise/restore arrives as a resize; keep the chrome's
                 // restore glyph and resize edges in step with it.
-                return window::oldest().then(|id| {
-                    id.map_or(Task::none(), |id| {
-                        window::is_maximized(id).map(Message::WindowMaximized)
-                    })
-                });
+                return self.on_window(WindowOp::is_maximized(Message::WindowMaximized));
             }
             Message::WindowMaximized(maximized) => self.maximized = maximized,
             Message::WindowOpened(id) => {
-                return window::run(id, |w| window_chrome::native_handle(w))
-                    .map(Message::NativeWindow)
+                if self.window == Some(id) { return self.on_window(WindowOp::native_handle(Message::NativeWindow)); }
             }
             Message::NativeWindow(hwnd) => {
                 window_chrome::attach(hwnd, self.settings.light_theme)
             }
-            Message::MinimizeWindow => {
-                return window::oldest()
-                    .then(|id| id.map_or(Task::none(), |id| window::minimize(id, true)))
-            }
-            Message::MaximizeWindow => {
-                return window::oldest().then(|id| id.map_or(Task::none(), window::toggle_maximize))
-            }
+            Message::MinimizeWindow => return self.on_window(WindowOp::Minimize(true)),
+            Message::MaximizeWindow => return self.on_window(WindowOp::ToggleMaximize),
             Message::TitlePressed => {
                 self.title_held = !window_chrome::title_press_is_double();
-                if !self.title_held {
-                    return window::oldest()
-                        .then(|id| id.map_or(Task::none(), window::toggle_maximize));
-                }
+                if !self.title_held { return self.on_window(WindowOp::ToggleMaximize); }
             }
             Message::TitleMoved => {
-                if std::mem::take(&mut self.title_held) {
-                    return window::oldest().then(|id| id.map_or(Task::none(), window::drag));
-                }
+                if std::mem::take(&mut self.title_held) { return self.on_window(WindowOp::Drag); }
             }
             Message::TitleReleased => self.title_held = false,
-            Message::ResizeWindow(direction) => {
-                return window::oldest().then(move |id| {
-                    id.map_or(Task::none(), |id| window::drag_resize(id, direction))
-                })
-            }
+            Message::ResizeWindow(edge) => return self.on_window(WindowOp::DragResize(edge)),
             Message::Navigate(page) => {
                 self.cancel_account_drag();
                 self.page = page;
@@ -3999,10 +4939,31 @@ impl App {
                 }
             }
             Message::ToggleDetails => self.show_details = !self.show_details,
-            Message::Launch(key) => self.start(vec![key]),
-            Message::LaunchSelected => self.start(self.launch_keys(true)),
+            Message::Launch(key) => {
+                if let Some(features) = &self.features { features.cancel_relaunch(&key); }
+                if self.features_view.offers.remove(&key).is_some() { self.features_view.touch(); }
+                self.play(vec![key])
+            }
             Message::MainAction => return self.run_main_action(),
-            Message::LaunchAll => self.start(self.launch_keys(false)),
+            Message::LaunchAll => self.play(self.launch_keys(false)),
+            Message::SignIn(key) => {
+                if self.accounts.iter().any(|row| row.key == key && row.account.mode == AccountMode::Retail && row.can_play() && row.pid.is_none()) {
+                    self.connect(vec![key]);
+                }
+            }
+            Message::SetCharacterSelect(on) => {
+                let mut settings = self.settings.clone();
+                for key in self.play_target_keys() {
+                    let mut choice = settings.account_auto_login.get(&key).copied().unwrap_or_default().normalized();
+                    choice.enabled = on;
+                    if choice == pol_less::AutoLogin::default() { settings.account_auto_login.remove(&key); }
+                    else { settings.account_auto_login.insert(key, choice); }
+                }
+                if !self.preview {
+                    if let Err(error) = save_settings(&self.config, &settings) { self.status = error; return Effect::none(); }
+                }
+                self.settings = settings;
+            }
             Message::OtpChanged(key, value) => {
                 if let Some(row) = self.accounts.iter_mut().find(|r| r.key == key && !r.busy) {
                     row.otp.zeroize();
@@ -4013,19 +4974,13 @@ impl App {
                 self.cancel_account_drag();
                 if self.vault_ready && !self.vault_saving {
                     self.status = t("Enter account details, then save.").into();
-                    self.editor = Some(Editor {
-                        key: None,
-                        account: blank_account(),
-                        game_install: String::new(),
-                        dat_overlays: Vec::new(),
-                        auto_login: pol_less::AutoLogin::default(),
-                    });
+                    self.editor = Some(Editor::blank());
                 }
             }
             Message::AccountImport(msg) => return self.import_update(msg),
             Message::EditAccount(key) => {
                 self.cancel_account_drag();
-                if self.vault_saving { return Task::none(); }
+                if self.vault_saving { return Effect::none(); }
                 if let Some(row) = self
                     .accounts
                     .iter()
@@ -4035,6 +4990,7 @@ impl App {
                         game_install: self.settings.account_installs.get(&key).cloned().unwrap_or_default(),
                         dat_overlays: self.settings.account_overlays.get(&key).cloned().unwrap_or_default(),
                         auto_login: self.settings.account_auto_login.get(&key).copied().unwrap_or_default().normalized(),
+                        flags: EditorFlags { uses_otp: self.settings.account_otp.contains(&key), ..Default::default() },
                         key: Some(key),
                         account: row.account.clone(),
                     });
@@ -4044,46 +5000,49 @@ impl App {
             Message::EditorChanged(field, value) => {
                 if matches!(field, Field::PolId | Field::Server) && self.editor.as_ref().and_then(|editor| editor.key.as_ref())
                     .is_some_and(|key| self.accounts.iter().any(|row| &row.key == key && (row.busy || row.pid.is_some()))) {
-                    return Task::none();
+                    return Effect::none();
                 }
-                if !self.vault_saving {
-                    if let Some(editor) = &mut self.editor {
-                        let destination = match field {
-                            Field::Label => &mut editor.account.label,
-                            Field::Server => &mut editor.account.server,
-                            Field::PolId => &mut editor.account.pol_id,
-                            Field::PolPassword => &mut editor.account.pol_password,
-                            Field::SeId => &mut editor.account.se_id,
-                            Field::SePassword => &mut editor.account.se_password,
-                        };
-                        destination.zeroize();
-                        *destination = value;
-                    }
+                if let Some(editor) = self.editor_mut() {
+                    let destination = match field {
+                        Field::Label => &mut editor.account.label,
+                        Field::Server => &mut editor.account.server,
+                        Field::PolId => &mut editor.account.pol_id,
+                        Field::PolPassword => &mut editor.account.pol_password,
+                        Field::SeId => &mut editor.account.se_id,
+                        Field::SePassword => &mut editor.account.se_password,
+                        Field::PolHandleNames => &mut editor.account.pol_handle_names,
+                    };
+                    destination.zeroize();
+                    *destination = value;
                 }
             }
             Message::EditorRegion(region) => {
-                if !self.vault_saving {
-                    if let Some(editor) = &mut self.editor {
-                        editor.account.region = region;
+                if let Some(editor) = self.editor_mut() { editor.account.region = region; }
+            }
+            Message::EditorAutoLogin(enabled) => {
+                if let Some(editor) = self.editor_mut() { editor.auto_login.enabled = enabled; }
+            }
+            Message::EditorFlag(flag, on) => {
+                if let Some(editor) = self.editor_mut() {
+                    let flags = &mut editor.flags;
+                    match flag {
+                        EditorFlag::UsesOtp => flags.uses_otp = on,
+                        EditorFlag::SignInNow => flags.sign_in_now = on,
+                        EditorFlag::ShowId => flags.show_id = on,
+                        EditorFlag::ShowPassword => flags.show_password = on,
+                        EditorFlag::ChangePassword => flags.change_password = on,
                     }
                 }
             }
-            Message::EditorAutoLogin(enabled) => {
-                if !self.vault_saving {
-                    if let Some(editor) = &mut self.editor { editor.auto_login.enabled = enabled; }
-                }
-            }
             Message::EditorCharacterSlot(slot) => {
-                if !self.vault_saving && (1..=16).contains(&slot) {
-                    if let Some(editor) = &mut self.editor { editor.auto_login.character_slot = slot; }
-                }
+                if let Some(editor) = self.editor_mut().filter(|_| (1..=16).contains(&slot)) { editor.auto_login.character_slot = slot; }
             }
             Message::SaveAccount => {
                 if let Some(editor) = &self.editor {
-                    if self.settings.launch_with_for(&editor.account) == ui::LaunchWith::Native {
-                        if editor.dat_overlays.len() > 8 { self.status = t("Choose at most eight DAT overlay folders.").into(); return Task::none(); }
+                    if self.settings.launch_with_for(&editor.account) == crate::backend::LaunchWith::Native {
+                        if editor.dat_overlays.len() > 8 { self.status = t("Choose at most eight DAT overlay folders.").into(); return Effect::none(); }
                         for path in &editor.dat_overlays {
-                            if let Err(error) = selected_folder(path, true) { self.status = error; return Task::none(); }
+                            if let Err(error) = selected_folder(path, true) { self.status = error; return Effect::none(); }
                         }
                     }
                     if !editor.game_install.trim().is_empty() {
@@ -4094,13 +5053,13 @@ impl App {
                                 Err(t("Choose the game folder containing FFXiMain.dll and FFXi.dll.").into())
                             }
                         });
-                        if let Err(error) = valid { self.status = error; return Task::none(); }
+                        if let Err(error) = valid { self.status = error; return Effect::none(); }
                     }
                     let key = account_key(&editor.account);
                     if editor.key.as_ref().is_some_and(|previous| *previous != key
                         && self.accounts.iter().any(|row| &row.key == previous && (row.busy || row.pid.is_some()))) {
                         self.status = t("Keep the account ID unchanged while its session is running.").into();
-                        return Task::none();
+                        return Effect::none();
                     }
                     if self
                         .accounts
@@ -4110,7 +5069,7 @@ impl App {
                         self.status =
                             t("This login is already saved. Edit its existing account instead.")
                                 .into();
-                        return Task::none();
+                        return Effect::none();
                     }
                     let mut replaced = false;
                     let mut values: Vec<Account> = self.accounts.iter().map(|row| {
@@ -4131,7 +5090,7 @@ impl App {
             Message::CancelDeleteAccount => self.pending_delete = None,
             Message::DeleteAccount(key) => {
                 if self.pending_delete.as_deref() != Some(key.as_str()) {
-                    return Task::none();
+                    return Effect::none();
                 }
                 self.pending_delete = None;
                 if self
@@ -4139,7 +5098,7 @@ impl App {
                     .iter()
                     .any(|r| r.key == key && (r.busy || r.pid.is_some()))
                 {
-                    return Task::none();
+                    return Effect::none();
                 }
                 let values = self
                     .accounts
@@ -4159,21 +5118,14 @@ impl App {
             Message::SetLightTheme(light) => {
                 self.settings.light_theme = light;
                 window_chrome::set_theme(light);
-                if !self.preview {
-                    if let Err(error) = save_settings(&self.config, &self.settings) {
-                        self.status = error;
-                    }
-                }
+                self.persist_settings();
             }
             // Display only and at once: the next view draws pseudonyms.
             Message::SetPrivacy(on) => {
                 self.settings.privacy = on;
                 privacy::set(on);
-                if !self.preview {
-                    if let Err(error) = save_settings(&self.config, &self.settings) {
-                        self.status = error;
-                    }
-                }
+                if let Some(features) = &self.features { features.set_privacy(on); }
+                self.persist_settings();
             }
             // Applies at once: the next view reads the new language.
             Message::SetLanguage(lang) => {
@@ -4181,11 +5133,7 @@ impl App {
                 self.settings.language = Some(lang);
                 i18n::set(lang);
                 self.retranslate(before);
-                if !self.preview {
-                    if let Err(error) = save_settings(&self.config, &self.settings) {
-                        self.status = error;
-                    }
-                }
+                self.persist_settings();
                 if lang != before {
                     // The official news is per language: drop the old language's
                     // headlines at once, show the new language's saved ones, and
@@ -4195,60 +5143,27 @@ impl App {
                         // The status (page reading, windows, read time) is the same in every
                         // language: keep it, or Play is ungated until the new read lands.
                         self.services = services::keep_status(self.services.as_ref(), services::cached(&news_cache_path(&self.config, lang), lang));
-                        return self.start_news();
+                        // A version-record read in flight words its placeholders in the old
+                        // language (PatchLoaded matches them): read again, so it is dropped.
+                        let patch = if self.patch_loading { self.read_installed_version() } else { Effect::none() };
+                        return Effect::batch([self.start_news(), patch]);
                     }
                 }
             }
-            Message::ChooseProfile(key) => {
-                for account in &mut self.accounts {
-                    account.selected = account.key == key;
-                }
-                self.settings.selected_accounts = Some(
-                    self.accounts
-                        .iter()
-                        .filter(|r| r.selected)
-                        .map(|r| r.key.clone())
-                        .collect(),
-                );
-                if !self.preview {
-                    if let Err(error) = save_settings(&self.config, &self.settings) {
-                        self.status = error;
-                    }
-                }
-            }
-            // Home's Launch with sets the shown account's own launcher
-            // (the one Home's profile card shows: the first selected, else the first).
+            // Home's Launch with sets the own launcher of every account Play starts
+            // (the selected ones, else the first).
             Message::SetLaunchWith(choice) => {
-                let shown = self
-                    .accounts
-                    .iter()
-                    .find(|r| r.selected)
-                    .or_else(|| self.accounts.first())
-                    .map(|r| r.key.clone());
-                if let Some(key) = shown {
-                    return self.set_account_launcher(&key, choice);
-                }
+                let keys = self.play_target_keys();
+                return self.set_account_launcher(&keys, choice);
             }
             Message::EditorLaunchWith(choice) => {
-                if choice != Some(ui::LaunchWith::Native) && !self.vault_saving {
-                    if let Some(editor) = &mut self.editor {
-                        editor.account.launch_with = choice;
-                    }
-                }
+                if let Some(editor) = self.editor_mut().filter(|_| choice != Some(crate::backend::LaunchWith::Native)) { editor.account.launch_with = choice; }
             }
             Message::EditorBootIni(choice) => {
-                if !self.vault_saving {
-                    if let Some(editor) = &mut self.editor {
-                        editor.account.ashita_boot_ini = choice;
-                    }
-                }
+                if let Some(editor) = self.editor_mut() { editor.account.ashita_boot_ini = choice; }
             }
             Message::EditorProfile(choice) => {
-                if !self.vault_saving {
-                    if let Some(editor) = &mut self.editor {
-                        editor.account.windower_profile = choice;
-                    }
-                }
+                if let Some(editor) = self.editor_mut() { editor.account.windower_profile = choice; }
             }
             Message::WikiQueryChanged(value) => self.wiki_query = value,
             Message::AhQueryChanged(value) => self.ah_query = value,
@@ -4261,7 +5176,7 @@ impl App {
             Message::NewsFilter(value) => self.news_filter = value,
             Message::SearchAh => return self.search_ah(),
             Message::SearchWiki => {
-                let url = ui::wiki_search_url(&self.wiki_query);
+                let url = crate::ffxiah::wiki_search_url(&self.wiki_query);
                 if !self.preview {
                     if let Err(error) = open_url(url.as_str()) {
                         self.status = error;
@@ -4286,31 +5201,35 @@ impl App {
             Message::SelectInstallPath => self.select_path(false),
             Message::FindInstallation => return self.find_installation(false),
             Message::InstallationFound(generation, automatic, folder) => {
-                if generation != self.installation_generation { return Task::none(); }
+                if generation != self.installation_generation { return Effect::none(); }
                 self.park_checked = None;
                 self.installation_loading = false;
-                if self.preview || self.maintenance.is_some() { return Task::none(); }
+                if self.preview || self.maintenance.is_some() { return Effect::none(); }
                 let Some(folder) = folder else {
                     if !automatic { self.status = t("No installed FFXI folder was found. Run official setup or use Browse.").into(); }
-                    return Task::none();
+                    self.start_ready_startup_signins();
+                    return Effect::none();
                 };
                 let path = folder.to_string_lossy().into_owned();
                 if self.settings.install_selected && self.settings.install_path == path {
                     if !automatic { self.status = tf("Found FINAL FANTASY XI: {path}", &[("path", &folder.display())]); }
-                    return Task::none();
+                    self.start_ready_startup_signins();
+                    return Effect::none();
                 }
                 let _ = self.update(Message::InstallPathChanged(path));
                 // Recovery defaults must not replace an unreadable settings file
                 // merely because startup found an installation.
-                if automatic && self.startup_warning.is_some() {
+                if automatic && self.settings_damaged {
                     self.settings.install_selected = true;
                 } else {
                     self.select_path(false);
                 }
                 if self.settings.install_selected {
                     if !automatic { self.status = tf("Found FINAL FANTASY XI: {path}", &[("path", &folder.display())]); }
+                    self.start_ready_startup_signins();
                     return self.read_installed_version();
                 }
+                self.start_ready_startup_signins();
             }
             Message::InstallerPathChanged(value) => {
                 if self.maintenance.is_none() {
@@ -4321,29 +5240,23 @@ impl App {
             }
             Message::SelectInstallerPath => self.select_path(true),
             Message::Browse(target) => return self.browse(target),
-            Message::Picked(target, picked) => self.picked(target, picked),
+            Message::Picked(target, picked) => return self.picked(target, picked),
             Message::AccountInstallChanged(value) => {
-                if !self.vault_saving {
-                    if let Some(editor) = &mut self.editor { editor.game_install = value; }
-                }
+                if let Some(editor) = self.editor_mut() { editor.game_install = value; }
             }
             Message::PickedAccountFolder(key, picked) => {
-                if !self.vault_saving {
-                    if let Some(editor) = &mut self.editor {
-                        if account_key(&editor.account) == key {
-                            if let Some(path) = picked { editor.game_install = backend::plain_windows_path(&path).to_string_lossy().into_owned(); }
-                        }
+                if let Some(editor) = self.editor_mut() {
+                    if account_key(&editor.account) == key {
+                        if let Some(path) = picked { editor.game_install = backend::plain_windows_path(&path).to_string_lossy().into_owned(); }
                     }
                 }
             }
             Message::PickedAccountOverlay(key, picked) => {
-                if !self.vault_saving {
-                    if let Some(editor) = &mut self.editor {
-                        if account_key(&editor.account) == key && editor.dat_overlays.len() < 8 {
-                            if let Some(path) = picked {
-                                let path = backend::plain_windows_path(&path).to_string_lossy().into_owned();
-                                if !editor.dat_overlays.iter().any(|p| p.eq_ignore_ascii_case(&path)) { editor.dat_overlays.push(path); }
-                            }
+                if let Some(editor) = self.editor_mut() {
+                    if account_key(&editor.account) == key && editor.dat_overlays.len() < 8 {
+                        if let Some(path) = picked {
+                            let path = backend::plain_windows_path(&path).to_string_lossy().into_owned();
+                            if !editor.dat_overlays.iter().any(|p| p.eq_ignore_ascii_case(&path)) { editor.dat_overlays.push(path); }
                         }
                     }
                 }
@@ -4376,65 +5289,69 @@ impl App {
                     // An Update started from refused Plays starts them again once it succeeded
                     // (the update signed their sessions out: each is a new sign-in).
                     let reissue = if kind == MaintenanceKind::Update { std::mem::take(&mut self.reissue_after_update) } else { Vec::new() };
-                    let (waited, waited_folder) = match self.wait_update.take() {
-                        Some(update) if kind == MaintenanceKind::Update && update.started => (update.keys, update.folder),
-                        other => { self.wait_update = other; (Vec::new(), None) }
-                    };
                     let updated = result.is_ok();
                     let failure = result.as_ref().err().cloned();
                     self.maintenance_result =
                         result.unwrap_or_else(|error| tf("Operation stopped: {error}", &[("error", &error)]));
                     self.status = self.maintenance_result.clone();
-                    let refresh = shown.is_none() && matches!(kind, MaintenanceKind::Update | MaintenanceKind::Repair);
+                    // No report came back: read the installed record again, so a Check never
+                    // leaves the installed version at a placeholder.
+                    let refresh = shown.is_none() && matches!(kind, MaintenanceKind::Check | MaintenanceKind::Update | MaintenanceKind::Repair);
                     if let Some(report) = shown {
-                        self.patch_generation += 1;
-                        self.patch_loading = false;
                         // An Update reports the folder it updated (an account's own one when
                         // its W20 asked); Check and Repair the Settings folder.
                         if kind != MaintenanceKind::Update { self.patch_folder = None; }
-                        self.patch = Some(report);
+                        // An Update or Repair told the official version (Check's is a placeholder).
+                        let official = report.remote_version.clone();
+                        self.show_patch(report);
+                        let folder = self.shown_game_folder();
+                        self.learn_from_update(&folder, Some(&official), None);
                     }
-                    for (key, clicked) in reissue.into_iter().filter(|_| updated) {
+                    for (key, clicked) in reissue.iter().filter(|_| updated).cloned() {
                         // Every restarted Play signs in again after the updater signed out its
                         // session. An OTP account needs a replacement code; one entered during
                         // the update stays on the row until the normal launch consumes it.
                         let otp_account = self.settings.account_otp.contains(&key);
                         if let Some(row) = self.accounts.iter_mut().find(|row| row.key == key
                             && (row.otp_spent || otp_account) && row.otp.is_empty() && !row.busy && row.pid.is_none()) {
-                            row.status = if waited.contains(&key) { t("FFXI is back — enter your one-time password to start") }
-                                else { t("That one-time code was used. Enter a new one, then press Play.") }.into();
+                            row.status = t("That one-time code was used. Enter a new one, then press Play.").into();
                             row.problem = true;
                             continue;
                         }
                         if self.accounts.iter().any(|row| row.key == key && row.can_play() && !row.busy && row.pid.is_none()) {
-                            // A waited Play in another game folder than the one just updated may
-                            // ask for that folder's Update, which then starts by itself too; one
-                            // in this folder may not (no loop).
-                            let again = waited.contains(&key) && self.account_game_folder(&key) != waited_folder;
                             self.start_launch(vec![key.clone()], false, clicked, Some(launch_timing::LaunchTrigger::ReissuedPlay));
-                            if again && !self.is_waiting(&key) && !self.released.contains(&key) { self.released.push(key); }
                         }
                     }
-                    if let Some(error) = failure { self.waited_update_failed(&waited, &error); }
+                    // The Play that asked for a PlayOnline update it could not finish says why.
+                    if let Some(error) = failure.filter(|_| kind == MaintenanceKind::Update) {
+                        let shown = tf("PlayOnline could not be updated: {error}", &[("error", &error)]);
+                        for (key, _) in &reissue {
+                            if let Some(row) = self.accounts.iter_mut().find(|row| row.key == *key && !row.busy) {
+                                row.status = shown.clone();
+                                row.problem = true;
+                            }
+                        }
+                    }
                     if refresh { return self.refresh(); }
                     if setup_finished {
-                        return Task::batch([self.find_installation(false), self.start_viewer_check()]);
+                        return Effect::batch([self.find_installation(false), self.start_viewer_check()]);
                     }
                 }
             }
             Message::SaveSettings => {
                 if self.preview {
-                    return Task::none();
+                    return Effect::none();
                 }
                 // Settings holds the only game-folder field: saving a typed folder selects it.
                 // A folder that is not a game installation keeps the dialog open with the reason.
                 if !self.settings.install_selected && !self.settings.install_path.trim().is_empty()
                     && self.maintenance.is_none() && !self.reshade.busy {
                     self.select_path(false);
-                    if !self.settings.install_selected { return Task::none(); }
+                    if !self.settings.install_selected { return Effect::none(); }
                 }
                 match save_settings(&self.config, &self.settings) {
                     Ok(()) => {
+                        self.settings_damaged = false;
                         self.park_checked = None;
                         self.show_settings = false;
                         self.status = t("Settings saved. Checking the installed version…").into();
@@ -4454,9 +5371,8 @@ impl App {
                         self.replace_accounts(values);
                         self.vault_ready = true;
                         self.status = t("Ready. Select accounts or use Launch all. Games continue when you close Crystal.").into();
-                        let keys = self.take_startup_signins();
                         self.log_launcher_start();
-                        self.start_startup(keys, launch_timing::LaunchTrigger::StartupSignIn);
+                        self.start_ready_startup_signins();
                     }
                     Err(error) => {
                         self.vault_ready = false;
@@ -4473,6 +5389,12 @@ impl App {
                     Ok(values) => {
                         let mut settings = self.settings.clone();
                         let saved: BTreeSet<String> = values.iter().map(account_key).collect();
+                        settings.account_pol_handles.retain(|key, _| saved.contains(key));
+                        for account in &values {
+                            let key = account_key(account);
+                            if account.pol_handle_names.trim().is_empty() { settings.account_pol_handles.remove(&key); }
+                            else { settings.account_pol_handles.insert(key, account.pol_handle_names.clone()); }
+                        }
                         // A login edit changes the account key. Keep its non-editor
                         // preferences with the account before removing obsolete keys.
                         if let Some(editor) = &self.editor {
@@ -4501,6 +5423,7 @@ impl App {
                         settings.account_no_otp.retain(|key| saved.contains(key));
                         settings.account_order.retain(|key| saved.contains(key));
                         if let Some(selected) = &mut settings.selected_accounts { selected.retain(|key| saved.contains(key)); }
+                        if self.play_updates.viewer_confirm.as_ref().is_some_and(|(key, _)| !saved.contains(key)) { self.play_updates.viewer_confirm = None; }
                         if let Some(editor) = &self.editor {
                             let key = account_key(&editor.account);
                             if saved.contains(&key) {
@@ -4509,6 +5432,14 @@ impl App {
                                 else { settings.account_installs.insert(key.clone(), plain_text_path(path)); }
                                 if editor.dat_overlays.is_empty() { settings.account_overlays.remove(&key); }
                                 else { settings.account_overlays.insert(key.clone(), editor.dat_overlays.iter().map(|p| plain_text_path(p)).collect()); }
+                                // "Uses a one-time password": Crystal then never signs it in by
+                                // itself; cleared, the next sign-in teaches it again.
+                                if editor.flags.uses_otp {
+                                    settings.account_no_otp.remove(&key);
+                                    settings.account_otp.insert(key.clone());
+                                } else {
+                                    settings.account_otp.remove(&key);
+                                }
                                 if editor.auto_login != pol_less::AutoLogin::default() {
                                     settings.account_auto_login.insert(key, editor.auto_login.normalized());
                                 } else { settings.account_auto_login.remove(&key); }
@@ -4519,6 +5450,7 @@ impl App {
                         if (self.editor.is_some() || settings.account_installs != self.settings.account_installs || settings.account_overlays != self.settings.account_overlays
                             || settings.account_auto_away != self.settings.account_auto_away || settings.account_auto_login != self.settings.account_auto_login || settings.selected_accounts != self.settings.selected_accounts
                             || settings.account_order != self.settings.account_order
+                            || settings.account_pol_handles != self.settings.account_pol_handles
                             || settings.account_otp != self.settings.account_otp
                             || settings.account_no_otp != self.settings.account_no_otp) && !self.preview {
                             if let Err(error) = save_settings(&self.config, &settings) {
@@ -4539,14 +5471,24 @@ impl App {
                                 // The vault saved the edit: it declines a sign-in after the game too.
                                 for row in self.accounts.iter_mut().filter(|row| edited.contains(&row.key)) { row.decline_resign(); }
                                 self.status = tf("Accounts saved, but launcher settings were not saved: {error}", &[("error", &error)]);
-                                return Task::none();
+                                return Effect::none();
                             }
                         }
                         self.settings = settings;
                         self.replace_accounts(values);
                         for row in self.accounts.iter_mut().filter(|row| edited.contains(&row.key)) { row.decline_resign(); }
+                        // A new account's "Sign in now", under the
+                        // Settings switch and never for a one-time-password account.
+                        let sign_in = self.editor.as_ref()
+                            .filter(|editor| editor.key.is_none() && editor.flags.sign_in_now && !editor.flags.uses_otp && self.settings.auto_sign_in)
+                            .map(|editor| account_key(&editor.account));
                         self.editor = None;
                         self.park_checked = None;
+                        if let Some(key) = sign_in {
+                            if self.accounts.iter().any(|row| row.key == key && row.account.mode == AccountMode::Retail && row.can_play() && row.pid.is_none()) {
+                                self.connect(vec![key]);
+                            }
+                        }
                         if self.account_import.batch.is_some() { self.account_import.open = true; }
                         self.status = t("Accounts saved.").into();
                     }
@@ -4566,7 +5508,14 @@ impl App {
                     self.refreshed = Instant::now();
                 }
                 match result {
-                    Ok(snapshot) => {
+                    Ok(mut snapshot) => {
+                        // --preview-news-pictures (with --preview-live-news): only headlines that have a picture.
+                        // The README shots show Home ready to play whatever the live status is that day.
+                        if self.preview && preview::has("--preview-news-pictures") {
+                            snapshot.news.retain(|item| item.image.is_some());
+                            snapshot.availability = services::Availability::Operational;
+                            snapshot.windows.clear();
+                        }
                         services::apply(&mut self.services, services::Update::Headlines { items: snapshot.news.clone(), note: snapshot.news_note.clone() });
                         services::apply(&mut self.services, services::Update::Status(snapshot));
                         self.news_error.clear();
@@ -4592,6 +5541,7 @@ impl App {
                 self.note_status_read();
             }
             Message::PatchLoaded(generation, mut result) => {
+                self.reload_official();
                 if generation == self.patch_generation {
                     self.patch_loading = false;
                     // A version-record read contains no new server or file-check evidence.
@@ -4622,33 +5572,53 @@ impl App {
             Message::OpenLog(key) => self.open_log(&key, false),
             Message::OpenLogsFolder(key) => self.open_log(&key, true),
             Message::CloseRequested => {
-                if matches!(self.self_update, self_update::State::Applying) {
-                    self.status = t("Waiting for the launcher update helper…").into();
-                    return Task::none();
+                if self.settings.close_to_tray && (!self.preview || preview_idle()) && !matches!(self.self_update, self_update::State::Applying) {
+                    return self.hide_window();
                 }
-                if self.reshade.busy {
-                    self.page = Page::Settings;
-                    self.settings_tab = settings_page::Tab::Graphics;
-                    self.status = t("Finish ReShade setup before closing Crystal.").into();
-                    return Task::none();
+                return self.request_quit();
+            }
+            Message::Tray(tray::Command::Open) => return self.show_window(),
+            Message::Tray(tray::Command::Quit) => {
+                let quit = self.request_quit();
+                // Something holds the quit (an update, a save): the window says what.
+                if !self.closing && self.window.is_none() { return Effect::batch([quit, self.show_window()]); }
+                return quit;
+            }
+            Message::WindowClosed(id) => {
+                if self.window == Some(id) {
+                    self.window = None;
+                    window_chrome::detach();
+                    tray::set_icon(true);
                 }
-                if self.prereqs.busy() {
-                    self.page = Page::Settings;
-                    self.settings_tab = settings_page::Tab::System;
-                    self.status = t("Wait for Windows component setup to finish, or cancel its download, before closing.").into();
-                    return Task::none();
+            }
+            Message::TrimMemory => {
+                if self.window.is_none() && (!self.preview || preview_idle()) {
+                    let before = footprint::memory(None);
+                    footprint::trim(None);
+                    let after = footprint::memory(None);
+                    let show = |m: Option<footprint::Memory>| m.map_or_else(|| "unknown".to_owned(), footprint::Memory::text);
+                    launch_log::append_history(&self.config.history_path(), "Crystal", &format!(
+                        "background: trimmed, pid {}, {} -> {}", std::process::id(), show(before), show(after)), None);
                 }
-                if self.maintenance.is_some() {
-                    self.page = Page::Maintenance;
-                    self.show_settings = false;
-                    self.show_details = false;
-                    self.status = t("Wait for the operation to finish, or request Cancel, before closing the launcher.").into();
-                    return Task::none();
-                }
-                if self.vault_saving {
-                    self.confirm_close = true;
-                } else {
-                    return self.begin_close();
+            }
+            Message::CloseToTray(on) => {
+                self.settings.close_to_tray = on;
+                self.persist_settings();
+            }
+            Message::StartWithWindows(on) => {
+                if self.preview { self.settings.start_with_windows = on; return Effect::none(); }
+                if self.startup_task_busy { return Effect::none(); }
+                self.startup_task_busy = true;
+                return self.startup_task(Some(on));
+            }
+            Message::StartupTaskSet(on, result) => {
+                self.startup_task_busy = false;
+                match result {
+                    Ok(()) => {
+                        self.settings.start_with_windows = on;
+                        self.persist_settings();
+                    }
+                    Err(error) => self.status = error,
                 }
             }
             Message::ConfirmClose => {
@@ -4658,70 +5628,11 @@ impl App {
                 self.confirm_close = false;
             }
             Message::CancelClose => self.confirm_close = false,
+            Message::Feature(msg) => return self.feature_update(msg),
             Message::PreviewReady(screenshot) => {
-                // light/empty/close variants get their own files.
+                // Each scene (and its light variant) gets its own file.
                 let light = self.settings.light_theme;
-                let filename = if std::env::args().any(|a| a == "--preview-delete") {
-                    "preview-delete.png"
-                } else if std::env::args().any(|a| a == "--preview-server-maintenance") {
-                    "preview-server-maintenance.png"
-                } else if std::env::args().any(|a| a == "--preview-servers-offline") {
-                    "preview-servers-offline.png"
-                } else if std::env::args().any(|a| a == "--preview-update-ready") {
-                    "preview-update-ready.png"
-                } else if std::env::args().any(|a| a == "--preview-news-events") {
-                    "preview-news-events.png"
-                } else if std::env::args().any(|a| a == "--preview-news-maintenance") {
-                    "preview-news-maintenance.png"
-                } else if std::env::args().any(|a| a == "--preview-news-empty") {
-                    "preview-news-empty.png"
-                } else if std::env::args().any(|a| a == "--preview-inbox") {
-                    if light { "preview-inbox-light.png" } else { "preview-inbox.png" }
-                } else if std::env::args().any(|a| a == "--preview-compose") {
-                    if light { "preview-compose-light.png" } else { "preview-compose.png" }
-                } else if std::env::args().any(|a| a == "--preview-friends-ingame") {
-                    if light { "preview-friends-ingame-light.png" } else { "preview-friends-ingame.png" }
-                } else if std::env::args().any(|a| a == "--preview-friends") {
-                    if light { "preview-friends-light.png" } else { "preview-friends.png" }
-                } else if std::env::args().any(|a| a == "--preview-close") {
-                    if light { "preview-close-light.png" } else { "preview-close.png" }
-                } else if std::env::args().any(|a| a == "--preview-modal") {
-                    if light { "preview-account-light.png" } else { "preview-account.png" }
-                } else if std::env::args().any(|a| a == "--preview-empty") {
-                    if light { "preview-accounts-empty-light.png" } else { "preview-accounts-empty.png" }
-                } else if std::env::args().any(|a| a == "--preview-accounts") {
-                    if light { "preview-accounts-light.png" } else { "preview-accounts.png" }
-                } else if std::env::args().any(|a| a == "--preview-update") {
-                    if light { "preview-update-light.png" } else { "preview-update.png" }
-                } else if std::env::args().any(|a| a == "--preview-maintenance") {
-                    // keep theme/busy variants apart.
-                    match (self.settings.light_theme, self.maintenance.is_some()) {
-                        (false, false) => "preview-maintenance.png",
-                        (true, false) => "preview-maintenance-light.png",
-                        (false, true) => "preview-maintenance-busy.png",
-                        (true, true) => "preview-maintenance-busy-light.png",
-                    }
-                } else if std::env::args().any(|a| a == "--preview-playing") {
-                    if light { "preview-playing-light.png" } else { "preview-playing.png" }
-                } else if std::env::args().any(|a| a == "--preview-starting") {
-                    if light { "preview-starting-light.png" } else { "preview-starting.png" }
-                } else if std::env::args().any(|a| a == "--preview-details") {
-                    "preview-details.png"
-                } else if std::env::args().any(|a| a == "--preview-live-news") {
-                    "preview-live-news.png"
-                } else if std::env::args().any(|a| a == "--preview-vanilla") {
-                    "preview-vanilla.png"
-                } else if std::env::args().any(|a| a == "--preview-small") {
-                    "preview-small.png"
-                } else if std::env::args().any(|a| a == "--preview-wide") {
-                    "preview-wide.png"
-                } else {
-                    if self.settings.light_theme {
-                        "preview-portal-light.png"
-                    } else {
-                        "preview-portal-dark.png"
-                    }
-                };
+                let filename = preview::capture_name(light, self.maintenance.is_some());
                 // XI_PREVIEW_DIR lets parallel worktrees keep their previews apart.
                 let dir = std::env::var_os("XI_PREVIEW_DIR")
                     .map(PathBuf::from)
@@ -4749,10 +5660,10 @@ impl App {
                     Ok(()) => format!("Preview saved: {}", path.display()),
                     Err(e) => e,
                 };
-                return iced::exit();
+                return Effect::Exit;
             }
         }
-        Task::none()
+        Effect::none()
     }
 
     /// After a language change, the stored lines that are fixed sentences
@@ -4767,7 +5678,9 @@ impl App {
         swap(&mut self.maintenance_result, &RESULT_TEXTS);
         swap(&mut self.status, &STATUS_TEXTS);
         for row in &mut self.accounts {
+            let noted = row.note_on == row.status;
             swap(&mut row.status, &ROW_TEXTS);
+            if noted { row.note_on.clone_from(&row.status); }
         }
         if let Some(patch) = &mut self.patch {
             swap(&mut patch.local_version, &PATCH_TEXTS);
@@ -4775,229 +5688,6 @@ impl App {
             swap(&mut patch.detail, &PATCH_TEXTS);
         }
         if let Some(viewer) = &mut self.viewer { viewer.retranslate(from); }
-    }
-
-    /// `--preview-ja`: the sample news as the Japanese official site words it
-    /// (headlines from its topics feed, dates as it dates them), so a capture
-    /// shows Japanese cards, dates and tabs without the network.
-    fn use_japanese_preview_news(&mut self) {
-        let Some(snapshot) = &mut self.services else { return };
-        let articles = [
-            ("フリートライアルのレベル上限が75に！ プレイ期間が無制限になりました！", "Wed, 30 Sep 2026 14:00:00 JST",
-             "「ファイナルファンタジーXI for Windows® フリートライアル」のレベル上限が75に引き上げられ、プレイ期間が無期限になりました！",
-             "https://www.playonline.com/pcd2/topics/ff11/detail/40431/detail.html"),
-            ("ヴァナ・ディールの異変を再調査せよ", "Thu, 24 Sep 2026 17:00:00 JST",
-             "突如、とある巨大なモンスターが、本来は居ないはずのエリアに姿を現しました。冒険者の皆さんで、調査と討伐に向かいましょう！",
-             "https://www.playonline.com/pcd2/topics/ff11/detail/40421/detail.html"),
-            ("「真夏のノマドモグボナンザ2026」当せん番号発表！", "Fri, 18 Sep 2026 17:00:00 JST",
-             "厳正なる抽選の結果、真夏のノマドモグボナンザ2026の当せん番号が決定しました！",
-             "https://sqex.to/wuqaC"),
-        ];
-        for (item, (title, date, summary, url)) in snapshot.news.iter_mut().zip(articles) {
-            item.title = title.into();
-            item.date = date.into();
-            item.summary = summary.into();
-            item.url = url.into();
-        }
-        let notices = [
-            ("全ワールド メンテナンス作業のお知らせ(9/29)", "2026.09.27(日) 14:00 From: ファイナルファンタジーXI",
-             "下記日時におきまして、ファイナルファンタジーXIのメンテナンス作業を実施いたします。"),
-            ("全ワールド メンテナンス作業のお知らせ(9/10)", "2026.09.08(火) 14:00 From: ファイナルファンタジーXI",
-             "下記日時におきまして、サーバーメンテナンス作業を実施いたします。"),
-            ("アカウント管理システム メンテナンス作業のお知らせ(9/28)", "2026.09.26(土) 01:30 From: プレイオンライン", ""),
-        ];
-        for (item, (title, date, summary)) in snapshot.notices.iter_mut().zip(notices) {
-            item.title = title.into();
-            item.date = date.into();
-            item.summary = summary.into();
-            item.url = "https://www.playonline.com/ff11/polnews/news.xml".into();
-        }
-    }
-
-    /// The Friends previews: synthetic friends, mail and a conversation with
-    /// messages both ways and one unread. Nothing is read from a session.
-    fn load_ah_preview(&mut self) {
-        self.ah_query = "copper".into();
-        self.ah_server = "Bismarck";
-        let generation = self.ah_lookup.begin("copper", "Bismarck");
-        self.ah_lookup.finish(generation, Ok(ffxiah::Results {
-            items: vec![ffxiah::Quote { name: "Copper Ore".into(), url: "https://www.ffxiah.com/item/640".into(),
-                stack: Some(12), price: Some(2000), stock: Some(2), last_sale: false },
-                ffxiah::Quote { name: "Copper Ingot".into(), url: "https://www.ffxiah.com/item/648".into(),
-                stack: None, price: Some(2000), stock: Some(0), last_sale: false }], ..Default::default()
-        }));
-    }
-
-    fn load_friends_preview(&mut self, mailbox: bool, in_game: bool, compose: bool, new_mail: bool) {
-        const ME: u64 = 900;
-        self.page = Page::Friends;
-        self.friends.account = self.accounts.first().map(|a| a.key.clone());
-        self.friends.connected = true;
-        let friend = |slot: u16, name: &str, online: Option<bool>, location: Option<&str>, character: Option<&str>, alternate: bool| friends::Friend {
-            name: name.into(), alternate, slot, uid: Some(slot as u64 + 1 + if alternate { 500 } else { 0 }), online,
-            location: location.map(Into::into), character: character.map(Into::into),
-        };
-        let entries = vec![
-            friend(0, "Alyria", Some(true), Some("Lyrielle · Port Jeuno"), Some("Lyrielle"), false),
-            friend(1, "Balthier", Some(true), Some("PlayOnline"), None, false),
-            friend(2, "Celestine", Some(true), Some("FINAL FANTASY XI"), None, false),
-            friend(3, "Haruko", Some(false), None, None, false),
-            friend(4, "Nocturne", None, None, None, false),
-            friend(0, "Mallory", None, None, None, true),
-        ];
-        // A day ago and today, at fixed clock times, so the capture reads naturally.
-        let at = |days_ago: i64, hour: u32, minute: u32| -> u32 {
-            let day = chrono::Local::now().date_naive() - chrono::Duration::days(days_ago);
-            day.and_hms_opt(hour, minute, 0).and_then(|t| t.and_local_timezone(chrono::Local).single()).map_or(0, |t| t.timestamp() as u32)
-        };
-        let header = |id: u32, from: u64, to: u64, sender: &str, subject: &str, unread: bool, stamp: u32| {
-            let mut bytes = [0u8; 72];
-            bytes[..8].copy_from_slice(&from.to_le_bytes());
-            bytes[8..16].copy_from_slice(&to.to_le_bytes());
-            bytes[16..16 + sender.len().min(15)].copy_from_slice(&sender.as_bytes()[..sender.len().min(15)]);
-            bytes[32..32 + subject.len().min(15)].copy_from_slice(&subject.as_bytes()[..subject.len().min(15)]);
-            bytes[0x30..0x34].copy_from_slice(&id.to_le_bytes());
-            bytes[0x34..0x38].copy_from_slice(&stamp.to_le_bytes());
-            bytes[0x3e..0x40].copy_from_slice(&(if unread { 0x8000u16 } else { 0 }).to_le_bytes());
-            let mut raw = Vec::new();
-            pol_less::pipe::base64_into(&mut raw, &bytes);
-            social::Header { raw: String::from_utf8(raw).unwrap(), sender: sender.into(), subject: subject.into(), unread, kind: 0, recipient: Some(to) }
-        };
-        // (id, from Alyria?, subject, text, unread, stamp)
-        let alyria: [(u32, bool, &str, &str, bool, u32); 6] = [
-            (1, true, "Sortie tonight?", "Are you free for Sortie tonight? We have five so far and could use your Red Mage.", false, at(1, 20, 41)),
-            (2, false, "", "I'm in. Give me twenty minutes to finish crafting.", false, at(1, 20, 47)),
-            (3, false, "", "Should I bring the Ambuscade set or the usual one?", false, at(1, 20, 48)),
-            (4, true, "", "Usual one is fine. We'll meet at the Rhapsodies home point in Jeuno.", false, at(1, 20, 52)),
-            (5, false, "Thanks!", "That was a great run. Thanks for carrying the last boss!", false, at(0, 9, 14)),
-            (6, true, "Re: Thanks!", "Any time! Same time on Saturday? Celestine might join us too.", true, at(0, 18, 6)),
-        ];
-        let mut inbox = Vec::new();
-        let mut sent = Vec::new();
-        let mut bodies = Vec::new();
-        for (id, theirs, subject, message, unread, stamp) in alyria {
-            let h = if theirs { header(id, 1, ME, "Alyria", subject, unread, stamp) } else { header(id, ME, 1, "Ardent", subject, false, stamp) };
-            bodies.push((social::message_key(&h.raw), subject, message));
-            if theirs { inbox.push(h) } else { sent.push(h) }
-        }
-        inbox.push(header(7, 2, ME, "Balthier", "Linkshell event", true, at(0, 12, 30)));
-        inbox.push(header(8, 77, ME, "Rook", "Bazaar price", false, at(2, 15, 2)));
-        inbox.sort_by_key(|h| std::cmp::Reverse(h.stamp()));
-        sent.sort_by_key(|h| std::cmp::Reverse(h.stamp()));
-        let mut snapshot = friends::Snapshot {
-            entries, fetched_at: friends::now(), game_running: Some(in_game),
-            own_mode: Some(0), social: social::State { ready: true, ..Default::default() }, ..friends::Snapshot::default()
-        };
-        snapshot.social.inbox_unread = Some(if mailbox { 2 } else { 1 });
-        if mailbox {
-            snapshot.social.headers = inbox.clone();
-            snapshot.social.total = inbox.len() as u32;
-            snapshot.social.inbox_changed = new_mail;
-            snapshot.social.opened = Some(social::Opened { sender: "Alyria".into(), subject: "Sortie tonight?".into(), message: "Are you free for Sortie tonight? We have five so far and could use your Red Mage.".into(), recipient: None });
-        }
-        self.friends.snapshot = Some(snapshot.clone());
-        let mut listed = snapshot.clone();
-        listed.social.action = Some("inbox".into());
-        listed.social.headers = inbox;
-        self.friends.completed(&listed);
-        listed.social.folder = 2;
-        listed.social.headers = sent;
-        self.friends.completed(&listed);
-        for (key, subject, message) in bodies {
-            self.friends.mail.bodies.insert(key, friends::Body { subject: subject.into(), message: message.into() });
-        }
-        if mailbox {
-            self.friends.select(Some(friends::Pane::Mailbox));
-            return;
-        }
-        self.friends.select(Some(friends::Pane::Friend { slot: 0, name: "Alyria".into() }));
-        // Opening the conversation read the unread one; the divider stays.
-        for entry in self.friends.mail.listed[0].iter_mut().flatten().filter(|e| e.sender == "Alyria") {
-            entry.unread = false;
-        }
-        if let Some(draft) = &mut self.friends.composer {
-            if compose {
-                draft.show_subject = true;
-                draft.subject = "Saturday".into();
-                draft.text = iced::widget::text_editor::Content::with_text("Saturday works for me.\nI'll bring the usual set.");
-            }
-        }
-    }
-
-    fn load_preview(&mut self) {
-        let values = ["Main account", "Second account", "Crafting account"]
-            .into_iter()
-            .enumerate()
-            .map(|(i, label)| {
-                let mut a = blank_account();
-                a.label = label.into();
-                a.pol_id = format!("ABC1234{i}");
-                a.pol_password = "synthetic".into();
-                a.se_id = "preview".into();
-                a.se_password = "synthetic".into();
-                a
-            })
-            .collect();
-        self.replace_accounts(values);
-        self.vault_ready = true;
-        self.status = t("Design preview — synthetic accounts. No account vault or game connection was accessed.").into();
-        self.services = Some(services::ServiceSnapshot {
-            news: vec![
-                services::NewsItem {
-                    title: "Free trial expands to level 75".into(),
-                    url: "https://www.playonline.com/pcd2/topics/ff11us/detail/40432/detail.html"
-                        .into(),
-                    date: "Sep 30".into(),
-                    summary: "No time limit. More to explore.".into(),
-                    image_url: String::new(),
-                    image: None,
-                },
-                services::NewsItem {
-                    title: "Strange Happenings returns to Vana’diel".into(),
-                    url: "https://www.playonline.com/pcd2/topics/ff11us/detail/40422/detail.html"
-                        .into(),
-                    date: "Sep 24".into(),
-                    summary: "Unusual visitors await.".into(),
-                    image_url: String::new(),
-                    image: None,
-                },
-                services::NewsItem {
-                    title: "Nomad Mog Bonanza · The results are in".into(),
-                    url: "https://sqex.to/w97dY".into(),
-                    date: "Sep 18".into(),
-                    summary: "Find your prize collection details.".into(),
-                    image_url: String::new(),
-                    image: None,
-                },
-            ],
-            notices: [
-                ("All Worlds Maintenance (Sep. 28)", "Sep. 26, 2026 22:00 [PDT] From: FINAL FANTASY XI", "At the following time, we will be performing maintenance on all worlds."),
-                ("All Worlds Maintenance (Sep. 9)", "Sep. 7, 2026 22:00 [PDT] From: FINAL FANTASY XI", "At the following time, we will be performing server maintenance."),
-                ("Forum Technical Difficulties (Sep. 2)", "Sep. 3, 2026 01:24 [PDT] From: FINAL FANTASY XI", ""),
-            ].into_iter().map(|(title, date, summary)| services::NewsItem {
-                title: title.into(), date: date.into(), summary: summary.into(),
-                url: "https://www.playonline.com/ff11us/polnews/news.xml".into(),
-                image_url: String::new(), image: None,
-            }).collect(),
-            news_note: t("Preview content. Live feeds load when the launcher starts normally.").into(),
-            availability: services::Availability::Unknown,
-            availability_note: t("Not checked in design preview").into(),
-            windows: Vec::new(),
-            windows_complete: false,
-            ended_early: Vec::new(),
-            checked_at: t("Preview").into(),
-        });
-        if i18n::current() == i18n::Lang::Ja {
-            self.use_japanese_preview_news();
-        }
-        self.patch = Some(patch::PatchReport {
-            state: patch::PatchState::Current, // mockup shows "Ready to play"
-            local_version: t("Not checked").into(),
-            remote_version: t("Not checked").into(),
-            detail: t("The launcher compares your installation with the official patch service.")
-                .into(),
-            source_url: None, files_verified: None,
-        });
     }
 }
 
@@ -5014,6 +5704,7 @@ fn blank_account() -> Account {
         launch_with: None,
         ashita_boot_ini: None,
         windower_profile: None,
+        pol_handle_names: String::new(),
     }
 }
 
@@ -5054,6 +5745,13 @@ async fn pick_path(target: PickTarget, start: Option<PathBuf>) -> Option<PathBuf
         PickTarget::LoaderFile => {
             dialog
                 .set_title(t("Choose the Crystal loader (pol.exe)"))
+                .add_filter(t("Executable"), &["exe"])
+                .pick_file()
+                .await
+        }
+        PickTarget::ProgramFile(_) => {
+            dialog
+                .set_title(t("Choose a program to open with the game"))
                 .add_filter(t("Executable"), &["exe"])
                 .pick_file()
                 .await
@@ -5109,7 +5807,7 @@ impl Settings {
         if let Some(path) = self.account_installs.get(&account_key(account)).filter(|p| !p.trim().is_empty()) {
             config.game_install = Some(backend::plain_windows_path(PathBuf::from(path).as_path()));
         }
-        config.dat_overlays = if self.launch_with_for(account) == ui::LaunchWith::Native {
+        config.dat_overlays = if self.launch_with_for(account) == crate::backend::LaunchWith::Native {
             self.account_overlays.get(&account_key(account)).into_iter().flatten()
                 .map(|p| backend::plain_windows_path(PathBuf::from(p).as_path())).collect()
         } else { Vec::new() };
@@ -5184,21 +5882,21 @@ fn selected_folder(raw: &str, must_exist: bool) -> Result<PathBuf, String> {
     }
 }
 
-fn initial_window_size() -> iced::Size {
+fn initial_window_size() -> Size {
     // TEMP: XI_PREVIEW_SIZE=WxH for responsive checks.
     if let Some((w, h)) = std::env::var("XI_PREVIEW_SIZE").ok().and_then(|v| {
         let (w, h) = v.split_once('x')?;
         Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?))
     }) {
-        return iced::Size::new(w, h);
+        return Size::new(w, h);
     }
-    if std::env::args().any(|arg| arg == "--preview-small") {
-        iced::Size::new(900.0, 650.0)
-    } else if std::env::args().any(|arg| arg == "--preview-wide") {
+    if preview::has("--preview-small") {
+        Size::new(900.0, 650.0)
+    } else if preview::has("--preview-wide") {
         // a large window, to check the layout reflows at 1.0.
-        iced::Size::new(1920.0, 1080.0)
+        Size::new(1920.0, 1080.0)
     } else {
-        iced::Size::new(1440.0, 900.0)
+        Size::new(1440.0, 900.0)
     }
 }
 
@@ -5221,6 +5919,17 @@ fn load_settings_and_language(config: &Config) -> Result<Settings, String> {
         i18n::set(language);
     }
     Ok(settings)
+}
+
+/// The status line for a launch of `count` accounts through `tools` (none: the native client).
+fn launch_status(social_only: bool, all_native: bool, count: usize, tools: &[&str]) -> String {
+    if social_only { return t("Signing in to PlayOnline…").into(); }
+    match (all_native, count == 1) {
+        (true, true) => t("Starting 1 account in parallel. Continue in each game window after sign-in.").into(),
+        (true, false) => tf("Starting {count} accounts in parallel. Continue in each game window after sign-in.", &[("count", &count)]),
+        (false, true) => tf("Starting 1 account through {tools}.", &[("tools", &join_and(tools))]),
+        (false, false) => tf("Starting {count} accounts through {tools}.", &[("count", &count), ("tools", &join_and(tools))]),
+    }
 }
 
 /// "A", "A and B", "A and B and C"; each join is a translatable sentence part.
@@ -5318,16 +6027,9 @@ fn save_settings(config: &Config, settings: &Settings) -> Result<(), String> {
                 .map_err(|_| t("Could not preserve the damaged settings file; it was kept unchanged."))?;
         }
     }
-    let temporary = path.with_extension(format!("{}.tmp", backend::unique_id()?));
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)
-            .map_err(|_| t("Could not write launcher settings."))?;
-        file.write_all(&data).and_then(|_| file.sync_all()).map_err(|_| t("Could not write launcher settings."))?;
-        drop(file);
-        std::fs::rename(&temporary, &path).map_err(|_| t("Could not replace launcher settings.").into())
-    })();
-    if result.is_err() { let _ = std::fs::remove_file(&temporary); }
-    result
+    fsutil::write_atomic(&path, &data).map_err(|failed| {
+        if failed.replacing { t("Could not replace launcher settings.") } else { t("Could not write launcher settings.") }.into()
+    })
 }
 
 fn read_settings_bytes(path: &std::path::Path) -> Result<Option<Vec<u8>>, String> {
@@ -5382,11 +6084,10 @@ fn open_log_path(logs_dir: &std::path::Path, target: &std::path::Path) -> Result
 }
 /// ShellExecute "open" on a URL or path the caller has already vetted.
 fn shell_open(target: &str) -> Result<(), ()> {
-    #[cfg(windows)]
     {
         use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
-        let target: Vec<u16> = target.encode_utf16().chain(Some(0)).collect();
-        let verb: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+        let target = win::wide(target);
+        let verb = win::wide("open");
         let result = unsafe {
             ShellExecuteW(
                 std::ptr::null_mut(),
@@ -5401,24 +6102,21 @@ fn shell_open(target: &str) -> Result<(), ()> {
             return Err(());
         }
     }
-    #[cfg(not(windows))]
-    let _ = target;
     Ok(())
 }
-fn save_screenshot(path: &std::path::Path, screenshot: window::Screenshot) -> Result<(), String> {
-    let output = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    let mut encoder = png::Encoder::new(output, screenshot.size.width, screenshot.size.height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
-    writer
-        .write_image_data(&screenshot.rgba)
-        .map_err(|e| e.to_string())
+fn save_screenshot(path: &std::path::Path, screenshot: Screenshot) -> Result<(), String> {
+    imagecrate::save_buffer_with_format(
+        path,
+        &screenshot.rgba,
+        screenshot.width,
+        screenshot.height,
+        imagecrate::ExtendedColorType::Rgba8,
+        imagecrate::ImageFormat::Png,
+    )
+    .map_err(|e| e.to_string())
 }
 
-#[cfg(windows)]
 struct InstanceGuard(windows_sys::Win32::Foundation::HANDLE);
-#[cfg(windows)]
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
         unsafe {
@@ -5426,39 +6124,63 @@ impl Drop for InstanceGuard {
         }
     }
 }
-#[cfg(windows)]
 fn claim_instance() -> Result<Option<InstanceGuard>, String> {
     use windows_sys::Win32::{
-        Foundation::{GetLastError, ERROR_ALREADY_EXISTS},
+        Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS},
         System::Threading::CreateMutexW,
-        UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE},
     };
     let name: Vec<u16> = "Local\\XI-Iced-Launcher-Test-1"
         .encode_utf16()
         .chain(Some(0))
         .collect();
-    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
-    if handle.is_null() {
-        return Err(
-            t("Windows could not start the launcher instance. Close any other copy and try again.")
-                .into(),
-        );
-    }
-    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(handle);
-        }
-        let title: Vec<u16> = "Crystal Launcher".encode_utf16().chain(Some(0)).collect();
-        let window = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
-        if !window.is_null() {
-            unsafe {
-                ShowWindow(window, SW_RESTORE);
-                SetForegroundWindow(window);
+    let failed = || t("Windows could not start the launcher instance. Close any other copy and try again.").to_owned();
+    let background = std::env::args().any(|a| a == startup_task::BACKGROUND_ARG);
+    // A closing Crystal holds the mutex while it signs idle sessions out (close_idle_sessions,
+    // up to 30 s, plus the park close) but has already destroyed its tray window: wait for it.
+    let deadline = Instant::now() + INSTANCE_CLOSE_WAIT;
+    loop {
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() { return Err(failed()); }
+        if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS { return Ok(Some(InstanceGuard(handle))); }
+        unsafe { CloseHandle(handle) };
+        // A background start (Start with Windows) finding Crystal already running changes nothing.
+        if background { return Ok(None); }
+        // The running Crystal (its hidden window exists from its start) opens or brings forward
+        // its own window, whether or not it has one.
+        match tray::ask_running_instance_to_open() {
+            Some(tray::OpenAnswer::Opened) => return Ok(None),
+            // Found but not reachable (a running Crystal at a higher integrity level refuses the
+            // message): bring its window forward directly, if it has one.
+            Some(tray::OpenAnswer::Unreachable) => {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
+                let title = win::wide("Crystal Launcher");
+                let window = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+                if !window.is_null() {
+                    unsafe {
+                        ShowWindow(window, SW_RESTORE);
+                        SetForegroundWindow(window);
+                    }
+                }
+                return Ok(None);
             }
+            // Closing (or its hidden window is already gone): wait for it to end.
+            Some(tray::OpenAnswer::Closing) | None => {}
         }
-        return Ok(None);
+        if Instant::now() >= deadline { return Err(failed()); }
+        std::thread::sleep(Duration::from_millis(200));
     }
-    Ok(Some(InstanceGuard(handle)))
+}
+
+/// The longest a new start waits for a closing Crystal to finish its cleanup (idle sign-outs
+/// up to 30 s, then the park close).
+const INSTANCE_CLOSE_WAIT: Duration = Duration::from_secs(45);
+
+/// Task Scheduler for Start with Windows; unit tests never register a real task.
+#[cfg(not(test))]
+fn startup_task_runner() -> impl FnMut(&[String]) -> Result<(bool, String), String> { startup_task::schtasks }
+#[cfg(test)]
+fn startup_task_runner() -> impl FnMut(&[String]) -> Result<(bool, String), String> {
+    |_: &[String]| Err("unit tests do not run schtasks".to_owned())
 }
 
 /// Close park workers on their own thread, so a re-park or a suspension never holds the UI.
@@ -5468,10 +6190,20 @@ fn close_parks_later(workers: Vec<session_worker::ParkWorker>) {
     let _ = std::thread::Builder::new().name("park-close".into()).spawn(move || pol_less::park::close_workers(workers));
 }
 
-fn main() -> iced::Result {
+/// Close park workers off the interface thread and wait for them and their hosts to exit (a
+/// park still starting included, up to park::EXIT_WAIT): the first step of work that changes
+/// the files they hold (an Update, a Repair, setup, a launcher update). `Err`: one still runs,
+/// so that work must not write.
+async fn close_parks_now(workers: Vec<session_worker::ParkWorker>) -> Result<(), String> {
+    if workers.is_empty() { return Ok(()); }
+    tokio::task::spawn_blocking(move || pol_less::park::close_workers_and_wait(workers, pol_less::park::EXIT_WAIT)).await
+        .unwrap_or_else(|_| Err(t("Could not close the parked game hosts.").into()))
+}
+
+fn main() {
     if let Some(result) = self_update::cli(&std::env::args().collect::<Vec<_>>()) {
         if let Err(error) = result { eprintln!("{error}"); std::process::exit(1); }
-        return Ok(());
+        return;
     }
     if std::env::args().nth(1).as_deref() == Some("--windower-profile-editor-worker") {
         let _ = load_settings_and_language(&Config::default());
@@ -5492,105 +6224,20 @@ fn main() -> iced::Result {
         pol_less::profile_access::finish_pending_launchers();
         std::process::exit(code);
     }
-    // Anonymous maintenance diagnostics never load saved accounts or create UI.
-    let args: Vec<String> = std::env::args().collect();
-    if let Some(index) = args
-        .iter()
-        .position(|a| a == "--check-files" || a == "--patch-probe")
-    {
-        let Some(target) = args.get(index + 1) else {
-            eprintln!("An absolute game installation path is required.");
-            std::process::exit(2);
-        };
-        let path = PathBuf::from(target);
-        if !path.is_absolute() {
-            eprintln!("An absolute game installation path is required.");
-            std::process::exit(2);
-        }
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let op = operation::Operation::new();
-        let result = runtime.block_on(async {
-            let progress = op.clone();
-            let monitor = tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-                    let p = progress.snapshot();
-                    eprintln!("{} {}/{}: {}", p.stage, p.done, p.total, p.detail);
-                }
-            });
-            let result = if args[index] == "--patch-probe" {
-                updater::probe(path, op).await
-            } else {
-                updater::run(path, updater::Mode::Check, op).await.map(|r| {
-                    let mut details = r.summary;
-                    for issue in r.issues {
-                        details.push_str(&format!("\n{issue}"));
-                    }
-                    details
-                })
-            };
-            monitor.abort();
-            result
-        });
-        match result {
-            Ok(report) => println!("{report}"),
-            Err(error) => {
-                eprintln!("{error}");
-                std::process::exit(1);
-            }
-        }
-        return Ok(());
-    }
-    if std::env::args().any(|a| a == "--check-services") {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        runtime.block_on(async {
-            // Installed record only: the official patch server is asked before a game start.
-            let services = services::refresh().await;
-            let patch = patch::local_report(&PathBuf::from(Settings::default().install_path));
-            println!(
-                "Patch: {:?}; local {}; official {}; {}; source {}",
-                patch.state,
-                patch.local_version,
-                patch.remote_version,
-                patch.detail,
-                patch.source_url.as_deref().unwrap_or("Unavailable")
-            );
-            match services {
-                Ok(s) => {
-                    // The Play gate's verdict (window first), then the status page's own reading.
-                    let (verdict, note) = s.recent_status(chrono::Utc::now());
-                    println!(
-                        "News items: {}; decoded article images: {}; maintenance notices: {}; Play gate {:?}: {}; status page {:?}: {}; feed note: {}",
-                        s.news.len(),
-                        s.news.iter().filter(|item| item.image.is_some()).count(),
-                        s.notices.len(),
-                        verdict,
-                        note,
-                        s.availability,
-                        s.availability_note,
-                        s.news_note
-                    )
-                }
-                Err(e) => println!("Services: {e}"),
-            }
-        });
-        return Ok(());
-    }
-    let preview = std::env::args().any(|a| a.starts_with("--preview"));
+    let preview = preview::flags().is_some();
     // Before the single-instance check, so its error box is in the user's language too.
     if !preview {
         let _ = load_settings_and_language(&Config::default());
     }
-    #[cfg(windows)]
     let _instance = if preview {
         None
     } else {
         match claim_instance() {
             Ok(Some(guard)) => Some(guard),
-            Ok(None) => return Ok(()),
+            Ok(None) => return,
             Err(error) => {
-                let text: Vec<u16> = error.encode_utf16().chain(Some(0)).collect();
-                let title: Vec<u16> = "Crystal Launcher".encode_utf16().chain(Some(0)).collect();
+                let text = win::wide(&error);
+                let title = win::wide("Crystal Launcher");
                 unsafe {
                     windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
                         std::ptr::null_mut(),
@@ -5599,52 +6246,17 @@ fn main() -> iced::Result {
                         windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
                     );
                 }
-                return Ok(());
+                return;
             }
         }
     };
-    // wgpu on Direct3D 12 only. Probing every backend (Vulkan and GL too)
-    // costs ~150 ms of startup here; if D3D12 is unavailable iced falls back to
-    // its tiny-skia software renderer. The low-power preference keeps a hybrid
-    // laptop on its integrated GPU. Software rendering by default saved ~200 MB
-    // but repainted the whole window on the CPU for every hover and tick, which
-    // made the launcher sluggish; ICED_BACKEND=tiny-skia still selects it.
-    #[cfg(windows)]
-    for (key, value) in [("WGPU_BACKEND", "dx12"), ("WGPU_POWER_PREF", "low")] {
-        if std::env::var_os(key).is_none() {
-            std::env::set_var(key, value);
-        }
-    }
-    // Japanese text falls back to Yu Gothic UI glyph by glyph.
-    i18n::install_font_fallback();
-    let result = iced::application(App::new, App::update, ui::view)
-        .title("Crystal Launcher")
-        .theme(|app: &App| ui::theme(app.settings.light_theme))
-        .subscription(App::subscription)
-        .default_font(Font::with_name("Segoe UI"))
-        .window(window::Settings {
-            size: initial_window_size(),
-            position: window::Position::Centered,
-            decorations: false,
-            min_size: Some(iced::Size::new(900.0, 650.0)),
-            exit_on_close_request: false,
-            // The taskbar and Alt+Tab icon: the title bar's crystal (assets/crystal.ico
-            // is the same art, embedded as the exe's icon by build.rs).
-            icon: window::icon::from_rgba(include_bytes!("../assets/crystal-icon-64.rgba").to_vec(), 64, 64).ok(),
-            // Rounded corners from the start; the shadow and border colour are
-            // added by window_chrome once the window has a handle.
-            #[cfg(windows)]
-            platform_specific: window::settings::PlatformSpecific {
-                corner_preference: window::settings::platform::CornerPreference::Round,                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .run();
+    tray::note_ui_thread();
+    if let Err(error) = slint_host::run() { eprintln!("{error}"); }
+    tray::shutdown();
     if let Err(error) = launcher_close::finish() {
         launch_log::append_history(&Config::default().history_path(), "Crystal", &format!(
             "launcher close failed: pid {}, {error}", std::process::id()), None);
     }
-    result
 }
 
 #[cfg(test)]
@@ -5652,96 +6264,56 @@ mod tests {
     use super::*;
     pub(super) fn app() -> App {
         let (sender, receiver) = mpsc::channel();
-        let mut app = App {
-            viewport: iced::Size::new(1200.0, 820.0),
-            maximized: false,
-            title_held: false,
-            page: Page::Home,
-            show_details: false,
-            accounts: vec![],
-            account_drag: account_order::Drag::default(),
-            windower_editor_open: false,
-            editor: None, account_import: account_import_ui::State::default(),
-            services: None,
-            news_loading: false,
-            news_lang: i18n::Lang::En,
-            news_generation: 0,
-            news_error: String::new(),
-            startup_warning: None,
-            patch: None,
-            patch_loading: false,
-            installation_loading: false,
-            installation_generation: 0,
-            viewer: None,
-            viewer_loading: false,
-            viewer_generation: 0,
-            settings: Settings::default(),
-            show_settings: false,
-            status: String::new(),
-            vault_ready: true,
-            startup_signin_pending: false,
-            startup_waiting: Vec::new(),
-            startup_issued: None,
-            launcher_start_logged: false,
-            status_read_done: true,
-            status_hold_spent: false,
-            held_plays: Vec::new(),
-            waiting_plays: Vec::new(),
-            play_flag: play_flag::Known::default(),
-            flag_schedule: play_flag::Schedule::default(),
-            released: Vec::new(),
-            wait_update: None,
-            launches: None,
-            parks: Default::default(),
-            park_prints: Default::default(),
-            park_checked: None,
-            park_tended: None,
-            confirm_close: false,
-            closing: false,
-            pending_delete: None,
-            wiki_query: String::new(),
-            ah_query: String::new(),
-            ah_lookup: ffxiah::Lookup::default(),
-            ah_server: ui::DEFAULT_AH_SERVER,
-            news_filter: 0,
-            maintenance: None,
-            maintenance_progress: operation::Progress::default(),
-            maintenance_result: String::new(),
-            installer_error: None,
-            maintenance_tone: ResultTone::default(),
-            maintenance_cancelled: false,
-            update_scope: (true, true),
-            troubleshooting_open: false,
-            recovering: None,
-            patch_folder: None,
-            refused_plays: Vec::new(),
-            reissue_after_update: Vec::new(),
-            active_operation: None,
-            config: Config::default(),
-            sender,
-            receiver,
-            vault_saving: false,
-            patch_generation: 0,
-            refreshed: Instant::now(),
-            preview: true,
-            preview_capture_sent: false,
-            // The Settings page fields, so the test build compiles.
-            settings_tab: settings_page::Tab::default(),
-            game_config: game_config::State::default(),
-            prereqs: prereqs::State::default(),
-            gamepad: gamepad::State::default(),
-            launch_tools: launch_tools::State::default(),
-            friends: friends::State::default(),
-            friends_generation: 0,
-            friends_checked: Instant::now(),
-            dgvoodoo: dgvoodoo::State::new(false),
-            reshade: reshade::State::default(),
-            self_update: self_update::State::default(),
-            controller_nav: controller_nav::State::default(),
-        };
+        let mut app = App::base(Config::default(), Settings::default(), tick_gate::EventSender::new(sender), receiver, dgvoodoo::State::new(false));
         app.load_preview();
         app
     }
+    /// Audit 2026-11-09: launcher close reads the sign-in's flag (IdleSessionClose::with_sign_in_done);
+    /// it is set before the Complete goes out, never by progress.
+    #[test]
+    fn a_sign_in_marks_itself_done_before_its_completion_is_sent() {
+        let (sender, events) = mpsc::channel();
+        let done = Arc::new(AtomicBool::new(false));
+        let tx = LaunchTx { done: Some(done.clone()), ..LaunchTx::new(tick_gate::EventSender::new(sender), "a".into(), 1) };
+        tx.progress("signing in");
+        assert!(!done.load(Ordering::Acquire), "progress is no completion");
+        tx.complete(Err("failed before its worker started".into()));
+        assert!(done.load(Ordering::Acquire));
+        assert_eq!(events.try_iter().count(), 2);
+    }
+    #[test]
+    fn game_shutdown_selection_is_scoped_and_stays_signed_out_with_the_setting_off() {
+        let mut app=app();
+        for (i,row) in app.accounts.iter_mut().enumerate() {
+            row.pid=Some(100+i as u32); row.busy=false; row.selected=i==0;
+            row.game_running=Some(Arc::new(AtomicBool::new(true)));
+            row.alive=Some(Arc::new(AtomicBool::new(true)));
+        }
+        assert_eq!(app.shutdown_count(true),1);
+        assert_eq!(app.update(Message::ShutdownSelected).units(),1);
+        assert!(app.accounts[0].shutting_down && !app.accounts[0].can_play());
+        assert!(app.accounts[0].resign_declined && app.accounts[0].signed_out);
+        let _=app.update(Message::Tick);
+        assert!(app.accounts[0].resign_declined && app.accounts[0].signed_out,"the first game-observation tick must preserve explicit shutdown");
+        app.accounts[0].pid=None;
+        assert!(app.has_sessions() && app.sessions_block_update() && !app.can_restart_launcher(),"POL cleanup remains pending after the game window closes");
+        app.accounts[0].pid=Some(100);
+        assert!(!app.accounts[1].shutting_down);
+        assert_eq!(app.update(Message::ShutdownSelected).units(),0,"a repeated click must not toggle the game countdown");
+        assert_eq!(app.update(Message::ShutdownAll).units(),2);
+        let key=app.accounts[0].key.clone(); let generation=app.accounts[0].launch_generation;
+        let _=app.update(Message::GameShutdownFinished(key,generation,Err("Game refused shutdown".into())));
+        assert!(app.accounts[0].pid.is_some() && app.accounts[0].problem && !app.accounts[0].shutting_down);
+        assert!(app.accounts[1].shutting_down,"one failure cannot change another client");
+        let key=app.accounts[1].key.clone(); let generation=app.accounts[1].launch_generation;
+        let _=app.update(Message::GameShutdownFinished(key.clone(),generation,Ok(())));
+        let _=app.update(Message::Tick);
+        assert!(app.accounts[1].pid.is_none() && !app.accounts[1].problem && !app.accounts[1].shutting_down);
+        app.accounts[1].launch_generation+=1; app.accounts[1].pid=Some(999);
+        let _=app.update(Message::GameShutdownFinished(key,generation,Ok(())));
+        assert_eq!(app.accounts[1].pid,Some(999),"a stale result cannot clear a fresh launch");
+    }
+
     #[test]
     fn reshade_setup_blocks_launch_updates_and_launcher_restart() {
         let mut app = app();
@@ -5809,172 +6381,588 @@ mod tests {
 
     fn refused_report() -> patch::PatchReport {
         patch::PatchReport { state: patch::PatchState::Required, local_version: "30260904_1".into(),
-            remote_version: "30261006_0".into(), detail: String::new(), files_verified: None, source_url: None }
+            remote_version: "30261006_0".into(), detail: String::new(), files_verified: None }
     }
 
-    /// Proposal 09 phase 1: an Update started from a refused Play starts that Play again
-    /// when it succeeds; a failed one, or a Play pressed meanwhile, does not.
-    #[test]
-    fn an_update_started_from_a_refused_play_starts_that_play_again() {
+    /// A game folder at `version` (no record: a fresh install), isolated app state under it,
+    /// and the Settings folder pointing there.
+    fn play_update_app(label: &str, version: Option<&str>) -> (App, PathBuf) {
+        let root = std::env::temp_dir().join(format!("crystal-play-update-{label}-{}", backend::unique_id().unwrap()));
+        let game = root.join("FINAL FANTASY XI");
+        std::fs::create_dir_all(&game).unwrap();
+        for name in ["FFXi.dll", "FFXiMain.dll"] { std::fs::write(game.join(name), b"fixture").unwrap(); }
+        if let Some(version) = version { std::fs::write(game.join("patch.ver"), patch::encode_applied_record(version, 1).unwrap()).unwrap(); }
         let mut app = app();
         app.preview = false;
         app.launches = Some(Vec::new());
+        app.viewer = None;
+        app.config = Config { experiment: root.join("data"), repository: root.join("runtime"), game_install: None, dat_overlays: Vec::new() };
+        app.settings.install_path = game.to_string_lossy().into_owned();
         app.settings.install_selected = true;
-        let key = app.accounts[0].key.clone();
-        // The W20 refused a pre-signed Play.
-        let clicked = Instant::now() - Duration::from_secs(3);
-        app.accounts[0].busy = true;
-        app.accounts[0].play_timing = Some(launch_timing::Timeline::begin_at(clicked));
-        let message = patch::gate(patch::LaunchCheck::Update(refused_report())).unwrap_err();
-        app.worker_event(WorkerEvent::StartGame(key.clone(), Some(refused_report()), Err(message)));
-        assert_eq!(app.main_action(), MainAction::Update);
-        assert_eq!(app.refused_plays, vec![(key.clone(), clicked)]);
-        // The Update takes it along (its sessions sign out); success starts it again, cold.
-        let _ = app.start_maintenance(MaintenanceKind::Update);
-        assert!(app.maintenance == Some(MaintenanceKind::Update));
-        assert!(app.refused_plays.is_empty() && app.reissue_after_update.len() == 1);
-        let mut current = refused_report();
-        current.state = patch::PatchState::Current;
-        let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Ok("Updated".into()), Some(current.clone())));
-        assert_eq!(app.launches.as_ref().unwrap().as_slice(),
-            &[(vec![key.clone()], false, clicked, Some(launch_timing::LaunchTrigger::ReissuedPlay))]);
-        // A failed Update starts nothing.
-        app.launches = Some(Vec::new());
-        app.note_refused_play(&key, clicked);
-        let _ = app.start_maintenance(MaintenanceKind::Update);
-        let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Err("Cancelled".into()), None));
-        assert!(app.launches.as_ref().unwrap().is_empty() && app.reissue_after_update.is_empty());
-        // A Play pressed after the refusal replaces it.
-        app.note_refused_play(&key, clicked);
-        app.start_launch(vec![key.clone()], false, Instant::now(), None);
-        assert!(app.refused_plays.is_empty());
-        // A sign-in only (Connect) refused by an outdated PlayOnline is no Play to start again.
-        app.accounts[0].busy = true;
-        app.accounts[0].launch_trigger = Some(launch_timing::LaunchTrigger::Connect);
-        let outdated = viewer::ConnectVerdict::Outdated { local: "20110829_E".into(), remote: "20261001_0".into() }.message();
-        app.worker_event(WorkerEvent::Complete(key.clone(), Err(outdated.clone())));
-        assert!(app.refused_plays.is_empty());
-        // The same refusal of a cold Play is.
-        app.accounts[0].busy = true;
-        app.accounts[0].launch_trigger = Some(launch_timing::LaunchTrigger::Play);
-        app.worker_event(WorkerEvent::Complete(key.clone(), Err(outdated)));
-        assert_eq!(app.refused_plays.iter().map(|(known, _)| known.as_str()).collect::<Vec<_>>(), [key.as_str()]);
+        (app, root)
     }
 
+    /// A row signed in at the PlayOnline main menu (its host `pid`), its Play in flight.
+    fn signed_in(app: &mut App, index: usize, pid: u32, clicked: Instant) -> String {
+        let row = &mut app.accounts[index];
+        row.pid = Some(pid);
+        row.alive = Some(Arc::new(AtomicBool::new(true)));
+        row.game_running = Some(Arc::new(AtomicBool::new(false)));
+        row.busy = true;
+        row.play_timing = Some(launch_timing::Timeline::begin_at(clicked));
+        row.key.clone()
+    }
+
+    fn refused(app: &mut App, key: &str) {
+        let message = patch::gate(patch::LaunchCheck::Update(refused_report())).unwrap_err();
+        app.worker_event(WorkerEvent::StartGame(key.to_owned(), Some(refused_report()), Err(message)));
+    }
+
+    fn generation(app: &App) -> u64 { app.play_updates.jobs[0].generation }
+
+    /// A row signed in and idle at the PlayOnline main menu (its host `pid`).
+    fn idle_signed_in(app: &mut App, index: usize, pid: u32) -> String {
+        let key = signed_in(app, index, pid, Instant::now());
+        let row = &mut app.accounts[index];
+        (row.busy, row.play_timing) = (false, None);
+        key
+    }
+
+    /// A play flag read made now, during maintenance, with `$patch_enable` as given.
+    fn closed_flag(app: &mut App, patch: Option<bool>) {
+        let _ = app.update(Message::PlayFlagLoaded(play_flag::Reading { at: chrono::Utc::now(),
+            result: Ok(play_flag::Flag::Down(Some("The game is unavailable for play during maintenance.".into()))), patch }));
+    }
+
+    fn maintenance_signins(app: &App) -> Vec<Vec<String>> {
+        app.launches.as_ref().unwrap().iter()
+            .filter(|(_, social, _, trigger)| *social && *trigger == Some(launch_timing::LaunchTrigger::MaintenanceSignIn))
+            .map(|(keys, ..)| keys.clone()).collect()
+    }
+
+    /// Owner, 1.1.0: "I want it to update as soon as update is available". In maintenance, at
+    /// `$patch_enable`'s 0 → 1: the accounts Crystal may sign in by itself and a waiting Play
+    /// without a code sign in (once per trigger; an OTP account never), one W20 runs for the
+    /// folder from a session at the main menu, "update required" runs the in-session update
+    /// with no Play waiting on it, and the outcome is installed, game not started.
     #[test]
-    fn ordinary_plays_require_a_replacement_otp_after_update() {
-        let root = std::env::temp_dir().join(format!("crystal-update-otp-{}", backend::unique_id().unwrap()));
-        for (used_code, replacement) in [(true, ""), (true, "654321"), (false, "")] {
-            let mut app = app();
-            app.preview = false;
-            app.config = Config { experiment: root.join(format!("{used_code}-{replacement}")), repository: root.join("runtime"), game_install: None, dat_overlays: Vec::new() };
-            app.accounts.truncate(1);
-            app.launches = Some(Vec::new());
-            app.settings.install_selected = true;
-            let key = app.accounts[0].key.clone();
-            let clicked = Instant::now();
-            let row = &mut app.accounts[0];
-            row.busy = true;
-            row.otp_spent = used_code;
-            row.launch_trigger = Some(launch_timing::LaunchTrigger::Play);
-            row.play_timing = Some(launch_timing::Timeline::begin_at(clicked));
-            // Authentication consumed the original code, then W20 refused this ordinary
-            // Play for an update. Its session remains signed in until the update signs out.
-            let message = patch::gate(patch::LaunchCheck::Update(refused_report())).unwrap_err();
-            app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult {
-                pid: 77, detail: message, alive: Arc::new(AtomicBool::new(true)),
-                game_running: Arc::new(AtomicBool::new(false)), log: app.config.experiment.join("launch.log"),
-                outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
-            })));
-            assert_eq!(app.settings.account_otp.contains(&key), used_code);
-            assert_eq!(app.refused_plays, vec![(key.clone(), clicked)]);
-            assert!(app.wait_update.is_none(), "this Play did not come from a maintenance wait");
-            // Simulate the original native session ending; the updater task is never polled,
-            // so this fixture touches no network, registry settings or game process.
-            let row = &mut app.accounts[0];
-            (row.pid, row.alive, row.game_running) = (None, None, None);
-            let _ = app.start_maintenance(MaintenanceKind::Update);
-            assert!(app.maintenance == Some(MaintenanceKind::Update));
-            let _ = app.update(Message::OtpChanged(key.clone(), replacement.into()));
-            let mut current = refused_report();
-            current.state = patch::PatchState::Current;
-            let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Ok("Updated".into()), Some(current)));
-            if used_code && replacement.is_empty() {
-                assert!(app.launches.as_ref().unwrap().is_empty());
-                assert_eq!(app.accounts[0].status, t("That one-time code was used. Enter a new one, then press Play."));
-                assert!(app.accounts[0].problem && !app.accounts[0].busy && app.accounts[0].pid.is_none() && app.accounts[0].can_play());
-            } else {
-                assert_eq!(app.launches.as_ref().unwrap().as_slice(),
-                    &[(vec![key], false, clicked, Some(launch_timing::LaunchTrigger::ReissuedPlay))]);
+    fn maintenance_checks_the_version_and_installs_the_update_without_starting_the_game() {
+        i18n::set(i18n::Lang::En);
+        let (mut app, root) = play_update_app("watch", Some("30260904_1"));
+        let game = root.join("FINAL FANTASY XI");
+        status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(7 * 60)));
+        assert_eq!(app.main_action(), MainAction::Maintenance);
+        let keys: Vec<String> = app.accounts.iter().map(|row| row.key.clone()).collect();
+        app.settings.auto_sign_in = true;
+        app.settings.account_no_otp.extend([keys[0].clone(), keys[2].clone()]);
+        app.settings.account_otp.insert(keys[1].clone());
+        // Plays that wait: an OTP account with its code, and an account that needs none.
+        app.accounts[1].otp = "123456".into();
+        app.start_launch(vec![keys[1].clone(), keys[2].clone()], false, Instant::now(), None);
+        assert!(app.is_waiting(&keys[1]) && app.is_waiting(&keys[2]));
+        // patch_enable 0: nothing signs in and nothing is checked.
+        closed_flag(&mut app, Some(false));
+        assert!(app.launches.as_ref().unwrap().is_empty() && app.patch_watch.checks.is_empty());
+        // The flip: one maintenance sign-in, never the OTP account; not again in this cycle.
+        closed_flag(&mut app, Some(true));
+        assert_eq!(maintenance_signins(&app), vec![vec![keys[0].clone(), keys[2].clone()]]);
+        closed_flag(&mut app, Some(true));
+        let _ = app.update(Message::Tick);
+        assert_eq!(maintenance_signins(&app).len(), 1, "once per trigger");
+        // Signed in at the main menu: one W20 for the folder.
+        idle_signed_in(&mut app, 0, 41);
+        let _ = app.update(Message::Tick);
+        let _ = app.update(Message::Tick);
+        assert_eq!(app.patch_watch.checks.len(), 1, "one check per folder per trigger");
+        assert!(play_update::same_folder(&app.patch_watch.checks[0].0, &game) && app.patch_watch.checks[0].1 == keys[0]);
+        assert_eq!(play_update::watch_line(&app, &keys[0]).unwrap().headline, "Checking for the FFXI update");
+        // Update required: the update a Play's W20 would start, with no Play waiting on it.
+        app.worker_event(WorkerEvent::PatchCheck(app.patch_watch.checks[0].0.clone(), keys[0].clone(), Ok((refused_report(), false, None))));
+        assert_eq!(app.play_updates.spawned.len(), 1);
+        assert!(app.play_updates.jobs[0].probe && app.play_updates.jobs[0].waiters.is_empty() && !app.accounts[0].busy);
+        assert_eq!(play_update::watch_line(&app, &keys[0]).unwrap().headline, "Downloading the FFXI update");
+        let row = account_row::row_view(&app, &app.accounts[0]);
+        assert!(row.detail.starts_with("Downloading the FFXI update") && matches!(row.action, Some((_, Message::CancelPlayUpdate(_), _))));
+        let job = generation(&app);
+        app.worker_event(WorkerEvent::PlayUpdate(job, play_update::Event::Finished(Ok(play_update::Done { summary: "Updated.".into(), report: None }))));
+        assert!(app.play_updates.jobs.is_empty() && app.w20_skipped.is_empty());
+        assert_eq!(app.launches.as_ref().unwrap().iter().filter(|(_, social, ..)| !social).count(), 0, "installed, game not started");
+        assert_eq!(play_update::watch_line(&app, &keys[0]).unwrap().headline, "Update installed · waiting for servers");
+        assert_eq!(app.status, "Update installed · waiting for servers");
+        let _ = app.update(Message::Tick);
+        assert_eq!(app.patch_watch.checks.len(), 1, "nothing more once installed");
+        // The worlds open: the waiting Plays go through the normal start path (W20 → GameStart).
+        let _ = app.update(Message::PlayFlagLoaded(play_flag::Reading { at: chrono::Utc::now(), result: Ok(play_flag::Flag::Up), patch: Some(true) }));
+        assert!(!app.patch_watch.active() && play_update::watch_line(&app, &keys[0]).is_none());
+        let plays: Vec<_> = app.launches.as_ref().unwrap().iter().filter(|(_, social, ..)| !social).collect();
+        assert_eq!(plays.len(), 1, "the waiting Plays start together through the normal start path");
+        assert_eq!(plays[0].0, vec![keys[1].clone(), keys[2].clone()]);
+        let history = std::fs::read_to_string(app.config.history_path()).unwrap();
+        for line in ["play flag: $patch_enable unknown → 0", "play flag: $patch_enable 0 → 1", "maintenance sign-in: 2 accounts",
+            "maintenance update check (W20): update required, installed 30260904_1, official 30261006_0",
+            "maintenance update: started, official 30261006_0", "maintenance update: installed 30261006_0: Updated."] {
+            assert!(history.contains(line), "{line}\n{history}");
+        }
+        for row in &app.accounts {
+            for secret in [&row.account.label, &row.account.pol_id, &row.account.se_id].into_iter().filter(|text| text.len() > 2) {
+                assert!(!history.contains(secret.as_str()), "no account names in the history");
             }
-            // The recorder stops at the normal launch boundary: a replacement is still there
-            // for that launch to consume, rather than discarded by MaintenanceFinished.
-            assert_eq!(app.accounts[0].otp, replacement);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The schedule in the window: nothing outside maintenance, at once at first sight with a
+    /// session at the main menu, then 5 min ± 30 s after "current", none while
+    /// `$patch_enable` is 0; a session maintenance ended signs in again once per trigger.
+    #[test]
+    fn maintenance_version_checks_follow_the_schedule_and_never_run_outside_maintenance() {
+        i18n::set(i18n::Lang::En);
+        let (mut app, root) = play_update_app("watch-schedule", Some("30261006_0"));
+        let keys: Vec<String> = app.accounts.iter().map(|row| row.key.clone()).collect();
+        app.settings.auto_sign_in = true;
+        app.settings.account_no_otp.extend([keys[0].clone(), keys[1].clone()]);
+        let key = idle_signed_in(&mut app, 0, 51);
+        // Outside maintenance: no flag read is wanted, and a 1 changes nothing.
+        status_read(&mut app, services::Availability::Operational, None);
+        assert!(!app.flag_wanted());
+        let _ = app.update(Message::PlayFlagLoaded(play_flag::Reading { at: chrono::Utc::now(), result: Ok(play_flag::Flag::Up), patch: Some(true) }));
+        let _ = app.update(Message::Tick);
+        assert!(app.patch_watch.checks.is_empty() && !app.patch_watch.active() && maintenance_signins(&app).is_empty());
+        // Maintenance first seen with patch_enable 1 and a session at the main menu: at once.
+        status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(7 * 60)));
+        app.play_flag = play_flag::Known::default();
+        assert!(app.flag_wanted());
+        closed_flag(&mut app, Some(true));
+        assert_eq!(app.patch_watch.checks.len(), 1);
+        assert_eq!(maintenance_signins(&app), vec![vec![keys[1].clone()]], "the account not signed in signs in");
+        let folder = app.patch_watch.checks[0].0.clone();
+        let current = patch::PatchReport { state: patch::PatchState::Current, local_version: "30261006_0".into(),
+            remote_version: "30261006_0".into(), detail: String::new(), files_verified: None };
+        app.worker_event(WorkerEvent::PatchCheck(folder.clone(), key.clone(), Ok((current.clone(), true, Some("connect 180 ms".into())))));
+        let _ = app.update(Message::Tick);
+        assert_eq!(app.patch_watch.checks.len(), 1, "not before the next 5 minutes");
+        let next = app.patch_watch.next_due().unwrap();
+        let now = Instant::now();
+        assert!(next > now + patch_watch::RECHECK - patch_watch::JITTER - Duration::from_secs(5) && next <= now + patch_watch::RECHECK + patch_watch::JITTER);
+        assert!(app.next_timed_work().is_some_and(|at| at <= next), "a quiet window wakes for it");
+        app.patch_watch.checked(&folder, false, now - patch_watch::RECHECK * 2, Duration::ZERO);
+        let _ = app.update(Message::Tick);
+        assert_eq!(app.patch_watch.checks.len(), 2, "due again");
+        assert!(app.play_updates.spawned.is_empty(), "current never updates");
+        // A check that sent nothing (the session left its main menu) waits for the schedule too.
+        app.worker_event(WorkerEvent::PatchCheck(folder.clone(), key.clone(), Err("PlayOnline did not return to its main menu in time, so FFXI was not started.".into())));
+        let _ = app.update(Message::Tick);
+        assert_eq!(app.patch_watch.checks.len(), 2, "no tight loop");
+        // patch_enable 0: no checks, however long.
+        closed_flag(&mut app, Some(false));
+        app.patch_watch.checked(&folder, false, now - patch_watch::RECHECK * 2, Duration::ZERO);
+        let _ = app.update(Message::Tick);
+        assert_eq!(app.patch_watch.checks.len(), 2);
+        // Back to 1 (a flip): checked at once, and the account whose session maintenance ended
+        // (it never signed in here) signs in once more.
+        closed_flag(&mut app, Some(true));
+        assert_eq!(app.patch_watch.checks.len(), 3);
+        assert_eq!(maintenance_signins(&app).len(), 2);
+        closed_flag(&mut app, Some(true));
+        assert_eq!(maintenance_signins(&app).len(), 2, "once per trigger");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Review findings: an answer that comes once `$patch_enable` is no longer 1 starts no
+    /// update; "update required" with no update possible stops the folder until the next flip;
+    /// a waiting Play whose account's OTP use is unknown is not signed in for the check.
+    #[test]
+    fn a_late_or_unusable_update_required_starts_nothing_and_stops_further_checks() {
+        i18n::set(i18n::Lang::En);
+        let (mut app, root) = play_update_app("watch-late", Some("30260904_1"));
+        let keys: Vec<String> = app.accounts.iter().map(|row| row.key.clone()).collect();
+        status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(7 * 60)));
+        app.start_launch(vec![keys[2].clone()], false, Instant::now(), None);
+        assert!(app.is_waiting(&keys[2]));
+        idle_signed_in(&mut app, 0, 61);
+        closed_flag(&mut app, Some(true));
+        assert!(maintenance_signins(&app).is_empty(), "OTP use unknown: not signed in");
+        assert_eq!(app.patch_watch.checks.len(), 1);
+        let folder = app.patch_watch.checks[0].0.clone();
+        // $patch_enable 0 before the answer: no update.
+        closed_flag(&mut app, Some(false));
+        app.worker_event(WorkerEvent::PatchCheck(folder.clone(), keys[0].clone(), Ok((refused_report(), false, None))));
+        assert!(app.play_updates.spawned.is_empty() && app.play_updates.jobs.is_empty());
+        // The flip checks at once; "required" with no update possible (the host is gone).
+        closed_flag(&mut app, Some(true));
+        assert_eq!(app.patch_watch.checks.len(), 2);
+        app.accounts[0].pid = None;
+        app.worker_event(WorkerEvent::PatchCheck(folder.clone(), keys[0].clone(), Ok((refused_report(), false, None))));
+        assert!(app.play_updates.spawned.is_empty());
+        let later = Instant::now() + patch_watch::RECHECK * 10;
+        assert!(!app.patch_watch.due(&folder, later), "no more W20s with no download");
+        closed_flag(&mut app, Some(false));
+        closed_flag(&mut app, Some(true));
+        assert!(app.patch_watch.due(&folder, Instant::now()), "until the next flip");
+        let history = std::fs::read_to_string(app.config.history_path()).unwrap();
+        assert!(history.contains("maintenance update: not started") && !history.contains("maintenance update: started"), "{history}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Review finding: one W20 at a time on a session. Two sessions of one folder give one
+    /// check; a Play on the session with a check out (a wait maintenance's end releases, or a
+    /// click) waits for its answer, then starts once.
+    #[test]
+    fn a_play_waits_for_the_check_out_on_its_session() {
+        i18n::set(i18n::Lang::En);
+        let (mut app, root) = play_update_app("watch-overlap", Some("30261006_0"));
+        let keys: Vec<String> = app.accounts.iter().map(|row| row.key.clone()).collect();
+        status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(7 * 60)));
+        closed_flag(&mut app, Some(false));
+        idle_signed_in(&mut app, 0, 71);
+        idle_signed_in(&mut app, 1, 72);
+        app.start_launch(vec![keys[0].clone()], false, Instant::now(), None);
+        assert!(app.is_waiting(&keys[0]));
+        closed_flag(&mut app, Some(true));
+        let _ = app.update(Message::Tick);
+        assert_eq!(app.patch_watch.checks.len(), 1, "one check per folder");
+        let (folder, key) = app.patch_watch.checks[0].clone();
+        assert!(app.patch_watch.in_flight(&key));
+        let plays = |app: &App| app.launches.as_ref().unwrap().iter().filter(|(keys, social, ..)| !social && keys.contains(&key)).count();
+        // The worlds open while it is out: the wait is not released on that session yet.
+        let _ = app.update(Message::PlayFlagLoaded(play_flag::Reading { at: chrono::Utc::now(), result: Ok(play_flag::Flag::Up), patch: Some(true) }));
+        assert!(!app.patch_watch.active() && app.patch_watch.in_flight(&key));
+        let _ = app.update(Message::Tick);
+        assert_eq!(plays(&app), 0);
+        assert!(key == keys[0] && app.is_waiting(&key));
+        // A click there waits too.
+        let _ = app.update(Message::CancelWait(vec![keys[0].clone()]));
+        app.start_launch(vec![key.clone()], false, Instant::now(), None);
+        let _ = app.update(Message::Tick);
+        assert_eq!(plays(&app), 0, "no second W20 on the session");
+        assert!(app.accounts.iter().any(|row| row.key == key && row.queued_play.is_some()));
+        // The answer: then it starts, once.
+        let current = patch::PatchReport { state: patch::PatchState::Current, local_version: "30261006_0".into(),
+            remote_version: "30261006_0".into(), detail: String::new(), files_verified: None };
+        app.worker_event(WorkerEvent::PatchCheck(folder, key.clone(), Ok((current, true, None))));
+        let _ = app.update(Message::Tick);
+        assert_eq!(plays(&app), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A Friends request past its time limit is reported as stalled, but a later read that finds
+    /// it done (the loader's mail deadlines are longer) counts it: a send relists Sent.
+    #[test]
+    fn a_friends_result_after_its_time_limit_still_counts() {
+        let mut app = app();
+        app.friends.pending = Some(("req-1".into(), Instant::now() - FRIENDS_REQUEST_LIMIT - Duration::from_secs(1)));
+        app.friends.mail.listed[2] = Some(Vec::new());
+        app.expire_friends_request();
+        assert!(app.friends.pending.is_none() && app.friends.mail.stalled && !app.friends.error.is_empty());
+        assert_eq!(app.friends_expired.as_deref(), Some("req-1"));
+        let mut snapshot = friends::Snapshot::default();
+        snapshot.social.id = Some("req-1".into());
+        snapshot.social.action = Some(crate::social::Action::Send);
+        app.friends_read(true, Some(snapshot));
+        assert!(app.friends_expired.is_none() && !app.friends.mail.stalled && app.friends.error.is_empty());
+        assert!(app.friends.mail.listed[2].is_none(), "Sent is listed again");
+    }
+
+    /// An expired send's draft no longer shows as sending (Send stays usable) once another
+    /// request replaces the expired one, which can then no longer be matched.
+    #[test]
+    fn a_new_friends_request_drops_an_expired_sends_draft() {
+        let mut app = app();
+        app.friends.pending = Some(("req-1".into(), Instant::now() - FRIENDS_REQUEST_LIMIT - Duration::from_secs(1)));
+        app.friends.outgoing = Some(friends::Outgoing { uid: 7, subject: String::new(), message: "hi".into(), sent: false });
+        app.expire_friends_request();
+        assert!(app.friends.outgoing.is_some(), "kept while the late result may still match");
+        app.friends_request_started("req-2".into(), None);
+        assert!(app.friends_expired.is_none() && app.friends.outgoing.is_none());
+        assert_eq!(app.friends.pending.as_ref().map(|(id, _)| id.as_str()), Some("req-2"));
+        // A draft already sent is not touched.
+        app.friends_expired = Some("req-2".into());
+        app.friends.outgoing = Some(friends::Outgoing { uid: 7, subject: String::new(), message: "hi".into(), sent: true });
+        app.friends_request_started("req-3".into(), None);
+        assert!(app.friends.outgoing.as_ref().is_some_and(|o| o.sent));
+    }
+
+    /// Remove confirmed while a sync request is in flight: nothing goes out, the bar stays
+    /// open with its reason, and conversation sync waits (so the reason is not cleared).
+    #[test]
+    fn remove_confirmed_during_a_sync_request_waits_with_the_bar_open() {
+        let mut app = app();
+        app.preview = false;
+        app.friends.pending = Some(("sync-1".into(), Instant::now()));
+        let friend = friends::Friend { name: "Ayame".into(), alternate: false, slot: 1, uid: Some(9), online: None, location: None, character: None };
+        let _ = app.update(Message::FriendsRemove(friend));
+        let _ = app.update(Message::FriendsRemoveConfirm);
+        assert!(app.friends.remove.is_some());
+        assert_eq!(app.friends.pending.as_ref().map(|(id, _)| id.as_str()), Some("sync-1"));
+        assert_eq!(app.friends.error, t("Wait for the current PlayOnline request to finish."));
+        app.friends.pending = None;
+        assert!(app.friends.next_sync().is_none(), "sync waits for the open Remove");
+        let _ = app.drive_sync();
+        assert_eq!(app.friends.error, t("Wait for the current PlayOnline request to finish."));
+    }
+
+    /// A row's note follows the language and is removed by what it is: a language switch while
+    /// it signs back in after its game no longer leaves the old language's note behind.
+    #[test]
+    fn a_row_note_follows_the_language_and_goes_after_a_switch() {
+        let mut app = app();
+        app.accounts[0].status = t("Ready to launch").into();
+        app.accounts[0].set_note(Some(RowNote::ResignAfterGame));
+        let _ = app.update(Message::SetLanguage(i18n::Lang::Ja));
+        let shown = app.accounts[0].status_text().into_owned();
+        assert_eq!(shown, format!("{} · {}", t("Ready to launch"), t("Signing back in after the game closed.")));
+        app.accounts[0].drop_resign();
+        assert_eq!(app.accounts[0].status_text(), t("Ready to launch"));
+        // A status that replaces the one the note was added to ends the note too.
+        app.accounts[0].set_note(Some(RowNote::NetworkGone));
+        app.accounts[0].status = t("Client closed").into();
+        assert_eq!(app.accounts[0].status_text(), t("Client closed"));
+        i18n::set(i18n::Lang::En);
+    }
+
+    /// A Play with nothing launchable before the first status read holds nothing and leaves no
+    /// "checking" line behind that nothing would clear.
+    #[test]
+    fn an_empty_play_before_the_first_status_read_is_not_held() {
+        let mut app = app();
+        app.preview = false;
+        app.status_read_done = false;
+        app.status = "Ready.".into();
+        app.start_launch(Vec::new(), false, Instant::now(), None);
+        assert!(app.held_plays.is_empty());
+        assert_eq!(app.status, "Ready.");
+    }
+
+    /// The W20 skip after an in-session update is one-shot: a start that waits (here for a
+    /// maintenance that began meanwhile) runs its own W20 when it is released later.
+    #[test]
+    fn a_play_update_skip_does_not_outlive_a_start_that_waits() {
+        let (mut app, root) = play_update_app("skip-wait", Some("30260904_1"));
+        let clicked = Instant::now();
+        let key = signed_in(&mut app, 0, 101, clicked);
+        refused(&mut app, &key);
+        let job = generation(&app);
+        status_read(&mut app, services::Availability::Maintenance, None);
+        app.worker_event(WorkerEvent::PlayUpdate(job, play_update::Event::Finished(Ok(play_update::Done { summary: "Updated.".into(), report: None }))));
+        assert!(app.is_waiting(&key), "the release waits for FFXI");
+        assert!(app.w20_skipped.is_empty(), "no skip survives the wait");
+        status_read(&mut app, services::Availability::Operational, None);
+        app.play_flag.note(play_flag::Reading { at: chrono::Utc::now(), result: Ok(play_flag::Flag::Up), patch: None });
+        app.release_waiting_plays(true);
+        assert_eq!(app.launches.as_ref().unwrap().last().map(|launch| launch.0.clone()), Some(vec![key.clone()]));
+        assert!(app.w20_skipped.is_empty(), "the released Play runs its own W20");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Proposal 09 phase 2: the W20 of a signed-in Play says "update". The account stays signed
+    /// in while its folder updates, using that W20's verdict (no second version request), another
+    /// account of the folder that the W20 refused joins the same job, and both start through the
+    /// signed-in path with no version check once it is installed.
+    #[test]
+    fn a_refused_play_updates_in_its_session_then_starts_without_a_second_check() {
+        let (mut app, root) = play_update_app("session", Some("30260904_1"));
+        let game = root.join("FINAL FANTASY XI");
+        let clicked = Instant::now() - Duration::from_secs(3);
+        let first = signed_in(&mut app, 0, 101, clicked);
+        let second = signed_in(&mut app, 1, 102, clicked);
+        refused(&mut app, &first);
+        // One job, for the account's own folder, on the W20's official version.
+        assert_eq!(app.play_updates.spawned.len(), 1);
+        let (folder, official, closed) = &app.play_updates.spawned[0];
+        assert!(play_update::same_folder(folder, &game) && official == "30261006_0" && closed.is_none());
+        assert_eq!(app.main_action(), MainAction::Play, "no Update button: Play is the update");
+        assert!(app.refused_plays.is_empty(), "nothing waits for a Downloads update");
+        let row = &app.accounts[0];
+        assert!(row.busy && !row.problem && row.pid == Some(101), "still signed in: {}", row.status);
+        let line = crate::play_update::line(&app, &first).unwrap();
+        assert!(line.headline.starts_with(t("Updating FINAL FANTASY XI")), "{}", line.headline);
+        assert_eq!(line.cancel, Some(generation(&app)));
+        // The second account's W20 asked for the same update: it waits for this one.
+        refused(&mut app, &second);
+        assert_eq!(app.play_updates.spawned.len(), 1, "one job per folder");
+        assert_eq!(app.play_updates.jobs[0].waiters.iter().map(|w| w.key.as_str()).collect::<Vec<_>>(), [first.as_str(), second.as_str()]);
+        // A third account's Play now waits at its main menu, before its own version check.
+        let third = app.accounts[2].key.clone();
+        {
+            let row = &mut app.accounts[2];
+            (row.pid, row.alive, row.game_running) = (Some(103), Some(Arc::new(AtomicBool::new(true))), Some(Arc::new(AtomicBool::new(false))));
+        }
+        app.launches = None;
+        let pressed = Instant::now();
+        app.start_launch_now(vec![third.clone()], false, pressed, None, false);
+        app.launches = Some(Vec::new());
+        assert_eq!(app.accounts[2].queued_play, Some(pressed));
+        assert!(matches!(app.play_update_of(&third), Some((_, false))));
+        assert!(crate::play_update::line(&app, &third).unwrap().headline.starts_with("Waiting for the update"));
+        app.start_queued_plays();
+        assert!(app.launches.as_ref().unwrap().is_empty() && app.accounts[2].queued_play.is_some(), "held while the folder updates");
+        // Downloaded; a game on another account still runs from the folder: it waits for it.
+        let job = generation(&app);
+        app.worker_event(WorkerEvent::PlayUpdate(job, play_update::Event::Waiting(Some("Alice".into()))));
+        let line = crate::play_update::line(&app, &first).unwrap();
+        assert!(line.headline.contains("Alice") && line.label == t("Update ready"), "{}", line.headline);
+        app.worker_event(WorkerEvent::PlayUpdate(job, play_update::Event::Installing));
+        // Installed: both start, signed in, without another W20.
+        app.worker_event(WorkerEvent::PlayUpdate(job, play_update::Event::Finished(Ok(play_update::Done {
+            summary: "3 files updated. Applied version 30261006_0.".into(), report: None }))));
+        assert!(app.play_updates.jobs.is_empty());
+        let reissued = Some(launch_timing::LaunchTrigger::ReissuedPlay);
+        assert_eq!(app.launches.as_ref().unwrap().as_slice(), &[(vec![first.clone()], false, clicked, reissued), (vec![second.clone()], false, clicked, reissued)]);
+        assert_eq!(app.w20_skipped, [first.clone(), second.clone()], "both start without a second W20");
+        assert!(app.accounts.iter().take(2).all(|row| row.pid.is_some()), "nobody signed out");
+        // The account that waited before its W20 is released now, with its own check.
+        app.start_queued_plays();
+        assert_eq!(app.launches.as_ref().unwrap().last().unwrap().0, vec![third.clone()]);
+        assert!(!app.w20_skipped.contains(&third));
+        // The signed-in start with the skip (its thread finds no live session here).
+        app.launches = None;
+        app.accounts[0].busy = false;
+        app.settings.loader_path = root.join("no-loader.exe").to_string_lossy().into_owned();
+        app.start_launch_now(vec![first.clone()], false, clicked, reissued, true);
+        // Wait for that start thread to finish (it writes into `root`) before removing it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match app.receiver.recv_timeout(left) {
+                Ok(WorkerEvent::Launch(key, _, event)) if key == first && matches!(*event, WorkerEvent::StartGame(..)) => break,
+                Ok(_) => {}
+                Err(error) => panic!("the signed-in start did not finish: {error}"),
+            }
         }
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// An account with its own game folder: its W20's Update updates that folder, and a
-    /// Settings-folder read does not drop the verdict that asked for it.
+    /// Cancel and a network drop pause the update: the rows say Play continues it (its verified
+    /// downloads stay in the folder's cache), nothing starts, and a Play that waited stops waiting.
     #[test]
-    fn an_accounts_own_game_folder_is_the_one_its_refused_play_updates() {
-        let mut app = app();
-        app.preview = false;
-        app.launches = Some(Vec::new());
-        app.settings.install_path = r"C:\Games\SquareEnix\FINAL FANTASY XI".into();
-        app.settings.install_selected = true;
-        let key = app.accounts[0].key.clone();
-        let own = PathBuf::from(r"D:\Second\FINAL FANTASY XI");
-        app.settings.account_installs.insert(account_key(&app.accounts[0].account), own.to_string_lossy().into_owned());
-        app.accounts[0].busy = true;
-        let message = patch::gate(patch::LaunchCheck::Update(refused_report())).unwrap_err();
-        app.worker_event(WorkerEvent::StartGame(key.clone(), Some(refused_report()), Err(message)));
-        assert_eq!(app.main_action(), MainAction::Update);
-        assert_eq!(app.update_account_folder(MaintenanceKind::Update), Some(own.clone()));
-        assert_eq!(app.update_account_folder(MaintenanceKind::Repair), None, "Repair is the Settings folder's");
-        // A read of the Settings folder's record keeps the other folder's verdict.
-        app.patch_generation += 1;
-        let local = patch::PatchReport { state: patch::PatchState::Unknown, local_version: "30261006_0".into(),
-            remote_version: t("Not checked").into(), detail: String::new(), files_verified: None, source_url: None };
-        let _ = app.update(Message::PatchLoaded(app.patch_generation, local));
-        assert_eq!(app.patch.as_ref().unwrap().state, patch::PatchState::Required);
-        assert_eq!(app.update_account_folder(MaintenanceKind::Update), Some(own.clone()));
-        // A Settings-folder account's verdict, or another Settings folder, targets Settings again.
-        app.settings.account_installs.clear();
-        app.accounts[0].busy = true;
-        let message = patch::gate(patch::LaunchCheck::Update(refused_report())).unwrap_err();
-        app.worker_event(WorkerEvent::StartGame(key, Some(refused_report()), Err(message)));
-        assert_eq!(app.update_account_folder(MaintenanceKind::Update), None);
+    fn a_cancelled_or_failed_play_update_is_paused_and_play_continues_it() {
+        for cancel in [true, false] {
+            let (mut app, root) = play_update_app("pause", None);
+            let clicked = Instant::now();
+            let key = signed_in(&mut app, 0, 101, clicked);
+            refused(&mut app, &key);
+            assert_eq!(app.play_updates.spawned.len(), 1, "a fresh install updates in its session too");
+            let job = generation(&app);
+            if cancel {
+                let _ = app.update(Message::CancelPlayUpdate(job));
+                assert!(app.play_updates.jobs[0].op.cancelled());
+                assert_eq!(crate::play_update::line(&app, &key).unwrap().cancel, None);
+            }
+            let error = if cancel { t("Cancelled. Verified downloads are kept for resuming.").to_owned() } else { "Patch server timed out".to_owned() };
+            app.worker_event(WorkerEvent::PlayUpdate(job, play_update::Event::Finished(Err(error))));
+            let row = &app.accounts[0];
+            assert!(!row.busy && row.status == t("Update paused. Press Play to continue.") && row.problem != cancel);
+            assert!(row.pid.is_some() && row.can_play(), "still signed in; Play continues it");
+            assert!(app.launches.as_ref().unwrap().is_empty() && app.play_updates.jobs.is_empty());
+            assert!(cancel || app.status.contains("Patch server timed out"), "{}", app.status);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
-    /// A sign-in refused because PlayOnline is out of date updates the PlayOnline status,
-    /// so the main button becomes Update, and that Update covers PlayOnline only.
+    /// A signed-in host that holds a game file (its install could not proceed) was signed out:
+    /// that one account signs in again after the install (one new sign-in, still one click). An
+    /// account with a one-time code asks for a new one instead.
     #[test]
-    fn an_outdated_playonline_sign_in_turns_play_into_a_playonline_update() {
-        let mut app = app();
-        app.preview = false;
-        app.launches = Some(Vec::new());
+    fn an_account_whose_host_held_a_file_signs_in_again_after_the_install() {
+        for otp in [false, true] {
+            let (mut app, root) = play_update_app("fallback", Some("30260904_1"));
+            let clicked = Instant::now();
+            let key = signed_in(&mut app, 0, 101, clicked);
+            if otp { app.settings.account_otp.insert(key.clone()); }
+            refused(&mut app, &key);
+            let job = generation(&app);
+            app.worker_event(WorkerEvent::PlayUpdate(job, play_update::Event::SignedOut(key.clone())));
+            assert!(app.play_updates.jobs[0].waiters[0].fallback);
+            // Its host ended with the sign-out.
+            app.accounts[0].alive.as_ref().unwrap().store(false, Ordering::Release);
+            let _ = app.update(Message::Tick);
+            assert!(app.accounts[0].pid.is_none() && crate::play_update::line(&app, &key).is_some(), "the row still shows the update");
+            app.worker_event(WorkerEvent::PlayUpdate(job, play_update::Event::Finished(Ok(play_update::Done { summary: "Updated.".into(), report: None }))));
+            assert!(!app.w20_skipped.contains(&key), "a new sign-in checks its version");
+            if otp {
+                assert!(app.launches.as_ref().unwrap().is_empty());
+                assert!(app.accounts[0].problem && app.accounts[0].status == t("FINAL FANTASY XI is updated. Enter a new one-time code, then press Play."), "{}", app.accounts[0].status);
+            } else {
+                assert_eq!(app.launches.as_ref().unwrap().as_slice(), &[(vec![key.clone()], false, clicked, Some(launch_timing::LaunchTrigger::ReissuedPlay))]);
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// A batch reports one account's update refusal to every account. One whose own folder is
+    /// another, already at that version, starts on its own; one without a session, or a report
+    /// without a usable official version, keeps the refusal (nothing to update in-session).
+    #[test]
+    fn only_folders_the_refusal_applies_to_update_and_a_current_batch_account_starts() {
+        let (mut app, root) = play_update_app("batch", Some("30260904_1"));
+        let current = root.join("current");
+        std::fs::create_dir_all(&current).unwrap();
+        for name in ["FFXi.dll", "FFXiMain.dll"] { std::fs::write(current.join(name), b"fixture").unwrap(); }
+        std::fs::write(current.join("patch.ver"), patch::encode_applied_record("30261006_0", 1).unwrap()).unwrap();
+        app.settings.account_installs.insert(account_key(&app.accounts[1].account), current.to_string_lossy().into_owned());
+        let clicked = Instant::now();
+        let (first, second) = (signed_in(&mut app, 0, 101, clicked), signed_in(&mut app, 1, 102, clicked));
+        let message = patch::gate(patch::LaunchCheck::Update(refused_report())).unwrap_err();
+        for key in [&first, &second] {
+            app.accounts.iter_mut().find(|row| row.key == **key).unwrap().batch_requested = true;
+            app.worker_event(WorkerEvent::Complete((*key).clone(), Err(message.clone())));
+        }
+        assert_eq!(app.play_updates.spawned.len(), 1);
+        assert!(app.play_updates.jobs[0].has(&first) && !app.play_updates.jobs[0].has(&second));
+        assert_eq!(app.launches.as_ref().unwrap().as_slice(), &[(vec![second.clone()], false, clicked, Some(launch_timing::LaunchTrigger::ReissuedPlay))]);
+        // No official version in the report (an unreadable record sends no W20): no job.
+        let (mut app, other) = play_update_app("no-version", Some("30260904_1"));
+        let key = signed_in(&mut app, 0, 101, clicked);
+        let mut report = refused_report();
+        report.remote_version = t("Unavailable").into();
+        app.worker_event(WorkerEvent::StartGame(key.clone(), Some(report), Err("Update required".into())));
+        assert!(app.play_updates.spawned.is_empty() && app.accounts[0].problem && !app.accounts[0].busy);
+        std::fs::remove_dir_all(other).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// PlayOnline's own update is driven by the Play it refused: it starts by itself (PlayOnline
+    /// only, `run_combined(Some(viewer), None, ..)`), and its success starts that Play again. A Connect (no Play) only
+    /// shows the verdict; a game running elsewhere says why it can't run now.
+    #[test]
+    fn an_outdated_playonline_sign_in_updates_playonline_from_that_play_then_plays() {
+        let (mut app, root) = play_update_app("viewer", None);
         app.patch = None;
         let key = app.accounts[0].key.clone();
+        let outdated = viewer::ConnectVerdict::Outdated { local: "20110829_E".into(), remote: "20261001_0".into() }.message();
+        // A sign-in only (Connect) refused by an outdated PlayOnline is no Play to start again.
         app.accounts[0].busy = true;
-        let message = viewer::ConnectVerdict::Outdated { local: "20110829_E".into(), remote: "20261001_0".into() }.message();
-        app.worker_event(WorkerEvent::Complete(key, Err(message)));
+        app.accounts[0].launch_trigger = Some(launch_timing::LaunchTrigger::Connect);
+        app.worker_event(WorkerEvent::Complete(key.clone(), Err(outdated.clone())));
+        assert!(app.refused_plays.is_empty() && app.maintenance.is_none());
         let shown = app.viewer.as_ref().unwrap();
         assert!(shown.requires_update());
         assert_eq!((shown.version.local_version.as_str(), shown.version.remote_version.as_str()), ("20110829_E", "20261001_0"));
-        assert_eq!(app.main_action(), MainAction::Update);
-        assert_eq!(app.update_scope(), (true, false));
-        // The game's own W20 verdict adds FFXI; without PlayOnline's it is FFXI alone.
-        app.patch = patch::parse_update_required(&patch::gate(patch::LaunchCheck::Update(patch::PatchReport {
-            state: patch::PatchState::Required, local_version: "30260904_1".into(), remote_version: "30261006_0".into(),
-            detail: String::new(), files_verified: None, source_url: None })).unwrap_err());
-        assert_eq!(app.update_scope(), (true, true));
-        app.viewer = None;
-        assert_eq!(app.update_scope(), (false, true));
-        app.update_scope = app.update_scope();
-        app.maintenance = Some(MaintenanceKind::Update);
-        assert_eq!(app.maintenance_label(), t("Updating FINAL FANTASY XI"));
+        assert_eq!(app.main_action(), MainAction::Play);
+        // Another account in game: PlayOnline can't update now, and the row says so.
+        app.accounts[1].pid = Some(55);
+        app.accounts[1].game_running = Some(Arc::new(AtomicBool::new(true)));
+        let clicked = Instant::now();
+        app.accounts[0].busy = true;
+        app.accounts[0].launch_trigger = Some(launch_timing::LaunchTrigger::Play);
+        app.accounts[0].queued_play = Some(clicked);
+        app.worker_event(WorkerEvent::Complete(key.clone(), Err(outdated.clone())));
+        assert!(app.maintenance.is_none() && app.accounts[0].status.contains("Close FINAL FANTASY XI"), "{}", app.accounts[0].status);
+        // Nothing else signed in: the same refusal updates PlayOnline by itself, PlayOnline only.
+        (app.accounts[1].pid, app.accounts[1].game_running) = (None, None);
+        app.accounts[0].busy = true;
+        app.accounts[0].queued_play = Some(clicked);
+        app.worker_event(WorkerEvent::Complete(key.clone(), Err(outdated)));
+        assert!(app.maintenance == Some(MaintenanceKind::Update), "{}", app.status);
+        assert_eq!(app.update_scope, (true, false));
+        assert_eq!(app.maintenance_label(), t("Updating PlayOnline"));
+        assert_eq!(app.play_updates.tasks.len(), 1, "the Tick returns its task");
+        let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Ok("Updated".into()), None));
+        assert!(app.launches.as_ref().unwrap().iter().any(|(keys, social, at, trigger)|
+            keys == std::slice::from_ref(&key) && !social && *at == clicked && *trigger == Some(launch_timing::LaunchTrigger::ReissuedPlay)));
+        std::fs::remove_dir_all(root).unwrap();
     }
+
 
     #[test]
     fn reshade_toggle_preserves_a_running_sessions_renderer() {
@@ -6026,49 +7014,6 @@ mod tests {
         assert!(!app.ah_lookup.open && !app.controller_modal());
     }
 
-    /// Privacy mode on: no synthetic name, ID, character, subject or message
-    /// is readable anywhere the screens put text, and the names are there as
-    /// fixed-width placeholders, on every page that shows them.
-    #[test]
-    fn privacy_mode_blurs_every_identity_on_every_page() {
-        i18n::set(i18n::Lang::En);
-        let secrets = [
-            "Main account", "Second account", "Crafting account", "ABC12340", "ABC12341",
-            "Alyria", "Balthier", "Celestine", "Haruko", "Nocturne", "Mallory", "Rook", "Lyrielle", "Ardent",
-            "Sortie tonight", "Rhapsodies", "Red Mage", "Linkshell event", "Bazaar price", "Saturday",
-        ];
-        let size = iced::Size::new(1440.0, 900.0);
-        let render = |page: Page, pane: Option<friends::Pane>, mailbox: bool, in_game: bool| {
-            let mut app = app();
-            app.load_friends_preview(mailbox, in_game, true, false);
-            app.page = page;
-            if let Some(pane) = pane { app.friends.select(Some(pane)); }
-            app.settings.privacy = true;
-            app.status = "Main account: Alyria sent a message".into();
-            privacy::set(true);
-            let texts = privacy::testing::texts(ui::view(&app), size);
-            privacy::set(false);
-            texts
-        };
-        let pages = [
-            (render(Page::Home, None, false, false), &["Main account"][..]),
-            (render(Page::Accounts, None, false, false), &["Main account", "Second account", "Crafting account"][..]),
-            (render(Page::Friends, None, false, false), &["Alyria", "Balthier", "Lyrielle"][..]),
-            (render(Page::Friends, None, false, true), &["Alyria", "Haruko"][..]),
-            (render(Page::Friends, Some(friends::Pane::Mailbox), true, false), &["Rook", "Sortie tonight?"][..]),
-            (render(Page::Friends, Some(friends::Pane::Blocked), false, false), &["Mallory"][..]),
-        ];
-        for (texts, blurred) in &pages {
-            assert!(texts.len() > 10, "the page rendered: {texts:?}");
-            privacy::testing::assert_blurred(texts, &secrets, blurred);
-        }
-        // The same pages read normally with privacy off.
-        let mut app = app();
-        app.load_friends_preview(false, false, false, false);
-        let texts = privacy::testing::texts(ui::view(&app), size);
-        assert!(texts.iter().any(|t| t == "Alyria") && texts.iter().any(|t| t.contains("Rhapsodies")), "{texts:?}");
-    }
-
     #[test]
     fn controller_changes_target_running_retail_games_without_selection_or_passwords() {
         let mut app = app();
@@ -6092,95 +7037,6 @@ mod tests {
         assert_eq!(app.accounts[0].account.se_password, "kept locally too");
         app.accounts[0].alive.as_ref().unwrap().store(false, Ordering::Release);
         assert!(app.controller_settings_targets().is_empty(), "a client already closed receives no changes");
-    }
-
-    #[test]
-    fn update_activity_shows_remaining_time_and_clears_it_when_cancelled() {
-        privacy::set(false);
-        for (language, remaining, estimate, estimating) in [
-            (i18n::Lang::En, "65% remaining in this step", "About 2 min remaining", "Estimating time remaining…"),
-            (i18n::Lang::Ja, "このステップの残り：65%", "残り約2分", "残り時間を計算しています…"),
-        ] {
-            i18n::set(language);
-            let mut app = app();
-            app.page = Page::Maintenance;
-            app.maintenance = Some(MaintenanceKind::Update);
-            app.maintenance_progress = operation::Progress {
-                stage: "Download".into(), done: 42_000_000, total: 120_000_000,
-                bytes: true, remaining: Some(Duration::from_secs(115)),
-                ..operation::Progress::default()
-            };
-            for size in [iced::Size::new(1100.0, 720.0), iced::Size::new(1440.0, 900.0)] {
-                let texts = privacy::testing::texts(ui::view(&app), size);
-                assert!(texts.iter().any(|text| text.contains(remaining) && text.contains(estimate)), "{texts:?}");
-                assert!(texts.iter().any(|text| text.contains("42 MB")), "byte progress must retain its units: {texts:?}");
-            }
-            app.maintenance_progress.remaining = None;
-            let size = iced::Size::new(1100.0, 720.0);
-            let texts = privacy::testing::texts(ui::view(&app), size);
-            assert!(texts.iter().any(|text| text.contains(estimating)), "{texts:?}");
-            app.maintenance_cancelled = true;
-            let texts = privacy::testing::texts(ui::view(&app), size);
-            assert!(texts.iter().any(|text| text.contains(remaining)));
-            assert!(!texts.iter().any(|text| text.contains(estimating) || text.contains(estimate)));
-            app.maintenance_cancelled = false;
-            app.maintenance = Some(MaintenanceKind::Setup);
-            app.maintenance_progress = operation::Progress::default();
-            let texts = privacy::testing::texts(ui::view(&app), size);
-            assert!(!texts.iter().any(|text| text.contains(estimating)));
-        }
-        i18n::set(i18n::Lang::En);
-    }
-
-    #[test]
-    fn update_activity_uses_the_whole_update_estimate_above_current_step() {
-        privacy::set(false);
-        for (language, title, percent, estimate, calculating, estimating, finalizing) in [
-            (i18n::Lang::En, "Overall update", "72% remaining overall", "About 5 min remaining for the whole update",
-             "Calculating total update size…", "Estimating total time remaining…", "Finalizing update…"),
-            (i18n::Lang::Ja, "アップデート全体", "全体の残り：72%", "アップデート全体の残り時間：約5分",
-             "アップデート全体のサイズを計算しています…", "アップデート全体の残り時間を計算しています…", "アップデートの最終処理を行っています…"),
-        ] {
-            i18n::set(language);
-            let mut app = app();
-            app.page = Page::Maintenance;
-            app.maintenance = Some(MaintenanceKind::Update);
-            app.maintenance_progress = operation::Progress {
-                stage: "Download".into(), done: 120_000_000, total: 120_000_000, bytes: true,
-                remaining: Some(Duration::ZERO),
-                overall: Some(operation::OverallProgress { fraction: Some(0.28), remaining: Some(Duration::from_secs(265)), complete: false }),
-                ..operation::Progress::default()
-            };
-            for size in [iced::Size::new(900.0, 650.0), iced::Size::new(1440.0, 900.0)] {
-                let texts = privacy::testing::texts(ui::view(&app), size);
-                let title_index = texts.iter().position(|text| text == title).unwrap();
-                let step_label = tf("Current step: {step}", &[("step", &t("Downloading official files"))]);
-                let step_index = texts.iter().position(|text| text == &step_label).unwrap();
-                assert!(title_index < step_index, "overall progress must lead the current step");
-                assert!(texts.iter().any(|text| text == percent), "{texts:?}");
-                assert!(texts.iter().any(|text| text == estimate), "{texts:?}");
-                let step_remaining = tf("{percent}% remaining in this step", &[("percent", &0)]);
-                assert!(!texts.iter().any(|text| text.contains(&step_remaining)));
-            }
-            let size = iced::Size::new(900.0, 650.0);
-            app.maintenance_progress.overall.as_mut().unwrap().remaining = None;
-            let texts = privacy::testing::texts(ui::view(&app), size);
-            assert!(texts.iter().any(|text| text == estimating));
-            app.maintenance_cancelled = true;
-            let texts = privacy::testing::texts(ui::view(&app), size);
-            assert!(!texts.iter().any(|text| text == estimating || text == estimate));
-            app.maintenance_cancelled = false;
-            app.maintenance_progress.overall = Some(operation::OverallProgress::default());
-            let texts = privacy::testing::texts(ui::view(&app), size);
-            assert!(texts.iter().any(|text| text == calculating));
-            app.maintenance_progress.overall = Some(operation::OverallProgress {
-                fraction: Some(0.99), remaining: Some(Duration::ZERO), complete: false,
-            });
-            let texts = privacy::testing::texts(ui::view(&app), size);
-            assert!(texts.iter().any(|text| text == finalizing));
-            assert!(texts.iter().any(|text| text == &tf("{percent}% remaining overall", &[("percent", &1)])));
-        }
-        i18n::set(i18n::Lang::En);
     }
 
     #[test]
@@ -6317,8 +7173,7 @@ mod tests {
         load_settings_and_language(&config).unwrap();
         assert_eq!(i18n::current(), i18n::system_default());
         // A saved choice wins, whatever Windows says.
-        let mut settings = Settings::default();
-        settings.language = Some(i18n::Lang::Ja);
+        let settings = Settings { language: Some(i18n::Lang::Ja), ..Settings::default() };
         save_settings(&config, &settings).unwrap();
         i18n::set(i18n::Lang::En);
         assert!(load_settings_and_language(&config).is_ok());
@@ -6427,6 +7282,26 @@ mod tests {
     }
 
     #[test]
+    fn installation_completion_starts_pending_signin_without_waiting_for_a_ui_tick() {
+        let (mut app, key) = resign_app("startup-install-ready");
+        app.startup_signin_pending = true;
+        app.installation_loading = true;
+        app.installation_generation = 2;
+        let install = app.config.experiment.join("game");
+        std::fs::create_dir_all(&install).unwrap();
+        app.settings.install_selected = true;
+        app.settings.install_path = install.to_string_lossy().into_owned();
+        assert!(app.take_startup_signins().is_empty());
+        let _ = app.update(Message::InstallationFound(2, true, Some(install.clone())));
+        assert!(!app.startup_signin_pending);
+        assert_eq!(app.launches.as_ref().unwrap().len(), 1);
+        assert_eq!(app.launches.as_ref().unwrap()[0].0, vec![key]);
+        let _ = app.update(Message::InstallationFound(2, true, Some(install)));
+        assert_eq!(app.launches.as_ref().unwrap().len(), 1, "one automatic sign-in only");
+        std::fs::remove_dir_all(&app.config.experiment).unwrap();
+    }
+
+    #[test]
     fn automatic_detection_keeps_a_damaged_settings_file_unchanged() {
         let root = std::env::temp_dir().join(format!("crystal-detect-damaged-{}", backend::unique_id().unwrap()));
         let install = root.join("game");
@@ -6439,6 +7314,11 @@ mod tests {
         std::fs::write(&path, damaged).unwrap();
         app.preview = false;
         app.startup_warning = Some("Settings could not be read".into());
+        app.settings_damaged = true;
+        // The vault loads first and shows (takes) the warning: the file stays protected.
+        app.launcher_start_logged = true;
+        let _ = app.update(Message::AccountsLoaded(Ok(Vec::new())));
+        assert!(app.startup_warning.is_none() && app.settings_damaged);
         app.installation_loading = true;
         app.installation_generation = 5;
         assert_eq!(app.update(Message::InstallationFound(5, true, Some(install.clone()))).units(), 1);
@@ -6484,7 +7364,7 @@ mod tests {
     fn an_exit_report_on_a_row_is_worded_when_shown() {
         i18n::set(i18n::Lang::En);
         let mut app = app();
-        let report = launch_log::classify_exit("", Some(3), Some(Duration::from_secs(1)));
+        let report = launch_log::classify_loader_end(&launch_log::LoaderEnd::Closed, Duration::from_secs(1));
         app.accounts[0].set_exit(report.clone());
         assert!(app.accounts[0].problem);
         assert_eq!(app.accounts[0].status, report.summary, "stored in English");
@@ -6561,22 +7441,10 @@ mod tests {
     }
 
     #[test]
-    fn ignored_escape_uses_back_and_closes_friends_panes_before_leaving_the_page() {
-        use iced::keyboard::{self, key};
-        let escape = iced::Event::Keyboard(keyboard::Event::KeyPressed {
-            key: keyboard::Key::Named(key::Named::Escape),
-            modified_key: keyboard::Key::Named(key::Named::Escape),
-            physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
-            location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::default(), text: None, repeat: false,
-        });
-        assert!(!matches!(user_input(escape.clone(), iced::event::Status::Captured, window::Id::unique()), Some(Message::ControllerBack)));
-        let back = user_input(escape, iced::event::Status::Ignored, window::Id::unique()).unwrap();
-        assert!(matches!(back, Message::ControllerBack));
-
+    fn back_closes_the_settings_dialog_and_friends_panes_before_leaving_the_page() {
         let mut app = app();
         app.show_settings = true;
-        let _ = app.update(back);
+        let _ = app.update(Message::ControllerBack);
         assert!(!app.show_settings);
         app.load_friends_preview(false, false, true, false);
         app.friends.remove = Some(app.friends.snapshot.as_ref().unwrap().entries[0].clone());
@@ -6612,12 +7480,11 @@ mod tests {
         let _ = app.update(Message::MainAction);
         assert!(app.show_details);
         assert!(app.accounts.iter().all(|row| !row.busy && row.pid.is_none()));
+        // A published patch installs from the Play that asks for it, not from a main-button Update.
         app.patch.as_mut().unwrap().state = patch::PatchState::Required;
-        assert_eq!(app.main_action(), MainAction::Update, "A published patch can be installed during maintenance");
-        let _ = app.update(Message::MainAction);
-        assert!(app.page == Page::Maintenance);
-        assert!(!app.show_details);
-        assert!(app.maintenance.is_none(), "Preview mode does not execute live updates");
+        assert_eq!(app.main_action(), MainAction::Maintenance);
+        app.services.as_mut().unwrap().availability = services::Availability::Operational;
+        assert_eq!(app.main_action(), MainAction::Play);
         app.maintenance = Some(MaintenanceKind::Update);
         assert_eq!(app.main_action(), MainAction::Working);
         app.maintenance = None;
@@ -6651,9 +7518,7 @@ mod tests {
 
             // Creating the task must schedule the shared updater without polling
             // it here: this test must not download or alter an installation.
-            assert_eq!(app.update(Message::MainAction).units(), 1);
-            assert!(app.page == Page::Maintenance);
-            assert!(!app.show_settings && !app.show_details);
+            assert_eq!(app.start_maintenance(MaintenanceKind::Update).units(), 1);
             assert!(app.maintenance == Some(MaintenanceKind::Update));
             assert!(app.active_operation.is_some());
             assert_eq!(app.main_action(), MainAction::Working);
@@ -6663,6 +7528,7 @@ mod tests {
             app.page = Page::Home;
             assert_eq!(app.update(Message::MainAction).units(), 0);
             assert!(app.page == Page::Maintenance);
+            assert!(!app.show_settings && !app.show_details);
             assert_eq!(app.viewer_generation, generation);
             assert!(app.maintenance == Some(MaintenanceKind::Update));
         }
@@ -6674,20 +7540,19 @@ mod tests {
         app.preview = false;
         app.patch.as_mut().unwrap().state = patch::PatchState::Required;
 
-        assert_eq!(app.update(Message::MainAction).units(), 0);
-        assert!(app.page == Page::Maintenance);
+        assert_eq!(app.start_maintenance(MaintenanceKind::Update).units(), 0);
         assert!(app.maintenance.is_none() && app.active_operation.is_none());
         assert_eq!(app.status, t("Select the target folder explicitly before starting this operation."));
 
         app.settings.install_selected = true;
         app.vault_ready = false;
-        assert_eq!(app.update(Message::MainAction).units(), 0);
+        assert_eq!(app.start_maintenance(MaintenanceKind::Update).units(), 0);
         assert!(app.maintenance.is_none() && app.active_operation.is_none());
         assert_eq!(app.status, t("Wait for saved accounts and running sessions to be checked before changing game files."));
 
         app.vault_ready = true;
         app.accounts[0].pid = Some(42);
-        assert_eq!(app.update(Message::MainAction).units(), 0);
+        assert_eq!(app.start_maintenance(MaintenanceKind::Update).units(), 0);
         assert!(app.maintenance.is_none() && app.active_operation.is_none());
         assert_eq!(app.accounts[0].pid, Some(42));
         assert_eq!(app.status, t("Close all games and sign out PlayOnline sessions before updating, repairing, or running official setup. Existing sessions were kept."));
@@ -6701,7 +7566,7 @@ mod tests {
         local.state = patch::PatchState::Unknown;
         local.remote_version = t("Not checked").into();
         let _ = app.update(Message::PatchLoaded(app.patch_generation, local.clone()));
-        assert_eq!(app.main_action(), MainAction::Update);
+        assert_eq!(app.patch.as_ref().unwrap().state, patch::PatchState::Required);
         local.local_version = "30260904_2".into();
         let _ = app.update(Message::PatchLoaded(app.patch_generation, local));
         assert_eq!(app.patch.as_ref().unwrap().state, patch::PatchState::Unknown);
@@ -6727,6 +7592,57 @@ mod tests {
         let _ = app.update(Message::PatchLoaded(app.patch_generation, local));
         assert_eq!(app.patch.as_ref().unwrap().files_verified, None);
         assert_eq!(app.patch.as_ref().unwrap().state, patch::PatchState::Unknown);
+    }
+
+    /// The Downloads page after Check files: no version check ran, so the latest version is
+    /// the remembered one with its age, until nothing is known ("Press Play to check").
+    #[test]
+    fn check_files_shows_the_remembered_official_version_instead_of_not_checked() {
+        let root = std::env::temp_dir().join(format!("crystal-latest-{}-{}", std::process::id(), official_versions::now()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut app = app();
+        app.preview = false;
+        app.config = Config { experiment: root.clone(), repository: root.join("runtime"), game_install: None, dat_overlays: Vec::new() };
+        app.settings.install_path = r"C:\Games\FFXI".into();
+        let mut local = app.patch.as_ref().unwrap().clone();
+        local.state = patch::PatchState::Unknown;
+        local.local_version = "30260904_1".into();
+        local.remote_version = t("Not checked").into();
+        app.patch = Some(local.clone());
+        // Nothing learned yet: asks for a Play, never "Not checked".
+        assert_eq!(crate::official_versions::latest_game_text(&app), t("Press Play to check"));
+        assert_eq!(crate::official_versions::latest_playonline_text(&app), t("Press Play to check"));
+        // A Play's W20 (any process) wrote the answer: the next outcome reaching the window reads it.
+        let path = official_versions::path_for(&app.config);
+        let now = official_versions::now();
+        official_versions::learn_game_at(&path, Path::new(r"C:\Games\FFXI"), "30260905_0", now - 3 * 3600);
+        official_versions::learn_playonline_at(&path, "20110829_E", now - 90);
+        let _ = app.update(Message::PatchLoaded(app.patch_generation, local));
+        assert_eq!(crate::official_versions::latest_game_text(&app), "30260905_0 (checked 3 h ago)");
+        assert_eq!(crate::official_versions::latest_playonline_text(&app), "20110829_E (checked 1 min ago)");
+        // Installed 30260904_1 is older than the remembered 30260905_0.
+        assert_eq!(official_versions::compare("30260904_1", app.learned_game()), Some(std::cmp::Ordering::Less));
+        // An Update installs it: the updater's own answer is remembered and installed matches it.
+        let mut updated = app.patch.as_ref().unwrap().clone();
+        updated.state = patch::PatchState::Current;
+        updated.local_version = "30260906_0".into();
+        updated.remote_version = "30260906_0".into();
+        app.maintenance = Some(MaintenanceKind::Update);
+        let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Ok("Updated".into()), Some(updated)));
+        assert_eq!(app.learned_game().map(|l| l.version.as_str()), Some("30260906_0"));
+        assert_eq!(official_versions::compare("30260906_0", app.learned_game()), Some(std::cmp::Ordering::Equal));
+        // A Check afterwards (offline: placeholder remote) leaves the memory alone.
+        let mut checked = app.patch.as_ref().unwrap().clone();
+        checked.state = patch::PatchState::Unknown;
+        checked.remote_version = t("Not checked").into();
+        app.maintenance = Some(MaintenanceKind::Check);
+        let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Check, Ok("Checked".into()), Some(checked)));
+        assert_eq!(app.learned_game().map(|l| l.version.as_str()), Some("30260906_0"));
+        assert!(crate::official_versions::latest_game_text(&app).starts_with("30260906_0 (checked "), "{}", crate::official_versions::latest_game_text(&app));
+        // Another game folder has its own answer.
+        app.patch_folder = Some(PathBuf::from(r"D:\Other"));
+        assert_eq!(crate::official_versions::latest_game_text(&app), t("Press Play to check"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6768,7 +7684,7 @@ mod tests {
         invalid.files_verified = None;
         invalid.detail = "Interrupted update".into();
         let _ = app.update(Message::PatchLoaded(app.patch_generation, invalid));
-        assert_eq!(app.main_action(), MainAction::Update);
+        assert_eq!(app.patch.as_ref().unwrap().state, patch::PatchState::Required);
         assert_eq!(app.patch.as_ref().unwrap().files_verified, None);
     }
 
@@ -6777,17 +7693,17 @@ mod tests {
         let mut app = app();
         let fresh = patch::PatchReport { state: patch::PatchState::Required,
             local_version: t("Not initialized").into(), remote_version: "30260904_1".into(),
-            detail: "Initial update required".into(), source_url: None, files_verified: None };
+            detail: "Initial update required".into(), files_verified: None };
         app.maintenance = Some(MaintenanceKind::Update);
         let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update,
             Ok("0 known files updated; files preserved".into()), Some(fresh.clone())));
-        assert_eq!(app.main_action(), MainAction::Update);
+        assert_eq!(app.patch.as_ref().unwrap().state, patch::PatchState::Required);
         assert_eq!(app.maintenance_tone, ResultTone::Unverified);
         let mut local = fresh;
         local.remote_version = t("Not checked").into();
         let _ = app.update(Message::PatchLoaded(app.patch_generation, local));
         assert_eq!(app.patch.as_ref().unwrap().remote_version, "30260904_1");
-        assert_eq!(app.main_action(), MainAction::Update);
+        assert_eq!(app.patch.as_ref().unwrap().state, patch::PatchState::Required);
     }
 
     /// Every world down: a Play waits for them ("Wait and play"), and nothing signs in meanwhile.
@@ -6800,7 +7716,7 @@ mod tests {
         snapshot.checked_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
         let keys = app.launch_keys(true);
         assert!(!keys.is_empty());
-        app.start_mode_at(keys.clone(), false, Instant::now());
+        app.start_launch(keys.clone(), false, Instant::now(), None);
         assert!(keys.iter().all(|key| app.is_waiting(key)));
         assert!(app.accounts.iter().all(|row| !row.busy && row.pid.is_none() && row.queued_play.is_none()));
         assert_eq!(app.status, "FFXI's worlds are down. Starting as soon as they're back…");
@@ -6835,30 +7751,6 @@ mod tests {
     }
 
     #[test]
-    fn main_button_has_update_and_maintenance_labels_in_both_languages() {
-        for lang in i18n::Lang::ALL {
-            i18n::set(lang);
-            let mut app = app();
-            for size in [iced::Size::new(900.0, 650.0), iced::Size::new(1440.0, 900.0)] {
-                app.viewport = size;
-                app.patch.as_mut().unwrap().state = patch::PatchState::Required;
-                let texts = privacy::testing::texts(ui::view(&app), size);
-                assert!(texts.iter().any(|line| line == t("Update")), "{texts:?}");
-                assert!(texts.iter().any(|line| line == t("Click Update to install official updates")), "{texts:?}");
-                app.patch.as_mut().unwrap().state = patch::PatchState::Current;
-                app.services.as_mut().unwrap().availability = services::Availability::Maintenance;
-                let texts = privacy::testing::texts(ui::view(&app), size);
-                assert!(texts.iter().any(|line| line == t("Maintenance")), "{texts:?}");
-                let _ = app.update(Message::MainAction);
-                let texts = privacy::testing::texts(ui::view(&app), size);
-                assert!(texts.iter().any(|line| line == t("Maintenance notices")), "{texts:?}");
-                app.show_details = false;
-            }
-        }
-        i18n::set(i18n::Lang::En);
-    }
-
-    #[test]
     fn damaged_settings_are_preserved_before_saving_and_warn_at_startup() {
         let root = std::env::temp_dir().join(format!("crystal-settings-{}", backend::unique_id().unwrap()));
         let config = Config { experiment: root.clone(), repository: root.join("runtime"), game_install: None, dat_overlays: Vec::new() };
@@ -6868,8 +7760,7 @@ mod tests {
         std::fs::write(&path, damaged).unwrap();
         assert!(load_settings(&config).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), damaged);
-        let mut settings = Settings::default();
-        settings.install_path = root.join("client").to_string_lossy().into_owned();
+        let settings = Settings { install_path: root.join("client").to_string_lossy().into_owned(), ..Settings::default() };
         save_settings(&config, &settings).unwrap();
         assert_eq!(load_settings(&config).unwrap().install_path, settings.install_path);
         let backup = std::fs::read_dir(path.parent().unwrap()).unwrap()
@@ -6891,12 +7782,14 @@ mod tests {
 
     #[test]
     fn verbatim_prefixes_are_cleaned_from_saved_settings_and_picked_folders() {
-        let mut settings = Settings::default();
-        settings.install_path = r"\\?\C:\Games\SquareEnix\FINAL FANTASY XI".into();
-        settings.installer_path = r"\\?\C:\Downloads\installer".into();
-        settings.ashita_path = r"\\?\D:\Ashita".into();
-        settings.windower_path = r"\\?\UNC\srv\share\Windower".into();
-        settings.loader_path = r"\\?\C:\crystal\pol.exe".into();
+        let mut settings = Settings {
+            install_path: r"\\?\C:\Games\SquareEnix\FINAL FANTASY XI".into(),
+            installer_path: r"\\?\C:\Downloads\installer".into(),
+            ashita_path: r"\\?\D:\Ashita".into(),
+            windower_path: r"\\?\UNC\srv\share\Windower".into(),
+            loader_path: r"\\?\C:\crystal\pol.exe".into(),
+            ..Settings::default()
+        };
         settings.plain_paths();
         assert_eq!(settings.install_path, r"C:\Games\SquareEnix\FINAL FANTASY XI");
         assert_eq!(settings.installer_path, r"C:\Downloads\installer");
@@ -6930,15 +7823,6 @@ mod tests {
         assert_eq!(dialog_start(&exe.to_string_lossy(), true), dialog_start(&dir.to_string_lossy(), false));
     }
 
-    // the layout zooms only below the 1440 px design width.
-    #[test]
-    fn scale_reflows_above_design_width_and_shrinks_below() {
-        let mut app = app();
-        for (width, expected) in [(2560.0, 1.0), (1920.0, 1.0), (1440.0, 1.0), (1080.0, 0.75), (900.0, 0.68)] {
-            app.viewport = iced::Size::new(width, 900.0);
-            assert!((ui::scale(&app) - expected).abs() < 1e-6, "{width}: {}", ui::scale(&app));
-        }
-    }
     #[test]
     fn separate_completions_preserve_other_running_account() {
         let mut app = app();
@@ -7043,7 +7927,7 @@ mod tests {
     fn viewer_report(state: patch::PatchState) -> viewer::Status {
         viewer::Status { folder: Some(PathBuf::from(r"C:\fixture\PlayOnlineViewer")),
             version: patch::PatchReport { state, local_version: "20070101_E".into(), remote_version: "20110829_E".into(),
-                detail: "Viewer fixture".into(), source_url: None, files_verified: None }, core_error: None }
+                detail: "Viewer fixture".into(), files_verified: None }, core_error: None }
     }
 
     #[test]
@@ -7051,14 +7935,14 @@ mod tests {
         let mut app = app();
         app.viewer_generation = 2;
         let game = patch::PatchReport { state: patch::PatchState::Current, local_version: "30260904_1".into(),
-            remote_version: "30260904_1".into(), detail: "Game fixture".into(), source_url: None, files_verified: None };
+            remote_version: "30260904_1".into(), detail: "Game fixture".into(), files_verified: None };
         app.patch = Some(game);
         let _ = app.update(Message::ViewerLoaded(1, viewer_report(patch::PatchState::Required)));
         assert!(app.viewer.is_none()); assert_eq!(app.main_action(), MainAction::Play);
         let _ = app.update(Message::ViewerLoaded(2, viewer_report(patch::PatchState::Required)));
-        assert_eq!(app.main_action(), MainAction::Update);
-        let _ = app.run_main_action();
-        assert!(app.page == Page::Maintenance); assert!(app.maintenance.is_none());
+        // Play updates PlayOnline when its sign-in finds it out of date: no Update button.
+        assert!(app.viewer.as_ref().is_some_and(viewer::Status::requires_update));
+        assert_eq!(app.main_action(), MainAction::Play);
         assert_eq!(app.patch.as_ref().unwrap().local_version, "30260904_1");
         app.viewer_generation = 3;
         let _ = app.update(Message::ViewerLoaded(3, viewer_report(patch::PatchState::Current)));
@@ -7130,7 +8014,7 @@ mod tests {
         app.accounts[0].account.mode = AccountMode::Private;
         let key = app.accounts[0].key.clone();
         assert!(!app.launch_keys(false).contains(&key));
-        app.start(vec![key.clone()]);
+        app.play(vec![key.clone()]);
         assert!(!app.accounts[0].busy);
         assert!(app.accounts[0].status.contains("temporarily unavailable"));
         assert_eq!(app.accounts[0].key, key);
@@ -7141,10 +8025,9 @@ mod tests {
     fn legacy_native_default_loads_as_an_available_retail_launcher() {
         let root = std::env::temp_dir().join(format!("crystal-retail-default-{}", backend::unique_id().unwrap()));
         let config = Config { experiment: root.clone(), repository: root.join("runtime"), game_install: None, dat_overlays: Vec::new() };
-        let mut settings = Settings::default();
-        settings.launch_with = ui::LaunchWith::Native;
+        let settings = Settings { launch_with: crate::backend::LaunchWith::Native, ..Settings::default() };
         save_settings(&config, &settings).unwrap();
-        assert_eq!(load_settings(&config).unwrap().launch_with, ui::LaunchWith::Windower);
+        assert_eq!(load_settings(&config).unwrap().launch_with, crate::backend::LaunchWith::Windower);
         let account = blank_account();
         assert_eq!(load_settings(&config).unwrap().launch_plan(&account).unwrap().tool, pol_less::Tool::Windower);
         std::fs::remove_dir_all(root).unwrap();
@@ -7164,7 +8047,7 @@ mod tests {
     fn launcher_update_handshake_cannot_start_new_work_or_change_settings() {
         let mut app = app();
         app.self_update = self_update::State::Applying;
-        let _ = app.update(Message::Navigate(Page::Accounts));
+        let _ = app.update(Message::Navigate(Page::Friends));
         let _ = app.update(Message::NewAccount);
         let _ = app.update(Message::MainAction);
         let _ = app.update(Message::SelfUpdate(self_update::Msg::AutoCheck(false)));
@@ -7271,7 +8154,7 @@ mod tests {
             row.key.clone()
         }).collect();
         let clicked = Instant::now() - Duration::from_secs(2);
-        app.start_mode_at(keys, false, clicked);
+        app.start_launch(keys, false, clicked, None);
         app.start_queued_plays();
         for row in &app.accounts[..2] {
             assert_eq!(row.queued_play, Some(clicked));
@@ -7397,20 +8280,20 @@ mod tests {
         assert!(!row.game_start_pending(), "background preparation is not a requested game launch");
         assert!(app.launch_keys(true).contains(&key));
         let clicked = Instant::now() - Duration::from_secs(2);
-        app.start_mode_at(vec![key.clone()], false, clicked);
+        app.start_launch(vec![key.clone()], false, clicked, None);
         let row = &app.accounts[0];
         assert_eq!(row.queued_play, Some(clicked));
         assert!(row.game_start_pending());
         assert!(!row.can_play(), "a second click must not queue another launch");
         assert!(row.pid.is_none());
         assert!(!app.launch_keys(true).contains(&key));
-        app.start(vec![key.clone()]);
+        app.play(vec![key.clone()]);
         assert_eq!(app.accounts[0].queued_play, Some(clicked));
         app.start_queued_plays();
         assert_eq!(app.accounts[0].queued_play, Some(clicked), "an unpublished or legacy worker must keep the original queue");
         assert!(!app.accounts[0].batch_pending);
         app.worker_event(WorkerEvent::Progress(key, "Signing in to PlayOnline…".into()));
-        assert!(app.accounts[0].status.contains("FFXI will start when sign-in finishes."));
+        assert!(app.accounts[0].status_text().contains("FFXI will start when sign-in finishes."));
         assert!(app.receiver.try_recv().is_err(), "queued Play reuses the existing worker");
     }
 
@@ -7466,7 +8349,7 @@ mod tests {
         app.worker_event(WorkerEvent::Complete(key.clone(), Err("Game loader error during startup: Native PlayOnline login failed (state 39, POL result -19). (Windower via crystal-loader).".into())));
         let row = &app.accounts[0];
         assert_eq!(row.network_wait, Some(NetworkWait::Reissue(clicked)));
-        assert!(row.status.ends_with("Crystal will try again when the network is back."), "{}", row.status);
+        assert!(row.status_text().ends_with("Crystal will try again when the network is back."), "{}", row.status_text());
         assert!(app.launches.as_ref().unwrap().is_empty(), "not before the network is back");
         let generation = row.launch_generation;
         app.worker_event(WorkerEvent::NetworkBack(key.clone(), true).for_launch(&key, generation));
@@ -7505,7 +8388,7 @@ mod tests {
             app.worker_event(WorkerEvent::Complete(key.clone(), Err(failure.to_owned())));
             let row = &app.accounts[0];
             assert!(row.network_wait.is_none() && row.queued_play.is_none(), "{failure}");
-            assert!(row.status.ends_with("That one-time code was used. Enter a new one, then press Play."), "{}", row.status);
+            assert!(row.status_text().ends_with("That one-time code was used. Enter a new one, then press Play."), "{}", row.status_text());
         }
         assert!(app.launches.as_ref().unwrap().is_empty(), "no automatic login without a code");
         // A new code typed since: the re-issue may use it.
@@ -7546,10 +8429,10 @@ mod tests {
         let row = &mut app.accounts[0];
         (row.busy, row.preparing_session, row.launch_trigger) = (true, true, Some(launch_timing::LaunchTrigger::StartupSignIn));
         app.worker_event(WorkerEvent::Complete(key.clone(), Err(network.into())));
-        assert!(app.accounts[0].status.ends_with("Crystal will try again when the network is back."));
+        assert!(app.accounts[0].status_text().ends_with("Crystal will try again when the network is back."));
         let generation = app.accounts[0].launch_generation;
         app.worker_event(WorkerEvent::NetworkBack(key.clone(), false).for_launch(&key, generation));
-        let status = &app.accounts[0].status;
+        let status = app.accounts[0].status_text();
         assert!(!status.contains("Crystal will try again") && status.starts_with(network)
             && status.ends_with("The network did not come back. Sign in again once it is."), "{status}");
     }
@@ -7666,7 +8549,7 @@ mod tests {
         assert!(app.launch_blocked());
         assert!(app.take_startup_signins().is_empty());
         assert!(app.startup_signin_pending);
-        app.start_launch_now(vec![app.accounts[0].key.clone()], false, Instant::now(), None);
+        app.start_launch_now(vec![app.accounts[0].key.clone()], false, Instant::now(), None, false);
         assert!(app.launches.as_ref().unwrap().is_empty());
         assert!(app.status.contains("profile editor"));
         app.windower_editor_open = false;
@@ -7739,6 +8622,100 @@ mod tests {
     fn signed_out() -> launch_log::ExitReport { launch_log::classify_loader_end(&launch_log::LoaderEnd::SignedOut, Duration::from_secs(900)) }
 
     #[test]
+    fn shutdown_buttons_sign_back_in_once_in_either_completion_order() {
+        for selected in [true, false] {
+            for completion_first in [true, false] {
+                let (mut app, _) = resign_app("shutdown-resign-order");
+                let mut ended = Vec::new();
+                for (index, row) in app.accounts.iter_mut().enumerate() {
+                    row.pid = Some(77 + index as u32);
+                    row.busy = false;
+                    row.selected = index == 0;
+                    row.alive = Some(Arc::new(AtomicBool::new(true)));
+                    row.game_running = Some(Arc::new(AtomicBool::new(true)));
+                    let outcome = Arc::new(std::sync::Mutex::new(None));
+                    row.outcome = Some(outcome.clone());
+                    app.settings.account_no_otp.insert(row.key.clone());
+                    if !selected || row.selected {
+                        ended.push((row.key.clone(), row.launch_generation, row.alive.clone().unwrap(), outcome));
+                    }
+                }
+                let _ = app.update(Message::Tick);
+                let message = if selected { Message::ShutdownSelected } else { Message::ShutdownAll };
+                assert_eq!(app.update(message).units(), ended.len());
+                for (key, generation, _, _) in &ended {
+                    let row = app.accounts.iter().find(|row| row.key == *key).unwrap();
+                    assert!(row.shutting_down && row.game_seen);
+                    assert!(!row.resign_declined && !row.signed_out, "shutdown must respect automatic sign-in");
+                    if completion_first {
+                        let _ = app.update(Message::GameShutdownFinished(key.clone(), *generation, Ok(())));
+                        let row = app.accounts.iter().find(|row| row.key == *key).unwrap();
+                        assert!(row.game_seen && row.pid.is_some() && row.outcome.is_some(), "the exit observer still owns the report");
+                    }
+                }
+                // The monitor publishes the exit report before releasing `alive`.
+                for (_, _, alive, outcome) in &ended {
+                    *outcome.lock().unwrap() = Some(signed_out());
+                    alive.store(false, Ordering::Release);
+                }
+                let _ = app.update(Message::Tick);
+                for (key, generation, _, _) in &ended {
+                    let row = app.accounts.iter().find(|row| row.key == *key).unwrap();
+                    let pending = row.resign.expect("one pending sign-in after game shutdown");
+                    assert!(!pending.network, "preserve the clean exit report");
+                    if !completion_first {
+                        let _ = app.update(Message::GameShutdownFinished(key.clone(), *generation, Ok(())));
+                    }
+                    let row = app.accounts.iter().find(|row| row.key == *key).unwrap();
+                    assert_eq!(row.resign.unwrap().ended, pending.ended, "completion must not restart the delay");
+                    assert!(row.status_text().ends_with(t("Signing back in after the game closed.")));
+                    assert!(!row.shutting_down && row.pid.is_none());
+                }
+                let _ = app.update(Message::Tick);
+                let keys = app.take_resigns(Instant::now() + RESIGN_DELAY);
+                assert_eq!(keys, ended.iter().map(|(key, ..)| key.clone()).collect::<Vec<_>>());
+                app.start_resigns(keys, launch_timing::LaunchTrigger::SignInAfterGame);
+                assert_eq!(app.launches.as_ref().unwrap().len(), 1);
+                assert!(app.take_resigns(Instant::now() + RESIGN_DELAY * 2).is_empty());
+                assert!(app.accounts.iter().filter(|row| selected && !row.selected).all(|row| row.is_playing() && row.resign.is_none()));
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_signout_cancels_relogin_even_with_a_shutdown_result_still_pending() {
+        for signout_before_end in [true, false] {
+            let (mut app, key) = resign_app("shutdown-resign-cancel");
+            let alive = Arc::new(AtomicBool::new(true));
+            let outcome = Arc::new(std::sync::Mutex::new(None));
+            let row = &mut app.accounts[0];
+            row.pid = Some(77);
+            row.alive = Some(alive.clone());
+            row.game_running = Some(Arc::new(AtomicBool::new(true)));
+            row.outcome = Some(outcome.clone());
+            row.selected = true;
+            let generation = row.launch_generation;
+            let _ = app.update(Message::Tick);
+            assert_eq!(app.update(Message::ShutdownSelected).units(), 1);
+            if signout_before_end {
+                let _ = app.update(Message::AccountSignOut(key.clone()));
+            }
+            *outcome.lock().unwrap() = Some(signed_out());
+            alive.store(false, Ordering::Release);
+            let _ = app.update(Message::Tick);
+            if !signout_before_end {
+                assert!(app.accounts[0].resign.is_some());
+                let _ = app.update(Message::AccountSignOut(key.clone()));
+            }
+            let _ = app.update(Message::GameShutdownFinished(key, generation, Ok(())));
+            let _ = app.update(Message::Tick);
+            assert!(app.accounts[0].signed_out && app.accounts[0].resign.is_none());
+            assert!(app.take_resigns(Instant::now() + RESIGN_DELAY).is_empty());
+            assert!(app.launches.as_ref().unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn closing_a_game_stays_signed_out_by_default_even_with_startup_signin_enabled() {
         let (mut app, key) = resign_app("close-game-stays-out");
         app.settings.sign_in_after_game = false;
@@ -7759,14 +8736,15 @@ mod tests {
     #[test]
     fn account_signout_is_available_without_opening_friends_and_blocks_recreation() {
         let mut app = app();
-        app.page = Page::Accounts;
+        app.page = Page::Home;
         let key = app.accounts[0].key.clone();
         app.settings.account_no_otp.insert(key.clone());
         app.accounts[0].pid = Some(77);
         app.accounts[0].game_running = Some(Arc::new(AtomicBool::new(false)));
         assert!(app.accounts[0].can_sign_out());
-        let texts = privacy::testing::texts(ui::view(&app), iced::Size::new(1600.0, 1000.0));
-        assert!(texts.iter().any(|text| text == t("Sign out")));
+        assert_eq!(account_row::row_state(&app, &app.accounts[0]), account_row::RowState::SignedIn);
+        let _ = app.update(Message::EditAccount(key.clone()));
+        let _ = app.update(Message::CloseEditor);
         assert_eq!(app.update(Message::AccountSignOut(key.clone())).units(), 1);
         assert!(app.accounts[0].busy && app.accounts[0].signed_out && !app.accounts[0].can_play());
         // Finished can be published while Windower still has its profile save.
@@ -7800,7 +8778,7 @@ mod tests {
         let _ = app.update(Message::Tick);
         let _ = app.update(Message::Launch(key));
         assert!(app.launches.as_ref().unwrap().is_empty(), "shutdown cannot start more work");
-        let size = iced::Size::new(1280.0, 720.0);
+        let size = Size::new(1280.0, 720.0);
         let _ = app.update(Message::WindowResized(size));
         assert_eq!(app.viewport, size, "window controls stay responsive during sign-out");
         app.title_held = true;
@@ -7821,7 +8799,7 @@ mod tests {
             game_ends(&mut app, 0, launch_log::classify_loader_end(&end, Duration::from_secs(900)));
             let resign = app.accounts[0].resign.expect("pending");
             assert!(!resign.network && resign.free_since.is_some(), "{end:?}");
-            assert!(app.accounts[0].status.ends_with("Signing back in after the game closed."), "{}", app.accounts[0].status);
+            assert!(app.accounts[0].status_text().ends_with("Signing back in after the game closed."), "{}", app.accounts[0].status_text());
             assert!(app.launches.as_ref().unwrap().is_empty(), "not at once");
             let free = resign.free_since.unwrap();
             assert!(app.take_resigns(free + RESIGN_DELAY - Duration::from_millis(1)).is_empty());
@@ -7838,13 +8816,13 @@ mod tests {
         let row = &mut app.accounts[0];
         (row.busy, row.preparing_session, row.launch_trigger) = (true, true, Some(launch_timing::LaunchTrigger::SignInAfterGame));
         app.worker_event(WorkerEvent::Progress(key.clone(), "Signing in to PlayOnline…".into()));
-        assert_eq!(app.accounts[0].status, "Signing in to PlayOnline… · Signing back in after the game closed.");
+        assert_eq!(app.accounts[0].status_text(), "Signing in to PlayOnline… · Signing back in after the game closed.");
         app.launches = None;
         let clicked = Instant::now();
-        app.start_mode_at(vec![key.clone()], false, clicked);
+        app.start_launch(vec![key.clone()], false, clicked, None);
         assert_eq!(app.accounts[0].queued_play, Some(clicked), "a queued Play, not a second sign-in");
         app.worker_event(WorkerEvent::Progress(key, "Signing in to PlayOnline…".into()));
-        assert!(app.accounts[0].status.ends_with("FFXI will start when sign-in finishes."));
+        assert!(app.accounts[0].status_text().ends_with("FFXI will start when sign-in finishes."));
         assert_eq!(launch_timing::LaunchTrigger::SignInAfterGame.line(), "launch trigger: sign-in after game");
         // Two accounts start together, as the startup sign-ins do (their tool turns stagger them).
         let (mut app, first) = resign_app("resign-two");
@@ -7973,7 +8951,7 @@ mod tests {
         game_ends(&mut app, 0, error);
         app.worker_event(WorkerEvent::NetworkBack(key.clone(), false).for_launch(&key, generation));
         assert!(app.accounts[0].resign.is_none() && app.accounts[0].network_wait.is_none());
-        assert!(app.accounts[0].status.ends_with("The network did not come back. Sign in again once it is."), "{}", app.accounts[0].status);
+        assert!(app.accounts[0].status_text().ends_with("The network did not come back. Sign in again once it is."), "{}", app.accounts[0].status_text());
         assert!(app.take_resigns(Instant::now() + RESIGN_DELAY).is_empty());
         assert_eq!(app.launches.as_ref().unwrap().len(), 2);
     }
@@ -8109,14 +9087,14 @@ mod tests {
         game_ends(&mut app, 0, signed_out());
         let row = &app.accounts[0];
         assert!(row.resign.is_none());
-        assert!(row.status.contains("No sign-in after the game while the worlds are down.") && row.status.contains("All Worlds Maintenance (Oct. 12)"), "{}", row.status);
+        assert!(row.status_text().contains("No sign-in after the game while the worlds are down.") && row.status_text().contains("All Worlds Maintenance (Oct. 12)"), "{}", row.status_text());
         // Pending when the window starts: dropped with the note.
         status_read(&mut app, services::Availability::Operational, None);
         game_ends(&mut app, 0, signed_out());
         assert!(app.accounts[0].resign.is_some());
         status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(60)));
         assert!(app.take_resigns(Instant::now() + RESIGN_DELAY).is_empty() && app.accounts[0].resign.is_none());
-        assert!(app.accounts[0].status.contains("No sign-in after the game while the worlds are down."), "{}", app.accounts[0].status);
+        assert!(app.accounts[0].status_text().contains("No sign-in after the game while the worlds are down."), "{}", app.accounts[0].status_text());
         assert!(!app.accounts[0].status.contains("Signing back in"), "{}", app.accounts[0].status);
         // The network retry is refused the same way.
         app.accounts[0].network_wait = Some(NetworkWait::AfterGameRetry);
@@ -8195,7 +9173,7 @@ mod tests {
         RUNNING_HOSTS.with(|hosts| hosts.borrow_mut().push(77));
         game_ends(&mut app, 0, signed_out());
         let resign = app.accounts[0].resign.unwrap();
-        assert_eq!(resign.host, Some(77));
+        assert_eq!(resign.host.map(|host| host.pid), Some(77));
         assert!(resign.free_since.is_none(), "host still running");
         assert!(app.take_resigns(Instant::now() + RESIGN_DELAY * 2).is_empty());
         RUNNING_HOSTS.with(|hosts| hosts.borrow_mut().clear());
@@ -8301,16 +9279,16 @@ mod tests {
         app.preview = false;
         app.status_read_done = false;
         let key = app.accounts[0].key.clone();
-        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        app.start_launch(vec![key.clone()], false, Instant::now(), None);
         assert_eq!(app.held_plays.len(), 1);
         assert_eq!(app.accounts[0].status, "Checking whether FINAL FANTASY XI is up…");
         assert_eq!(app.status, "Checking whether FINAL FANTASY XI is up…");
         assert!(!app.accounts[0].busy && app.receiver.try_recv().is_err(), "nothing started");
-        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        app.start_launch(vec![key.clone()], false, Instant::now(), None);
         assert_eq!(app.held_plays.len(), 1, "a second click is the same held Play");
         app.launches = Some(Vec::new());
         let other = app.accounts[1].key.clone();
-        app.start_mode_at(vec![other.clone()], true, Instant::now());
+        app.start_launch(vec![other.clone()], true, Instant::now(), None);
         assert_eq!(app.launches.as_ref().unwrap().len(), 1, "a sign-in only is not held");
         app.launches = None;
         // The read lands: the page still shows every world up, but the window covers now.
@@ -8337,7 +9315,7 @@ mod tests {
         app.launches = Some(Vec::new());
         let key = app.accounts[0].key.clone();
         let clicked = Instant::now();
-        app.start_mode_at(vec![key.clone()], false, clicked);
+        app.start_launch(vec![key.clone()], false, clicked, None);
         assert!(app.launches.as_ref().unwrap().is_empty());
         status_read(&mut app, services::Availability::Operational, None);
         let snapshot = app.services.clone().unwrap();
@@ -8351,7 +9329,7 @@ mod tests {
         let row = &mut app.accounts[0];
         (row.busy, row.preparing_session) = (true, true);
         let clicked = Instant::now();
-        app.start_mode_at(vec![key.clone()], false, clicked);
+        app.start_launch(vec![key.clone()], false, clicked, None);
         assert!(app.accounts[0].queued_play.is_none() && app.held_plays.len() == 1);
         status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(20 * 60)));
         let snapshot = app.services.clone().unwrap();
@@ -8370,7 +9348,7 @@ mod tests {
         app.launches = Some(Vec::new());
         let key = app.accounts[0].key.clone();
         let clicked = Instant::now();
-        app.start_mode_at(vec![key.clone()], false, clicked);
+        app.start_launch(vec![key.clone()], false, clicked, None);
         let since = app.held_plays[0].since;
         app.release_held_plays(since + STATUS_HOLD_LIMIT - Duration::from_millis(1));
         assert!(app.launches.as_ref().unwrap().is_empty() && app.held_plays.len() == 1);
@@ -8379,14 +9357,14 @@ mod tests {
         assert!(app.held_plays.is_empty() && app.status_hold_spent && !app.status_read_done);
         assert_eq!(app.launches.as_ref().unwrap()[0], (vec![key.clone()], false, clicked, None));
         let second = app.accounts[1].key.clone();
-        app.start_mode_at(vec![second.clone()], false, clicked);
+        app.start_launch(vec![second.clone()], false, clicked, None);
         assert_eq!(app.launches.as_ref().unwrap()[1].0, vec![second], "not held again");
         // A failed read releases at once.
         let mut app = self::app();
         app.preview = false;
         app.status_read_done = false;
         app.launches = Some(Vec::new());
-        app.start_mode_at(vec![key.clone()], false, clicked);
+        app.start_launch(vec![key.clone()], false, clicked, None);
         let _ = app.update(Message::ServiceStatusLoaded(app.news_generation, i18n::current(), Err("timed out".into())));
         assert_eq!(app.launches.as_ref().unwrap().len(), 1);
     }
@@ -8402,7 +9380,7 @@ mod tests {
         let before = app.accounts[0].status.clone();
         app.status = "Ready.".into();
         assert!(app.can_restart_launcher());
-        app.start_mode_at(vec![key.clone(), other.clone()], false, Instant::now());
+        app.start_launch(vec![key.clone(), other.clone()], false, Instant::now(), None);
         assert!(!app.can_restart_launcher(), "a held Play is pending launch work");
         // The second account is deleted and a save runs while the read lands: still held.
         app.accounts.retain(|row| row.key != other);
@@ -8421,7 +9399,7 @@ mod tests {
         let mut app = self::app();
         app.preview = false;
         app.status_read_done = false;
-        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        app.start_launch(vec![key.clone()], false, Instant::now(), None);
         let english = app.accounts[0].status.clone();
         i18n::set(i18n::Lang::Ja);
         app.retranslate(i18n::Lang::En);
@@ -8437,7 +9415,7 @@ mod tests {
     /// A read of the play flag, as `read_play_flag` delivers it, made `ago` before now.
     fn flag_read(app: &mut App, ago: Duration, result: Result<play_flag::Flag, String>) {
         let at = chrono::Utc::now() - chrono::Duration::from_std(ago).unwrap();
-        let _ = app.update(Message::PlayFlagLoaded(play_flag::Reading { at, result }));
+        let _ = app.update(Message::PlayFlagLoaded(play_flag::Reading { at, result, patch: None }));
     }
 
     const SERVER_STATUS: &str = "The game is unavailable for play during maintenance.";
@@ -8472,7 +9450,7 @@ mod tests {
         // A second click (main button or the row's Launch) is the same wait; the button then
         // explains the downtime.
         let _ = app.update(Message::MainAction);
-        app.start_mode_at(vec![first.clone()], false, Instant::now());
+        app.start_launch(vec![first.clone()], false, Instant::now(), None);
         assert_eq!(app.waiting_plays.len(), 1);
         assert_eq!(app.waiting_plays[0].keys, vec![first.clone(), second.clone()]);
         assert!(app.show_details);
@@ -8492,10 +9470,8 @@ mod tests {
         let launches = app.launches.as_ref().unwrap();
         assert_eq!(launches.len(), 1);
         assert_eq!((&launches[0].0, launches[0].1, launches[0].3), (&vec![first.clone(), second.clone()], false, None));
-        assert_eq!(app.released, vec![first, second]);
         // Nothing waits: no more reads.
         assert_eq!(app.update(Message::Tick).units(), 0);
-        assert!(app.released.is_empty(), "these Plays never started a worker (recorded), so they are done");
     }
 
     /// The flag wins both ways while fresh; without a fresh read the official status decides, and
@@ -8504,7 +9480,7 @@ mod tests {
     fn a_waiting_play_follows_the_official_status_when_the_flag_is_stale_or_unreadable() {
         let mut app = maintenance_app();
         let key = app.accounts[0].key.clone();
-        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        app.start_launch(vec![key.clone()], false, Instant::now(), None);
         // 0 while the status page shows every world up 20 minutes in (Round 4: ended early).
         flag_read(&mut app, Duration::from_secs(30), Ok(play_flag::Flag::Down(None)));
         status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(20 * 60)));
@@ -8516,7 +9492,7 @@ mod tests {
         // Once no read is fresh, the official status decides: maintenance still, and the row says
         // the flag could not be read.
         let mut app = maintenance_app();
-        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        app.start_launch(vec![key.clone()], false, Instant::now(), None);
         flag_read(&mut app, Duration::ZERO, Err("The play flag server answered HTTP 503.".into()));
         let _ = app.update(Message::Tick);
         assert!(app.is_waiting(&key));
@@ -8533,7 +9509,7 @@ mod tests {
         assert_eq!(app.launches.as_ref().unwrap()[0].0, vec![key.clone()]);
         // A stale 1 (over two minutes old) proves nothing.
         let mut app = maintenance_app();
-        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        app.start_launch(vec![key.clone()], false, Instant::now(), None);
         flag_read(&mut app, Duration::from_secs(150), Ok(play_flag::Flag::Up));
         let _ = app.update(Message::Tick);
         assert!(app.is_waiting(&key) && app.launches.as_ref().unwrap().is_empty());
@@ -8547,7 +9523,7 @@ mod tests {
     fn a_wait_is_released_only_on_evidence_that_ffxi_is_up() {
         let mut app = maintenance_app();
         let key = app.accounts[0].key.clone();
-        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        app.start_launch(vec![key.clone()], false, Instant::now(), None);
         assert_eq!(app.update(Message::Tick).units(), 1);
         flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Down(None)));
         // The PC slept 40 minutes, past the posted end of a maintenance that was extended: the
@@ -8557,7 +9533,7 @@ mod tests {
         snapshot.windows.clear();
         snapshot.checked_at = long_ago.format("%Y-%m-%d %H:%M:%S UTC").to_string();
         app.play_flag = play_flag::Known::default();
-        app.play_flag.note(play_flag::Reading { at: long_ago, result: Ok(play_flag::Flag::Down(None)) });
+        app.play_flag.note(play_flag::Reading { at: long_ago, result: Ok(play_flag::Flag::Down(None)), patch: None });
         assert_eq!(app.service_availability(), services::Availability::Unknown);
         app.flag_schedule.tick(long_ago);
         let _ = app.update(Message::Tick);
@@ -8578,12 +9554,12 @@ mod tests {
         let mut app = maintenance_app();
         status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(20 * 60)));
         flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Down(None)));
-        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        app.start_launch(vec![key.clone()], false, Instant::now(), None);
         assert!(app.is_waiting(&key));
         let now = chrono::Utc::now();
         app.play_flag = play_flag::Known::default();
-        app.play_flag.note(play_flag::Reading { at: now - chrono::Duration::seconds(121), result: Ok(play_flag::Flag::Down(None)) });
-        app.play_flag.note(play_flag::Reading { at: now - chrono::Duration::seconds(61), result: Err("timed out".into()) });
+        app.play_flag.note(play_flag::Reading { at: now - chrono::Duration::seconds(121), result: Ok(play_flag::Flag::Down(None)), patch: None });
+        app.play_flag.note(play_flag::Reading { at: now - chrono::Duration::seconds(61), result: Err("timed out".into()), patch: None });
         assert_eq!(app.service_availability(), services::Availability::Operational);
         let _ = app.update(Message::Tick);
         assert!(app.is_waiting(&key), "not between reads");
@@ -8602,7 +9578,7 @@ mod tests {
         app.launches = Some(Vec::new());
         status_read(&mut app, services::Availability::Outage, None);
         let key = app.accounts[0].key.clone();
-        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        app.start_launch(vec![key.clone()], false, Instant::now(), None);
         assert!(app.is_waiting(&key));
         assert_eq!(app.accounts[0].status, "FFXI's worlds are down. Starting as soon as they're back…");
         flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
@@ -8631,7 +9607,7 @@ mod tests {
             let key = app.accounts[0].key.clone();
             let row = &mut app.accounts[0];
             (row.busy, row.preparing_session, row.launch_trigger) = (true, true, Some(launch_timing::LaunchTrigger::StartupSignIn));
-            app.start_mode_at(vec![key.clone()], false, Instant::now());
+            app.start_launch(vec![key.clone()], false, Instant::now(), None);
             assert!(app.is_waiting(&key));
             app.worker_event(WorkerEvent::Complete(key.clone(), Err(failure.to_owned())));
             assert_eq!(app.is_waiting(&key), waits, "{failure}");
@@ -8652,8 +9628,8 @@ mod tests {
         app.launches = None;
         app.viewer = None;
         let (first, second) = (app.accounts[0].key.clone(), app.accounts[1].key.clone());
-        app.start_mode_at(vec![first.clone()], false, Instant::now());
-        app.start_mode_at(vec![second.clone()], false, Instant::now());
+        app.start_launch(vec![first.clone()], false, Instant::now(), None);
+        app.start_launch(vec![second.clone()], false, Instant::now(), None);
         assert_eq!(app.waiting_plays.len(), 2);
         assert!(app.receiver.try_recv().is_err());
         let root = std::env::temp_dir().join(format!("crystal-wait-recover-{}", backend::unique_id().unwrap()));
@@ -8663,39 +9639,42 @@ mod tests {
         app.settings.install_selected = true;
         flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
         assert!(app.recovering.is_some(), "the first group finishes the interrupted update first");
-        assert_eq!(app.released, vec![first.clone()]);
-        assert!(app.is_waiting(&second) && !app.released.contains(&second), "the second keeps waiting");
+        assert!(!app.is_waiting(&first) && app.is_waiting(&second), "the second keeps waiting");
         // The recovery worker answers (it refuses the fixture journal); nothing signed in.
         let event = app.receiver.recv_timeout(Duration::from_secs(30)).ok();
         assert!(matches!(event, Some(WorkerEvent::InterruptedUpdate(_))));
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// The flag is read only while a Play waits, once at the start, every minute, and again at
-    /// once after the PC wakes from sleep.
+    /// The flag is read only while a Play waits or FFXI is in maintenance (for `$patch_enable`,
+    /// patch_watch), once at the start, every minute, and again at once after the PC wakes.
     #[test]
-    fn the_flag_is_read_only_while_waiting_and_again_after_a_resume() {
+    fn the_flag_is_read_only_while_waiting_or_in_maintenance_and_again_after_a_resume() {
         let mut app = maintenance_app();
-        assert_eq!(app.update(Message::Tick).units(), 0, "nothing waits: no read");
-        let key = app.accounts[0].key.clone();
-        app.start_mode_at(vec![key.clone()], false, Instant::now());
-        assert_eq!(app.update(Message::Tick).units(), 1);
+        assert_eq!(app.update(Message::Tick).units(), 1, "maintenance: a read with nothing waiting");
         flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Down(None)));
+        assert_eq!(app.update(Message::Tick).units(), 0);
+        let key = app.accounts[0].key.clone();
+        app.start_launch(vec![key.clone()], false, Instant::now(), None);
+        assert_eq!(app.update(Message::Tick).units(), 0, "a wait adds no read");
         assert_eq!(app.update(Message::Tick).units(), 0);
         // Review finding: more waits (other rows, Cancel then Play again) send no extra reads.
         let others: Vec<String> = app.accounts[1..].iter().map(|row| row.key.clone()).collect();
-        for other in &others { app.start_mode_at(vec![other.clone()], false, Instant::now()); }
+        for other in &others { app.start_launch(vec![other.clone()], false, Instant::now(), None); }
         let _ = app.update(Message::CancelWait(vec![others[0].clone()]));
-        app.start_mode_at(vec![others[0].clone()], false, Instant::now());
+        app.start_launch(vec![others[0].clone()], false, Instant::now(), None);
         assert_eq!(app.waiting_plays.len(), others.len() + 1);
         assert_eq!(app.update(Message::Tick).units(), 0);
         // The last Tick was 40 minutes ago by the wall clock: the PC slept.
         app.flag_schedule.tick(chrono::Utc::now() - chrono::Duration::minutes(40));
         assert_eq!(app.update(Message::Tick).units(), 1, "a read at resume");
         flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Down(None)));
-        // Cancelled: no wait, no read, even at a resume.
+        // Cancelled, and the maintenance over: no wait, no read, even at a resume.
         let _ = app.update(Message::CancelWait([vec![key.clone()], others].concat()));
         assert!(app.waiting_plays.is_empty());
+        status_read(&mut app, services::Availability::Operational, None);
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
+        assert!(!app.patch_watch.active());
         app.flag_schedule.tick(chrono::Utc::now() - chrono::Duration::minutes(40));
         assert_eq!(app.update(Message::Tick).units(), 0);
     }
@@ -8707,7 +9686,7 @@ mod tests {
         let mut app = maintenance_app();
         let (first, second) = (app.accounts[0].key.clone(), app.accounts[1].key.clone());
         assert!(app.can_restart_launcher());
-        app.start_mode_at(vec![first.clone(), second.clone()], false, Instant::now());
+        app.start_launch(vec![first.clone(), second.clone()], false, Instant::now(), None);
         assert!(!app.can_restart_launcher(), "a waiting Play is pending launch work");
         let _ = app.update(Message::CancelWait(vec![first.clone()]));
         assert!(!app.is_waiting(&first) && app.is_waiting(&second));
@@ -8725,7 +9704,7 @@ mod tests {
         let _ = app.update(Message::CancelWait(vec![second.clone()]));
         assert_eq!(app.accounts[1].status, "FFXI is back — enter your one-time password to start");
         // A deleted account no longer waits (nor reads the flag, nor holds a restart back).
-        app.start_mode_at(vec![second.clone()], false, Instant::now());
+        app.start_launch(vec![second.clone()], false, Instant::now(), None);
         app.accounts.retain(|row| row.key != second);
         let _ = app.update(Message::Tick);
         assert!(app.waiting_plays.is_empty() && app.can_restart_launcher());
@@ -8734,13 +9713,10 @@ mod tests {
         let _ = app.update(Message::Tick);
         assert!(app.launches.as_ref().unwrap().is_empty());
         // FFXI is up (the flag read just now): a Play starts at once.
-        app.start_mode_at(vec![first.clone()], false, Instant::now());
+        app.start_launch(vec![first.clone()], false, Instant::now(), None);
         assert!(app.launches.as_ref().unwrap().len() == 1 && app.waiting_plays.is_empty(), "FFXI is up: no wait");
-        // A Play released from its wait and still starting, or the update it asked for, blocks it too.
-        app.released.push(first.clone());
-        assert!(!app.can_restart_launcher());
-        app.released.clear();
-        app.wait_update = Some(WaitUpdate { keys: vec![first], started: false, folder: None });
+        // The update a Play runs in its session blocks it too.
+        app.play_updates.begin(PathBuf::from(r"C:\fixture\FINAL FANTASY XI"), &first, "30261006_0".into(), Instant::now(), Vec::new(), false);
         assert!(!app.can_restart_launcher());
     }
 
@@ -8756,11 +9732,11 @@ mod tests {
         app.accounts[1].account.mode = AccountMode::Private;
         app.waiting_plays.push(WaitingPlay { keys: vec![key.clone(), other.clone()], otp: Vec::new(), armed: Instant::now(), codes: Vec::new() });
         assert!(!app.service_down());
-        app.start_launch_now(vec![key.clone()], false, Instant::now(), None);
+        app.start_launch_now(vec![key.clone()], false, Instant::now(), None, false);
         assert!(!app.is_waiting(&key) && app.is_waiting(&other));
         assert!(app.receiver.try_recv().is_err());
         // A sign-in only replaces nothing.
-        app.start_launch_now(vec![other.clone()], true, Instant::now(), None);
+        app.start_launch_now(vec![other.clone()], true, Instant::now(), None, false);
         assert!(app.is_waiting(&other));
     }
 
@@ -8784,7 +9760,7 @@ mod tests {
         (row.pid, row.otp_spent) = (Some(4242), true);
         row.alive = Some(Arc::new(AtomicBool::new(true)));
         row.game_running = Some(Arc::new(AtomicBool::new(false)));
-        app.start_mode_at(keys.clone(), false, Instant::now());
+        app.start_launch(keys.clone(), false, Instant::now(), None);
         assert!(keys.iter().all(|key| app.is_waiting(key)));
         assert!(app.accounts[0].otp.is_empty(), "the typed code goes with the wait");
         assert_eq!(app.waiting_plays[0].otp, vec![keys[0].clone()]);
@@ -8804,7 +9780,7 @@ mod tests {
         assert!(app.waiting_plays.is_empty());
         // A code typed during a long wait is stale by the release too.
         let mut app = maintenance_app();
-        app.start_mode_at(vec![keys[0].clone()], false, Instant::now());
+        app.start_launch(vec![keys[0].clone()], false, Instant::now(), None);
         app.accounts[0].otp = "654321".into();
         age_waits(&mut app);
         flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
@@ -8814,7 +9790,7 @@ mod tests {
         // none typed and no sign-in this run, asks for one instead of signing in without it.
         let mut app = maintenance_app();
         app.settings.account_otp.insert(keys[1].clone());
-        app.start_mode_at(vec![keys[1].clone()], false, Instant::now());
+        app.start_launch(vec![keys[1].clone()], false, Instant::now(), None);
         flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
         assert!(app.launches.as_ref().unwrap().is_empty());
         assert_eq!(app.accounts[1].status, "FFXI is back — enter your one-time password to start");
@@ -8829,7 +9805,7 @@ mod tests {
         let key = app.accounts[0].key.clone();
         app.accounts[0].otp = "123456".into();
         app.accounts[0].otp_spent = true;
-        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        app.start_launch(vec![key.clone()], false, Instant::now(), None);
         assert!(app.is_waiting(&key) && app.accounts[0].otp.is_empty());
         assert_eq!(app.update(Message::Tick).units(), 1, "the immediate read");
         flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
@@ -8839,7 +9815,7 @@ mod tests {
         // A Cancel drops the kept code with the wait.
         let mut app = maintenance_app();
         app.accounts[0].otp = "654321".into();
-        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        app.start_launch(vec![key.clone()], false, Instant::now(), None);
         let _ = app.update(Message::CancelWait(vec![key.clone()]));
         assert!(app.waiting_plays.is_empty() && app.accounts[0].otp.is_empty());
     }
@@ -8993,7 +9969,7 @@ mod tests {
             app.worker_event(WorkerEvent::Complete(key.clone(), Err(refused.into())));
             let row = &app.accounts[0];
             assert!(row.network_wait.is_none() && row.resign.is_none() && !row.busy, "{trigger:?}");
-            assert_eq!(row.status, format!("{refused} · This account may need a one-time password now: Crystal signs it in only when you press Play."));
+            assert_eq!(row.status_text(), format!("{refused} · This account may need a one-time password now: Crystal signs it in only when you press Play."));
             assert!(app.settings.account_otp.contains(&key) && !app.settings.presigns(&key), "{trigger:?}");
             assert!(load_settings(&app.config).unwrap().account_otp.contains(&key), "saved");
             // Nothing signs it in by itself any more.
@@ -9038,7 +10014,7 @@ mod tests {
             (row.busy, row.preparing_session, row.launch_trigger, row.presign_login) = (true, true, Some(launch_timing::LaunchTrigger::StartupSignIn), true);
             app.worker_event(WorkerEvent::Complete(key.clone(), Err(failure.into())));
             assert!(app.settings.presigns(&key) && !app.settings.account_otp.contains(&key), "{failure}");
-            assert_eq!(app.accounts[0].status, failure, "no 'may need a one-time password' note");
+            assert_eq!(app.accounts[0].status_text(), failure, "no 'may need a one-time password' note");
             let _ = std::fs::remove_dir_all(&app.config.experiment);
         }
         // The user's own sign-ins: Play, Connect, a parked one, a batch Play.
@@ -9059,7 +10035,7 @@ mod tests {
         (row.busy, row.batch_requested, row.launch_trigger, row.presign_login) = (true, true, Some(launch_timing::LaunchTrigger::QueuedPlay), true);
         app.worker_event(WorkerEvent::Complete(key.clone(), Err(refused.into())));
         assert!(app.settings.account_otp.contains(&key) && !app.settings.presigns(&key));
-        assert!(app.accounts[0].status.ends_with("This account may need a one-time password now: Crystal signs it in only when you press Play."));
+        assert!(app.accounts[0].status_text().ends_with("This account may need a one-time password now: Crystal signs it in only when you press Play."));
         let _ = std::fs::remove_dir_all(&app.config.experiment);
     }
 
@@ -9092,7 +10068,7 @@ mod tests {
         assert!(app.settings.presigns(&ready) && !app.settings.account_otp.contains(&ready), "it got its session");
         assert!(app.settings.presigns(&told) && !app.settings.account_otp.contains(&told));
         assert!(app.settings.account_otp.contains(&refused_key) && !app.settings.presigns(&refused_key));
-        assert!(!app.accounts[0].status.contains("may need a one-time password") && !app.accounts[2].status.contains("may need a one-time password"));
+        assert!(!app.accounts[0].status_text().contains("may need a one-time password") && !app.accounts[2].status_text().contains("may need a one-time password"));
         let _ = std::fs::remove_dir_all(&app.config.experiment);
     }
 
@@ -9162,108 +10138,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// The account editor has no per-account "Sign in when Crystal opens" any more; character
-    /// auto-select stays there. Settings → System has the one switch, in both languages.
+    /// A batch (Windower or Ashita accounts started together, or Plays released from a wait)
+    /// whose W20 asks for an update reports each account Ready, then Failed
+    /// (session_batch::coordinate). Their sessions stay signed in: the update runs in them, and
+    /// its success starts every account through the signed-in path with no second check.
     #[test]
-    fn the_editor_has_no_startup_sign_in_checkbox_and_settings_has_the_switch() {
-        let size = iced::Size::new(1440.0, 900.0);
-        for lang in i18n::Lang::ALL {
-            i18n::set(lang);
-            let mut app = app();
-            app.viewport = size;
-            let key = app.accounts[0].key.clone();
-            let _ = app.update(Message::EditAccount(key));
-            let texts = privacy::testing::texts(ui::view(&app), size);
-            assert!(texts.iter().any(|line| line == t("Log in to a character automatically")), "{texts:?}");
-            assert!(!texts.iter().any(|line| line == t("Sign accounts in when Crystal opens") || line.contains("Sign in when Crystal opens")
-                || line.contains("security token") || line.contains("Crystal起動時")), "{texts:?}");
-            app.editor = None;
-            app.page = Page::Settings;
-            app.settings_tab = settings_page::Tab::System;
-            let texts = privacy::testing::texts(ui::view(&app), size);
-            // A toggler reports no label to the widget tree; its explanation is plain text.
-            assert!(texts.iter().any(|line| line == t("Accounts that sign in without a one-time password sign in to PlayOnline in the background when Crystal opens, so Play starts FFXI without another sign-in.")), "{texts:?}");
-        }
-        i18n::set(i18n::Lang::En);
-    }
-
-    /// The released Play's version check asks for an update: it starts by itself (the Round 5
-    /// Update for that account's folder), its row shows the progress, and its success starts the
-    /// Play again; a failure, or an update that cannot start, says why.
-    #[test]
-    fn an_update_a_released_play_needs_starts_by_itself_then_the_play_again() {
-        let released = |busy_other: bool| {
-            let mut app = maintenance_app();
-            app.settings.install_selected = true;
-            let key = app.accounts[0].key.clone();
-            if busy_other {
-                // Another account's game is running: the update may not sign it out.
-                let row = &mut app.accounts[1];
-                row.pid = Some(77);
-                row.alive = Some(Arc::new(AtomicBool::new(true)));
-                row.game_running = Some(Arc::new(AtomicBool::new(true)));
-            }
-            app.start_mode_at(vec![key.clone()], false, Instant::now());
-            flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
-            assert_eq!(app.released, vec![key.clone()]);
-            // Its sign-in runs; the version check refuses the start for an update.
-            app.accounts[0].busy = true;
-            let _ = app.update(Message::Tick);
-            assert_eq!(app.released, vec![key.clone()], "still starting");
-            let message = patch::gate(patch::LaunchCheck::Update(refused_report())).unwrap_err();
-            app.worker_event(WorkerEvent::StartGame(key.clone(), Some(refused_report()), Err(message)));
-            assert!(app.released.is_empty() && app.wait_update.as_ref().is_some_and(|update| update.keys == [key.clone()]));
-            assert!(!app.can_restart_launcher());
-            (app, key)
-        };
-        // The Update starts on the next Tick; success starts the Play again.
-        let (mut app, key) = released(false);
-        let _ = app.update(Message::Tick);
-        assert!(app.maintenance == Some(MaintenanceKind::Update) && app.waited_update_running(&key));
-        assert_eq!(app.reissue_after_update.iter().map(|(known, _)| known.as_str()).collect::<Vec<_>>(), [key.as_str()]);
-        let mut current = refused_report();
-        current.state = patch::PatchState::Current;
-        app.launches = Some(Vec::new());
-        let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Ok("Updated".into()), Some(current.clone())));
-        let launches = app.launches.as_ref().unwrap();
-        assert_eq!((&launches[0].0, launches[0].3), (&vec![key.clone()], Some(launch_timing::LaunchTrigger::ReissuedPlay)));
-        assert!(app.wait_update.is_none() && app.can_restart_launcher());
-        // The update fails: the row says why, and nothing starts.
-        let (mut app, key) = released(false);
-        let _ = app.update(Message::Tick);
-        app.launches = Some(Vec::new());
-        let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Err("Cancelled.".into()), None));
-        assert!(app.launches.as_ref().unwrap().is_empty() && app.wait_update.is_none());
-        assert_eq!(app.accounts[0].status, "Could not update FFXI before it starts: Cancelled.");
-        assert!(app.accounts[0].problem && !app.waited_update_running(&key));
-        // The update cannot start (another game is running): the row says why.
-        let (mut app, _) = released(true);
-        let _ = app.update(Message::Tick);
-        assert!(app.maintenance.is_none() && app.wait_update.is_none());
-        assert_eq!(app.accounts[0].status, tf("Could not update FFXI before it starts: {error}",
-            &[("error", &t("Close all games and sign out PlayOnline sessions before updating, repairing, or running official setup. Existing sessions were kept."))]));
-        // An OTP account's re-issued Play would be a new sign-in without a code: it asks for one.
-        let (mut app, _) = released(false);
-        let _ = app.update(Message::Tick);
-        app.accounts[0].otp_spent = true;
-        app.launches = Some(Vec::new());
-        let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Ok("Updated".into()), Some(current)));
-        assert!(app.launches.as_ref().unwrap().is_empty());
-        assert_eq!(app.accounts[0].status, "FFXI is back — enter your one-time password to start");
-    }
-
-    /// Review finding: a released batch (Windower or Ashita accounts started together) whose W20
-    /// asks for an update reports each account Ready, then Failed (session_batch::coordinate);
-    /// that failure is still the Play's, so the update starts by itself and its success starts
-    /// every account again.
-    #[test]
-    fn a_released_batch_refused_for_an_update_starts_the_update_then_every_play() {
-        let mut app = maintenance_app();
-        app.settings.install_selected = true;
+    fn a_batch_refused_for_an_update_runs_it_in_the_sessions_the_batch_kept() {
+        let (mut app, root) = play_update_app("batch-kept", Some("30260904_1"));
         let keys = vec![app.accounts[0].key.clone(), app.accounts[1].key.clone()];
-        app.start_mode_at(keys.clone(), false, Instant::now());
-        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
-        assert_eq!(app.released, keys);
         // What start_together leaves on the rows, then the coordinator's events.
         let clicked = Instant::now();
         for row in &mut app.accounts[..2] {
@@ -9274,115 +10156,26 @@ mod tests {
         for (at, key) in keys.iter().enumerate() {
             app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult {
                 pid: 70 + at as u32, detail: "Signed in.".into(), alive: Arc::new(AtomicBool::new(true)),
-                game_running: Arc::new(AtomicBool::new(false)), log: PathBuf::from("batch.log"),
+                game_running: Arc::new(AtomicBool::new(false)), log: root.join("batch.log"),
                 outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
             })));
         }
         let message = patch::gate(patch::LaunchCheck::Update(refused_report())).unwrap_err();
-        for key in &keys { app.worker_event(WorkerEvent::Complete(key.clone(), Err(message.clone()))); }
-        assert!(app.released.is_empty());
-        assert_eq!(app.wait_update.as_ref().map(|update| update.keys.clone()), Some(keys.clone()));
-        assert_eq!(app.refused_plays.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>(), keys);
-        // The Update (it signs the prepared sessions out) starts by itself; its success starts
-        // both again.
-        for row in &mut app.accounts[..2] { (row.pid, row.alive, row.game_running) = (None, None, None); }
-        let _ = app.update(Message::Tick);
-        assert!(app.maintenance == Some(MaintenanceKind::Update), "{}", app.status);
-        let mut current = refused_report();
-        current.state = patch::PatchState::Current;
-        app.launches = Some(Vec::new());
-        let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Ok("Updated".into()), Some(current)));
+        for key in &keys {
+            app.accounts.iter_mut().find(|row| row.key == *key).unwrap().batch_requested = true;
+            app.worker_event(WorkerEvent::Complete(key.clone(), Err(message.clone())));
+        }
+        assert_eq!(app.play_updates.spawned.len(), 1);
+        assert_eq!(app.play_updates.jobs[0].waiters.iter().map(|w| w.key.clone()).collect::<Vec<_>>(), keys);
+        assert!(app.refused_plays.is_empty() && app.maintenance.is_none(), "no Downloads update, nobody signed out");
+        assert!(app.accounts[..2].iter().all(|row| row.busy && row.pid.is_some() && !row.problem));
+        assert!(!app.can_restart_launcher(), "an update in progress is pending launch work");
+        let job = generation(&app);
+        app.worker_event(WorkerEvent::PlayUpdate(job, play_update::Event::Finished(Ok(play_update::Done { summary: "Updated.".into(), report: None }))));
         let started: Vec<_> = app.launches.as_ref().unwrap().iter().map(|(keys, _, _, trigger)| (keys.clone(), *trigger)).collect();
         assert_eq!(started, keys.iter().map(|key| (vec![key.clone()], Some(launch_timing::LaunchTrigger::ReissuedPlay))).collect::<Vec<_>>());
-        // A batch whose game started keeps nothing for a later end to be classified by.
-        let row = &mut app.accounts[2];
-        (row.busy, row.batch_requested, row.launch_trigger) = (true, true, Some(launch_timing::LaunchTrigger::BatchPlay));
-        let key = row.key.clone();
-        app.worker_event(WorkerEvent::Complete(key, Ok(LaunchResult {
-            pid: 90, detail: "FFXI started with the selected accounts.".into(), alive: Arc::new(AtomicBool::new(true)),
-            game_running: Arc::new(AtomicBool::new(true)), log: PathBuf::new(),
-            outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
-        })));
-        assert!(app.accounts[2].is_playing() && app.accounts[2].launch_trigger.is_none());
-    }
-
-    /// Review finding: waited accounts in different game folders each get their folder's Update.
-    /// The first automatic Update covers the last refused account's folder; a Play it starts
-    /// again in another folder may ask for that folder's, which starts by itself too; a folder
-    /// that still refuses after its own Update never loops.
-    #[test]
-    fn waited_plays_in_other_game_folders_get_their_own_update() {
-        let mut app = maintenance_app();
-        app.settings.install_selected = true;
-        app.settings.install_path = std::env::temp_dir().join("crystal-wait-settings-folder").to_string_lossy().into_owned();
-        let own = std::env::temp_dir().join("crystal-wait-own-folder");
-        app.settings.account_installs.insert(account_key(&app.accounts[1].account), own.to_string_lossy().into_owned());
-        let (first, second) = (app.accounts[0].key.clone(), app.accounts[1].key.clone());
-        app.start_mode_at(vec![first.clone(), second.clone()], false, Instant::now());
-        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
-        assert_eq!(app.released, vec![first.clone(), second.clone()]);
-        let refuse = |app: &mut App, key: &str| {
-            let at = app.accounts.iter().position(|row| row.key == key).unwrap();
-            app.accounts[at].busy = true;
-            let message = patch::gate(patch::LaunchCheck::Update(refused_report())).unwrap_err();
-            app.worker_event(WorkerEvent::StartGame(key.to_owned(), Some(refused_report()), Err(message)));
-        };
-        let mut current = refused_report();
-        current.state = patch::PatchState::Current;
-        let finish = |app: &mut App| {
-            app.launches = Some(Vec::new());
-            let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Ok("Updated".into()), Some(current.clone())));
-            app.launches.as_ref().unwrap().iter().map(|(keys, ..)| keys[0].clone()).collect::<Vec<_>>()
-        };
-        refuse(&mut app, &first);
-        refuse(&mut app, &second);
-        // The first Update covers the second's own folder (the last refusal); both start again.
-        let _ = app.update(Message::Tick);
-        assert_eq!(app.wait_update.as_ref().map(|update| update.folder.clone()), Some(Some(own.clone())));
-        assert_eq!(finish(&mut app), vec![first.clone(), second.clone()]);
-        assert_eq!(app.released, vec![first.clone()], "the Settings folder is not updated yet");
-        // The first's W20 refuses again: the Settings folder's Update starts by itself.
-        refuse(&mut app, &first);
-        let _ = app.update(Message::Tick);
-        assert!(app.maintenance == Some(MaintenanceKind::Update) && app.waited_update_running(&first));
-        assert_eq!(app.wait_update.as_ref().map(|update| update.folder.clone()), Some(None));
-        assert_eq!(finish(&mut app), vec![first.clone()]);
-        // Still refused after its own folder's Update: shown, and no further Update.
-        assert!(app.released.is_empty());
-        refuse(&mut app, &first);
-        let _ = app.update(Message::Tick);
-        assert!(app.maintenance.is_none() && app.wait_update.is_none());
-    }
-
-    /// The button, the row's headline and Cancel, and the update's progress, in both languages.
-    #[test]
-    fn wait_and_play_is_shown_in_both_languages() {
-        for lang in i18n::Lang::ALL {
-            i18n::set(lang);
-            let mut app = app();
-            app.services.as_mut().unwrap().availability = services::Availability::Maintenance;
-            let size = iced::Size::new(1440.0, 900.0);
-            app.viewport = size;
-            for row in &mut app.accounts { row.selected = false; }
-            app.accounts[0].selected = true;
-            let key = app.accounts[0].key.clone();
-            let texts = privacy::testing::texts(ui::view(&app), size);
-            assert!(texts.iter().any(|line| line == t("Wait and play")), "{texts:?}");
-            app.waiting_plays.push(WaitingPlay { keys: vec![key.clone()], otp: Vec::new(), armed: Instant::now(), codes: Vec::new() });
-            let texts = privacy::testing::texts(ui::view(&app), size);
-            assert!(texts.iter().any(|line| line == t("Waiting for FFXI…")), "{texts:?}");
-            assert!(texts.iter().any(|line| line == t("FFXI is down for maintenance. Starting as soon as it's back…")), "{texts:?}");
-            app.page = Page::Accounts;
-            let texts = privacy::testing::texts(ui::view(&app), size);
-            assert!(texts.iter().any(|line| line == t("FFXI is down for maintenance. Starting as soon as it's back…")), "{texts:?}");
-            assert!(texts.iter().any(|line| line == t("Cancel")), "{texts:?}");
-            app.waiting_plays.clear();
-            app.maintenance = Some(MaintenanceKind::Update);
-            app.wait_update = Some(WaitUpdate { keys: vec![key], started: true, folder: None });
-            let texts = privacy::testing::texts(ui::view(&app), size);
-            assert!(texts.iter().any(|line| line == t("Updating FFXI before it starts…")), "{texts:?}");
-        }
-        i18n::set(i18n::Lang::En);
+        assert_eq!(app.w20_skipped, keys, "each starts without a second W20");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Review finding: a language switch replaced the status with the cached headlines
@@ -9401,7 +10194,7 @@ mod tests {
         let _ = app.update(Message::SetLanguage(i18n::Lang::Ja));
         assert!(app.service_down(), "still maintenance after the switch");
         app.launches = None;
-        app.start_mode_at(vec![app.accounts[0].key.clone()], false, Instant::now());
+        app.start_launch(vec![app.accounts[0].key.clone()], false, Instant::now(), None);
         assert!(!app.accounts[0].busy && app.receiver.try_recv().is_err(), "refused");
         let _ = app.update(Message::SetLanguage(i18n::Lang::En));
         let _ = std::fs::remove_dir_all(&app.config.experiment);
@@ -9481,7 +10274,7 @@ mod tests {
         app.accounts[0].game_running = Some(Arc::new(AtomicBool::new(false)));
         assert!(app.take_startup_signins().is_empty());
         // A social-only action on that session must not even schedule StartGame.
-        app.start_mode(vec![app.accounts[0].key.clone()], true);
+        app.connect(vec![app.accounts[0].key.clone()]);
         assert!(!app.accounts[0].busy);
         assert!(app.accounts[0].play_timing.is_none());
         assert!(app.receiver.try_recv().is_err());
@@ -9540,7 +10333,7 @@ mod tests {
         let row = &mut app.accounts[0];
         row.play_timing = Some(launch_timing::Timeline::begin());
         let key = row.key.clone();
-        let report = patch::PatchReport { state: patch::PatchState::Unknown, local_version: String::new(), remote_version: String::new(), detail: String::new(), source_url: None, files_verified: None };
+        let report = patch::PatchReport { state: patch::PatchState::Unknown, local_version: String::new(), remote_version: String::new(), detail: String::new(), files_verified: None };
         app.worker_event(WorkerEvent::StartGame(key.clone(), Some(report.clone()), Err("Version check refused".into())));
         assert!(app.accounts[0].play_timing.is_none());
         assert!(app.accounts[0].problem);
@@ -9559,29 +10352,48 @@ mod tests {
         let mut app = app();
         let key = app.accounts[0].key.clone();
         let other = app.accounts[1].account.launch_with;
-        let _ = app.set_account_launcher(&key, ui::LaunchWith::Vanilla);
+        let _ = app.set_account_launcher(std::slice::from_ref(&key), crate::backend::LaunchWith::Vanilla);
         let account = &app.accounts[0].account;
         assert_eq!(app.settings.launch_plan(account).unwrap().tool, pol_less::Tool::Vanilla);
         assert_eq!(app.accounts[1].account.launch_with, other);
         app.editor = Some(Editor { key: Some(key), account: account.clone(),
-            game_install: String::new(), dat_overlays: Vec::new(), auto_login: pol_less::AutoLogin::default() });
-        let _ = app.update(Message::EditorLaunchWith(Some(ui::LaunchWith::Windower)));
-        assert_eq!(app.editor.as_ref().unwrap().account.launch_with, Some(ui::LaunchWith::Windower));
-        let _ = app.update(Message::EditorLaunchWith(Some(ui::LaunchWith::Vanilla)));
+            game_install: String::new(), dat_overlays: Vec::new(), auto_login: pol_less::AutoLogin::default(), flags: EditorFlags::default() });
+        let _ = app.update(Message::EditorLaunchWith(Some(crate::backend::LaunchWith::Windower)));
+        assert_eq!(app.editor.as_ref().unwrap().account.launch_with, Some(crate::backend::LaunchWith::Windower));
+        let _ = app.update(Message::EditorLaunchWith(Some(crate::backend::LaunchWith::Vanilla)));
         assert_eq!(app.settings.launch_plan(&app.editor.as_ref().unwrap().account).unwrap().tool, pol_less::Tool::Vanilla);
-        assert_eq!(app.accounts[0].account.launch_with, Some(ui::LaunchWith::Vanilla));
+        assert_eq!(app.accounts[0].account.launch_with, Some(crate::backend::LaunchWith::Vanilla));
+    }
+
+    /// The sheet's "Uses a one-time password" is what Crystal knows about the login: on, it is
+    /// never signed in by itself; off, the next sign-in teaches it again.
+    #[test]
+    fn the_sheet_one_time_password_switch_sets_what_crystal_knows() {
+        let mut app = app();
+        let key = app.accounts[0].key.clone();
+        app.settings.account_no_otp.insert(key.clone());
+        assert!(app.settings.presigns(&key) || !app.settings.auto_sign_in);
+        let values: Vec<_> = app.accounts.iter().map(|row| row.account.clone()).collect();
+        let _ = app.update(Message::EditAccount(key.clone()));
+        assert!(!app.editor.as_ref().unwrap().flags.uses_otp);
+        let _ = app.update(Message::EditorFlag(EditorFlag::UsesOtp, true));
+        let _ = app.update(Message::AccountsSaved(Ok(values.clone())));
+        assert!(app.settings.account_otp.contains(&key) && !app.settings.account_no_otp.contains(&key));
+        assert!(!app.settings.presigns(&key));
+        let _ = app.update(Message::EditAccount(key.clone()));
+        assert!(app.editor.as_ref().unwrap().flags.uses_otp);
+        let _ = app.update(Message::EditorFlag(EditorFlag::UsesOtp, false));
+        let _ = app.update(Message::AccountsSaved(Ok(values)));
+        assert!(!app.settings.account_otp.contains(&key) && !app.settings.account_no_otp.contains(&key));
+        // A new account's sheet signs in in the background by default.
+        let _ = app.update(Message::NewAccount);
+        assert!(app.editor.as_ref().unwrap().flags.sign_in_now);
     }
 
     #[test]
     fn save_failure_keeps_account_state_and_editor() {
         let mut app = app();
-        app.editor = Some(Editor {
-            key: None,
-            account: blank_account(),
-            game_install: String::new(),
-            dat_overlays: Vec::new(),
-            auto_login: pol_less::AutoLogin::default(),
-        });
+        app.editor = Some(Editor::blank());
         app.vault_saving = true;
         let _ = app.update(Message::AccountsSaved(Err("Save failed".into())));
         assert_eq!(app.accounts.len(), 3);
@@ -9589,14 +10401,13 @@ mod tests {
         assert!(!app.vault_saving);
     }
 
-    #[cfg(windows)]
     #[test]
     fn dragging_accounts_persists_order_without_rewriting_credentials_or_live_state() {
         let mut app = app();
         let root = std::env::temp_dir().join(format!("crystal-account-order-{}", backend::unique_id().unwrap()));
         app.config.experiment = root.clone();
         app.preview = false;
-        app.page = Page::Accounts;
+        app.page = Page::Home;
         let values: Vec<_> = app.accounts.iter().map(|row| row.account.clone()).collect();
         backend::save_accounts(&app.config, &values).unwrap();
         let vault = root.join("iced-launcher/accounts.dpapi");
@@ -9632,7 +10443,7 @@ mod tests {
     #[test]
     fn canceled_or_failed_account_drags_restore_the_previous_order() {
         let mut app = app();
-        app.page = Page::Accounts;
+        app.page = Page::Home;
         let original: Vec<_> = app.accounts.iter().map(|row| row.key.clone()).collect();
         let _ = app.update(Message::AccountDragStart(original[0].clone()));
         let _ = app.update(Message::AccountDragOver(original[2].clone()));
@@ -9651,6 +10462,30 @@ mod tests {
         assert!(app.settings.account_order.is_empty());
         assert!(app.status.starts_with("Account order could not be saved:"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pol_handle_setup_survives_an_account_reload_and_can_be_cleared() {
+        let mut app=app();
+        let key=app.accounts[0].key.clone();
+        let _=app.update(Message::EditAccount(key.clone()));
+        let _=app.update(Message::EditorChanged(Field::PolHandleNames,"PublicOne, PublicTwo".into()));
+        let mut accounts:Vec<_>=app.accounts.iter().map(|r| r.account.clone()).collect();
+        accounts[0]=app.editor.as_ref().unwrap().account.clone();
+        let _=app.update(Message::AccountsSaved(Ok(accounts.clone())));
+        assert_eq!(app.settings.account_pol_handles.get(&key).map(String::as_str),Some("PublicOne, PublicTwo"));
+        let decoded:Settings=serde_json::from_str(&serde_json::to_string(&app.settings).unwrap()).unwrap();
+        app.settings=decoded;
+        for account in &mut accounts { account.pol_handle_names.clear(); }
+        let _=app.update(Message::AccountsLoaded(Ok(accounts)));
+        assert_eq!(app.accounts[0].account.pol_handle_names,"PublicOne, PublicTwo");
+        let _=app.update(Message::EditAccount(key.clone()));
+        let _=app.update(Message::EditorChanged(Field::PolHandleNames,String::new()));
+        let mut accounts:Vec<_>=app.accounts.iter().map(|r| r.account.clone()).collect();
+        accounts[0]=app.editor.as_ref().unwrap().account.clone();
+        let _=app.update(Message::AccountsSaved(Ok(accounts)));
+        assert!(!app.settings.account_pol_handles.contains_key(&key));
+        assert!(app.accounts[0].account.pol_handle_names.is_empty());
     }
 
     #[test]
@@ -9692,7 +10527,7 @@ mod tests {
         let path = r"C:\Games\Private Server";
         app.settings.install_path = r"C:\Games\Retail".into();
         app.settings.install_selected = true;
-        app.editor = Some(Editor { key: Some(first_key.clone()), account: first.clone(), game_install: path.into(), dat_overlays: vec![r"C:\Mods\High Priority".into(), r"C:\Mods\Fallback".into()], auto_login: pol_less::AutoLogin::default() });
+        app.editor = Some(Editor { key: Some(first_key.clone()), account: first.clone(), game_install: path.into(), dat_overlays: vec![r"C:\Mods\High Priority".into(), r"C:\Mods\Fallback".into()], auto_login: pol_less::AutoLogin::default(), flags: EditorFlags::default() });
         let values: Vec<_> = app.accounts.iter().map(|r| r.account.clone()).collect();
         let _ = app.update(Message::AccountsSaved(Ok(values.clone())));
         let config = app.settings.config_for(&app.config, &first);
@@ -9836,5 +10671,226 @@ mod tests {
         ] {
             assert!(!allowed_link(url));
         }
+    }
+}
+
+/// Background mode (window closed to the notification area) and the gated idle Tick.
+#[cfg(test)]
+mod background_tests {
+    use super::*;
+
+    fn live_app(name: &str) -> App {
+        let mut app = tests::app();
+        app.preview = false;
+        app.config.experiment = std::env::var_os("CRYSTAL_DATA_ROOT").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+            .join(format!("crystal-background-{name}-{}", backend::unique_id().unwrap()));
+        app.window = Some(WindowId::unique());
+        app
+    }
+
+    #[test]
+    fn the_close_button_hides_to_the_tray_only_when_settings_say_so() {
+        let mut app = live_app("hide");
+        app.settings.close_to_tray = true;
+        let _ = app.update(Message::CloseRequested);
+        assert!(app.window.is_none(), "the window closed");
+        assert!(!app.closing, "Crystal keeps running: sessions stay signed in");
+        // From the icon: back again, with a new window.
+        let _ = app.update(Message::Tray(tray::Command::Open));
+        assert!(app.window.is_some() && !app.closing);
+
+        let mut app = live_app("quit");
+        let _ = app.update(Message::CloseRequested);
+        assert!(app.closing, "off (the default): closing quits as before");
+        assert!(app.window.is_none());
+    }
+
+    #[test]
+    fn quitting_from_the_icon_while_something_holds_it_opens_the_window_to_say_why() {
+        let mut app = live_app("held-quit");
+        app.settings.close_to_tray = true;
+        let _ = app.update(Message::CloseRequested);
+        assert!(app.window.is_none());
+        app.vault_saving = true;
+        let _ = app.update(Message::Tray(tray::Command::Quit));
+        assert!(!app.closing && app.confirm_close);
+        assert!(app.window.is_some(), "the confirmation is visible");
+        app.vault_saving = false;
+        let _ = app.update(Message::Tray(tray::Command::Quit));
+        assert!(app.closing);
+    }
+
+    #[test]
+    fn an_update_handshake_is_never_hidden_away() {
+        let mut app = live_app("applying");
+        app.settings.close_to_tray = true;
+        app.self_update = self_update::State::Applying;
+        let _ = app.update(Message::CloseRequested);
+        assert!(app.window.is_some() && !app.closing);
+        assert!(app.status.contains("update helper"));
+    }
+
+    /// A signed-in session at its idle main menu for the first retail account, whose worker is
+    /// this test (`take_social` / `publish_friends` play the session worker), and the window
+    /// on the Friends page once its opening read asked for the Inbox.
+    fn friends_session(name: &str) -> (App, PathBuf, friends::Snapshot) {
+        let mut app = live_app(name);
+        let row = app.accounts.iter().position(|r| r.account.mode == AccountMode::Retail).unwrap();
+        let account = app.accounts[row].account.clone();
+        let config = app.settings.config_for(&app.config, &account);
+        let directory = config.account_directory(&account);
+        session_worker::save_live_record_for_test(&config, &account);
+        let mut snapshot = friends::Snapshot { game_running: Some(false), fetched_at: 1, ..Default::default() };
+        snapshot.social.ready = true;
+        session_worker::publish_friends(&directory, &snapshot).unwrap();
+        app.reset_friends(Some(app.accounts[row].key.clone()));
+        let _ = app.update(Message::Navigate(Page::Friends));
+        let started = Instant::now();
+        while app.friends.pending.is_none() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+            let _ = app.update(Message::Tick);
+        }
+        assert!(app.friends.pending.is_some(), "opening the page lists the Inbox: {}", app.friends.error);
+        // The read the request started has finished: what follows decides what is seen.
+        tick_until(&mut app, |app| !app.friends.loading);
+        (app, directory, snapshot)
+    }
+
+    /// The session worker takes the request and PlayOnline answers it at once: busy, then
+    /// result 0 (accepted) and result 1 (the page) — live 2026-10-22 11:17:46, one second.
+    fn answer_inbox(directory: &Path, snapshot: &mut friends::Snapshot) {
+        let (request, _lock) = session_worker::take_social(directory).expect("the request reached the worker");
+        snapshot.social.begin(request.id.clone(), &request.request);
+        session_worker::publish_friends(directory, snapshot).unwrap();
+        snapshot.social.apply(&request.id, crate::social::Action::Inbox, 0, None).unwrap();
+        session_worker::publish_friends(directory, snapshot).unwrap();
+        snapshot.social.apply(&request.id, crate::social::Action::Inbox, 1, Some(&[0; 12 + 32 * 72])).unwrap();
+        session_worker::publish_friends(directory, snapshot).unwrap();
+    }
+
+    fn tick_until(app: &mut App, done: impl Fn(&App) -> bool) {
+        let started = Instant::now();
+        while !done(app) && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = app.update(Message::Tick);
+        }
+    }
+
+    #[test]
+    fn opening_friends_lists_the_inbox_and_sees_it_complete() {
+        let (mut app, directory, mut snapshot) = friends_session("friends-open");
+        answer_inbox(&directory, &mut snapshot);
+        tick_until(&mut app, |app| app.friends.pending.is_none());
+        assert!(app.friends.pending.is_none() && app.friends.error.is_empty(), "{}", app.friends.error);
+        assert!(app.friends.mail.listed[0].is_some());
+    }
+
+    /// Live 2026-10-22: Friends opened after FFXI returned, the Inbox listing finished in the
+    /// same second (results 0 then 1, the cache idle with its id), yet the page later said
+    /// PlayOnline had not reported completion. The limit was checked before anything read
+    /// what had arrived: a window that had not looked for 45 s called a finished request lost.
+    #[test]
+    fn a_finished_request_is_not_reported_missing_when_the_window_looks_late() {
+        let (mut app, directory, mut snapshot) = friends_session("friends-late");
+        answer_inbox(&directory, &mut snapshot);
+        // Nothing read the session since: the window looks again only now, past the limit.
+        let id = app.friends.pending.as_ref().unwrap().0.clone();
+        app.friends.pending = Some((id, Instant::now() - FRIENDS_REQUEST_LIMIT - Duration::from_secs(1)));
+        let _ = app.update(Message::Tick);
+        assert!(app.friends.error.is_empty(), "{}", app.friends.error);
+        assert!(app.friends.pending.is_none() && !app.friends.mail.stalled);
+        assert!(app.friends.mail.listed[0].is_some(), "the listing it finished is learned");
+    }
+
+    /// Leaving the page stopped the reads while the limit kept running on every page.
+    #[test]
+    fn a_request_is_followed_after_leaving_the_friends_page() {
+        let (mut app, directory, mut snapshot) = friends_session("friends-left");
+        let _ = app.update(Message::Navigate(Page::Home));
+        tick_until(&mut app, |app| !app.friends.loading);
+        answer_inbox(&directory, &mut snapshot);
+        tick_until(&mut app, |app| app.friends.pending.is_none());
+        assert!(app.friends.pending.is_none() && app.friends.error.is_empty(), "{}", app.friends.error);
+        assert!(app.friends.mail.listed[0].is_some());
+        // Off the page nothing new is asked for.
+        app.friends.snapshot.as_mut().unwrap().social.inbox_changed = true;
+        app.worker_event(WorkerEvent::Friends(app.friends_generation, app.friends.account.clone().unwrap(), true, app.friends.snapshot.clone()));
+        assert!(app.friends.pending.is_none());
+    }
+
+    /// A request PlayOnline really has not finished still says so at the limit.
+    #[test]
+    fn an_unanswered_request_still_reports_at_the_limit() {
+        let (mut app, directory, mut snapshot) = friends_session("friends-unanswered");
+        let (request, lock) = session_worker::take_social(&directory).unwrap();
+        snapshot.social.begin(request.id.clone(), &request.request);
+        session_worker::publish_friends(&directory, &snapshot).unwrap();
+        drop(lock);
+        let id = app.friends.pending.as_ref().unwrap().0.clone();
+        app.friends.pending = Some((id, Instant::now() - FRIENDS_REQUEST_LIMIT - Duration::from_secs(1)));
+        let _ = app.update(Message::Tick);
+        assert!(app.friends.pending.is_none() && app.friends.mail.stalled);
+        assert!(app.friends.error.contains("has not reported completion"), "{}", app.friends.error);
+    }
+
+    #[test]
+    fn the_idle_tick_is_quiet_only_with_no_timed_work() {
+        let mut app = tests::app();
+        app.startup_signin_pending = false;
+        app.startup_waiting.clear();
+        assert!(app.tick_quiet());
+        app.page = Page::Friends;
+        assert!(!app.tick_quiet(), "the Friends page polls its list");
+        app.page = Page::Home;
+        app.startup_signin_pending = true;
+        assert!(!app.tick_quiet(), "startup sign-ins wait for the vault");
+        app.startup_signin_pending = false;
+        app.parks_settled = false;
+        assert!(!app.tick_quiet(), "a park to start");
+        app.parks_settled = true;
+        app.accounts[0].resign = Some(Resign { generation: 0, ended: Instant::now(), free_since: None, network: false, host: None });
+        assert!(!app.tick_quiet(), "a sign-in after the game");
+        app.accounts[0].resign = None;
+        app.accounts[0].queued_play = Some(Instant::now());
+        assert!(!app.tick_quiet(), "a queued Play");
+        app.accounts[0].queued_play = None;
+        assert!(app.tick_quiet());
+    }
+
+    #[test]
+    fn a_quiet_window_watches_each_session_and_game_flag() {
+        let mut app = tests::app();
+        let alive = Arc::new(AtomicBool::new(true));
+        let game = Arc::new(AtomicBool::new(false));
+        app.accounts[0].alive = Some(alive.clone());
+        app.accounts[0].game_running = Some(game.clone());
+        let flags = app.watched_flags();
+        assert_eq!(flags.len(), 2);
+        assert!(flags.iter().any(|(flag, seen)| Arc::ptr_eq(flag, &alive) && *seen));
+        assert!(flags.iter().any(|(flag, seen)| Arc::ptr_eq(flag, &game) && !*seen));
+    }
+
+    #[test]
+    fn background_settings_are_off_by_default_and_saved_only_when_on() {
+        let settings = Settings::default();
+        assert!(!settings.close_to_tray && !settings.start_with_windows);
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(!json.contains("close_to_tray") && !json.contains("start_with_windows"));
+        let on = Settings { close_to_tray: true, start_with_windows: true, ..Settings::default() };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        assert!(back.close_to_tray && back.start_with_windows);
+    }
+
+    #[test]
+    fn start_with_windows_waits_for_its_task_and_keeps_the_switch_on_failure() {
+        let mut app = live_app("startup-task");
+        let task = app.update(Message::StartWithWindows(true));
+        assert!(task.units() > 0 && app.startup_task_busy());
+        assert!(app.update(Message::StartWithWindows(false)).units() == 0, "one change at a time");
+        let _ = app.update(Message::StartupTaskSet(true, Err("refused".into())));
+        assert!(!app.settings.start_with_windows && !app.startup_task_busy());
+        assert_eq!(app.status, "refused");
+        let _ = app.update(Message::StartupTaskSet(true, Ok(())));
+        assert!(app.settings.start_with_windows);
     }
 }

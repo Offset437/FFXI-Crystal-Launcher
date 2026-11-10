@@ -4,12 +4,11 @@
 //! leaves control with the user. No global key events, window activation or
 //! menu writes.
 
-use std::{ffi::c_void, sync::{mpsc, Arc, LazyLock, Mutex, atomic::{AtomicUsize, Ordering}}, thread, time::{Duration, Instant}};
+use std::{sync::{mpsc, Arc, LazyLock, Mutex, atomic::{AtomicU64, AtomicUsize, Ordering}}, thread, time::{Duration, Instant}};
 use windows_sys::Win32::{
     Foundation::{FreeLibrary, HWND},
-    System::{Diagnostics::Debug::ReadProcessMemory,
-        LibraryLoader::{GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS},
-        Threading::{GetCurrentProcess, GetCurrentThreadId}, Memory::{VirtualProtect, PAGE_READWRITE}},
+    System::{LibraryLoader::{GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS},
+        Threading::GetCurrentThreadId},
     UI::{
         Input::KeyboardAndMouse::{GetAsyncKeyState, GetKeyboardState, IsWindowEnabled},
         WindowsAndMessaging::{GetClassNameW, GetForegroundWindow,
@@ -43,19 +42,9 @@ pub(crate) const CONFIRM_VARIANT: usize = 0xA5E0;
 /// The keyboard controller's GetKeyboardState buffer (lea ecx,[esi+0x298]).
 pub(crate) const KEYBOARD_BUFFER: usize = 0x298;
 
-fn read<T: Copy>(address: usize) -> Option<T> {
-    let mut out = std::mem::MaybeUninit::<T>::uninit();
-    let mut bytes = 0;
-    // Windows rejects inaccessible ranges; no Rust game-memory dereference.
-    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), address as *const c_void,
-        out.as_mut_ptr().cast(), std::mem::size_of::<T>(), &mut bytes) };
-    (ok != 0 && bytes == std::mem::size_of::<T>()).then(|| unsafe { out.assume_init() })
-}
+use crate::mem::read;
 
-fn pointer(address: usize) -> Option<usize> {
-    read::<u32>(address).map(|value| value as usize)
-        .filter(|value| *value >= 0x10000 && *value <= usize::MAX - 0x20000 && value % 4 == 0)
-}
+fn pointer(address: usize) -> Option<usize> { crate::mem::pointer(address, 0x20000) }
 
 fn operand_matches(base: usize, code: &[u8], prefix: &[u8], rva: usize, suffix: &[u8]) -> bool {
     let Some(address) = base.checked_add(rva).and_then(|n| u32::try_from(n).ok()) else { return false; };
@@ -88,11 +77,12 @@ fn verified_layout(layout: &Layout) -> bool {
     // Relocation is checked too. Deletion reuses dbnamese with help mode 0x12.
     let (base, m) = (layout.base, &layout.menus);
     let at = |rva: usize| base.checked_add(rva);
-    let Some(focus) = at(m.sites.focus).and_then(read::<[u8; 8]>) else { return false; };
+    // `cmp eax,[FOCUS]; jne` (the branch distance is not checked, as in the scan).
+    let Some(focus) = at(m.sites.focus).and_then(read::<[u8; 7]>) else { return false; };
     let Some(row) = at(m.sites.selected).and_then(read::<[u8; 10]>) else { return false; };
     let Some(help) = at(m.sites.help).and_then(read::<[u8; 13]>) else { return false; };
     let Some(window) = at(m.sites.window).and_then(read::<[u8; 6]>) else { return false; };
-    operand_matches(base, &focus, &[0x3B, 0x05], m.focus, &[0x75, 0x09])
+    operand_matches(base, &focus, &[0x3B, 0x05], m.focus, &[0x75])
         && operand_matches(base, &row, &[0x0F, 0xBF, 0x40, 0x4C, 0x48, 0xA3], m.selected, &[])
         && operand_matches(base, &help, &[0x8B, 0x0D], m.help, &[0xC7, 0x41, 0x14, 2, 0, 0, 0])
         && operand_matches(base, &window, &[0x8B, 0x0D], m.window, &[])
@@ -102,10 +92,9 @@ fn verified_layout(layout: &Layout) -> bool {
 
 /// `call rel32` at `code[at]`, where `code` was read from RVA `site`, lands
 /// on RVA `target`. Relative calls are the same at any load address.
-fn call_lands(code: &[u8], site: usize, at: usize, target: usize) -> bool {
-    code.get(at) == Some(&0xE8) && code.get(at + 1..at + 5).is_some_and(|rel| {
-        let rel = i32::from_le_bytes(rel.try_into().unwrap()) as isize;
-        (site + at + 5).checked_add_signed(rel) == Some(target)
+pub(crate) fn call_lands(code: &[u8], site: usize, at: usize, target: usize) -> bool {
+    code.get(at) == Some(&0xE8) && code.get(at + 1..at + 5).and_then(|rel| rel.try_into().ok()).is_some_and(|rel: [u8; 4]| {
+        (site + at + 5).checked_add_signed(i32::from_le_bytes(rel) as isize) == Some(target)
     })
 }
 
@@ -144,6 +133,19 @@ fn screen(name: &[u8; 16]) -> Screen {
     }
 }
 
+impl Screen {
+    /// Fixed category names; boot_timing uses them as checkpoint names.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Warning => "warning",
+            Self::Title => "title",
+            Self::Characters => "characters",
+            Self::Confirm => "confirmation",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Snapshot {
     screen: Screen,
@@ -156,11 +158,21 @@ struct Snapshot {
     login_confirmation: bool,
 }
 
+/// The focused menu, its resource and its resource name.
+fn focused_menu(layout: &Layout) -> Option<(usize, usize, [u8; 16])> {
+    let focus = pointer(layout.base + layout.menus.focus)?;
+    let resource = pointer(focus + MENU_RESOURCE)?;
+    Some((focus, resource, read::<[u8; 16]>(resource + MENU_NAME)?))
+}
+
+/// The same menu is still focused: no switch happened during a read.
+fn menu_unchanged(layout: &Layout, focus: usize, resource: usize, name: &[u8; 16]) -> bool {
+    pointer(layout.base + layout.menus.focus) == Some(focus) && read::<[u8; 16]>(resource + MENU_NAME).as_ref() == Some(name)
+}
+
 fn snapshot(layout: &Layout, target: u8) -> Option<Snapshot> {
     let (base, m) = (layout.base, &layout.menus);
-    let focus = pointer(base + m.focus)?;
-    let resource = pointer(focus + MENU_RESOURCE)?;
-    let name = read::<[u8; 16]>(resource + MENU_NAME)?;
+    let (focus, resource, name) = focused_menu(layout)?;
     let screen = screen(&name);
     let controller_rva = match screen {
         Screen::Warning => m.license,
@@ -202,7 +214,7 @@ fn snapshot(layout: &Layout, target: u8) -> Option<Snapshot> {
         }
     }
     // Reject a menu switch during this multi-field read.
-    (pointer(base + m.focus)? == focus && read::<[u8; 16]>(resource + MENU_NAME)? == name).then_some(state)
+    menu_unchanged(layout, focus, resource, &name).then_some(state)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,6 +274,10 @@ impl Navigator {
             }
         }
         match state.screen {
+            // A retained POL host can show an initialization menu before the
+            // new game's title screen. Wait for a recognized login menu before
+            // sending any input; a later unexpected transition still stops us.
+            Screen::Other if self.taps == 0 => Action::Wait,
             Screen::Warning | Screen::Title if !self.selected => {
                 if state.cursor == 0 { Action::Tap(Key::Enter) }
                 else { Action::Stop("login menu selection was changed; finish login manually") }
@@ -308,7 +324,15 @@ fn game_window(layout: &Layout) -> Option<(HWND, u32)> {
     (thread != 0 && pid == std::process::id() && owned_window(window, thread)).then_some((window, thread))
 }
 
-fn owned_window(window: HWND, game_thread: u32) -> bool {
+/// The keyboard controller, when `data` is its GetKeyboardState buffer: the
+/// keyboard frame of this game, not another caller of the import.
+pub(crate) fn frame_keyboard(base: usize, keyboard_rva: usize, data: *mut u8) -> Option<usize> {
+    let keyboard = pointer(base.checked_add(keyboard_rva)?)?;
+    (keyboard.checked_add(KEYBOARD_BUFFER) == Some(data as usize)).then_some(keyboard)
+}
+
+/// `window` is this process's game window (class FFXiClass) on `game_thread`.
+pub(crate) fn owned_window(window: HWND, game_thread: u32) -> bool {
     if window.is_null() { return false; }
     let mut pid = 0;
     let mut class = [0u16; 32];
@@ -338,9 +362,48 @@ fn keys_down() -> bool {
 #[derive(Debug, PartialEq, Eq)]
 enum Tap { Sent, Skipped, Cancelled, Failed }
 
+/// The GameStart this host is running, numbered from 1. A key belongs to one
+/// generation; 0 means no login worker is active and nothing may be sent.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// The generation whose worker may still send keys; 0 once it has stopped,
+/// finished, reached the world or been dropped. Never re-armed for that game.
+static ACTIVE: AtomicU64 = AtomicU64::new(0);
+
+/// The client's world-entry "commands enabled" DWORD (game_layout's shutdown
+/// group). Nonzero means a character is in the world.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct World { flag: usize }
+impl World {
+    fn entered(self, base: usize) -> Option<bool> {
+        base.checked_add(self.flag).and_then(read::<u32>).map(|value| value != 0)
+    }
+}
+
+/// Every condition, apart from the live screen, under which a queued key may
+/// still reach the game: the same GameStart, its worker still active, and a
+/// readable world flag that says the character is not in the world.
+fn admitted(generation: u64, base: usize, world: World) -> Result<(), &'static str> {
+    if generation == 0 || GENERATION.load(Ordering::Acquire) != generation {
+        return Err("key belongs to an earlier game");
+    }
+    if ACTIVE.load(Ordering::Acquire) != generation { return Err("login input already stopped for this game"); }
+    world_clear(world.entered(base))
+}
+
+/// The world flag must be readable and clear: an unreadable or set flag is
+/// never treated as a login screen.
+fn world_clear(entered: Option<bool>) -> Result<(), &'static str> {
+    match entered {
+        Some(false) => Ok(()),
+        Some(true) => Err("character is in the world"),
+        None => Err("world state unreadable"),
+    }
+}
+
 struct Command {
     layout: Layout, keys: Input, window: usize, game_thread: u32, target: u8,
     expected: Snapshot, key: Key, expires: Instant, result: mpsc::Sender<Tap>,
+    generation: u64, world: World,
 }
 
 /// A read-only timing probe, independent of the optional input worker. It
@@ -384,20 +447,9 @@ impl TitleProbe {
 // Fixed menu categories only. This explains a missing timing marker without
 // reading names, character rows, menu text or changing the input worker.
 fn title_focus(layout: &Layout) -> &'static str {
-    let focus_at = layout.base + layout.menus.focus;
-    let focus = pointer(focus_at);
-    let resource = focus.and_then(|focus| pointer(focus + MENU_RESOURCE));
-    let name = resource.and_then(|resource| read::<[u8; 16]>(resource + MENU_NAME));
-    if name.is_none() || pointer(focus_at) != focus
-        || resource.and_then(|resource| read::<[u8; 16]>(resource + MENU_NAME)) != name {
-        return "pending";
-    }
-    match screen(&name.unwrap()) {
-        Screen::Warning => "warning",
-        Screen::Title => "title",
-        Screen::Characters => "characters",
-        Screen::Confirm => "confirmation",
-        Screen::Other => "other",
+    match focused_menu(layout) {
+        Some((focus, resource, name)) if menu_unchanged(layout, focus, resource, &name) => screen(&name).label(),
+        _ => "pending",
     }
 }
 
@@ -427,6 +479,7 @@ unsafe extern "system" fn keyboard_state(data: *mut u8) -> i32 {
         std::mem::transmute(if original == 0 { GetKeyboardState as *const () as usize } else { original });
     let result = original(data);
     crate::controller_settings::on_input(data);
+    crate::game_shutdown::on_input(data);
     let mut pending = command();
     let Some(input) = pending.as_ref() else { return result; };
     let outcome = deliver(input, data, |context, key| {
@@ -434,11 +487,12 @@ unsafe extern "system" fn keyboard_state(data: *mut u8) -> i32 {
         unsafe {
             // Only addresses the scan resolved (and a known build's table
             // confirmed), re-checked byte for byte before the hook was installed.
+            type Setter = unsafe extern "thiscall" fn(usize, u32);
             let base = input.layout.base;
             dispatch_key(context, key,
-                [std::mem::transmute(base + input.keys.pressed),
-                 std::mem::transmute(base + input.keys.edge),
-                 std::mem::transmute(base + input.keys.repeat)]);
+                [std::mem::transmute::<usize, Setter>(base + input.keys.pressed),
+                 std::mem::transmute::<usize, Setter>(base + input.keys.edge),
+                 std::mem::transmute::<usize, Setter>(base + input.keys.repeat)]);
             true
         }
         #[cfg(not(target_arch = "x86"))]
@@ -456,11 +510,17 @@ fn deliver(input: &Command, data: *mut u8, dispatch: impl FnOnce(usize, Key) -> 
     // may consume this command, directly after its ordinary keyboard update.
     let base = input.layout.base;
     if unsafe { GetCurrentThreadId() } != input.game_thread
-        || pointer(base + input.keys.keyboard).and_then(|controller| controller.checked_add(KEYBOARD_BUFFER)) != Some(data as usize) {
+        || frame_keyboard(base, input.keys.keyboard, data).is_none() {
         return None;
     }
     let window = input.window as HWND;
     let outcome = if input.expires < Instant::now() || crate::events::pipe_closed() {
+        Tap::Cancelled
+    } else if let Err(reason) = admitted(input.generation, base, input.world) {
+        // Fail closed and permanently: this game's login input is over.
+        ACTIVE.store(0, Ordering::Release);
+        log!("auto-login: gen={} {:?} key={:?} refused on the game thread: {reason}",
+            input.generation, input.expected.screen, input.key);
         Tap::Cancelled
     } else if game_window(&input.layout) != Some((window, input.game_thread))
         || !usable(window, input.game_thread)
@@ -477,6 +537,18 @@ fn deliver(input: &Command, data: *mut u8, dispatch: impl FnOnce(usize, Key) -> 
 struct KeyboardImport { slot: usize, original: usize, users: usize }
 type SharedImport = Arc<Mutex<Option<KeyboardImport>>>;
 static SHARED_KEYBOARD: LazyLock<SharedImport> = LazyLock::new(|| Arc::new(Mutex::new(None)));
+
+/// A login or live-controller lease on the game's input import is still held.
+pub(crate) fn keyboard_leased() -> bool {
+    SHARED_KEYBOARD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|import| import.users != 0)
+}
+
+/// FFXiMain.dll was unloaded after its game (game_modules): forget the old
+/// image's import slot, so the next mapping's first lease records its own.
+pub(crate) fn forget_keyboard_import() {
+    let mut guard = SHARED_KEYBOARD.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.as_ref().is_some_and(|import| import.users == 0) { *guard = None; }
+}
 
 /// A lease on the one input import used by login and live controller settings.
 /// A later injector can retain our forwarding wrapper after every lease ends;
@@ -504,12 +576,12 @@ impl KeyboardHook {
     fn install(base: usize, keys: &Input) -> Option<Self> {
         // Redirect this game's one import. Keep an injector's prior function;
         // no system-wide hooks or executable-instruction patches are needed.
-        let imports = unsafe { crate::ffxi_settings::import_slots(base, "user32.dll") };
+        let imports = unsafe { crate::iat::import_slots(base, "user32.dll") };
         let slot = imports.iter().find(|slot| slot.name.as_deref()
             .is_some_and(|name| name.eq_ignore_ascii_case("GetKeyboardState")))?.slot as usize;
         // The named import must be the slot the verified keyboard frame calls.
         if Some(slot) != base.checked_add(keys.iat_slot) { return None; }
-        if slot % std::mem::align_of::<AtomicUsize>() != 0 { return None; }
+        if !slot.is_multiple_of(std::mem::align_of::<AtomicUsize>()) { return None; }
         Self::acquire(Arc::clone(&SHARED_KEYBOARD), slot, true)
     }
     fn acquire(shared: SharedImport, slot: usize, publish: bool) -> Option<Self> {
@@ -541,15 +613,7 @@ impl KeyboardHook {
 }
 impl KeyboardImport {
     fn replace(&self, expected: usize, value: usize) -> bool {
-        let mut old = 0;
-        unsafe {
-            if VirtualProtect(self.slot as *const c_void, std::mem::size_of::<usize>(), PAGE_READWRITE, &mut old) == 0 { return false; }
-            let slot = &*(self.slot as *const AtomicUsize);
-            let replaced = slot.compare_exchange(expected, value, Ordering::AcqRel, Ordering::Acquire).is_ok();
-            let mut ignored = 0;
-            VirtualProtect(self.slot as *const c_void, std::mem::size_of::<usize>(), old, &mut ignored);
-            replaced
-        }
+        crate::iat::swap(self.slot, expected, value).is_ok_and(|done| done.changed)
     }
 }
 impl Drop for KeyboardHook {
@@ -576,11 +640,13 @@ pub(crate) fn input_hook(resolution: &Resolution) -> Result<KeyboardHook, String
 }
 
 #[allow(clippy::too_many_arguments)]
-fn tap(window: HWND, game_thread: u32, layout: Layout, keys: Input, target: u8, expected: Snapshot, key: Key, stop: &mpsc::Receiver<()>) -> Tap {
+fn tap(window: HWND, game_thread: u32, layout: Layout, keys: Input, target: u8, expected: Snapshot, key: Key,
+    generation: u64, world: World, stop: &mpsc::Receiver<()>) -> Tap {
     if stop.try_recv() != Err(mpsc::TryRecvError::Empty) { return Tap::Cancelled; }
+    if admitted(generation, layout.base, world).is_err() { return Tap::Cancelled; }
     let (result, receive) = mpsc::channel();
     let expires = Instant::now() + Duration::from_secs(5);
-    *command() = Some(Command { layout, keys, window: window as usize, game_thread, target, expected, key, expires, result });
+    *command() = Some(Command { layout, keys, window: window as usize, game_thread, target, expected, key, expires, result, generation, world });
     loop {
         if let Ok(outcome) = receive.try_recv() { return outcome; }
         if stop.recv_timeout(Duration::from_millis(10)) != Err(mpsc::RecvTimeoutError::Timeout) {
@@ -590,39 +656,79 @@ fn tap(window: HWND, game_thread: u32, layout: Layout, keys: Input, target: u8, 
     }
 }
 
-/// The menu layout plus key input, both verified live; then the hook.
-fn prepare(resolution: &Resolution) -> Result<(Layout, Input, KeyboardHook), String> {
+/// The menu layout plus key input, both verified live; then the hook. The
+/// world flag is required: without it the world cannot be ruled out, so no
+/// login key is ever sent (fail closed).
+fn prepare(resolution: &Resolution) -> Result<(Layout, Input, World, KeyboardHook), String> {
     let layout = Layout::resolve(resolution)?;
     let keys = resolution.input.clone().map_err(|reason| format!("key input: {reason}"))?;
+    let world = World { flag: resolution.shutdown.as_ref().map_err(|reason| format!("world state: {reason}"))?.enabled };
     let hook = input_hook(resolution)?;
-    Ok((layout, keys, hook))
+    Ok((layout, keys, world, hook))
 }
+
+/// Starts this GameStart's generation: every key queued by an earlier game is
+/// discarded and can never be consumed by this one.
+fn begin_generation() -> u64 {
+    let generation = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    ACTIVE.store(0, Ordering::Release);
+    if let Some(stale) = command().take() { let _ = stale.result.send(Tap::Cancelled); }
+    generation
+}
+
+/// Ends `generation`'s input for good (finished, stopped, dropped, panicked).
+struct Ended(u64);
+impl Drop for Ended {
+    fn drop(&mut self) {
+        let _ = ACTIVE.compare_exchange(self.0, 0, Ordering::AcqRel, Ordering::Acquire);
+        let mut pending = command();
+        if pending.as_ref().is_some_and(|input| input.generation == self.0) {
+            if let Some(input) = pending.take() { let _ = input.result.send(Tap::Cancelled); }
+        }
+    }
+}
+
 
 pub(crate) struct Worker { stop: mpsc::Sender<()>, worker: Option<thread::JoinHandle<()>> }
 impl Worker {
     pub(crate) fn start(config: AutoLogin) -> Option<Self> {
+        // Every GameStart starts a new generation, even with auto-login off.
+        let generation = begin_generation();
         if !config.enabled || !(1..=16).contains(&config.character_slot) { return None; }
         let (stop, receiver) = mpsc::channel();
+        ACTIVE.store(generation, Ordering::Release);
         let worker = thread::Builder::new().name("crystal-auto-login".into()).spawn(move || {
+            let _ended = Ended(generation);
             let started = Instant::now();
             let mut prepared = None;
             let mut stable = None;
             let mut changed = Instant::now();
             let mut navigator = Navigator::new(config.character_slot);
-            log!("auto-login: waiting for this game's login screen (slot {}; background input enabled)", config.character_slot);
+            log!("auto-login: gen={generation} waiting for this game's login screen (slot {}; background input enabled)", config.character_slot);
             while started.elapsed() < LIMIT {
                 if receiver.recv_timeout(POLL) != Err(mpsc::RecvTimeoutError::Timeout) { return; }
                 if crate::events::pipe_closed() { return; }
+                if ACTIVE.load(Ordering::Acquire) != generation { log!("auto-login: gen={generation} input stopped"); return; }
                 if prepared.is_none() {
                     // None until FFXiMain is loaded and initialized; keep polling.
                     let Some(resolution) = crate::game_layout::ffximain() else { continue; };
                     match prepare(resolution) {
-                        Ok(ready) => prepared = Some(ready),
-                        Err(reason) => { log!("auto-login: unsupported game layout ({reason}); finish login manually"); return; }
+                        Ok(ready) => {
+                            log!("auto-login: gen={generation} FFXiMain at {:#x}; world flag at start: {:?}",
+                                resolution.base, ready.2.entered(resolution.base));
+                            prepared = Some(ready);
+                        }
+                        Err(reason) => { log!("auto-login: gen={generation} unsupported game layout ({reason}); finish login manually"); return; }
                     }
                 }
-                let (layout, keys, _) = prepared.as_ref().unwrap();
-                let (layout, keys) = (*layout, *keys);
+                let (layout, keys, world, _) = prepared.as_ref().unwrap();
+                let (layout, keys, world) = (*layout, *keys, *world);
+                // A host that kept FFXiMain loaded from an earlier game may
+                // carry the flag over: checked before every poll.
+                if let Err(reason) = world_clear(world.entered(layout.base)) {
+                    log!("auto-login: gen={generation} {reason}; login input stopped for this game");
+                    return;
+                }
                 let Some((window, game_thread)) = game_window(&layout) else { stable = None; continue; };
                 if !usable(window, game_thread) || (unsafe { GetForegroundWindow() } == window && keys_down()) { stable = None; continue; }
                 let current = snapshot(&layout, navigator.target);
@@ -631,38 +737,48 @@ impl Worker {
                 let Some(current) = current else { continue; };
                 match navigator.action(current, started.elapsed()) {
                     Action::Wait => {},
-                    Action::Finished => { log!("auto-login: character login confirmed; input finished"); return; }
+                    Action::Finished => { log!("auto-login: gen={generation} character login confirmed; input finished"); return; }
                     Action::Stop(reason) => {
-                        log!("auto-login: {reason} (screen={:?}, cursor={}, slot={}, count={})",
+                        log!("auto-login: gen={generation} {reason} (screen={:?}, cursor={}, slot={}, count={})",
                             current.screen, current.cursor, config.character_slot, current.character_count);
                         return;
                     }
                     Action::Tap(key) => {
-                        match tap(window, game_thread, layout, keys, navigator.target, current, key, &receiver) {
+                        let outcome = tap(window, game_thread, layout, keys, navigator.target, current, key, generation, world, &receiver);
+                        if outcome != Tap::Skipped {
+                            log!("auto-login: gen={generation} {:?} key={key:?} cursor={} result={outcome:?}",
+                                current.screen, current.cursor);
+                        }
+                        match outcome {
                             Tap::Sent => {
-                                log!("auto-login: {:?} key={key:?} cursor={}", current.screen, current.cursor);
                                 navigator.sent(current, key, started.elapsed());
                                 if navigator.confirmed {
-                                    log!("auto-login: login confirmation submitted; input finished");
+                                    log!("auto-login: gen={generation} login confirmation submitted; input finished");
                                     return;
                                 }
                             },
                             Tap::Skipped => {},
                             Tap::Cancelled => return,
-                            Tap::Failed => { log!("auto-login: game did not consume login input; finish login manually"); return; }
+                            Tap::Failed => { log!("auto-login: gen={generation} game did not consume login input; finish login manually"); return; }
                         }
                         stable = None;
                     }
                 }
             }
-            log!("auto-login: timed out; finish login manually");
+            log!("auto-login: gen={generation} timed out; finish login manually");
             drop(prepared);
-        }).ok()?;
-        Some(Self { stop, worker: Some(worker) })
+        });
+        match worker {
+            Ok(worker) => Some(Self { stop, worker: Some(worker) }),
+            Err(_) => { ACTIVE.store(0, Ordering::Release); None }
+        }
     }
 }
 impl Drop for Worker {
     fn drop(&mut self) {
+        // Stop input before joining: a key already queued is refused on the
+        // game thread from here on, whatever the worker is doing.
+        ACTIVE.store(0, Ordering::Release);
         let _ = self.stop.send(());
         if let Some(worker) = self.worker.take() { let _ = worker.join(); }
     }
@@ -682,6 +798,8 @@ mod tests {
     const SELECTED_RVA: usize = OLD.menus.selected;
     const WINDOW_RVA: usize = OLD.menus.window;
     const LOBBY_PTR_RVA: usize = OLD.lobby.ptr;
+    /// A world flag inside the fixture, clear of every other field it uses.
+    const WORLD_RVA: usize = 0x9800;
 
     fn keys() -> Input { OLD.input }
 
@@ -745,7 +863,7 @@ mod tests {
         for invalid in [Snapshot { login_context: false, ..state(Screen::Characters, 0) },
             Snapshot { target_available: false, ..state(Screen::Characters, 0) },
             Snapshot { character_count: 1, ..state(Screen::Characters, 0) },
-            state(Screen::Confirm, 0), state(Screen::Title, 1), state(Screen::Other, 0)] {
+            state(Screen::Confirm, 0), state(Screen::Title, 1)] {
             assert!(matches!(Navigator::new(2).action(invalid, Duration::ZERO), Action::Stop(_)));
         }
         let mut nav = Navigator::new(2);
@@ -755,6 +873,22 @@ mod tests {
         let mut nav = Navigator::new(2);
         nav.sent(state(Screen::Characters, 0), Key::Down, Duration::ZERO);
         assert!(matches!(nav.action(state(Screen::Characters, 2), Duration::from_secs(1)), Action::Stop(_)));
+    }
+    #[test]
+    fn retained_host_waits_for_the_new_login_screen_before_first_input() {
+        let mut nav = Navigator::new(1);
+        let initializing = state(Screen::Other, -1);
+        assert_eq!(nav.action(initializing, Duration::from_secs(12)), Action::Wait);
+        assert_eq!(nav.action(initializing, Duration::from_secs(16)), Action::Wait);
+        let title = state(Screen::Title, 0);
+        assert_eq!(nav.action(title, Duration::from_secs(17)), Action::Tap(Key::Enter));
+        nav.sent(title, Key::Enter, Duration::from_secs(17));
+        assert_eq!(nav.action(initializing, Duration::from_secs(18)), Action::Wait);
+        let characters = state(Screen::Characters, 0);
+        assert_eq!(nav.action(characters, Duration::from_secs(19)), Action::Tap(Key::Enter));
+        nav.sent(characters, Key::Enter, Duration::from_secs(19));
+        assert!(matches!(nav.action(initializing, Duration::from_secs(20)), Action::Stop(_)),
+            "an unexpected screen after choosing a character still requires manual login");
     }
     #[test]
     fn waits_through_the_lobby_connection_between_login_screens() {
@@ -834,7 +968,7 @@ mod tests {
         let mut image = vec![0u8; 0x12_4000];
         let base = image.as_ptr() as usize;
         let abs = |rva: usize| ((base + rva) as u32).to_le_bytes();
-        let rel = |from: usize, to: usize| ((to as isize - (from as isize + 5)) as i32).to_le_bytes();
+        let rel = |from: usize, to: usize| (to.wrapping_sub(from + 5) as u32).to_le_bytes();
         let mut put = |at: usize, bytes: &[u8]| image[at..at + bytes.len()].copy_from_slice(bytes);
         put(k.frame_call, &[[0xFF, 0x15].as_slice(), &abs(k.iat_slot)].concat());
         put(k.controller_call, &[[0x8B, 0x0D].as_slice(), &abs(k.keyboard)].concat());
@@ -869,9 +1003,144 @@ mod tests {
         let (send, receive) = mpsc::channel();
         send.send(()).unwrap();
         let layout = Layout { base: 0, menus: OLD.menus, lobby: LOBBY_PTR_RVA };
-        assert_eq!(tap(std::ptr::null_mut(), 0, layout, keys(), 0, state(Screen::Title, 0), Key::Enter, &receive), Tap::Cancelled);
+        let world = World { flag: WORLD_RVA };
+        assert_eq!(tap(std::ptr::null_mut(), 0, layout, keys(), 0, state(Screen::Title, 0), Key::Enter, 1, world, &receive), Tap::Cancelled);
         drop(send);
-        assert_eq!(tap(std::ptr::null_mut(), 0, layout, keys(), 0, state(Screen::Title, 0), Key::Enter, &receive), Tap::Cancelled);
+        assert_eq!(tap(std::ptr::null_mut(), 0, layout, keys(), 0, state(Screen::Title, 0), Key::Enter, 1, world, &receive), Tap::Cancelled);
+        assert!(command().is_none());
+    }
+
+    /// GENERATION/ACTIVE/COMMAND are process-wide, as in the real host; the
+    /// tests that drive them run one at a time.
+    static GENERATIONS: Mutex<()> = Mutex::new(());
+    fn generations() -> std::sync::MutexGuard<'static, ()> { GENERATIONS.lock().unwrap_or_else(|e| e.into_inner()) }
+
+    /// A Command for the fixture's dbnamese screen, as the worker would queue it.
+    fn queued(fixture: &Fixture, generation: u64, key: Key) -> (Command, mpsc::Receiver<Tap>) {
+        let (result, receive) = mpsc::channel();
+        (Command { layout: fixture.layout(), keys: keys(), window: 0,
+            game_thread: unsafe { GetCurrentThreadId() }, target: 1,
+            expected: fixture.snapshot().unwrap(), key, expires: Instant::now() + Duration::from_secs(30),
+            result, generation, world: World { flag: WORLD_RVA } }, receive)
+    }
+    fn buffer(fixture: &Fixture) -> *mut u8 { (fixture.base() + 0x9298) as *mut u8 }
+
+    #[test]
+    fn relaunch_in_the_same_process_never_delivers_the_first_games_key() {
+        let _one = generations();
+        let fixture = Fixture::new();
+        let first = begin_generation();
+        ACTIVE.store(first, Ordering::Release);
+        let (input, _receive) = queued(&fixture, first, Key::Down);
+        // Game 1 returned and game 2's GameStart began in this same host.
+        let second = begin_generation();
+        ACTIVE.store(second, Ordering::Release);
+        assert!(second > first);
+        assert_eq!(deliver(&input, buffer(&fixture), |_, _| panic!("game 1's key reached game 2")), Some(Tap::Cancelled));
+        assert_eq!(ACTIVE.load(Ordering::Acquire), 0, "a refused key ends this game's login input for good");
+        // Even the current generation sends nothing once its input stopped.
+        let (current, _receive) = queued(&fixture, second, Key::Enter);
+        assert_eq!(deliver(&current, buffer(&fixture), |_, _| panic!("stopped input was re-armed")), Some(Tap::Cancelled));
+    }
+
+    #[test]
+    fn a_pending_enter_is_discarded_at_the_next_gamestart() {
+        let _one = generations();
+        let fixture = Fixture::new();
+        let first = begin_generation();
+        ACTIVE.store(first, Ordering::Release);
+        let (input, receive) = queued(&fixture, first, Key::Enter);
+        *command() = Some(input);
+        let second = begin_generation();
+        assert_eq!(receive.try_recv(), Ok(Tap::Cancelled), "the queued Enter is answered, not kept");
+        assert!(command().is_none(), "nothing from game 1 is left for game 2's keyboard frame");
+        // A worker that ends drops only its own generation's command.
+        ACTIVE.store(second, Ordering::Release);
+        let (mine, receive) = queued(&fixture, second, Key::Enter);
+        *command() = Some(mine);
+        drop(Ended(first));
+        assert!(command().is_some(), "an older worker cannot cancel the current game's command");
+        assert_eq!(ACTIVE.load(Ordering::Acquire), second);
+        drop(Ended(second));
+        assert_eq!(receive.try_recv(), Ok(Tap::Cancelled));
+        assert!(command().is_none());
+        assert_eq!(ACTIVE.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn no_key_is_sent_once_the_character_is_in_the_world() {
+        let _one = generations();
+        let mut fixture = Fixture::new();
+        let generation = begin_generation();
+        ACTIVE.store(generation, Ordering::Release);
+        let world = World { flag: WORLD_RVA };
+        assert_eq!(admitted(generation, fixture.base(), world), Ok(()));
+        // World entry sets the flag. Even a screen that still reads as a login
+        // menu gets nothing, and the game's own thread is the one that refuses.
+        fixture.u32(WORLD_RVA, 1);
+        assert_eq!(world_clear(world.entered(fixture.base())), Err("character is in the world"));
+        let (input, _receive) = queued(&fixture, generation, Key::Enter);
+        assert_eq!(deliver(&input, buffer(&fixture), |_, _| panic!("key sent in the world")), Some(Tap::Cancelled));
+        assert_eq!(ACTIVE.load(Ordering::Acquire), 0);
+        // Clearing the flag later (a logout) does not re-arm this game.
+        fixture.u32(WORLD_RVA, 0);
+        assert!(admitted(generation, fixture.base(), world).is_err());
+        // An unreadable flag is never taken as "not in the world".
+        ACTIVE.store(generation, Ordering::Release);
+        assert_eq!(admitted(generation, 0, World { flag: 0 }), Err("world state unreadable"));
+        assert_eq!(world_clear(None), Err("world state unreadable"));
+        ACTIVE.store(0, Ordering::Release);
+    }
+
+    #[test]
+    fn misidentified_or_unknown_screens_never_produce_a_key() {
+        // Every in-world or unrecognised menu is Screen::Other.
+        for name in [b"menu    mogmenu0", b"menu    jobchang", b"menu    ptc6yes0", b"menu    loby2wi ", b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"] {
+            assert_eq!(screen(name), Screen::Other);
+        }
+        let other = state(Screen::Other, 2);
+        // Before any input: wait, never send.
+        assert_eq!(Navigator::new(1).action(other, Duration::ZERO), Action::Wait);
+        // After the character is chosen, an unknown screen stops for good.
+        let mut nav = Navigator::new(1);
+        nav.sent(state(Screen::Characters, 0), Key::Enter, Duration::ZERO);
+        assert!(matches!(nav.action(other, Duration::from_secs(1)), Action::Stop(_)));
+        // After the confirmation, anything is the end of login.
+        let mut nav = Navigator::new(1);
+        nav.sent(state(Screen::Characters, 0), Key::Enter, Duration::ZERO);
+        nav.sent(state(Screen::Confirm, 0), Key::Enter, Duration::from_secs(1));
+        assert!(matches!(nav.action(state(Screen::Characters, 0), Duration::from_secs(2)), Action::Finished | Action::Stop(_)));
+        // The 60 s lobby wait after Title/Warning Enter sends nothing and then stops.
+        let mut nav = Navigator::new(1);
+        nav.sent(state(Screen::Title, 0), Key::Enter, Duration::ZERO);
+        for second in 1..=60 { assert_eq!(nav.action(other, Duration::from_secs(second)), Action::Wait); }
+        assert!(matches!(nav.action(other, Duration::from_secs(61)), Action::Stop(_)));
+        // A queued key whose screen no longer reads back exactly is skipped on
+        // the game thread (the window and screen checks are both required).
+        let _one = generations();
+        let mut fixture = Fixture::new();
+        let generation = begin_generation();
+        ACTIVE.store(generation, Ordering::Release);
+        let (input, _receive) = queued(&fixture, generation, Key::Down);
+        fixture.menu(b"menu    mogmenu0", 2);
+        assert_eq!(deliver(&input, buffer(&fixture), |_, _| panic!("key sent to an unknown menu")), Some(Tap::Skipped));
+        ACTIVE.store(0, Ordering::Release);
+    }
+
+    #[test]
+    fn slot_one_login_is_enter_only() {
+        // The whole slot-1 sequence: no arrow key unless the game's own
+        // confirmation cursor sits on "No".
+        let mut nav = Navigator::new(1);
+        let mut keys = Vec::new();
+        for (screen, focus) in [(Screen::Warning, 1), (Screen::Title, 2), (Screen::Characters, 3), (Screen::Confirm, 4)] {
+            let current = Snapshot { focus, selected: 0, ..state(screen, 0) };
+            let Action::Tap(key) = nav.action(current, Duration::ZERO) else { panic!("{screen:?}") };
+            nav.sent(current, key, Duration::ZERO);
+            keys.push(key);
+        }
+        assert_eq!(keys, [Key::Enter; 4]);
+        assert!(nav.confirmed);
     }
 
     #[test]
@@ -954,9 +1223,13 @@ mod tests {
         fixture.u32(WINDOW_RVA, window.0 as usize as u32);
         let (result, _receive) = mpsc::channel();
         let input_rva = keys().input;
+        let _one = generations();
+        let generation = begin_generation();
+        ACTIVE.store(generation, Ordering::Release);
         let mut input = Command { layout: fixture.layout(), keys: keys(), window: window.0 as usize,
             game_thread: unsafe { GetCurrentThreadId() }, target: 1, expected: fixture.snapshot().unwrap(),
-            key: Key::Enter, expires: Instant::now() + Duration::from_secs(30), result };
+            key: Key::Enter, expires: Instant::now() + Duration::from_secs(30), result,
+            generation, world: World { flag: WORLD_RVA } };
         let buffer = (fixture.base() + 0x9298) as *mut u8;
         let dispatch = |context, key| { unsafe { dispatch_key(context, key, [held, edge, repeat]); } true };
         assert_eq!(deliver(&input, buffer, dispatch), Some(Tap::Sent));

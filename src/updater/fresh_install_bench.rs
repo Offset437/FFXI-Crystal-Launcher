@@ -22,8 +22,8 @@ async fn fresh_official_install_total_update_timing() {
     let original = fs::read(game.join("FFXiMain.dll")).unwrap();
     assert!(installer_baseline::load().unwrap().matches("FFXiMain.dll", original.len() as u64,
         md5::compute(&original).0), "The game must originate from the official full installer");
-    let baseline_game_version = crate::patch::installed_for_request_for(&game, "0001");
-    let baseline_viewer_version = crate::patch::installed_for_request_for(&viewer, "1000");
+    let baseline_game_version = crate::patch::installed_for_request_for(&game, crate::updater::Product::Ffxi);
+    let baseline_viewer_version = crate::patch::installed_for_request_for(&viewer, crate::updater::Product::Viewer);
     let output = fs::OpenOptions::new().write(true).create_new(true)
         .open(root.join("update-progress.jsonl")).unwrap();
     let op = Operation::new();
@@ -35,7 +35,7 @@ async fn fresh_official_install_total_update_timing() {
     let monitor = tokio::spawn(async move {
         let mut output = output;
         let mut interval = tokio::time::interval(Duration::from_millis(100));
-        let mut previous_stage = String::new();
+        let mut previous_stage = crate::operation::Stage::None;
         let mut last_saved = Duration::ZERO;
         let mut last_console = Duration::ZERO;
         loop {
@@ -46,7 +46,7 @@ async fn fresh_official_install_total_update_timing() {
             let ending = stop_watch.load(Ordering::Acquire);
             if stage_changed || elapsed.saturating_sub(last_saved) >= Duration::from_secs(1) || ending {
                 let row = serde_json::json!({"elapsed_seconds": elapsed.as_secs_f64(),
-                    "stage": p.stage, "done": p.done, "total": p.total, "bytes": p.bytes,
+                    "stage": p.stage.as_str(), "done": p.done, "total": p.total, "bytes": p.bytes,
                     "detail": p.detail, "remaining_seconds": p.remaining.map(|d| d.as_secs_f64()),
                     "overall_remaining_seconds": p.overall.and_then(|o| o.remaining).map(|d| d.as_secs_f64()),
                     "overall_fraction": p.overall.and_then(|o| o.fraction)});
@@ -70,7 +70,7 @@ async fn fresh_official_install_total_update_timing() {
     monitor.await.unwrap();
     let final_progress = op.snapshot();
     let mut summary = serde_json::json!({"started_utc": started_utc, "completed_utc": completed_utc,
-        "total_update_seconds": elapsed.as_secs_f64(), "production_download_workers": MAX_DOWNLOAD_WORKERS,
+        "total_update_seconds": elapsed.as_secs_f64(), "production_download_workers": 1,
         "fresh_patch_cache": true, "baseline_game_version": baseline_game_version,
         "baseline_viewer_version": baseline_viewer_version,
         "timing_scope": "Production run_combined: manifests, file scans, downloads, staging, application, final verification and applied records. MSI extraction and later independent checks excluded.",

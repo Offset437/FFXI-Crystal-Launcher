@@ -55,6 +55,16 @@ pub fn sources(lang: Lang) -> Sources {
 pub const WORLD_STATUS_URL: &str = "https://www.playonline.com/pcd/service/ff11usindex.html";
 const MAX_BODY: usize = 1_048_576;
 const MAX_IMAGE_BODY: usize = 4 * 1_048_576;
+/// The news section's tabs. Maintenance shows the portal notices; the others filter the articles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum NewsTab {
+    #[default]
+    Latest,
+    Updates,
+    Events,
+    Maintenance,
+}
+
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct NewsItem {
@@ -65,7 +75,30 @@ pub struct NewsItem {
     pub image_url: String,
     /// Decoded once on a worker; painting the launcher never decodes network bytes.
     #[serde(skip)]
-    pub image: Option<iced::widget::image::Handle>,
+    pub image: Option<NewsImage>,
+}
+
+/// A headline's picture, decoded: RGBA rows, shared between snapshots and front ends.
+/// `id` is unique per decoded picture, so a front end can cache what it builds from it.
+#[derive(Clone)]
+pub struct NewsImage {
+    pub id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: std::sync::Arc<[u8]>,
+}
+
+impl NewsImage {
+    pub fn from_rgba(width: u32, height: u32, pixels: Vec<u8>) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self { id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), width, height, pixels: pixels.into() }
+    }
+}
+
+impl std::fmt::Debug for NewsImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NewsImage({}, {}x{})", self.id, self.width, self.height)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,10 +419,7 @@ fn save_cache(path: &Path, lang: Lang, items: &[NewsItem]) {
                 return;
             }
         }
-        let temporary = path.with_extension("json.tmp");
-        if std::fs::write(&temporary, bytes).is_ok() {
-            let _ = std::fs::rename(temporary, path);
-        }
+        let _ = crate::fsutil::write_atomic(path, &bytes);
     }
 }
 
@@ -415,7 +445,7 @@ async fn collect_feeds(mut feeds: FeedTasks, publish: &Publisher) -> (Vec<NewsIt
             Ok((label, Err(error))) => notes.push(tf("{label} unavailable: {error}", &[("label", &label), ("error", &error)])),
             Err(_) => notes.push(t("An official feed reader could not finish.").into()),
         }
-        news.sort_by(|a, b| rss_date(&b.date).cmp(&rss_date(&a.date)));
+        news.sort_by_cached_key(|n| std::cmp::Reverse(rss_date(&n.date)));
         let mut seen = HashSet::new();
         news.retain(|n| seen.insert(n.url.clone()));
         news.truncate(24);
@@ -430,7 +460,7 @@ async fn collect_feeds(mut feeds: FeedTasks, publish: &Publisher) -> (Vec<NewsIt
     (news, notes.join(" "))
 }
 
-/// Run through iced's async task executor. All requests have finite deadlines.
+/// Run on the shared runtime (`runtime`). All requests have finite deadlines.
 /// Reads the feeds of the language showing now.
 pub async fn refresh() -> Result<ServiceSnapshot, String> {
     refresh_with_progress(crate::i18n::current(), None, |_| {}).await
@@ -503,7 +533,7 @@ async fn read_status(client: &reqwest::Client, lang: Lang) -> ServiceSnapshot {
     // check and the freshness age must describe the page reading itself.
     let requested = Utc::now();
     let (maintenance, world_status) = tokio::join!(
-        fetch_page(client, source.maintenance, lang), fetch(client, WORLD_STATUS_URL),
+        fetch_page(client, source.maintenance, lang), fetch_page(client, WORLD_STATUS_URL, Lang::En),
     );
     let mut notes = Vec::new();
     let mut windows_complete = true;
@@ -562,7 +592,7 @@ pub async fn refresh_with_progress(
             feeds.spawn(async move {
                 (
                     label,
-                    fetch(&client, url).await.and_then(|body| parse_rss(&body)),
+                    fetch_page(&client, url, Lang::En).await.and_then(|body| parse_rss(&body)),
                 )
             });
         }
@@ -609,12 +639,7 @@ pub fn official_url(raw: &str) -> Option<String> {
     Some(url.to_string())
 }
 
-async fn fetch(client: &reqwest::Client, url: &str) -> Result<String, String> {
-    let (_, body) = fetch_bytes(client, url, MAX_BODY).await?;
-    Ok(String::from_utf8_lossy(&body).into_owned())
-}
-
-/// An HTML page in `lang`. English is read exactly as `fetch` does; Japanese
+/// An HTML page in `lang`. English pages are read as lossy UTF-8; Japanese
 /// pages are not all UTF-8 (the maintenance list is Shift_JIS).
 async fn fetch_page(client: &reqwest::Client, url: &str, lang: Lang) -> Result<String, String> {
     let (_, body) = fetch_bytes(client, url, MAX_BODY).await?;
@@ -636,19 +661,17 @@ fn decode_page(body: &[u8], lang: Lang) -> String {
 /// is tried as Shift_JIS, then EUC-JP, strictly, so a wrong guess is refused
 /// rather than turned into mojibake.
 fn decode_japanese_page(body: &[u8]) -> String {
-    const SHIFT_JIS: u32 = 932; // Windows' Shift_JIS, a superset of the standard
-    const EUC_JP: u32 = 20932;
+    use crate::win::codepage::{decode, EUC_JP, SHIFT_JIS};
     if let Ok(text) = std::str::from_utf8(body) {
         return text.to_owned();
     }
     let decoded = match declared_charset(body).as_deref() {
         Some("shift_jis" | "shift-jis" | "x-sjis" | "sjis" | "windows-31j" | "ms932" | "cp932") => {
-            legacy_to_string(SHIFT_JIS, body, false)
+            decode(SHIFT_JIS, body, false)
         }
-        Some("euc-jp" | "x-euc-jp" | "eucjp") => legacy_to_string(EUC_JP, body, false),
+        Some("euc-jp" | "x-euc-jp" | "eucjp") => decode(EUC_JP, body, false),
         Some(_) => None,
-        None => legacy_to_string(SHIFT_JIS, body, true)
-            .or_else(|| legacy_to_string(EUC_JP, body, true)),
+        None => decode(SHIFT_JIS, body, true).or_else(|| decode(EUC_JP, body, true)),
     };
     decoded.unwrap_or_else(|| String::from_utf8_lossy(body).into_owned())
 }
@@ -668,32 +691,6 @@ fn declared_charset(body: &[u8]) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// `bytes` in a Windows code page as text. `strict` refuses invalid input
-/// instead of substituting characters.
-#[cfg(windows)]
-fn legacy_to_string(code_page: u32, bytes: &[u8], strict: bool) -> Option<String> {
-    use windows_sys::Win32::Globalization::{MultiByteToWideChar, MB_ERR_INVALID_CHARS};
-    let length = i32::try_from(bytes.len()).ok()?;
-    let flags = if strict { MB_ERR_INVALID_CHARS } else { 0 };
-    // SAFETY: both calls read `length` bytes from `bytes`; the second writes at
-    // most the `needed` u16 the first reported into a buffer of that size.
-    unsafe {
-        let needed = MultiByteToWideChar(code_page, flags, bytes.as_ptr(), length, std::ptr::null_mut(), 0);
-        if needed <= 0 {
-            return None;
-        }
-        let mut wide = vec![0u16; needed as usize];
-        let written = MultiByteToWideChar(code_page, flags, bytes.as_ptr(), length, wide.as_mut_ptr(), needed);
-        if written <= 0 {
-            return None;
-        }
-        String::from_utf16(&wide[..written as usize]).ok()
-    }
-}
-#[cfg(not(windows))]
-fn legacy_to_string(_code_page: u32, _bytes: &[u8], _strict: bool) -> Option<String> {
-    None
-}
 
 async fn fetch_bytes(
     client: &reqwest::Client,
@@ -870,7 +867,7 @@ async fn enrich_news_images(
     }
 }
 
-fn decode_article_image(bytes: Vec<u8>) -> Option<iced::widget::image::Handle> {
+fn decode_article_image(bytes: Vec<u8>) -> Option<NewsImage> {
     let mut reader = imagecrate::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
@@ -884,11 +881,7 @@ fn decode_article_image(bytes: Vec<u8>) -> Option<iced::widget::image::Handle> {
         return None;
     }
     let rgba = image.thumbnail(1200, 700).to_rgba8();
-    Some(iced::widget::image::Handle::from_rgba(
-        rgba.width(),
-        rgba.height(),
-        rgba.into_raw(),
-    ))
+    Some(NewsImage::from_rgba(rgba.width(), rgba.height(), rgba.into_raw()))
 }
 
 fn plain_html(html: &str) -> String {
@@ -927,6 +920,7 @@ fn parse_rss(xml: &str) -> Result<Vec<NewsItem>, String> {
     let mut items = Vec::new();
     let mut item: Option<NewsItem> = None;
     let mut field = String::new();
+    let images = Selector::parse("img").unwrap();
     loop {
         match reader
             .read_event()
@@ -964,7 +958,6 @@ fn parse_rss(xml: &str) -> Result<Vec<NewsItem>, String> {
                                 article_image_url(&n.url, &n.image_url).unwrap_or_default();
                             if n.image_url.is_empty() {
                                 let fragment = Html::parse_fragment(&n.summary);
-                                let images = Selector::parse("img").unwrap();
                                 n.image_url = fragment
                                     .select(&images)
                                     .find_map(|node| image_candidate(node, &n.url))
@@ -1197,16 +1190,10 @@ fn window_ja(text: &str) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
         .chars()
         .filter(|c| !c.is_whitespace() && *c != '頃')
         .collect();
-    let Some(rest) = compact
+    let (_, rest) = compact
         .split_once("日時：")
-        .or_else(|| compact.split_once("日時:"))
-        .map(|(_, rest)| rest)
-    else {
-        return None;
-    };
-    let Some((window, _)) = rest.split_once("まで") else {
-        return None;
-    };
+        .or_else(|| compact.split_once("日時:"))?;
+    let (window, _) = rest.split_once("まで")?;
     // Weekday marks "(火)" / "（火）".
     let mut plain = String::new();
     let mut depth = 0;
@@ -1218,19 +1205,12 @@ fn window_ja(text: &str) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
             _ => {}
         }
     }
-    let Some((from, to)) = plain
+    let (from, to) = plain
         .split_once("より")
         .or_else(|| plain.split_once("から"))
-        .or_else(|| plain.split_once(['～', '〜', '~']))
-    else {
-        return None;
-    };
-    let (Some(start), Some(end)) = (ja_clock(from), ja_clock(to)) else {
-        return None;
-    };
-    let (Some(year), Some((month, day))) = (start.year, start.month_day) else {
-        return None;
-    };
+        .or_else(|| plain.split_once(['～', '〜', '~']))?;
+    let (start, end) = (ja_clock(from)?, ja_clock(to)?);
+    let (year, (month, day)) = (start.year?, start.month_day?);
     let jst = FixedOffset::east_opt(9 * 3600).expect("valid offset");
     let at = |year: i32, (month, day): (u32, u32), (hour, minute): (u32, u32)| {
         chrono::NaiveDate::from_ymd_opt(year, month, day)
@@ -1291,9 +1271,7 @@ fn window_en(text: &str) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
     // Deliberately accept only the official explicit, same-day PDT/PST format.
     // Unsupported/multi-day windows stay unknown rather than inventing downtime.
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let Some(rest) = normalized.split("[Date & Time]").nth(1) else {
-        return None;
-    };
+    let rest = normalized.split("[Date & Time]").nth(1)?;
     let (date_range, offset) = if let Some((range, _)) = rest.split_once("(PDT)") {
         (range.trim(), -7 * 3600)
     } else if let Some((range, _)) = rest.split_once("(PST)") {
@@ -1301,13 +1279,9 @@ fn window_en(text: &str) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
     } else {
         return None;
     };
-    let Some((start, end)) = date_range.split_once(" to ") else {
-        return None;
-    };
+    let (start, end) = date_range.split_once(" to ")?;
     let start = start.replace('.', "");
-    let Some((day, _)) = start.rsplit_once(' ') else {
-        return None;
-    };
+    let (day, _) = start.rsplit_once(' ')?;
     let end = format!("{day} {end}");
     let parse = |value: &str| {
         NaiveDateTime::parse_from_str(value, "%b %d, %Y %H:%M")
@@ -1329,15 +1303,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn square_enix_sites_see_a_browser_user_agent() {
-        let agent = browser_user_agent();
-        assert!(agent.starts_with("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/"));
-        assert!(agent.ends_with(".0.0.0 Safari/537.36"));
-        for marker in ["Launcher", "Crystal", "Iced", "XI"] { assert!(!agent.contains(marker), "{marker}"); }
-        assert!(web_client().is_ok());
-    }
-
-    #[test]
     fn the_chrome_version_follows_the_date_one_behind_stable() {
         let day = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap();
         // Chrome 138 stable 2025-06-24: a player then runs 137.
@@ -1353,7 +1318,10 @@ mod tests {
         assert_eq!(browser_user_agent_on(day(2026, 10, 13)),
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36");
         // Today's is computed, never a fixed build-time number.
-        assert_eq!(browser_user_agent(), browser_user_agent_on(chrono::Utc::now().date_naive()));
+        let agent = browser_user_agent();
+        assert_eq!(agent, browser_user_agent_on(chrono::Utc::now().date_naive()));
+        for marker in ["Launcher", "Crystal", "Iced", "XI"] { assert!(!agent.contains(marker), "{marker}"); }
+        assert!(web_client().is_ok());
     }
 
     /// What Crystal concludes from the live status page and notices right now (Play gate).
@@ -1380,7 +1348,7 @@ mod tests {
         for w in &s.windows { println!("PROBE window: {:?} {} to {} (now inside: {})", w.title, w.start, w.end, w.start <= now && now < w.end); }
         for n in &s.notices { println!("PROBE notice: {:?} all_worlds={} active={} summary[..300]={:?}", n.title, is_all_worlds_notice(&n.title), maintenance_window_active(&n.summary, now), n.summary.chars().take(300).collect::<String>()); }
         // The markup the parser reads: each world's heading and status icon.
-        if let Ok(body) = fetch(&client, WORLD_STATUS_URL).await {
+        if let Ok(body) = fetch_page(&client, WORLD_STATUS_URL, Lang::En).await {
             let document = Html::parse_document(&body);
             let selector = Selector::parse("#bc_zone2 h2, #bc_zone2 img.img_status").unwrap();
             let line: Vec<String> = document.select(&selector).map(|node| match node.value().name() {
@@ -1452,7 +1420,7 @@ mod tests {
         let mut status = empty_snapshot();
         status.availability = Availability::Maintenance;
         apply(&mut state, Update::Status(status));
-        apply(&mut state, Update::Image(NewsItem { image: Some(iced::widget::image::Handle::from_rgba(1, 1, vec![255; 4])), ..item.clone() }));
+        apply(&mut state, Update::Image(NewsItem { image: Some(NewsImage::from_rgba(1, 1, vec![255; 4])), ..item.clone() }));
         apply(&mut state, Update::Image(item)); // failed subsequent image fetch
         let state = state.unwrap();
         assert_eq!(state.news[0].title, "Headline");
@@ -1513,30 +1481,15 @@ mod tests {
     fn downloaded_images_are_decoded_and_capped_before_painting() {
         let encode = |width, height| {
             let mut output = Vec::new();
-            {
-                let mut encoder = png::Encoder::new(&mut output, width, height);
-                encoder.set_color(png::ColorType::Rgba);
-                encoder.set_depth(png::BitDepth::Eight);
-                let mut writer = encoder.write_header().unwrap();
-                writer
-                    .write_image_data(&vec![255; (width * height * 4) as usize])
-                    .unwrap();
-            }
+            imagecrate::RgbaImage::from_pixel(width, height, imagecrate::Rgba([255; 4]))
+                .write_to(&mut Cursor::new(&mut output), imagecrate::ImageFormat::Png)
+                .unwrap();
             output
         };
         assert!(decode_article_image(vec![0, 1, 2]).is_none());
         assert!(decode_article_image(encode(1, 1)).is_none());
         assert!(decode_article_image(encode(4097, 32)).is_none());
-        let handle = decode_article_image(encode(1300, 800)).unwrap();
-        let iced::widget::image::Handle::Rgba {
-            width,
-            height,
-            pixels,
-            ..
-        } = handle
-        else {
-            panic!("worker must return ready RGBA pixels");
-        };
+        let NewsImage { width, height, pixels, .. } = decode_article_image(encode(1300, 800)).unwrap();
         assert!(width <= 1200 && height <= 700);
         assert_eq!(pixels.len(), (width * height * 4) as usize);
     }

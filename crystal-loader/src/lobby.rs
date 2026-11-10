@@ -1,10 +1,7 @@
 //! Read-only, per-process lobby diagnostics for the resolved game layout.
 //! Only state codes are sampled. No packets, tickets, names or account IDs.
 
-use std::{ffi::c_void, sync::mpsc, thread, time::{Duration, Instant}};
-use windows_sys::Win32::{
-    System::{Diagnostics::Debug::ReadProcessMemory, Threading::GetCurrentProcess},
-};
+use std::{sync::mpsc, thread, time::{Duration, Instant}};
 use crate::{game_layout::{self, Lobby, Resolution}, log};
 
 // Fields of the lobby controller ([LOBBY]) and the objects it points to.
@@ -16,7 +13,6 @@ pub(crate) const LOBBY_ERROR: usize = 0x136AC;
 /// 100ef790: the character count; 0x8c-byte entries follow it (100efca0).
 pub(crate) const LOBBY_CHARACTER_COUNT: usize = 0x13820;
 pub(crate) const LOBBY_CHARACTERS: usize = 0x13824;
-pub(crate) const LOBBY_CHARACTER_SIZE: usize = 0x8C;
 pub(crate) const LOBBY_CHARACTER_SLOTS: usize = 16;
 pub(crate) const TCP_OPERATION: usize = 0x4F1A8;
 pub(crate) const TCP_CONTEXT: usize = 0x4F1AC;
@@ -37,33 +33,12 @@ pub(crate) const OP_MAX: u32 = 21;
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 const TITLE_INTERVAL: Duration = Duration::from_millis(100);
 
-fn host_micros() -> Option<u64> {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn QueryPerformanceCounter(value: *mut i64) -> i32;
-        fn QueryPerformanceFrequency(value: *mut i64) -> i32;
-    }
-    let (mut ticks, mut frequency) = (0i64, 0i64);
-    // Only a local diagnostic clock; no POL clock or game state is changed.
-    if unsafe { QueryPerformanceCounter(&mut ticks) } == 0
-        || unsafe { QueryPerformanceFrequency(&mut frequency) } == 0
-        || ticks < 0 || frequency <= 0 { return None; }
-    u64::try_from(ticks as u128 * 1_000_000 / frequency as u128).ok()
-}
-
-fn read<T: Copy>(address: usize) -> Option<T> {
-    let mut value = std::mem::MaybeUninit::<T>::uninit();
-    let mut bytes = 0;
-    // SAFETY: reads our own address space. Windows rejects inaccessible or
-    // partially mapped ranges; never dereference game-owned pointers in Rust.
-    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), address as *const c_void,
-        value.as_mut_ptr().cast(), std::mem::size_of::<T>(), &mut bytes) };
-    (ok != 0 && bytes == std::mem::size_of::<T>()).then(|| unsafe { value.assume_init() })
-}
+use crate::mem::read;
 
 fn valid_layout(base: usize, lobby: &Lobby, getter: [u8; 9]) -> bool {
-    // Live 100ef920: mov eax,[LOBBY]; test eax,eax; je ..., with the relocated operand.
-    getter[0] == 0xA1 && getter[5..9] == [0x85, 0xC0, 0x74, 0x1E]
+    // Live 100ef920: mov eax,[LOBBY]; test eax,eax; je ..., with the relocated
+    // operand (the branch distance is not checked, as in the scan).
+    getter[0] == 0xA1 && getter[5..8] == [0x85, 0xC0, 0x74]
         && base.checked_add(lobby.ptr).and_then(|v| u32::try_from(v).ok())
             == Some(u32::from_le_bytes(getter[1..5].try_into().unwrap()))
 }
@@ -179,13 +154,14 @@ impl Observer {
                     if let Some(probe) = &title {
                         let observed = probe.observe();
                         if last_title != Some(observed) {
+                            crate::boot_timing::checkpoint(observed.menu);
                             log!("launch timing: title observer menu={} menu_live={} window={}",
                                 observed.menu, observed.menu_live, observed.window);
                             last_title = Some(observed);
                         }
                         if observed.ready() {
                             title_seen = true;
-                            log!("launch timing: FFXI title menu ready in visible window host_clock_us={}", host_micros().unwrap_or(0));
+                            log!("launch timing: FFXI title menu ready in visible window host_clock_us={}", crate::startup_timing::host_micros_now().unwrap_or(0));
                         }
                     }
                 }

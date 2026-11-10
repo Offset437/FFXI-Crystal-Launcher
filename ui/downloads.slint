@@ -1,0 +1,618 @@
+// The Downloads page: the installation and its versions with
+// troubleshooting, the Activity card with the running operation's progress, and the official
+// installer's three steps with per-part download progress; plus the launcher settings dialog
+// and the launcher-update strip under the title bar (self_update::banner).
+// The page header, margins and gaps scale with Theme.scale.
+import { Theme } from "theme.slint";
+import { View, Ink } from "state.slint";
+import { Downloads, DlPart } from "downloads_state.slint";
+import { Glyph, Icon, Pressable, Control, Tone, IconButton, Rule, ScrollThumb, Field, FormLabel, Note, Bar } from "widgets.slint";
+import { PrereqBanner } from "home.slint";
+
+export { Downloads }
+
+/// A card on the page surface: soft fill, hairline, radius 10, GUTTER inside.
+component Card inherits Rectangle {
+    background: Theme.card;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.hairline;
+    VerticalLayout {
+        padding: Theme.gutter;
+        @children
+    }
+}
+
+/// A card heading.
+component CardTitle inherits Text {
+    font-size: Theme.type-heading;
+    font-weight: 600;
+    color: Theme.ink;
+    vertical-alignment: center;
+}
+
+/// The borderless tinted tile for stats and notes.
+component SoftTile inherits Rectangle {
+    in property <length> pad: Theme.sp-l;
+    border-radius: Theme.radius-inner;
+    background: Theme.select.with-alpha(Theme.light ? 0.7 : 0.55);
+    VerticalLayout {
+        padding: root.pad;
+        @children
+    }
+}
+
+/// Small muted caption over a value.
+component Caption inherits Text {
+    font-size: Theme.type-caption;
+    color: Theme.sub;
+}
+
+/// A version in the monospaced face so its digits line up; a status word keeps the interface face.
+component Version inherits Text {
+    in property <bool> mono;
+    font-family: root.mono ? Theme.mono : Theme.sans;
+    font-size: Theme.type-body;
+    color: Theme.ink;
+    overflow: elide;
+}
+
+/// One stat in a tile.
+component Stat inherits VerticalLayout {
+    in property <string> caption;
+    spacing: 6px;
+    // Equal columns.
+    horizontal-stretch: 1;
+    min-width: 0px;
+    preferred-width: 0px;
+    Caption { text: root.caption; }
+    @children
+}
+
+/// The confirmed / not-confirmed line under a folder.
+component Flag inherits HorizontalLayout {
+    in property <bool> ok;
+    in property <string> yes;
+    in property <string> no;
+    spacing: Theme.sp-s;
+    alignment: start;
+    Icon {
+        cross-axis-self-alignment: center;
+        glyph: root.ok ? Glyph.check-circle : Glyph.alert-circle;
+        size: 13px;
+        tint: root.ok ? Theme.ok : Theme.sub;
+    }
+    Text { text: root.ok ? root.yes : root.no; font-size: Theme.type-caption; color: Theme.sub; vertical-alignment: center; }
+}
+
+/// A version status: its glyph, then the state.
+component StateLine inherits HorizontalLayout {
+    in property <Glyph> glyph;
+    in property <Ink> ink;
+    in property <string> text;
+    spacing: Theme.sp-s;
+    alignment: start;
+    Icon { cross-axis-self-alignment: center; glyph: root.glyph; size: 15px; tint: View.tone(root.ink); }
+    Text { text: root.text; font-size: Theme.type-body; color: Theme.ink; vertical-alignment: center; overflow: elide; }
+}
+
+/// A path field (the text field in the monospaced face): masked and read-only while privacy mode
+/// is on.
+component PathField inherits Field {
+    font-family: Theme.mono;
+    font-size: Theme.type-small;
+}
+
+/// The Installation card: the game folder (chosen in Settings), FFXI's and PlayOnline's versions,
+/// and Troubleshooting (Check files, Repair files).
+component InstallationCard inherits Card {
+    VerticalLayout {
+        spacing: Theme.sp-xl;
+        CardTitle { text: Downloads.strings.installation; }
+        VerticalLayout {
+            spacing: Theme.sp-s;
+            FormLabel { text: Downloads.strings.game-folder; color: Theme.ink; }
+            HorizontalLayout {
+                spacing: Theme.sp-s;
+                Text {
+                    horizontal-stretch: 1;
+                    text: Downloads.install.folder;
+                    font-family: Downloads.install.folder-mono ? Theme.mono : Theme.sans;
+                    font-size: Theme.type-small;
+                    color: Theme.ink;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Control {
+                    text: Downloads.strings.change-in-settings;
+                    glyph: Glyph.folder;
+                    clicked => { Downloads.change-in-settings(); }
+                }
+            }
+            Flag { ok: Downloads.install.confirmed; yes: Downloads.strings.confirmed; no: Downloads.strings.confirm-first; }
+        }
+        CardTitle { text: Downloads.strings.ffxi; }
+        SoftTile {
+            HorizontalLayout {
+                spacing: Theme.gutter;
+                Stat { caption: Downloads.strings.installed-version; Version { text: Downloads.install.installed; mono: Downloads.install.installed-mono; } }
+                Stat { caption: Downloads.strings.latest-version; Version { text: Downloads.install.latest; mono: Downloads.install.latest-mono; } }
+                Stat { caption: Downloads.strings.version-status; StateLine { glyph: Downloads.install.state-glyph; ink: Downloads.install.state-ink; text: Downloads.install.state-text; } }
+            }
+        }
+        Text { text: Downloads.install.patch-detail; font-size: Theme.type-small; color: Theme.sub; wrap: word-wrap; }
+        VerticalLayout {
+            spacing: Theme.sp-s;
+            CardTitle { text: Downloads.strings.playonline; }
+            Text { text: Downloads.install.viewer-folder; font-family: Theme.mono; font-size: Theme.type-small; color: Theme.sub; overflow: elide; }
+            SoftTile {
+                HorizontalLayout {
+                    spacing: Theme.gutter;
+                    Stat { caption: Downloads.strings.installed-version; Version { text: Downloads.install.viewer-installed; mono: Downloads.install.viewer-installed-mono; } }
+                    Stat { caption: Downloads.strings.latest-version; Version { text: Downloads.install.viewer-latest; mono: Downloads.install.viewer-latest-mono; } }
+                    Stat { caption: Downloads.strings.version-status; StateLine { glyph: Downloads.install.viewer-state-glyph; ink: Downloads.install.viewer-state-ink; text: Downloads.install.viewer-state; } }
+                }
+            }
+            Text { text: Downloads.install.viewer-detail; font-size: Theme.type-small; color: Theme.sub; wrap: word-wrap; }
+            if Downloads.install.viewer-error != "": Text { text: Downloads.install.viewer-error; font-size: Theme.type-small; color: Theme.danger; wrap: word-wrap; }
+        }
+        Rule { tint: Theme.hairline; }
+        // Check and Repair are troubleshooting steps, not part of an update: Play updates.
+        VerticalLayout {
+            spacing: Theme.sp-m;
+            HorizontalLayout {
+                alignment: start;
+                head := Pressable {
+                    label: Downloads.strings.troubleshooting;
+                    accessible-expandable: true;
+                    accessible-expanded: Downloads.install.troubleshooting-open;
+                    min-width: head-row.preferred-width;
+                    min-height: head-row.preferred-height;
+                    horizontal-stretch: 0;
+                    clicked => { Downloads.toggle-troubleshooting(); }
+                    head-row := HorizontalLayout {
+                        spacing: Theme.sp-s;
+                        // Down while open, right while closed (icons.rs' chevrons).
+                        Icon {
+                            cross-axis-self-alignment: center;
+                            glyph: Downloads.install.troubleshooting-open ? Glyph.chevron-down : Glyph.chevron-right;
+                            size: 16px;
+                            tint: Theme.sub;
+                        }
+                        Text { text: Downloads.strings.troubleshooting; font-size: Theme.type-heading; font-weight: 600; color: Theme.ink; vertical-alignment: center; }
+                    }
+                }
+            }
+            if Downloads.install.troubleshooting-open: HorizontalLayout {
+                spacing: Theme.sp-s;
+                Control {
+                    text: Downloads.strings.check-files;
+                    glyph: Glyph.check-circle;
+                    enabled: Downloads.install.can-check;
+                    clicked => { Downloads.check-files(); }
+                }
+                Control {
+                    text: Downloads.strings.repair-files;
+                    glyph: Glyph.wrench;
+                    enabled: Downloads.install.can-repair;
+                    clicked => { Downloads.repair-files(); }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                if Downloads.install.close-clients: Text { text: Downloads.strings.close-clients; font-size: Theme.type-caption; color: Theme.sub; vertical-alignment: center; }
+            }
+            if Downloads.install.troubleshooting-open: Note { text: Downloads.strings.close-games; glyph: Glyph.alert-circle; }
+        }
+    }
+}
+
+/// The Activity card: the running operation (overall and current step), then the last result.
+component ActivityCard inherits Card {
+    VerticalLayout {
+        spacing: Theme.sp-l;
+        HorizontalLayout {
+            CardTitle { horizontal-stretch: 1; text: Downloads.strings.activity; }
+            if Downloads.activity.running && Downloads.activity.cancellable: Control {
+                text: Downloads.activity.cancel-label;
+                glyph: Glyph.close;
+                enabled: Downloads.activity.cancel-enabled;
+                clicked => { Downloads.cancel(); }
+            }
+        }
+        if Downloads.activity.running && Downloads.activity.has-overall: VerticalLayout {
+            spacing: 10px;
+            Text { text: Downloads.strings.overall-update; font-size: Theme.type-heading; font-weight: 600; color: Theme.ink; }
+            Bar { fraction: Downloads.activity.overall-fraction; girth: 10px; }
+            Text {
+                text: Downloads.activity.overall-line;
+                font-size: Downloads.activity.overall-known ? Theme.type-lead : Theme.type-body;
+                font-weight: Downloads.activity.overall-known ? 600 : 400;
+                color: Downloads.activity.overall-known ? Theme.ink : Theme.sub;
+                wrap: word-wrap;
+            }
+            if Downloads.activity.estimate != "": Text { text: Downloads.activity.estimate; font-size: Theme.type-body; color: Theme.ink; wrap: word-wrap; }
+        }
+        if Downloads.activity.running && Downloads.activity.has-overall: Rule { tint: Theme.hairline; }
+        if Downloads.activity.running: HorizontalLayout {
+            spacing: Theme.sp-m;
+            Icon {
+                cross-axis-self-alignment: center;
+                glyph: Glyph.refresh;
+                size: 18px;
+                tint: Downloads.activity.has-overall ? Theme.sub : Theme.accent;
+            }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 2px;
+                Text {
+                    text: Downloads.activity.step;
+                    font-size: Downloads.activity.has-overall ? Theme.type-small : Theme.type-lead;
+                    color: Downloads.activity.has-overall ? Theme.sub : Theme.ink;
+                    wrap: word-wrap;
+                }
+                Text { text: Downloads.activity.kind; font-size: Theme.type-caption; color: Theme.sub; }
+            }
+        }
+        if Downloads.activity.running: Bar {
+            fraction: Downloads.activity.has-total ? Downloads.activity.fraction : 0;
+            girth: Downloads.activity.has-overall ? 6px : 8px;
+        }
+        if Downloads.activity.running && Downloads.activity.has-total: HorizontalLayout {
+            spacing: Theme.sp-l;
+            Text { horizontal-stretch: 1; text: Downloads.activity.detail; font-family: Theme.mono; font-size: Theme.type-caption; color: Theme.sub; overflow: elide; }
+            Text { text: Downloads.activity.amount; font-size: Theme.type-caption; color: Theme.ink; horizontal-stretch: 0; }
+        }
+        if Downloads.activity.running && !Downloads.activity.has-total: Text { text: Downloads.strings.working; font-size: Theme.type-caption; color: Theme.sub; }
+        if Downloads.activity.running && !Downloads.activity.has-total && Downloads.activity.detail != "": Text {
+            text: Downloads.activity.detail;
+            font-family: Theme.mono;
+            font-size: Theme.type-caption;
+            color: Theme.sub;
+            wrap: word-wrap;
+        }
+        if Downloads.activity.running && Downloads.activity.remaining != "": Text { text: Downloads.activity.remaining; font-size: Theme.type-small; color: Theme.sub; wrap: word-wrap; }
+        if Downloads.activity.running && Downloads.activity.official-note: Note { text: Downloads.strings.official-step; glyph: Glyph.alert-circle; }
+        if !Downloads.activity.running: HorizontalLayout {
+            spacing: Theme.sp-m;
+            alignment: start;
+            Icon { cross-axis-self-alignment: center; glyph: Glyph.check-circle; size: 18px; tint: Theme.sub; }
+            Text { text: Downloads.strings.no-operation; font-size: Theme.type-lead; color: Theme.ink; vertical-alignment: center; }
+        }
+        if Downloads.activity.result != "": Rule { tint: Theme.hairline; }
+        if Downloads.activity.result != "": VerticalLayout {
+            spacing: Theme.sp-s;
+            Caption { text: Downloads.strings.last-result; }
+            HorizontalLayout {
+                spacing: Theme.sp-m;
+                VerticalLayout {
+                    alignment: start;
+                    Icon { glyph: Downloads.activity.result-glyph; size: 18px; tint: View.tone(Downloads.activity.result-ink); }
+                }
+                Text { horizontal-stretch: 1; text: Downloads.activity.result; font-size: Theme.type-body; color: Theme.ink; wrap: word-wrap; }
+            }
+        }
+        if Downloads.activity.status != "": Text { text: Downloads.activity.status; font-size: Theme.type-caption; color: Theme.sub; wrap: word-wrap; }
+    }
+}
+
+/// One installer step: the number badge, then title, description and its button.
+component Step inherits HorizontalLayout {
+    in property <string> number;
+    in property <string> title;
+    in property <string> body;
+    in property <Glyph> glyph;
+    in property <string> action;
+    in property <bool> enabled;
+    callback clicked();
+    spacing: Theme.sp-m;
+    VerticalLayout {
+        alignment: start;
+        Rectangle {
+            width: 28px;
+            height: 28px;
+            border-radius: 14px;
+            background: Theme.select;
+            Text { text: root.number; font-size: Theme.type-caption; font-weight: 600; color: Theme.accent; }
+        }
+    }
+    VerticalLayout {
+        horizontal-stretch: 1;
+        spacing: Theme.sp-xs;
+        // At least the badge's height and centred in it, so a one-line title sits on the badge's centre.
+        Text { min-height: 28px; text: root.title; font-size: Theme.type-body; font-weight: 600; color: Theme.ink; vertical-alignment: center; wrap: word-wrap; }
+        // A step without a description keeps its button as close under the title as the others.
+        if root.body != "": Text { text: root.body; font-size: Theme.type-caption; color: Theme.sub; wrap: word-wrap; }
+        Rectangle { height: Theme.sp-xs; }
+        HorizontalLayout {
+            alignment: start;
+            Control { text: root.action; glyph: root.glyph; enabled: root.enabled; clicked => { root.clicked(); } }
+        }
+    }
+}
+
+/// The official installer: its download folder, the three explicit steps and per-part progress.
+component InstallerCard inherits Card {
+    VerticalLayout {
+        spacing: Theme.sp-xl;
+        CardTitle { text: Downloads.strings.install-title; wrap: word-wrap; }
+        VerticalLayout {
+            spacing: Theme.sp-s;
+            FormLabel { text: Downloads.strings.installer-folder; color: Theme.ink; }
+            HorizontalLayout {
+                spacing: Theme.sp-s;
+                PathField {
+                    placeholder: Downloads.strings.installer-placeholder;
+                    text <=> Downloads.installer-path;
+                    enabled: Downloads.installer.editable;
+                    edited(value) => { Downloads.installer-edited(value); }
+                    accepted => { Downloads.installer-accepted(); }
+                }
+                IconButton {
+                    label: Downloads.strings.browse;
+                    glyph: Glyph.folder;
+                    bordered: true;
+                    enabled: Downloads.installer.browse-enabled;
+                    clicked => { Downloads.browse-installer(); }
+                }
+            }
+            if Downloads.installer.error != "": Rectangle {
+                border-radius: Theme.radius-mid;
+                border-width: 1px;
+                background: Theme.danger.with-alpha(0.08);
+                border-color: Theme.danger.with-alpha(0.3);
+                HorizontalLayout {
+                    padding: Theme.sp-m;
+                    spacing: 10px;
+                    VerticalLayout { alignment: start; Icon { glyph: Glyph.alert-circle; size: 16px; tint: Theme.danger; } }
+                    Text { horizontal-stretch: 1; text: Downloads.installer.error; font-size: Theme.type-small; color: Theme.danger; wrap: word-wrap; }
+                }
+            }
+        }
+        Rule { tint: Theme.hairline; }
+        Step {
+            number: "1";
+            title: Downloads.strings.step1-title;
+            body: Downloads.strings.step1-body;
+            glyph: Glyph.download;
+            action: Downloads.strings.download;
+            enabled: Downloads.installer.can-install;
+            clicked => { Downloads.download(); }
+        }
+        Step {
+            number: "2";
+            title: Downloads.strings.step2-title;
+            body: "";
+            glyph: Glyph.folder;
+            action: Downloads.strings.extract;
+            enabled: Downloads.installer.can-install;
+            clicked => { Downloads.extract(); }
+        }
+        Step {
+            number: "3";
+            title: Downloads.strings.step3-title;
+            body: Downloads.strings.step3-body;
+            glyph: Glyph.play;
+            action: Downloads.strings.run-setup;
+            enabled: Downloads.installer.can-setup;
+            clicked => { Downloads.run-setup(); }
+        }
+        if Downloads.installer.show-parts: Rule { tint: Theme.hairline; }
+        if Downloads.installer.show-parts: VerticalLayout {
+            spacing: Theme.sp-m;
+            HorizontalLayout {
+                Text { horizontal-stretch: 1; text: Downloads.strings.installer-files; font-size: Theme.type-body; font-weight: 600; color: Theme.ink; vertical-alignment: center; }
+                Text { text: Downloads.strings.parts; font-size: Theme.type-caption; color: Theme.sub; vertical-alignment: center; }
+            }
+            for part in Downloads.parts: VerticalLayout {
+                spacing: 6px;
+                HorizontalLayout {
+                    Text { horizontal-stretch: 1; text: part.name; font-family: Theme.mono; font-size: Theme.type-caption; color: Theme.ink; vertical-alignment: center; overflow: elide; }
+                    Text { text: part.state; font-size: Theme.type-caption; color: part.done ? Theme.ok : Theme.sub; vertical-alignment: center; }
+                }
+                Bar { fraction: part.fraction; girth: 4px; }
+            }
+        }
+        Rule { tint: Theme.hairline; }
+        Note { text: Downloads.strings.installer-note; glyph: Glyph.alert-circle; }
+    }
+}
+
+/// The Downloads page: header, the components banner, then the main column beside the installer
+/// card (stacked below 1150 px). A running operation moves Activity above the fold.
+export component DownloadsPage inherits Rectangle {
+    private property <float> s: Theme.scale;
+    page := Flickable {
+        content-width: self.width;
+        content-height: body.preferred-height;
+        body := VerticalLayout {
+            width: page.width;
+            padding-top: Theme.sp-3 * root.s;
+            padding-left: Theme.page-x * root.s;
+            // The page's scroller lane sits in the right margin, clear of the cards.
+            padding-right: Theme.page-x * root.s;
+            padding-bottom: Theme.gutter * root.s;
+            spacing: Theme.sp-xl * root.s;
+            alignment: start;
+            VerticalLayout {
+                spacing: Theme.sp-xs * root.s;
+                Text { text: Downloads.strings.title; font-size: Theme.type-title * root.s; font-weight: 600; color: Theme.ink; }
+                Text { text: Downloads.strings.description; font-size: Theme.type-body * root.s; color: Theme.sub; wrap: word-wrap; }
+            }
+            // Full size here, off Home.
+            if View.banner: PrereqBanner { scale: 1; }
+            // Crossing 1150 px (a window resize) rebuilds the cards in the other arrangement. The
+            // window's width comes from Rust: worked out here, it would loop through the layout.
+            if Downloads.wide: HorizontalLayout {
+                spacing: Theme.gutter * root.s;
+                alignment: stretch;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: Theme.gutter * root.s;
+                    alignment: start;
+                    if Downloads.activity.running: ActivityCard { }
+                    InstallationCard { }
+                    if !Downloads.activity.running: ActivityCard { }
+                }
+                VerticalLayout {
+                    width: 341px * root.s;
+                    alignment: start;
+                    InstallerCard { }
+                }
+            }
+            if !Downloads.wide: VerticalLayout {
+                spacing: Theme.gutter * root.s;
+                if Downloads.activity.running: ActivityCard { }
+                InstallationCard { }
+                if !Downloads.activity.running: ActivityCard { }
+                InstallerCard { }
+            }
+        }
+    }
+    // In the right margin (SCROLL_GUTTER inside PAGE_X).
+    ScrollThumb {
+        x: parent.width - Theme.page-x * root.s + 4px;
+        height: parent.height;
+        content-y: page.content-y;
+        content-height: page.content-height;
+        visible-height: page.height;
+    }
+}
+
+/// The launcher settings dialog: where the game lives, and the
+/// way to Install & repair. The dimmed page takes clicks without closing it; the
+/// dialog takes the focus, and Tab and the controller keep to it (Nav.modal, `modal: true`).
+export component SettingsDialog inherits Rectangle {
+    private property <bool> shown;
+    init => {
+        root.shown = true;
+        close.focus();
+    }
+    Rectangle {
+        background: Theme.scrim;
+        opacity: root.shown ? 1 : 0;
+        animate opacity { duration: Theme.calm; }
+    }
+    TouchArea { }
+    dialog := Rectangle {
+        width: min(600px, root.width - 48px);
+        height: min(frame.preferred-height, root.height - 48px);
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        background: Theme.chrome;
+        border-radius: Theme.radius;
+        border-width: 1px;
+        border-color: Theme.hairline;
+        drop-shadow-offset-y: 16px;
+        drop-shadow-blur: 48px;
+        drop-shadow-color: Theme.light ? #00000029 : #00000080;
+        opacity: root.shown ? 1 : 0;
+        animate opacity { duration: Theme.calm; }
+        accessible-role: groupbox;
+        accessible-label: Downloads.strings.settings-title;
+        clip: true;
+        frame := VerticalLayout {
+            HorizontalLayout {
+                padding: Theme.gutter;
+                // The close button's glyph, not its hit box, meets the body's right edge.
+                padding-right: Theme.gutter - 10.5px;
+                padding-bottom: Theme.sp-xl;
+                spacing: Theme.sp-l;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: Theme.sp-xs;
+                    Text { text: Downloads.strings.settings-title; font-size: Theme.type-title; font-weight: 600; color: Theme.ink; }
+                    Text { text: Downloads.strings.settings-subtitle; font-size: Theme.type-small; color: Theme.sub; wrap: word-wrap; }
+                }
+                VerticalLayout {
+                    alignment: start;
+                    close := IconButton { modal: true; label: Downloads.strings.close; glyph: Glyph.close; clicked => { Downloads.close-settings(); } }
+                }
+            }
+            Rule { tint: Theme.hairline; }
+            VerticalLayout {
+                padding: Theme.gutter;
+                spacing: Theme.sp-xl;
+                VerticalLayout {
+                    spacing: Theme.sp-s;
+                    FormLabel { text: Downloads.strings.install-label; color: Theme.ink; }
+                    HorizontalLayout {
+                        spacing: Theme.sp-s;
+                        PathField {
+                            modal: true;
+                            placeholder: Downloads.strings.install-placeholder;
+                            text <=> Downloads.install-path;
+                            enabled: Downloads.settings.editable;
+                            edited(value) => { Downloads.install-edited(value); }
+                            accepted => { Downloads.install-accepted(); }
+                        }
+                        Control {
+                            modal: true;
+                            text: Downloads.settings.find-label;
+                            glyph: Glyph.search;
+                            enabled: Downloads.settings.find-enabled;
+                            clicked => { Downloads.find-game(); }
+                        }
+                        IconButton {
+                            modal: true;
+                            label: Downloads.strings.browse;
+                            glyph: Glyph.folder;
+                            bordered: true;
+                            enabled: Downloads.settings.browse-enabled;
+                            clicked => { Downloads.browse-game(); }
+                        }
+                    }
+                    Flag { ok: Downloads.settings.confirmed; yes: Downloads.strings.confirmed; no: Downloads.strings.confirm-first; }
+                }
+                SoftTile {
+                    VerticalLayout {
+                        spacing: Theme.sp-s;
+                        HorizontalLayout {
+                            spacing: 10px;
+                            alignment: start;
+                            Icon { cross-axis-self-alignment: center; glyph: Glyph.wrench; size: 16px; tint: Theme.accent; }
+                            Text { text: Downloads.strings.install-repair; font-size: Theme.type-body; font-weight: 600; color: Theme.ink; vertical-alignment: center; }
+                        }
+                        Text { text: Downloads.strings.install-repair-body; font-size: Theme.type-caption; color: Theme.sub; wrap: word-wrap; }
+                        Rectangle { height: Theme.sp-xs; }
+                        // A full-width card link.
+                        link := Pressable {
+                            modal: true;
+                            label: Downloads.strings.open-downloads;
+                            height: 24px;
+                            clicked => { Downloads.open-downloads(); }
+                            HorizontalLayout {
+                                Text { horizontal-stretch: 1; text: Downloads.strings.open-downloads; font-size: Theme.type-small; font-weight: 600; color: Theme.accent; vertical-alignment: center; }
+                                Icon { cross-axis-self-alignment: center; glyph: Glyph.arrow-right; size: 16px; tint: Theme.accent; }
+                            }
+                        }
+                    }
+                }
+            }
+            Rule { tint: Theme.hairline; }
+            HorizontalLayout {
+                padding-top: Theme.sp-l;
+                padding-bottom: Theme.sp-l;
+                padding-left: Theme.gutter;
+                padding-right: Theme.gutter;
+                spacing: Theme.sp-s;
+                Text { horizontal-stretch: 1; text: Downloads.settings.status; font-size: Theme.type-caption; color: Theme.sub; vertical-alignment: center; wrap: word-wrap; }
+                Control { modal: true; text: Downloads.strings.close; clicked => { Downloads.close-settings(); } }
+                Control { modal: true; text: Downloads.strings.save-settings; tone: Tone.primary; clicked => { Downloads.save-settings(); } }
+            }
+        }
+    }
+}
+
+/// The launcher-update strip under the title bar (self_update::banner): found, downloading, ready
+/// or restarting. Its text starts at the page column's edge.
+export component UpdateStrip inherits HorizontalLayout {
+    padding-top: 6px;
+    padding-bottom: 6px;
+    padding-left: Theme.page-x * Theme.scale;
+    padding-right: Theme.page-x * Theme.scale;
+    spacing: Theme.sp-l;
+    Text { horizontal-stretch: 1; text: Downloads.update-strip.text; font-size: Theme.type-small; color: Theme.accent; vertical-alignment: center; wrap: word-wrap; }
+    if Downloads.update-strip.action != "": Control {
+        text: Downloads.update-strip.action;
+        clicked => { Downloads.update-strip-clicked(); }
+    }
+}

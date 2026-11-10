@@ -1,0 +1,117 @@
+// Crystal's "Refined" design tokens:
+// the palette of the approved renders (2026-10-22) in both themes, and the spacing, radius,
+// control and type scales at the 1440 px design width. Every page takes its sizes and colours
+// from here.
+export global Theme {
+    /// The light theme is showing.
+    in-out property <bool> light;
+    /// The window has focus: transitions and the busy ring run only then.
+    in-out property <bool> animate;
+    /// Layout scale: window width / 1440, clamped to 0.8..1.
+    in-out property <float> scale: 1;
+
+    // ---- palette ----
+    out property <color> bg: root.light ? #F2F5F8 : #0C131B;
+    out property <color> panel: root.light ? #FFFFFF : #0A1017;
+    out property <color> card: root.light ? #FFFFFF : #111A24;
+    out property <color> field: root.light ? #FFFFFF : #0A1017;
+    out property <color> line: root.light ? #C8D3DD : #2A3A49;
+    out property <color> ink: root.light ? #142130 : #E9EFF5;
+    out property <color> sub: root.light ? #52657A : #9DADBD;
+    out property <color> accent: root.light ? #1F6F9C : #8FCDEB;
+    out property <color> select: root.light ? #E3F0F8 : #1B3344;
+    out property <color> play: root.light ? #1F6F9C : #9DD6F0;
+    out property <color> play-text: root.light ? #FFFFFF : #07202C;
+    out property <color> hairline: root.light ? #D9E1E8 : #22303D;
+    out property <color> well: root.light ? #F7F9FB : #0C131B;
+    out property <color> tint: root.light ? #EEF2F6 : #111A24;
+    out property <color> shadow: root.light ? #1421301A : #00000059;
+    out property <color> chrome: root.light ? #FFFFFF : #0A1017;
+    out property <color> chrome-line: root.light ? #D9E1E8 : #1E2A36;
+    out property <color> divider: root.light ? #DCE4EB : #16212C;
+    out property <color> ink2: root.light ? #2A3D50 : #C6D1DD;
+    out property <color> faint: root.light ? #5B6D80 : #7F90A3;
+    out property <color> quiet: root.light ? #3E5165 : #B8C5D3;
+    out property <color> select-ink: root.light ? #0F4F72 : #BDE4F6;
+    out property <color> thumb: root.light ? #E3E9EF : #1A2633;
+    out property <color> ok: root.light ? #1E7A48 : #62CC93;
+    out property <color> info: root.light ? #19678F : #8FCDEB;
+    out property <color> warn: root.light ? #8A5A00 : #E8B85C;
+    out property <color> danger: root.light ? #A33F27 : #F2A58E;
+    out property <color> ok-fill: root.light ? #DDF3E6 : #153226;
+    out property <color> track: root.light ? #DCE4EB : #22303D;
+    out property <color> warn-bar: root.light ? #B8780A : #E8B85C;
+    out property <color> scrim: root.light ? #14213075 : #04080DBD;
+    /// Status tones readable on either theme.
+    out property <color> ok-tone: root.light ? #2E7A5E : #82CBA8;
+    out property <color> warn-tone: root.light ? #9A6519 : #E2B866;
+    out property <color> danger-tone: root.light ? #B24A4A : #E59494;
+    /// The caption Close button's hover and press fills (as Windows' own).
+    out property <color> close-hot: #C42B1C;
+    out property <color> close-pressed: #941E13;
+
+    // ---- radii, borders ----
+    out property <length> radius: 10px;
+    out property <length> radius-mid: 8px;
+    out property <length> radius-inner: 6px;
+    out property <length> border: 1px;
+
+    // ---- spacing (4-pt) ----
+    out property <length> sp-xs: 4px;
+    out property <length> sp-s: 8px;
+    out property <length> sp-m: 12px;
+    out property <length> sp-l: 16px;
+    out property <length> sp-xl: 20px;
+    out property <length> sp-3: 24px;
+    out property <length> sp-2xl: 32px;
+    out property <length> gutter: 24px;
+    out property <length> page-x: 40px;
+
+    // ---- controls ----
+    out property <length> control-h: 36px;
+    out property <length> control-sm-h: 28px;
+    out property <length> control-pad-x: 14px;
+    out property <length> control-sm-pad-x: 11px;
+    out property <length> bar-h: 48px;
+    out property <length> caption-w: 46px;
+    out property <length> sheet-w: 464px;
+    /// The features sheet: its lists carry several controls a row.
+    out property <length> sheet-wide-w: 600px;
+    out property <length> sheet-pad-x: 28px;
+    /// A form label above its control.
+    out property <length> label-gap: 6px;
+    /// A bordered list card's side inset and each row's top and bottom inset.
+    out property <length> card-pad-x: 14px;
+    out property <length> card-row-y: 9px;
+    out property <length> row-h: 40px;
+    out property <length> footer-h: 76px;
+
+    // ---- type ----
+    out property <string> sans: "Source Sans 3";
+    out property <string> serif: "Source Serif 4";
+    out property <string> mono: "JetBrains Mono";
+    out property <length> type-display: 24px;
+    out property <length> type-title: 22px;
+    /// A settings section's title (prereqs::view's header).
+    out property <length> type-section: 18px;
+    out property <length> type-heading: 16px;
+    /// A lead line: Downloads' idle Activity line and the known overall percent.
+    out property <length> type-lead: 15px;
+    out property <length> type-body: 14px;
+    out property <length> type-small: 13px;
+    /// A note under a settings section header (prereqs::view's intro).
+    out property <length> type-note: 12.5px;
+    out property <length> type-caption: 12px;
+    /// Status chips and evidence lines (prereqs::chip).
+    out property <length> type-fine: 11.5px;
+    out property <length> type-micro: 11px;
+    /// The in-between sizes: a dialog's title, a settings card's
+    /// heading and its detail lines (its fine print is type-fine).
+    out property <length> type-dialog: 20px;
+    out property <length> type-card: 18px;
+    out property <length> type-detail: 12.5px;
+
+    // ---- motion (zero while unfocused, so nothing animates in the background) ----
+    out property <duration> quick: root.animate ? 120ms : 0ms;
+    out property <duration> calm: root.animate ? 200ms : 0ms;
+}

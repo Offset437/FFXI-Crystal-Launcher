@@ -90,7 +90,6 @@ pub struct Registered<C> {
     pub session_key: Zeroizing<[u8; 8]>,
     pub iv: (u32, u32),
     maximum_line_bytes: usize,
-    pub(crate) friend_presence: crate::friend_presence::Feed,
 }
 
 impl<C: Read + Write> Registered<C> {
@@ -114,32 +113,6 @@ impl<C: Read + Write> Registered<C> {
         self.channel.get_mut().write_all(&encrypted)?;
         self.channel.get_mut().flush()?;
         Ok(())
-    }
-
-    /// A registered session over `channel` with a known key and IV, for
-    /// offline tests of code that maintains an already registered connection.
-    #[cfg(test)]
-    pub(crate) fn for_test(channel: C, session_key: [u8; 8], iv: (u32, u32)) -> Self {
-        let greeting = Greeting {
-            challenge: Vec::new(),
-            header: [0; 24],
-            server_clock: 0,
-            ipv4: [0; 4],
-            port: 0,
-        };
-        Self {
-            channel: BufReader::new(channel),
-            cipher: PolBlowfish::new(&session_key, iv),
-            greeting,
-            clock: ServerClock::new(0, 0),
-            metadata: RegistrationMetadata { converted: [0; 24] },
-            metadata_received: false,
-            address: [0; 20],
-            session_key: Zeroizing::new(session_key),
-            iv,
-            maximum_line_bytes: 4096,
-            friend_presence: Default::default(),
-        }
     }
 }
 
@@ -223,13 +196,11 @@ pub fn register_reconnecting<C: Read + Write>(
 
     let mut metadata = inputs.initial_metadata;
     let mut metadata_received = false;
-    let mut friend_presence = crate::friend_presence::Feed::default();
     loop {
         let raw = read_line(&mut channel, inputs.maximum_line_bytes)?;
         let plain = Zeroizing::new(cipher.stream(&raw, StreamReset::Boundary));
         let body = identity::verified_line_body(&plain)?;
         let (command, _) = command_tail(body)?;
-        if let Some(notice) = crate::friend_presence::Notice::parse(&plain) { friend_presence.push(notice); }
         if command == b"ERROR" {
             return Err(HandshakeError::ServerError);
         }
@@ -255,7 +226,6 @@ pub fn register_reconnecting<C: Read + Write>(
         session_key,
         iv,
         maximum_line_bytes: inputs.maximum_line_bytes,
-        friend_presence,
     })
 }
 
@@ -473,23 +443,6 @@ mod tests {
                 identity::verified_line_body(&pending).unwrap(),
                 b"300 recipient pending"
             );
-        }
-    }
-
-    #[test]
-    fn friend_notice_before_registration_completion_is_retained() {
-        for fragment in [3,4096] {
-            let (mut channel,key,suffix)=setup(fragment,false);
-            let ready_len=identity::frame_line(b"422 recipient").unwrap().len();
-            let pending_len=identity::frame_line(b"300 recipient pending").unwrap().len();
-            let at=channel.input.get_ref().len()-ready_len-pending_len;
-            let notice=crate::friend_presence::tests::frame(199,1,123,100,[2,1,0,0,1,0,0,0],&[],true);
-            let encrypted=PolBlowfish::new(&KEY,key.stream_iv()).stream(&notice,StreamReset::Boundary);
-            channel.input.get_mut().splice(at..at,encrypted);
-            let session=register(channel,key,inputs(&suffix),||5000).unwrap();
-            let mut friends=crate::friend_presence::tests::friends();
-            assert_eq!(session.friend_presence.apply(&mut friends,55),1);
-            assert_eq!(friends.presence(false,199).0,Some(true));
         }
     }
 

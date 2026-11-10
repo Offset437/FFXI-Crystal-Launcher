@@ -14,8 +14,6 @@
 
 use crate::i18n::tf;
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -47,14 +45,9 @@ impl MonotonicStamp {
     }
 }
 
-#[cfg(windows)]
 fn performance_counter() -> Option<(u64, u64)> {
-    // These kernel32 calls share one counter/frequency across local processes.
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn QueryPerformanceCounter(value: *mut i64) -> i32;
-        fn QueryPerformanceFrequency(value: *mut i64) -> i32;
-    }
+    // One counter/frequency shared across local processes.
+    use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
     let (mut ticks, mut frequency) = (0i64, 0i64);
     // SAFETY: both calls write to live, correctly sized local integers.
     if unsafe { QueryPerformanceCounter(&mut ticks) } == 0
@@ -62,9 +55,6 @@ fn performance_counter() -> Option<(u64, u64)> {
         || ticks < 0 || frequency <= 0 { return None; }
     Some((ticks as u64, frequency as u64))
 }
-
-#[cfg(not(windows))]
-fn performance_counter() -> Option<(u64, u64)> { None }
 
 /// Content-free cross-process timestamp for temporary startup diagnostics.
 pub(crate) fn diagnostic_host_micros() -> Option<u64> {
@@ -94,10 +84,6 @@ pub enum Milestone {
     MainMenu,
     /// The FFXI version check (W20 :53001) returned its verdict.
     GameChecked,
-    /// A native client process was spawned.
-    ClientSpawned,
-    /// The native client's login marker appeared.
-    LoginAccepted,
 }
 
 impl Milestone {
@@ -114,8 +100,6 @@ impl Milestone {
             Self::ViewerChecked => "W2U done",
             Self::MainMenu => "main menu reached",
             Self::GameChecked => "W20 done",
-            Self::ClientSpawned => "client process spawned",
-            Self::LoginAccepted => "login accepted",
         }
     }
     /// The account row's text for a terminal milestone reached `at` after the
@@ -128,11 +112,7 @@ impl Milestone {
         match (self, first) {
             (Self::GameStarted, true) => tf("Game started {time}", args),
             (Self::GameStarted, false) => tf("game started {time}", args),
-            (Self::ClientSpawned, true) => tf("Client started {time}", args),
-            (Self::ClientSpawned, false) => tf("client started {time}", args),
-            (Self::LoginAccepted, true) => tf("Login accepted {time}", args),
-            (Self::LoginAccepted, false) => tf("login accepted {time}", args),
-            // Only `TERMINALS` reach the row; any other milestone would show
+            // Only `TERMINAL` reaches the row; any other milestone would show
             // its time alone rather than an untranslated (history) label.
             _ => time,
         }
@@ -150,8 +130,6 @@ impl Milestone {
             Self::ViewerChecked => "W2U",
             Self::MainMenu => "main menu",
             Self::GameChecked => "W20",
-            Self::ClientSpawned => "client started",
-            Self::LoginAccepted => "login accepted",
         }
     }
 }
@@ -187,6 +165,9 @@ pub(crate) enum LaunchTrigger {
     SignInAfterGame,
     /// The one retry of that sign-in after it failed on the network.
     SignInAfterGameRetry,
+    /// A sign-in held at the main menu during maintenance for the FFXI version check
+    /// (patch_watch.rs), as a stock user signs in to press "Check Version".
+    MaintenanceSignIn,
 }
 impl LaunchTrigger {
     pub(crate) fn name(self) -> &'static str {
@@ -203,6 +184,7 @@ impl LaunchTrigger {
             Self::ReissuedPlay => "re-issued Play",
             Self::SignInAfterGame => "sign-in after game",
             Self::SignInAfterGameRetry => "sign-in after game retry",
+            Self::MaintenanceSignIn => "maintenance sign-in",
         }
     }
     /// The launch-log line.
@@ -210,7 +192,7 @@ impl LaunchTrigger {
     /// A sign-in Crystal starts by itself, without a code (owner decision 2026-10-13): at its
     /// start, after a game closed, or the one network retry of either.
     pub(crate) fn is_presign(self) -> bool {
-        matches!(self, Self::StartupSignIn | Self::StartupRetry | Self::SignInAfterGame | Self::SignInAfterGameRetry)
+        matches!(self, Self::StartupSignIn | Self::StartupRetry | Self::SignInAfterGame | Self::SignInAfterGameRetry | Self::MaintenanceSignIn)
     }
 }
 
@@ -268,7 +250,7 @@ pub(crate) fn check_lines(check: &str, timing: &crate::patch::CheckTiming) -> Ve
 /// starts; older routes sign in first, so their actual timestamps set the order.
 /// The stock checks and the main menu (pol-spec 07c §5.1) split the native sign-in:
 /// W2U before the member login, the main-menu publish after it, then W20.
-const PHASES: [Milestone; 9] = [
+const PHASES: [Milestone; 8] = [
     Milestone::SignInDone,
     Milestone::ToolStarted,
     Milestone::Hello,
@@ -277,10 +259,9 @@ const PHASES: [Milestone; 9] = [
     Milestone::ViewerChecked,
     Milestone::MainMenu,
     Milestone::GameChecked,
-    Milestone::ClientSpawned,
 ];
-/// How far a launch got, best first; the best one reached is reported as a total from the click.
-const TERMINALS: [Milestone; 3] = [Milestone::GameStarted, Milestone::LoginAccepted, Milestone::ClientSpawned];
+/// A launch that got this far is reported as a total from the click.
+const TERMINAL: Milestone = Milestone::GameStarted;
 
 #[derive(Clone, Debug)]
 struct Mark {
@@ -405,24 +386,13 @@ impl Timeline {
     }
 
     fn terminal(&self) -> Option<Milestone> {
-        TERMINALS.into_iter().find(|m| self.elapsed_at(*m).is_some())
+        self.elapsed_at(TERMINAL).map(|_| TERMINAL)
     }
 
     /// Append every unwritten mark to `path` (best effort: timing never fails a launch).
     pub fn append_to(&mut self, path: &Path) {
         let lines = self.unwritten_lines();
-        if lines.is_empty() {
-            return;
-        }
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-            let time = chrono::Local::now().format("%H:%M:%S");
-            for line in lines {
-                let _ = writeln!(file, "[{time}] [launcher] {line}");
-            }
-        }
+        crate::launch_log::append_launcher_lines_to(path, &lines, true);
     }
 }
 
@@ -451,6 +421,7 @@ pub fn sibling_path(stderr_log: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, io::Write};
 
     #[test]
     fn missing_or_invalid_monotonic_stamp_keeps_legacy_timing() {
@@ -459,7 +430,6 @@ mod tests {
             .elapsed() >= Duration::from_millis(250));
     }
 
-    #[cfg(windows)]
     #[test]
     #[ignore = "offline timing subprocess only"]
     fn clock_fixture() {
@@ -473,7 +443,6 @@ mod tests {
         println!("TIMING-ELAPSED {}", MonotonicStamp::restore(Some(stamp), 0).elapsed().as_millis());
     }
 
-    #[cfg(windows)]
     #[test]
     fn monotonic_click_includes_subprocess_startup_and_request_transit() {
         use std::process::{Command, Stdio};
@@ -573,19 +542,6 @@ mod tests {
     }
 
     #[test]
-    fn native_launches_end_at_the_spawn_or_the_login_marker() {
-        let retail = timeline(&[(2800, Milestone::SignInDone), (3100, Milestone::ClientSpawned)]);
-        assert_eq!(retail.summary(), "sign-in 2.8s, client started 3.1s");
-        assert_eq!(retail.row_summary(), "Signed in 2.8s · client started 3.1s");
-        let private = timeline(&[(100, Milestone::ClientSpawned), (4200, Milestone::LoginAccepted)]);
-        assert_eq!(private.summary(), "client started 0.1s, login accepted 4.2s");
-        assert_eq!(private.row_summary(), "Login accepted 4.2s");
-        let unconfirmed = timeline(&[(100, Milestone::ClientSpawned)]);
-        assert_eq!(unconfirmed.summary(), "client started 0.1s");
-        assert_eq!(unconfirmed.row_summary(), "Client started 0.1s");
-    }
-
-    #[test]
     fn row_summary_uses_totals_from_the_click() {
         assert_eq!(pol_less().row_summary(), "Signed in 2.8s · game started 9.4s");
         let unconfirmed = timeline(&[(2800, Milestone::SignInDone), (8000, Milestone::SessionSent)]);
@@ -656,7 +612,7 @@ mod tests {
         let mut t = timeline(&[(2800, Milestone::SignInDone)]);
         t.append_to(&path);
         t.append_to(&path);
-        t.push(Duration::from_millis(3100), Some(Milestone::ClientSpawned), "client process spawned".into());
+        t.push(Duration::from_millis(3100), Some(Milestone::ToolStarted), "tool process started".into());
         t.append_to(&path);
         let text = fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 2);

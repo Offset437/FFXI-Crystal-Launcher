@@ -1,7 +1,8 @@
 //! FFXI's play flag: the small public file the PlayOnline Viewer reads to enable its FFXI
 //! Play button (`$playbutton_enable`), with the server's own status line (`$status`).
 //!
-//! Crystal reads it only while a "Wait and play" is waiting (owner decision 2026-10-13): one
+//! Crystal reads it only while a "Wait and play" is waiting (owner decision 2026-10-13) or FFXI
+//! is in maintenance, for `$patch_enable` (the update as soon as it is out, patch_watch.rs): one
 //! plain GET at a time, every minute, with the same web client and browser User-Agent as the
 //! playonline.com reads (`services::web_client`). It never imitates the Viewer: no Viewer
 //! User-Agent, X-POL-VIEWER-VERSION or Accept header, no credentials and no Viewer page
@@ -37,10 +38,13 @@ pub enum Flag {
 
 /// One read of the flag: when it was requested and what it said. Anything that is not a clear
 /// 0 or 1 (no file, an HTTP error, a missing define, another value) is an error, never "up".
+/// `patch`: the same file's `$patch_enable` (the stock page's "Check Version" switch), `None`
+/// unless it is a clear 0 or 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reading {
     pub at: DateTime<Utc>,
     pub result: Result<Flag, String>,
+    pub patch: Option<bool>,
 }
 
 fn fresh(at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
@@ -54,6 +58,8 @@ fn fresh(at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
 pub struct Known {
     good: Option<(DateTime<Utc>, Flag)>,
     failed: Option<(DateTime<Utc>, String)>,
+    /// `$patch_enable` as the last good read gave it.
+    patch: Option<bool>,
 }
 
 impl Known {
@@ -62,9 +68,14 @@ impl Known {
             Ok(flag) => {
                 self.good = Some((reading.at, flag));
                 self.failed = None;
+                self.patch = reading.patch;
             }
             Err(error) => self.failed = Some((reading.at, error)),
         }
+    }
+    /// `$patch_enable` from a read within the last two minutes: `Some(true)` only for a clear 1.
+    pub fn patch(&self, now: DateTime<Utc>) -> Option<bool> {
+        self.fresh(now).and(self.patch)
     }
     /// When the flag was last read, whatever came of it.
     pub fn checked(&self) -> Option<DateTime<Utc>> {
@@ -110,11 +121,14 @@ pub async fn read() -> Reading {
 /// `read` from `url` (a local fake server in tests). Stamped when the request is made.
 pub(crate) async fn read_from(url: &str) -> Reading {
     let at = Utc::now();
-    let result = match crate::services::web_client() {
-        Ok(client) => fetch(&client, url).await.and_then(|body| parse(&body)),
+    let body = match crate::services::web_client() {
+        Ok(client) => fetch(&client, url).await,
         Err(error) => Err(error),
     };
-    Reading { at, result }
+    match body {
+        Ok(body) => Reading { at, result: parse(&body), patch: parse_patch(&body) },
+        Err(error) => Reading { at, result: Err(error), patch: None },
+    }
 }
 
 async fn fetch(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
@@ -145,12 +159,8 @@ async fn fetch(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
 /// any order, quoted either way or not at all, any whitespace and line ends, with or without
 /// a BOM. A missing, repeated-and-different or unknown `$playbutton_enable` is an error.
 pub fn parse(body: &[u8]) -> Result<Flag, String> {
-    let body = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body);
-    let text = String::from_utf8_lossy(body);
-    let defines = defines(&text);
-    let values = |wanted: &str| -> Vec<&str> {
-        defines.iter().filter(|(name, _)| name.eq_ignore_ascii_case(wanted)).map(|(_, value)| value.trim()).collect()
-    };
+    let defines = body_defines(body);
+    let values = |wanted: &str| define_values(&defines, wanted);
     let play = values("$playbutton_enable");
     let Some(first) = play.first() else { return Err(t("The play flag has no $playbutton_enable value.").into()) };
     if play.iter().any(|value| value != first) {
@@ -164,6 +174,25 @@ pub fn parse(body: &[u8]) -> Result<Flag, String> {
         }
         other => Err(tf("The play flag value {value} is not recognized.", &[("value", &other.chars().take(16).collect::<String>())])),
     }
+}
+
+/// `$patch_enable` in an `anews.pml` body, parsed as `parse` parses the play flag: `Some` only
+/// for a clear 0 or 1 that every repeat agrees on. Missing or anything else is unknown.
+pub fn parse_patch(body: &[u8]) -> Option<bool> {
+    let defines = body_defines(body);
+    let values = define_values(&defines, "$patch_enable");
+    let first = *values.first()?;
+    if values.iter().any(|value| *value != first) { return None; }
+    match first { "1" => Some(true), "0" => Some(false), _ => None }
+}
+
+fn body_defines(body: &[u8]) -> Vec<(String, String)> {
+    let body = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body);
+    defines(&String::from_utf8_lossy(body))
+}
+
+fn define_values<'a>(defines: &'a [(String, String)], wanted: &str) -> Vec<&'a str> {
+    defines.iter().filter(|(name, _)| name.eq_ignore_ascii_case(wanted)).map(|(_, value)| value.trim()).collect()
 }
 
 /// Each `<define …>` tag's `name` and `value` attributes, in order.
@@ -233,10 +262,11 @@ fn clean_status(raw: &str) -> String {
         .collect::<Vec<_>>().join(" ").chars().take(MAX_STATUS).collect()
 }
 
-/// When to read the flag: only while a Play waits, one read at a time, every CHECK_EVERY, and
-/// at once when the PC wakes from sleep. The first wait reads at once because no read was made
-/// in the last CHECK_EVERY; a wait that starts while another waits (or within a minute of the
-/// last read) relies on that read, so more waits never mean more reads.
+/// When to read the flag: only while a Play waits or FFXI is in maintenance (`wanted`), one
+/// read at a time, every CHECK_EVERY, and at once when the PC wakes from sleep. The first wait
+/// reads at once because no read was made in the last CHECK_EVERY; a wait that starts while
+/// another waits (or within a minute of the last read) relies on that read, so more waits never
+/// mean more reads.
 #[derive(Debug, Default)]
 pub struct Schedule {
     in_flight: bool,
@@ -253,10 +283,15 @@ impl Schedule {
         if self.last_tick.is_some_and(|last| wall.signed_duration_since(last) >= RESUME_GAP) { self.now_due = true; }
         self.last_tick = Some(wall);
     }
-    /// Whether a read starts now. Never while nothing waits.
-    pub fn due(&self, waiting: bool, now: Instant) -> bool {
-        waiting && !self.in_flight
+    /// Whether a read starts now. Never while it is not `wanted`.
+    pub fn due(&self, wanted: bool, now: Instant) -> bool {
+        wanted && !self.in_flight
             && (self.now_due || self.last.is_none_or(|at| now.saturating_duration_since(at) >= CHECK_EVERY))
+    }
+    /// When the next read falls due, for a quiet window's timer (none while one is in flight).
+    pub fn next(&self) -> Option<Instant> {
+        if self.in_flight { return None; }
+        self.last.map(|at| at + CHECK_EVERY)
     }
     pub fn begin(&mut self, now: Instant) {
         self.in_flight = true;
@@ -332,6 +367,41 @@ mod tests {
         assert!(parse(&[0xff, 0xfe, 0x00, 0x31]).is_err());
     }
 
+    /// `$patch_enable`, the stock page's "Check Version" switch: a clear 0 or 1 in either served
+    /// body, with the same markup leniency as the play flag; missing or unclear is unknown,
+    /// never ready.
+    #[test]
+    fn patch_enable_parses_and_anything_unclear_is_unknown() {
+        assert_eq!(parse_patch(MAINTENANCE.as_bytes()), Some(true));
+        assert_eq!(parse_patch(UP.as_bytes()), Some(true));
+        for (body, expected) in [
+            ("<define name=\"$playbutton_enable\" value=\"0\"><define name=\"$patch_enable\" value=\"0\">", Some(false)),
+            ("<DEFINE VALUE='1' NAME='$PATCH_ENABLE'>", Some(true)),
+            ("<define name=$patch_enable value= 0 >", Some(false)),
+            ("<define name=\"$playbutton_enable\" value=\"0\">", None),
+            ("", None),
+            ("<define name=\"$patch_enable\">", None),
+            ("<define name=\"$patch_enable\" value=\"\">", None),
+            ("<define name=\"$patch_enable\" value=\"yes\">", None),
+            ("<define name=\"$patch_enable\" value=\"1\"><define name=\"$patch_enable\" value=\"0\">", None),
+            ("<define name=\"$patch_enable_x\" value=\"1\">", None),
+            ("<define name=\"$patch_enable\" value=\"1", None),
+        ] {
+            assert_eq!(parse_patch(body.as_bytes()), expected, "{body:?}");
+        }
+        // Only a fresh good read speaks for it; a failed read keeps the last good one's.
+        let now = instant("2026-10-13T08:17:30Z");
+        let mut known = Known::default();
+        assert_eq!(known.patch(now), None);
+        known.note(Reading { at: now - chrono::Duration::seconds(30), result: Ok(Flag::Down(None)), patch: Some(true) });
+        assert_eq!(known.patch(now), Some(true));
+        known.note(Reading { at: now, result: Err("timed out".into()), patch: None });
+        assert_eq!(known.patch(now), Some(true));
+        assert_eq!(known.patch(now + chrono::Duration::minutes(3)), None, "stale");
+        known.note(Reading { at: now, result: Ok(Flag::Down(None)), patch: None });
+        assert_eq!(known.patch(now), None, "a read without the define");
+    }
+
     /// The decision table: flag fresh, stale, failed or missing, against every official verdict
     /// (a posted window or the status page's maintenance icon is `Maintenance`).
     #[test]
@@ -340,7 +410,7 @@ mod tests {
         let official = |state| (state, "official note".to_owned());
         let known = |reads: &[(i64, Result<Flag, String>)]| {
             let mut known = Known::default();
-            for (age, result) in reads { known.note(Reading { at: now - chrono::Duration::seconds(*age), result: result.clone() }); }
+            for (age, result) in reads { known.note(Reading { at: now - chrono::Duration::seconds(*age), result: result.clone(), patch: None }); }
             known
         };
         let down = Ok(Flag::Down(Some("The game is unavailable for play during maintenance.".into())));
@@ -458,6 +528,7 @@ mod tests {
         let request = server.join().unwrap();
         assert!(reading.at >= before && reading.at <= Utc::now());
         assert_eq!(reading.result, Ok(Flag::Down(Some("The game is unavailable for play during maintenance.".into()))));
+        assert_eq!(reading.patch, Some(true), "the same read gives $patch_enable");
         let mut lines = request.lines();
         assert_eq!(lines.next(), Some("GET /pcd/sftp/en-US/ff11/anews.pml HTTP/1.1"));
         let headers: Vec<(String, String)> = lines.filter_map(|line| line.split_once(':'))
@@ -477,6 +548,7 @@ mod tests {
         let reading = read_from(&url).await;
         server.join().unwrap();
         assert_eq!(reading.result, Err("The play flag server answered HTTP 503.".into()));
+        assert_eq!(reading.patch, None);
         let (url, server) = serve_once(http("302 Found", b""));
         assert!(read_from(&url).await.result.is_err(), "a redirect is no answer");
         server.join().unwrap();

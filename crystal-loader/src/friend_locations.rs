@@ -5,16 +5,11 @@ use crate::{game_layout::{self, Friends, Group}, log, proto};
 use std::collections::BTreeMap;
 use windows_sys::Win32::{
     Foundation::FreeLibrary,
-    System::{
-        Diagnostics::Debug::ReadProcessMemory, LibraryLoader::GetModuleHandleExW,
-        Threading::GetCurrentProcess,
-    },
+    System::LibraryLoader::GetModuleHandleExW,
 };
 use zeroize::Zeroizing;
 
-pub const MAGIC: &[u8; 8] = b"XIPOLG\x01\0";
-pub const RECORD_LEN: usize = 96; // CP932: character[16], area[64], world[16].
-pub const BLOB_LEN: usize = 8 + proto::FRIEND_SLOTS * RECORD_LEN;
+pub use crate::wire::{LOCATIONS_LEN as BLOB_LEN, LOCATIONS_MAGIC as MAGIC, LOCATION_RECORD_LEN as RECORD_LEN};
 
 // Every offset below is what this reader uses. game_layout extracts each from
 // the game's own code (100e6320, 101eaec0, 100e7900, 100efce0, 10152f20,
@@ -82,21 +77,7 @@ fn word(reader: &Reader<'_>, at: usize) -> Option<u16> {
 fn dword(reader: &Reader<'_>, at: usize) -> Option<usize> {
     Some(u32::from_le_bytes(read(reader, at)?) as usize)
 }
-fn process_read(at: usize, bytes: &mut [u8]) -> bool {
-    let mut done = 0;
-    // ReadProcessMemory rejects unmapped/partial ranges without dereferencing
-    // game-owned pointers in Rust. Only this host's address space is read.
-    unsafe {
-        ReadProcessMemory(
-            GetCurrentProcess(),
-            at as _,
-            bytes.as_mut_ptr().cast(),
-            bytes.len(),
-            &mut done,
-        ) != 0
-            && done == bytes.len()
-    }
-}
+use crate::mem::read_into as process_read;
 
 /// The live module still holds the scanned code at the resolved sites. The
 /// byte checks first written for build 6A995428, now at the located addresses.
@@ -114,13 +95,23 @@ fn verified(base: usize, reader: &Reader<'_>, layout: &Friends) -> Option<()> {
         0xc3,
     ];
     expected[16..20].copy_from_slice(&relocated(layout.lobby)?);
-    if read::<34>(reader, at(layout.cache_getter)?)? != expected
-        || read::<22>(reader, at(layout.name_getter)?)?
-            != [
-                0x8b, 0x44, 0x24, 0x04, 0xf6, 0x80, 0xb0, 0, 0, 0, 1, 0x74, 6, 5, 0xb4, 0, 0, 0,
-                0xc3, 0x33, 0xc0, 0xc3,
-            ]
-    {
+    let mut getter = read::<34>(reader, at(layout.cache_getter)?)?;
+    // The row capacity (0x12c in the known builds) may grow in an update, as
+    // the scan allows: it only has to hold the POL catalog.
+    if (u16::from_le_bytes([getter[7], getter[8]]) as usize) < proto::FRIEND_SLOTS {
+        return None;
+    }
+    getter[7..9].copy_from_slice(&expected[7..9]);
+    // Branch distances are not checked, as in the scan: the `jl` here and
+    // the name getter's `je`.
+    getter[10] = expected[10];
+    let mut name = read::<22>(reader, at(layout.name_getter)?)?;
+    let name_expected = [
+        0x8b, 0x44, 0x24, 0x04, 0xf6, 0x80, 0xb0, 0, 0, 0, 1, 0x74, 6, 5, 0xb4, 0, 0, 0,
+        0xc3, 0x33, 0xc0, 0xc3,
+    ];
+    name[12] = name_expected[12];
+    if getter != expected || name != name_expected {
         return None;
     }
     // 101eaf3f/101eaf4d: the own-zone object and field the display compares.
@@ -330,7 +321,9 @@ fn diagnostics(base: usize, layout: &Friends, native: &[u8], reader: &Reader<'_>
     out.game_ready = own_world.is_some();
     let own_zone = own_zone(base, layout, reader);
     for (index, r) in native[8..]
-        .chunks_exact(proto::FRIEND_RECORD_LEN)
+        .as_chunks::<{ proto::FRIEND_RECORD_LEN }>()
+        .0
+        .iter()
         .enumerate()
     {
         if r[IN_USE] & 1 == 0 {
@@ -412,7 +405,9 @@ fn copy_locations(base: usize, layout: &Friends, native: &[u8], reader: &Reader<
     let mut out = Zeroizing::new(vec![0; BLOB_LEN]);
     out[..8].copy_from_slice(MAGIC);
     for (index, record) in native[8..]
-        .chunks_exact(proto::FRIEND_RECORD_LEN)
+        .as_chunks::<{ proto::FRIEND_RECORD_LEN }>()
+        .0
+        .iter()
         .enumerate()
     {
         let Some(character) = selected(record) else {
@@ -481,7 +476,12 @@ pub(crate) struct GameFriends {
     layout: Option<Friends>,
     unavailable: bool,
     diagnostics: Option<Diagnostics>,
+    inputs: u64,
+    quiet_ticks: u32,
 }
+/// Snapshots between unconditional diagnostic re-walks (the observer ticks
+/// every 500 ms, so about 10 s).
+const RECOUNT_TICKS: u32 = 20;
 impl GameFriends {
     pub(crate) fn snapshot(&mut self, native: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
         if self.unavailable {
@@ -521,13 +521,32 @@ impl GameFriends {
             }
         }
         let layout = self.layout?;
-        let counts = diagnostics(self.module, &layout, native, &process_read);
-        if self.diagnostics.as_ref() != Some(&counts) {
-            log!("native friend display inputs: {counts:?}");
-            self.diagnostics = Some(counts);
+        let locations = copy_locations(self.module, &layout, native, &process_read);
+        // The stage counts are re-walked when the POL list or the published
+        // result changed, and every RECOUNT_TICKS otherwise: several counts
+        // read game rows that can change while both inputs stay the same.
+        let inputs = fingerprint(native, locations.as_deref().map(Vec::as_slice));
+        self.quiet_ticks = self.quiet_ticks.saturating_add(1);
+        if self.diagnostics.is_none() || self.inputs != inputs || self.quiet_ticks >= RECOUNT_TICKS {
+            self.inputs = inputs;
+            self.quiet_ticks = 0;
+            let counts = diagnostics(self.module, &layout, native, &process_read);
+            if self.diagnostics.as_ref() != Some(&counts) {
+                log!("native friend display inputs: {counts:?}");
+                self.diagnostics = Some(counts);
+            }
         }
-        copy_locations(self.module, &layout, native, &process_read)
+        locations
     }
+}
+
+/// A change detector for the native list and the published blob; neither is
+/// kept.
+fn fingerprint(native: &[u8], locations: Option<&[u8]>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    (native, locations).hash(&mut hasher);
+    hasher.finish()
 }
 impl Drop for GameFriends {
     fn drop(&mut self) {

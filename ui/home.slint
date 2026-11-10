@@ -1,0 +1,893 @@
+// Home: the hero band, the Windows components banner, PlayOnline news,
+// the account list beside Look up, and the footer play bar every page shares. Sizes are for the
+// 1440 px design width, scaled by Theme.scale below it.
+import { Theme } from "theme.slint";
+import { View, Ink, NewsCard, AccountLine } from "state.slint";
+import { Features } from "features.slint";
+import { Glyph, Icon, Spinner, Dot, Pressable, SmallButton, Control, IconButton, Link, Check, Field, Select, Rule, EmptyState, ScrollThumb, Banner, TipBody } from "widgets.slint";
+
+/// The slim hero band: the FFXI wordmark, the greeting and how many accounts are signed in, over
+/// the portal art on the right.
+component Hero inherits Rectangle {
+    private property <float> s: Theme.scale;
+    private property <length> band: 184px * root.s;
+    // The art keeps to the band's right half, clear of the greeting; Cover crops its top and
+    // bottom evenly so the figures sit on the band's centre line.
+    private property <length> art-w: min(720px * root.s, root.width * 0.5);
+    height: root.band + 1px;
+    background: Theme.chrome;
+    Rectangle {
+        y: 0;
+        height: root.band;
+        clip: true;
+        Image {
+            x: parent.width - self.width;
+            y: (parent.height - self.height) / 2;
+            width: root.art-w;
+            height: min(root.band, root.art-w / (1400 / 544));
+            source: Theme.light ? @image-url("../assets/portal-art-light.png") : @image-url("../assets/portal-art-dark.png");
+            image-fit: cover;
+            opacity: Theme.light ? 0.8 : 0.55;
+            accessible-role: none;
+        }
+    }
+    VerticalLayout {
+        x: 40px * root.s;
+        y: 26px * root.s;
+        width: parent.width - 80px * root.s;
+        height: root.band - 26px * root.s;
+        alignment: start;
+        spacing: 0px;
+        HorizontalLayout {
+            alignment: start;
+            Image {
+                width: 296px * root.s;
+                height: 296px * root.s / (747 / 154);
+                source: Theme.light ? @image-url("../assets/portal-wordmark-light.png") : @image-url("../assets/portal-wordmark-dark.png");
+                image-fit: contain;
+                accessible-role: image;
+                accessible-label: "FINAL FANTASY XI";
+            }
+        }
+        Rectangle { height: 12px * root.s; }
+        Text {
+            text: View.strings.greeting;
+            font-family: View.serif-greeting ? Theme.serif : Theme.sans;
+            font-italic: View.serif-greeting;
+            font-size: Theme.type-display * root.s;
+            color: Theme.ink;
+        }
+        Rectangle { height: 10px * root.s; }
+        HorizontalLayout {
+            alignment: start;
+            spacing: 8px * root.s;
+            Dot { cross-axis-self-alignment: center; tint: View.any-signed-in ? Theme.ok : Theme.faint; }
+            Text {
+                text: View.signed-in;
+                font-size: 14px * root.s;
+                font-weight: View.any-signed-in ? 600 : 400;
+                color: View.any-signed-in ? Theme.ink : Theme.sub;
+                vertical-alignment: center;
+            }
+        }
+    }
+    // Square Enix's notice sits in the band's corner, over the art.
+    Text {
+        x: parent.width - self.width - 40px * root.s;
+        y: root.band - self.height - 12px * root.s;
+        text: "FINAL FANTASY XI © SQUARE ENIX";
+        font-size: Theme.type-micro * root.s;
+        color: Theme.faint;
+    }
+    Rule { y: root.band; tint: Theme.chrome-line; }
+}
+
+/// The slim warning strip when a Windows component is missing (prereqs::banner). scale is the
+/// layout scale: Home's, or 1 where a page draws it at full size (Downloads).
+export component PrereqBanner inherits VerticalLayout {
+    in property <float> scale: Theme.scale;
+    private property <float> s: root.scale;
+    private property <color> tone: View.banner-restart ? Theme.accent : Theme.warn-tone;
+    Banner {
+        tone: root.tone;
+        glyph: View.banner-restart ? Glyph.refresh : Glyph.alert-circle;
+        glyph-size: 15px * root.s;
+        edge: 0.38;
+        pad-left: Theme.sp-l * root.s;
+        pad-right: 8px * root.s;
+        pad-y: 0px;
+        gap: Theme.sp-m * root.s;
+        height: 44px * root.s;
+        border-radius: Theme.radius-mid;
+        HorizontalLayout {
+            horizontal-stretch: 1;
+            alignment: start;
+            Text { text: View.banner-lead; font-size: Theme.type-small * root.s; font-weight: 600; color: Theme.ink; vertical-alignment: center; }
+            Text { text: View.banner-rest; font-size: Theme.type-small * root.s; color: Theme.ink2; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+        }
+        fix := Pressable {
+            label: View.banner-action;
+            cross-axis-self-alignment: center;
+            height: 28px * root.s;
+            min-width: fix-row.preferred-width + 22px * root.s;
+            horizontal-stretch: 0;
+            border-radius: Theme.radius-inner;
+            border-width: 1px;
+            background: root.tone.mix(Theme.bg, self.hot ? 0.2 : 0.12);
+            border-color: root.tone.mix(Theme.bg, 0.5);
+            clicked => { View.banner-clicked(); }
+            fix-row := HorizontalLayout {
+                x: 11px * root.s;
+                width: self.preferred-width;
+                spacing: 6px * root.s;
+                Text { text: View.banner-action; font-size: Theme.type-small * root.s; font-weight: 600; color: root.tone; vertical-alignment: center; }
+                Icon { cross-axis-self-alignment: center; glyph: Glyph.arrow-right; size: 13px * root.s; tint: root.tone; }
+            }
+        }
+    }
+}
+
+/// A Home section's heading: one size, weight and colour for News, Accounts and Look up.
+component SectionTitle inherits Text {
+    /// Its baseline below the row's centre line: smaller text in the header row shifts by the
+    /// difference, so the row shares one baseline.
+    out property <length> baseline: (self.font-metrics.ascent + self.font-metrics.descent) / 2;
+    font-size: Theme.type-heading * Theme.scale;
+    font-weight: 600;
+    color: Theme.ink;
+    vertical-alignment: center;
+    horizontal-stretch: 0;
+}
+
+/// The quiet note after a section title ("3 of 3 selected"), on the title's baseline.
+component HeadNote inherits Rectangle {
+    in property <string> text;
+    in property <length> baseline;
+    horizontal-stretch: 0;
+    min-width: note.preferred-width;
+    note := Text {
+        y: (parent.height - self.height) / 2 + root.baseline - (self.font-metrics.ascent + self.font-metrics.descent) / 2;
+        text: root.text;
+        font-size: Theme.type-small * Theme.scale;
+        color: Theme.sub;
+    }
+}
+
+/// A news text tab: ink when active or under the pointer, semibold when active.
+component NewsTab inherits Pressable {
+    in property <string> text;
+    in property <bool> active;
+    /// The baseline to sit on, below the row's centre (SectionTitle's `baseline`).
+    in property <length> baseline: (caption.font-metrics.ascent + caption.font-metrics.descent) / 2;
+    label: root.text;
+    accessible-role: tab;
+    accessible-checked: root.active;
+    min-width: caption.preferred-width;
+    preferred-width: self.min-width;
+    horizontal-stretch: 0;
+    caption := Text {
+        y: (parent.height - self.height) / 2 + root.baseline - (self.font-metrics.ascent + self.font-metrics.descent) / 2;
+        text: root.text;
+        font-size: 13px * Theme.scale;
+        font-weight: root.active ? 600 : 500;
+        color: root.active || root.hot ? Theme.ink : Theme.sub;
+        vertical-alignment: center;
+    }
+}
+
+/// One news card: the PlayOnline image (letterboxed whole into the slot, never cropped), then
+/// kind and date, the headline and the summary.
+component NewsCardView inherits Pressable {
+    in property <NewsCard> card;
+    in property <bool> thumbs;
+    private property <float> s: Theme.scale;
+    label: root.card.title;
+    border-radius: 10px;
+    border-width: 1px;
+    background: Theme.card;
+    border-color: root.hot ? Theme.accent : Theme.hairline;
+    clip: true;
+    VerticalLayout {
+        padding: 1px;
+        spacing: 0px;
+        if root.thumbs: Rectangle {
+            height: 132px * root.s;
+            background: Theme.thumb;
+            border-top-left-radius: 9px;
+            border-top-right-radius: 9px;
+            if root.card.has-image: Image {
+                width: parent.width;
+                height: parent.height;
+                source: root.card.image;
+                image-fit: contain;
+                accessible-role: none;
+            }
+            if !root.card.has-image: Icon {
+                glyph: root.card.notice ? Glyph.wrench : Glyph.rss;
+                size: 28px * root.s;
+                tint: Theme.faint;
+            }
+        }
+        if root.thumbs: Rule { tint: Theme.hairline; }
+        VerticalLayout {
+            padding-left: 14px * root.s;
+            padding-right: 14px * root.s;
+            padding-top: 12px * root.s;
+            padding-bottom: 10px * root.s;
+            spacing: 0px;
+            alignment: start;
+            HorizontalLayout {
+                spacing: 10px * root.s;
+                alignment: start;
+                Text { text: root.card.kind; font-size: 12px * root.s; font-weight: 600; color: View.tone(root.card.kind-ink); vertical-alignment: center; }
+                Text { text: root.card.date; font-family: Theme.mono; font-size: 12px * root.s; color: Theme.faint; vertical-alignment: center; overflow: elide; }
+            }
+            Rectangle { height: 6px * root.s; }
+            Text {
+                height: 16px * 1.43 * 2 * root.s;
+                text: root.card.title;
+                font-size: 16px * root.s;
+                font-weight: 600;
+                color: Theme.ink;
+                wrap: no-wrap;
+                overflow: clip;
+                vertical-alignment: top;
+            }
+            Rectangle { height: 6px * root.s; }
+            Text {
+                height: 13px * 1.45 * 2 * root.s;
+                text: root.card.teaser;
+                font-size: 13px * root.s;
+                color: Theme.sub;
+                wrap: no-wrap;
+                overflow: clip;
+                vertical-alignment: top;
+            }
+        }
+    }
+    // The whole headline over the clipped one.
+    Tooltip { TipBody { text: root.card.title; } }
+}
+
+/// The tile that ends a short news row: it spans the spare columns and opens the official news.
+component MoreTile inherits Pressable {
+    in property <bool> roomy;
+    private property <float> s: Theme.scale;
+    label: View.strings.more-news;
+    border-radius: 10px;
+    border-width: 1px;
+    background: root.hot ? Theme.card : Theme.tint;
+    border-color: root.hot ? Theme.accent : Theme.hairline;
+    VerticalLayout {
+        alignment: center;
+        padding: Theme.sp-l * root.s;
+        spacing: Theme.sp-xs * root.s;
+        if root.roomy: HorizontalLayout {
+            alignment: center;
+            Rectangle {
+                width: 44px * root.s;
+                height: 44px * root.s;
+                border-radius: 22px * root.s;
+                background: Theme.select;
+                Icon { glyph: Glyph.rss; size: 18px * root.s; tint: Theme.accent; }
+            }
+        }
+        if root.roomy: Rectangle { height: Theme.sp-s * root.s; }
+        Text {
+            text: View.strings.more-news;
+            font-size: Theme.type-heading * root.s;
+            font-weight: 600;
+            color: Theme.ink;
+            horizontal-alignment: center;
+        }
+        if root.roomy: Rectangle { height: Theme.sp-xs * root.s; }
+        if root.roomy: HorizontalLayout {
+            alignment: center;
+            spacing: 6px * root.s;
+            Text { text: View.strings.view-all-news; font-size: Theme.type-small * root.s; font-weight: 500; color: Theme.accent; vertical-alignment: center; }
+            Icon { cross-axis-self-alignment: center; glyph: Glyph.arrow-right; size: 13px * root.s; tint: Theme.accent; }
+        }
+    }
+}
+
+component NewsSection inherits VerticalLayout {
+    private property <float> s: Theme.scale;
+    private property <length> gap: 16px * root.s;
+    // The image slot, the hairline under it and the fixed text block.
+    private property <length> card-h: (View.news-thumbs ? 132px * root.s + 1px : 0px) + 132.9px * root.s + 2px;
+    spacing: 8px * root.s;
+    HorizontalLayout {
+        height: 28px * root.s;
+        spacing: Theme.sp-m * root.s;
+        news-title := SectionTitle { text: View.strings.news; }
+        if View.news-note != "": HeadNote { text: View.news-note; baseline: news-title.baseline; }
+        Rectangle { horizontal-stretch: 1; }
+        HorizontalLayout {
+            spacing: 14px * root.s;
+            horizontal-stretch: 0;
+            for tab[index] in View.news-tabs: NewsTab {
+                baseline: news-title.baseline;
+                text: tab;
+                active: index == View.news-tab;
+                clicked => { View.news-picked(index); }
+            }
+        }
+        Rectangle { width: 0px; }
+        IconButton {
+            label: View.strings.refresh-news;
+            glyph: Glyph.refresh;
+            side: 28px * root.s;
+            glyph-size: 13px * root.s;
+            clicked => { View.refresh-news(); }
+        }
+        Rectangle { width: 0px; }
+        Link {
+            text: View.strings.view-all-news;
+            size: Theme.type-small * root.s;
+            baseline: news-title.baseline;
+            clicked => { View.view-all-news(); }
+        }
+    }
+    if View.news-state == 0: HorizontalLayout {
+        height: root.card-h;
+        spacing: root.gap;
+        for card[index] in View.news: NewsCardView {
+            width: View.news-card-w;
+
+            card: card;
+            thumbs: View.news-thumbs;
+            clicked => { View.open-news(index); }
+        }
+        if View.news-more: MoreTile {
+            horizontal-stretch: 1;
+            preferred-width: 0px;
+            roomy: View.news-thumbs;
+            clicked => { View.view-all-news(); }
+        }
+    }
+    if View.news-state != 0: Rectangle {
+        height: root.card-h;
+        background: Theme.panel;
+        border-radius: Theme.radius;
+        border-width: 1px;
+        border-color: Theme.hairline;
+        VerticalLayout {
+            alignment: center;
+            padding-left: Theme.sp-l * root.s;
+            padding-right: Theme.sp-l * root.s;
+            EmptyState {
+                glyph: View.news-state == 2 ? Glyph.alert-circle : Glyph.rss;
+                busy: View.news-state == 1;
+                title: View.news-empty-title;
+                body: View.news-empty-body;
+                action: View.news-state == 1 ? "" : View.strings.refresh-news;
+                action-glyph: Glyph.refresh;
+                act => { View.refresh-news(); }
+            }
+        }
+    }
+}
+
+/// One account row: drag grip, Play checkbox, the name (opens its settings), the state with its
+/// detail, and one action column.
+component AccountRow inherits Rectangle {
+    in property <AccountLine> line;
+    in property <int> index;
+    private property <float> s: Theme.scale;
+    height: 40px * root.s + 1px;
+    // The dragged pointer is over this row: it takes the dragged row's place.
+    private property <bool> under: View.dragging && View.drag-y >= self.absolute-position.y && View.drag-y < self.absolute-position.y + self.height;
+    changed under => { if self.under { View.drag-over(root.index); } }
+    Rectangle {
+        height: 40px * root.s;
+        y: 0;
+        border-radius: Theme.radius-inner;
+        background: root.line.editing || root.line.dragging ? Theme.card : transparent;
+        border-width: root.line.dragging ? 1px : 0px;
+        border-color: root.line.dragging ? Theme.accent : transparent;
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            spacing: Theme.sp-m * root.s;
+            Rectangle {
+                width: 16px * root.s;
+                Icon { glyph: Glyph.grip; size: 14px * root.s; tint: root.line.dragging ? Theme.accent : Theme.faint; }
+                // Pressing the grip starts the drag; the release anywhere ends it (the host's
+                // window listener).
+                TouchArea {
+                    mouse-cursor: root.line.dragging ? grabbing : grab;
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                            View.drag-y = self.absolute-position.y + self.mouse-y;
+                            View.drag-start(root.index);
+                        }
+                    }
+                    moved => { if View.dragging { View.drag-y = self.absolute-position.y + self.mouse-y; } }
+                }
+            }
+            Rectangle {
+                width: 24px * root.s;
+                Check {
+                    x: 0;
+                    box: 16px * root.s;
+                    width: 16px * root.s;
+                    height: 16px * root.s;
+                    label: root.line.name;
+                    checked: root.line.checked;
+                    toggled(on) => { View.toggle-account(root.index, on); }
+                }
+            }
+            name := Pressable {
+                width: 160px * root.s;
+                label: root.line.name;
+                enabled: root.line.name-enabled;
+                clip: true;
+                clicked => { View.edit-account(root.index); }
+                Text {
+                    width: parent.width;
+                    text: root.line.name;
+                    font-size: Theme.type-body * root.s;
+                    font-weight: 600;
+                    color: root.line.editing ? Theme.info : Theme.ink;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+            HorizontalLayout {
+                horizontal-stretch: 1;
+                spacing: Theme.sp-s * root.s;
+                alignment: start;
+                Rectangle {
+                    width: 12px * root.s;
+                    if root.line.working: Spinner { size: 12px * root.s; tint: View.tone(root.line.ink); }
+                    if !root.line.working: Dot { tint: View.tone(root.line.ink); }
+                }
+                Text {
+                    text: root.line.label;
+                    font-size: Theme.type-small * root.s;
+                    font-weight: 600;
+                    color: View.tone(root.line.ink);
+                    vertical-alignment: center;
+                    horizontal-stretch: 0;
+                }
+                if root.line.progress >= 0: Rectangle {
+                    width: 120px * root.s;
+                    Rectangle {
+                        y: (parent.height - 3px) / 2;
+                        height: 3px;
+                        border-radius: 2px;
+                        background: Theme.track;
+                        Rectangle {
+                            x: 0;
+                            width: parent.width * clamp(root.line.progress, 0, 1);
+                            border-radius: 2px;
+                            background: Theme.warn-bar;
+                        }
+                    }
+                }
+                if root.line.progress >= 0: Text {
+                    text: root.line.percent;
+                    font-family: Theme.mono;
+                    font-size: Theme.type-caption * root.s;
+                    color: Theme.ink2;
+                    vertical-alignment: center;
+                }
+                if root.line.detail != "": Text {
+                    text: "· " + root.line.detail;
+                    font-size: Theme.type-small * root.s;
+                    color: Theme.faint;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+            }
+            // One action column for every row, so the state column starts and ends alike.
+            HorizontalLayout {
+                width: 200px * root.s;
+                spacing: 6px * root.s;
+                alignment: end;
+                if root.line.otp: Field {
+                    cross-axis-self-alignment: center;
+                    width: 80px * root.s;
+                    height: 28px * root.s;
+                    pad-x: 9px * root.s;
+                    font-size: Theme.type-small * root.s;
+                    placeholder: View.strings.code;
+                    password: true;
+                    text: root.line.otp-text;
+                    edited(value) => { View.otp-edited(root.index, value); }
+                    accepted => { if root.line.action-enabled { View.row-action(root.index); } }
+                }
+                if root.line.action != "": SmallButton {
+                    cross-axis-self-alignment: center;
+                    text: root.line.action;
+                    soft: root.line.action-soft;
+                    enabled: root.line.action-enabled;
+                    clicked => { View.row-action(root.index); }
+                }
+            }
+        }
+    }
+    // From the section's edge to the end of the action column, where the header's buttons end.
+    Rule { x: 0; y: 40px * root.s; width: parent.width - 8px; tint: Theme.divider; }
+}
+
+/// `pinned`: the rows scroll inside the list, under a fixed header.
+component AccountsSection inherits VerticalLayout {
+    in property <bool> pinned;
+    private property <float> s: Theme.scale;
+    private property <length> row-h: 40px * root.s + 1px;
+    private property <length> rows-h: View.accounts.length == 0 ? 72px * root.s : View.accounts.length * root.row-h;
+    spacing: 8px * root.s;
+    // The header's buttons end where the rows' buttons end.
+    HorizontalLayout {
+        height: 28px * root.s;
+        padding-right: 8px + (root.pinned ? 12px : 0px);
+        spacing: Theme.sp-m * root.s;
+        accounts-title := SectionTitle { text: View.strings.accounts; }
+        HeadNote { text: View.accounts-note; baseline: accounts-title.baseline; }
+        Rectangle { horizontal-stretch: 1; }
+        HorizontalLayout {
+            spacing: Theme.sp-s * root.s;
+            horizontal-stretch: 0;
+            if View.show-shut-down-all: SmallButton { y: 0; text: View.strings.shut-down-all; glyph: Glyph.power; clicked => { View.shut-down-all(); } }
+            if View.show-play-all: SmallButton { text: View.strings.play-all; glyph: Glyph.play; clicked => { View.play-all(); } }
+            SmallButton { text: Features.strings.entry; glyph: Glyph.wrench; clicked => { Features.open-sheet(true); } }
+            SmallButton { text: View.strings.import; glyph: Glyph.download; enabled: View.can-add; clicked => { View.import-accounts(); } }
+            SmallButton { text: View.strings.add-account; glyph: Glyph.plus; enabled: View.can-add; clicked => { View.add-account(); } }
+        }
+    }
+    rows := Rectangle {
+        vertical-stretch: root.pinned ? 1 : 0;
+        min-height: root.pinned ? min(root.rows-h, 3 * root.row-h) : root.rows-h;
+        preferred-height: root.rows-h;
+        flick := Flickable {
+            width: parent.width - (root.pinned ? 12px : 0px);
+            x: 0;
+            content-width: self.width;
+            content-height: root.rows-h;
+            VerticalLayout {
+                width: flick.width;
+                spacing: 0px;
+                alignment: start;
+                if View.accounts.length == 0: EmptyState {
+                    glyph: Glyph.users;
+                    title: View.strings.no-accounts;
+                    body: View.strings.no-accounts-body;
+                    action: View.strings.add-account;
+                    action-glyph: Glyph.plus;
+                    action-soft: true;
+                    action-enabled: View.can-add;
+                    act => { View.add-account(); }
+                }
+                for line[index] in View.accounts: AccountRow {
+                    line: line;
+                    index: index;
+                }
+            }
+        }
+        if root.pinned: ScrollThumb {
+            x: parent.width - 8px;
+            height: parent.height;
+            content-y: flick.content-y;
+            content-height: flick.content-height;
+            visible-height: flick.height;
+        }
+    }
+}
+
+/// One search's caption row: the site's name, and a link to the site at its end.
+component SearchCaption inherits HorizontalLayout {
+    in property <string> title;
+    callback open();
+    height: 16px * Theme.scale;
+    Text { text: root.title; font-size: Theme.type-caption * Theme.scale; font-weight: 500; color: Theme.sub; vertical-alignment: center; }
+    Rectangle { horizontal-stretch: 1; }
+    link := Pressable {
+        label: View.strings.open-website;
+        width: 16px * Theme.scale;
+        clicked => { root.open(); }
+        Icon {
+            x: parent.width - self.width;
+            glyph: Glyph.external-link;
+            size: 13px * Theme.scale;
+            tint: parent.hot ? Theme.ink : Theme.faint;
+        }
+        Tooltip {
+            TipBody { text: View.strings.open-website; }
+        }
+    }
+}
+
+/// BG Wiki (or the Japanese dictionary) and FFXIAH searches, each with a link to the site.
+component LookUp inherits VerticalLayout {
+    private property <float> s: Theme.scale;
+    spacing: 8px * root.s;
+    alignment: start;
+    HorizontalLayout { height: 28px * root.s; SectionTitle { text: View.strings.look-up; } }
+    VerticalLayout {
+        spacing: Theme.sp-m * root.s;
+        VerticalLayout {
+            spacing: 6px * root.s;
+            SearchCaption { title: View.strings.wiki-title; open => { View.open-wiki(); } }
+            Field {
+                height: 36px * root.s;
+                glyph: Glyph.search;
+                pad-x: 10px * root.s;
+                font-size: 14px * root.s;
+                placeholder: View.strings.wiki-placeholder;
+                text <=> View.wiki-query;
+                edited(value) => { View.wiki-edited(value); }
+                accepted => { View.wiki-search(); }
+            }
+        }
+        VerticalLayout {
+            spacing: 6px * root.s;
+            SearchCaption { title: "FFXIAH"; open => { View.open-ffxiah(); } }
+            Rectangle {
+                height: 36px * root.s;
+                border-radius: Theme.radius-inner;
+                border-width: 1px;
+                border-color: Theme.line;
+                background: Theme.field;
+                HorizontalLayout {
+                    Field {
+                        framed: false;
+                        height: parent.height;
+                        glyph: Glyph.search;
+                        pad-x: 10px * root.s;
+                        font-size: 14px * root.s;
+                        placeholder: View.strings.find-item;
+                        text <=> View.ah-query;
+                        edited(value) => { View.ah-edited(value); }
+                        accepted => { View.ah-search(); }
+                    }
+                    Rectangle { width: 8px * root.s; }
+                    Rectangle {
+                        width: 1px;
+                        Rectangle { y: 1px; height: parent.height - 2px; background: Theme.line; }
+                    }
+                    Select {
+                        width: 124px * root.s;
+                        height: parent.height;
+                        framed: false;
+                        scale: root.s;
+                        ink: Theme.ink2;
+                        label: "FFXIAH";
+                        items: View.ah-servers;
+                        current: View.ah-server;
+                        picked(index) => { View.ah-server-picked(index); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Home's page body under the hero.
+export component HomePage inherits VerticalLayout {
+    private property <float> s: Theme.scale;
+    Hero { }
+    Rectangle {
+        vertical-stretch: 1;
+        page := Flickable {
+            content-width: self.width;
+            content-height: body.height;
+            body := VerticalLayout {
+                width: page.width;
+                height: max(page.height, self.min-height);
+                padding-top: 20px * root.s;
+                padding-bottom: 20px * root.s;
+                padding-left: 40px * root.s;
+                padding-right: 40px * root.s;
+                spacing: 20px * root.s;
+                if View.banner: PrereqBanner { }
+                NewsSection { }
+                // The list and Look up side by side; a narrow window stacks them.
+                if View.wide: HorizontalLayout {
+                    vertical-stretch: 1;
+                    spacing: 36px * root.s;
+                    AccountsSection { horizontal-stretch: 1; pinned: true; }
+                    LookUp { width: 400px * root.s; }
+                }
+                if !View.wide: VerticalLayout {
+                    spacing: 20px * root.s;
+                    AccountsSection { pinned: false; }
+                    LookUp { }
+                }
+            }
+        }
+        ScrollThumb {
+            x: parent.width - 8px;
+            height: parent.height;
+            content-y: page.content-y;
+            content-height: page.content-height;
+            visible-height: page.height;
+        }
+    }
+}
+
+/// A footer control under its caption: an empty caption keeps the row's baseline.
+component Labelled inherits VerticalLayout {
+    in property <string> caption;
+    spacing: 6px * Theme.scale;
+    alignment: center;
+    Text {
+        height: 16px * Theme.scale;
+        text: root.caption;
+        font-size: Theme.type-caption * Theme.scale;
+        font-weight: 500;
+        color: Theme.sub;
+        vertical-alignment: center;
+    }
+    @children
+}
+
+/// The footer play bar: status, links, the launch pickers and the Play button.
+export component PlayBar inherits VerticalLayout {
+    private property <float> s: Theme.scale;
+    Rule { tint: Theme.chrome-line; }
+    Rectangle {
+        height: Theme.footer-h * root.s;
+        background: Theme.chrome;
+        HorizontalLayout {
+            // The status block's own hover inset sits outside the page margin.
+            padding-left: (40px - 6px) * root.s;
+            padding-right: 40px * root.s;
+            spacing: 16px * root.s;
+            // The status block opens Connection & activity.
+            status := Pressable {
+                label: View.footer.status;
+                cross-axis-self-alignment: center;
+                height: status-row.preferred-height + 8px * root.s;
+                min-width: status-row.preferred-width + 12px * root.s;
+                horizontal-stretch: 0;
+                border-radius: Theme.radius-inner;
+                background: self.hot ? Theme.tint : transparent;
+                clicked => { View.toggle-details(); }
+                status-row := HorizontalLayout {
+                    x: 6px * root.s;
+                    y: 4px * root.s;
+                    width: parent.width - 12px * root.s;
+                    height: parent.height - 8px * root.s;
+                    spacing: Theme.sp-m * root.s;
+                    Rectangle {
+                        cross-axis-self-alignment: center;
+                        width: 28px * root.s;
+                        height: 28px * root.s;
+                        border-radius: 14px * root.s;
+                        property <color> ink: View.footer.badge == 0 ? Theme.ok : View.footer.badge == 1 ? Theme.warn : Theme.sub;
+                        background: View.footer.badge == 0 ? Theme.ok-fill : View.footer.badge == 1 ? Theme.warn.mix(Theme.chrome, 0.16) : Theme.tint;
+                        if View.footer.badge == 0: Icon { glyph: Glyph.check; size: 12px * root.s; weight: 3; tint: parent.ink; }
+                        if View.footer.badge == 1: Icon { glyph: Glyph.alert-circle; size: 15px * root.s; tint: parent.ink; }
+                        if View.footer.badge == 2: Spinner { size: 15px * root.s; tint: parent.ink; }
+                        if View.footer.badge == 3: Icon { glyph: Glyph.help; size: 15px * root.s; tint: parent.ink; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px * root.s;
+                        Text { text: View.footer.status; font-size: 15px * root.s; font-weight: 600; color: Theme.ink; }
+                        // An empty detail takes no line, so a lone status centres on the badge.
+                        if View.footer.detail != "": Text { text: View.footer.detail; font-size: Theme.type-caption * root.s; color: Theme.sub; }
+                    }
+                }
+            }
+            Rectangle {
+                width: 1px;
+                Rectangle { y: (parent.height - self.height) / 2; height: 32px * root.s; background: Theme.chrome-line; }
+            }
+            Link {
+                text: View.strings.install-repair;
+                size: 14px * root.s;
+                weight: 400;
+                ink: Theme.quiet;
+                pad-x: 4px * root.s;
+                pad-y: 6px * root.s;
+                clicked => { View.install-repair(); }
+            }
+            Link {
+                text: View.strings.help-support;
+                size: 14px * root.s;
+                weight: 400;
+                ink: Theme.quiet;
+                pad-x: 4px * root.s;
+                pad-y: 6px * root.s;
+                clicked => { View.help-support(); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            if View.footer.shutdown: Labelled {
+                caption: "";
+                Control {
+                    scale: root.s;
+                    text: View.footer.shutdown-label;
+                    glyph: Glyph.power;
+                    busy: View.footer.shutdown-busy;
+                    enabled: View.footer.shutdown-enabled;
+                    clicked => { View.shut-down-selected(); }
+                }
+            }
+            if View.footer.picks: Labelled {
+                caption: View.strings.launch-with;
+                Select {
+                    width: 156px * root.s;
+                    scale: root.s;
+                    up: true;
+                    fill: Theme.well;
+                    label: View.strings.launch-with;
+                    items: View.launch-items;
+                    current: View.footer.launch-current;
+                    placeholder: View.mixed;
+                    picked(index) => { View.launch-picked(index); }
+                }
+            }
+            if View.footer.picks: Labelled {
+                caption: View.strings.character-select;
+                Select {
+                    width: 156px * root.s;
+                    scale: root.s;
+                    up: true;
+                    fill: Theme.well;
+                    label: View.strings.character-select;
+                    items: View.select-items;
+                    current: View.footer.select-current;
+                    placeholder: View.mixed;
+                    picked(index) => { View.select-picked(index); }
+                }
+            }
+            play := Pressable {
+                label: View.footer.play-label;
+                enabled: View.footer.play-enabled;
+                cross-axis-self-alignment: center;
+                // As tall as a labelled dropdown: its top meets their captions, its bottom their boxes.
+                height: 58px * root.s;
+                min-width: play-row.preferred-width + 46px * root.s;
+                horizontal-stretch: 0;
+                border-radius: Theme.radius-mid;
+                background: View.footer.play-fill == 1 ? Theme.warn.mix(Theme.chrome, 0.16)
+                    : View.footer.play-fill == 2 ? Theme.tint
+                    : View.footer.play-fill == 3 ? Theme.ok-fill
+                    : self.hot ? Theme.play-text.mix(Theme.play, 0.1) : Theme.play;
+                border-width: self.enabled ? 0px : 1px;
+                border-color: Theme.hairline;
+                clicked => { View.main-action(); }
+                property <color> ink: View.tone(View.footer.play-ink);
+                play-row := HorizontalLayout {
+                    x: 22px * root.s;
+                    width: self.preferred-width;
+                    spacing: 12px * root.s;
+                    if View.footer.play-glyph == 0: Path {
+                        cross-axis-self-alignment: center;
+                        width: 12px * root.s;
+                        height: 16px * root.s;
+                        viewbox-width: 12;
+                        viewbox-height: 16;
+                        commands: "M0 0 12 8 0 16Z";
+                        fill: play.ink;
+                        stroke: transparent;
+                        stroke-width: 0px;
+                    }
+                    if View.footer.play-glyph == 1: Icon { cross-axis-self-alignment: center; glyph: Glyph.check; size: 17px * root.s; tint: play.ink; }
+                    if View.footer.play-glyph == 2: Spinner { cross-axis-self-alignment: center; size: 17px * root.s; tint: play.ink; }
+                    if View.footer.play-glyph == 3: Icon { cross-axis-self-alignment: center; glyph: Glyph.download; size: 17px * root.s; tint: play.ink; }
+                    if View.footer.play-glyph == 4: Icon { cross-axis-self-alignment: center; glyph: Glyph.wrench; size: 17px * root.s; tint: play.ink; }
+                    if View.footer.play-glyph == 5: Icon { cross-axis-self-alignment: center; glyph: Glyph.alert-circle; size: 17px * root.s; tint: play.ink; }
+                    Text { text: View.footer.play-label; font-size: 17px * root.s; font-weight: 700; color: play.ink; vertical-alignment: center; }
+                    // Play names what it starts: the accounts, and how many start at once.
+                    if View.footer.names != "": Rectangle {
+                        width: 1px;
+                        Rectangle { y: (parent.height - self.height) / 2; height: 26px * root.s; background: Theme.play-text.with-alpha(0.3); }
+                    }
+                    if View.footer.names != "": Text {
+                        max-width: 320px * root.s;
+                        text: View.footer.names;
+                        font-size: 14px * root.s;
+                        font-weight: 600;
+                        color: play.ink;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
+    }
+}

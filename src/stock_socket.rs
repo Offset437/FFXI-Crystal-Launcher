@@ -17,7 +17,7 @@
 //!
 //! No TCP_NODELAY and no ACK-frequency change: the Viewer sets neither (owner, 07b).
 use std::io;
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddrV4, TcpStream};
 use std::os::windows::io::{FromRawSocket, RawSocket};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Networking::WinSock as ws;
@@ -44,27 +44,17 @@ impl Drop for Socket {
 fn last_error() -> io::Error { io::Error::from_raw_os_error(unsafe { ws::WSAGetLastError() }) }
 fn check(result: i32) -> io::Result<()> { if result == ws::SOCKET_ERROR { Err(last_error()) } else { Ok(()) } }
 
-/// sockaddr bytes for `address` (SOCKADDR_IN / SOCKADDR_IN6), port in network order.
+/// SOCKADDR_IN bytes for `address`, port in network order. IPv4 only: stock looks its patch
+/// hosts up with A queries alone (`dns::resolve_a`), so a v6 address never reaches here.
 #[repr(C, align(4))]
-struct Raw([u8; 28]);
-fn raw(address: &SocketAddr) -> (Raw, i32) {
-    let mut out = Raw([0; 28]);
+struct Raw([u8; 16]);
+fn raw(address: &SocketAddrV4) -> (Raw, i32) {
+    let mut out = Raw([0; 16]);
     let b = &mut out.0;
+    b[..2].copy_from_slice(&ws::AF_INET.to_le_bytes());
     b[2..4].copy_from_slice(&address.port().to_be_bytes());
-    match address {
-        SocketAddr::V4(v4) => {
-            b[..2].copy_from_slice(&ws::AF_INET.to_le_bytes());
-            b[4..8].copy_from_slice(&v4.ip().octets());
-            (out, 16)
-        }
-        SocketAddr::V6(v6) => {
-            b[..2].copy_from_slice(&ws::AF_INET6.to_le_bytes());
-            b[4..8].copy_from_slice(&v6.flowinfo().to_ne_bytes());
-            b[8..24].copy_from_slice(&v6.ip().octets());
-            b[24..28].copy_from_slice(&v6.scope_id().to_le_bytes());
-            (out, 28)
-        }
-    }
+    b[4..8].copy_from_slice(&address.ip().octets());
+    (out, 16)
 }
 
 /// WSAStartup once for this process (Winsock calls made outside std's sockets need it).
@@ -78,18 +68,16 @@ impl Socket {
     /// socket → bind to the wildcard address, port 0 → SO_RCVBUF/SO_SNDBUF 64 KB, in
     /// app.dll's order. Both buffers must be set before connect: the SYN's window and
     /// scale are fixed from SO_RCVBUF when it goes out.
-    pub(crate) fn configured(v6: bool) -> io::Result<Socket> {
+    pub(crate) fn configured() -> io::Result<Socket> {
         startup();
-        let family = if v6 { ws::AF_INET6 } else { ws::AF_INET };
         // Overlapped like std's sockets; not inheritable, so a loader started meanwhile
         // cannot hold the connection open past closesocket.
-        let s = unsafe { ws::WSASocketW(family as i32, ws::SOCK_STREAM, ws::IPPROTO_TCP, std::ptr::null(), 0,
+        let s = unsafe { ws::WSASocketW(ws::AF_INET as i32, ws::SOCK_STREAM, ws::IPPROTO_TCP, std::ptr::null(), 0,
             ws::WSA_FLAG_OVERLAPPED | ws::WSA_FLAG_NO_HANDLE_INHERIT) };
         if s == ws::INVALID_SOCKET { return Err(last_error()); }
         let socket = Socket(s);
         #[cfg(test)] OPENED.with(|n| n.set(n.get() + 1));
-        let any: SocketAddr = if v6 { (std::net::Ipv6Addr::UNSPECIFIED, 0).into() } else { (std::net::Ipv4Addr::UNSPECIFIED, 0).into() };
-        let (name, len) = raw(&any);
+        let (name, len) = raw(&SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
         check(unsafe { ws::bind(s, name.0.as_ptr().cast(), len) })?;
         for option in [ws::SO_RCVBUF, ws::SO_SNDBUF] {
             check(unsafe { ws::setsockopt(s, ws::SOL_SOCKET, option, (&BUFFER as *const i32).cast(), 4) })?;
@@ -102,7 +90,7 @@ impl Socket {
 
     /// Non-blocking connect bounded by `limit` (app.dll connects non-blocking too), then
     /// back to blocking for std's reads and writes.
-    pub(crate) fn connect(self, address: &SocketAddr, limit: Duration) -> io::Result<TcpStream> {
+    pub(crate) fn connect(self, address: &SocketAddrV4, limit: Duration) -> io::Result<TcpStream> {
         let s = self.0;
         let mut on = 1u32;
         check(unsafe { ws::ioctlsocket(s, ws::FIONBIO, &mut on) })?;
@@ -139,8 +127,8 @@ fn option(s: ws::SOCKET, name: i32) -> io::Result<i32> {
 }
 
 /// A stock-shaped connection to `address` within `limit`.
-pub(crate) fn connect(address: &SocketAddr, limit: Duration) -> io::Result<TcpStream> {
-    Socket::configured(address.is_ipv6())?.connect(address, limit)
+pub(crate) fn connect(address: &SocketAddrV4, limit: Duration) -> io::Result<TcpStream> {
+    Socket::configured()?.connect(address, limit)
 }
 
 /// closesocket (graceful: FIN, no linger change) once the stock delay since the last
@@ -174,14 +162,15 @@ mod tests {
     #[test]
     fn buffers_are_64k_and_bound_before_connect_and_kept_after() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let socket = Socket::configured(false).unwrap();
+        let socket = Socket::configured().unwrap();
         assert_eq!((socket.option(ws::SO_RCVBUF).unwrap(), socket.option(ws::SO_SNDBUF).unwrap()), (BUFFER, BUFFER));
         // Bound already (wildcard, ephemeral port), as app.dll's bind at 102a6f99.
-        let mut name = Raw([0; 28]); let mut len = 28;
+        let mut name = Raw([0; 16]); let mut len = 16;
         assert_eq!(unsafe { ws::getsockname(socket.0, name.0.as_mut_ptr().cast(), &mut len) }, 0);
         assert_eq!((&name.0[..2], &name.0[4..8]), (&ws::AF_INET.to_le_bytes()[..], &[0u8; 4][..]));
         assert_ne!(u16::from_be_bytes([name.0[2], name.0[3]]), 0);
-        let stream = socket.connect(&listener.local_addr().unwrap(), Duration::from_secs(5)).unwrap();
+        let std::net::SocketAddr::V4(address) = listener.local_addr().unwrap() else { unreachable!() };
+        let stream = socket.connect(&address, Duration::from_secs(5)).unwrap();
         let s = stream.as_raw_socket() as ws::SOCKET;
         assert_eq!((option(s, ws::SO_RCVBUF).unwrap(), option(s, ws::SO_SNDBUF).unwrap()), (BUFFER, BUFFER));
         assert!(!stream.nodelay().unwrap(), "Nagle stays on, as in the Viewer");
@@ -194,7 +183,7 @@ mod tests {
     #[test]
     fn a_refused_connect_fails_instead_of_waiting_out_the_limit() {
         // A loopback port with no listener: bind one, take its port, drop it.
-        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let std::net::SocketAddr::V4(free) = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap() else { unreachable!() };
         let started = Instant::now();
         assert!(connect(&free, Duration::from_secs(10)).is_err());
         assert!(started.elapsed() < Duration::from_secs(9));

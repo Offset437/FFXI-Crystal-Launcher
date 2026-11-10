@@ -34,7 +34,7 @@ pub(super) fn load() -> Result<&'static Baseline, String> {
             let len = fields[1].parse::<u64>().map_err(|_| "Invalid embedded installer length")?;
             if fields[2].len() != 32 { return Err("Invalid embedded installer digest".into()); }
             let mut md5 = [0u8; 16];
-            for (value, pair) in md5.iter_mut().zip(fields[2].as_bytes().chunks_exact(2)) {
+            for (value, pair) in md5.iter_mut().zip(fields[2].as_bytes().as_chunks::<2>().0) {
                 let pair = std::str::from_utf8(pair).map_err(|_| "Invalid embedded installer digest")?;
                 *value = u8::from_str_radix(pair, 16).map_err(|_| "Invalid embedded installer digest")?;
             }

@@ -3,7 +3,6 @@
 use crate::i18n::{t, tf};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
-use zeroize::Zeroizing;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Friend {
@@ -41,18 +40,13 @@ impl std::fmt::Debug for Snapshot {
     }
 }
 
-pub(crate) struct Fetched {
-    pub snapshot: Snapshot,
-    pub line: Zeroizing<String>,
-}
-
 /// Snapshot copied by POL's original, locked getters. A catalog entry without
 /// a received status timestamp does not establish that someone is offline.
 pub(crate) fn native_snapshot(blob:&[u8])->Result<Snapshot,String> {
     use crystal_pol::friends::{BLOB_LEN,MAGIC,RECORD_LEN};
     if blob.len()!=BLOB_LEN || &blob[..8]!=MAGIC { return Err("Invalid native POL friend snapshot.".into()); }
     let mut entries=Vec::new();
-    for (slot,rec) in blob[8..].chunks_exact(RECORD_LEN).enumerate() {
+    for (slot,rec) in blob[8..].as_chunks::<RECORD_LEN>().0.iter().enumerate() {
         if rec[0x98]&1==0 { continue; }
         let alternate=slot>=200;
         let flags=u64::from_le_bytes(rec[8..16].try_into().unwrap());
@@ -62,17 +56,15 @@ pub(crate) fn native_snapshot(blob:&[u8])->Result<Snapshot,String> {
         let location=if online==Some(true) {
             match class { 1=>Some("FINAL FANTASY XI".into()),1000=>Some("PlayOnline".into()),_=>None }
         } else { None };
-        let name=&rec[0xa0..];let name=&name[..name.iter().position(|b| *b==0).unwrap_or(name.len())];
-        entries.push(Friend { name:decode_name(name),alternate,slot:(if alternate { slot-200 } else { slot }) as u16,uid:Some(u64::from_le_bytes(rec[..8].try_into().unwrap())),online,location,character:None });
+        entries.push(Friend { name:c_name(&rec[0xa0..]),alternate,slot:(if alternate { slot-200 } else { slot }) as u16,uid:Some(u64::from_le_bytes(rec[..8].try_into().unwrap())),online,location,character:None });
     }
-    entries.sort_by_cached_key(|f| (f.name.to_lowercase(),f.alternate,f.slot));
+    sort_entries(&mut entries);
     Ok(Snapshot { entries,fetched_at:now(), ..Snapshot::default() })
 }
 
-const LOCATION_RECORD_LEN: usize = 96;
-const LOCATION_BLOB_LEN: usize = 8 + 300 * LOCATION_RECORD_LEN;
+use crate::wire::{LOCATIONS_LEN as LOCATION_BLOB_LEN, LOCATION_RECORD_LEN};
 pub(crate) fn valid_locations(blob: &[u8]) -> bool {
-    blob.len() == LOCATION_BLOB_LEN && &blob[..8] == b"XIPOLG\x01\0"
+    blob.len() == LOCATION_BLOB_LEN && &blob[..8] == crate::wire::LOCATIONS_MAGIC
 }
 
 /// Display only the fields the verified game cache published for this snapshot.
@@ -84,56 +76,39 @@ pub(crate) fn apply_native_locations(snapshot: &mut Snapshot, blob: &[u8]) -> Re
     if !valid_locations(blob) { return Err("Invalid game friend locations.".into()); }
     for friend in &mut snapshot.entries {
         if friend.online != Some(true) || friend.alternate { continue; }
-        let index = friend.slot as usize + if friend.alternate { 200 } else { 0 };
-        if index >= 300 { continue; }
+        let index = friend.slot as usize;
+        if index >= crate::wire::FRIEND_SLOTS { continue; }
         let record = &blob[8 + index * LOCATION_RECORD_LEN..][..LOCATION_RECORD_LEN];
+        // Stricter than `c_name`: a field without its NUL is not shown.
         let text = |field: &[u8]| -> Option<String> {
             let end = field.iter().position(|b| *b == 0)?;
             let value = decode_name(&field[..end]);
             (!value.is_empty() && !value.chars().any(char::is_control)).then_some(value)
         };
-        let fields: Vec<_> = [&record[..16], &record[16..80], &record[80..96]].into_iter().filter_map(text).collect();
-        friend.character = text(&record[..16]);
+        let character = text(&record[..16]);
+        let fields: Vec<_> = character.iter().cloned().chain([&record[16..80], &record[80..96]].into_iter().filter_map(text)).collect();
+        friend.character = character;
         if !fields.is_empty() { friend.location = Some(fields.join(" · ")); }
     }
     Ok(())
 }
 
-pub(crate) fn fetched(records: &crystal_pol::friends::Friends) -> Fetched {
-    let mut entries: Vec<_> = records.entries().map(|(alternate, index, rec)| {
-        let name = &rec[0xa0..0xb0];
-        let name = &name[..name.iter().position(|b| *b == 0).unwrap_or(name.len())];
-        let (online, location) = records.presence(alternate,index);
-        let location = location.filter(|bytes| !bytes.is_empty()).map(decode_name)
-            .filter(|text| !text.chars().any(char::is_control));
-        Friend { name: decode_name(name), alternate, slot: index as u16, uid:None, online, location, character:None }
-    }).collect();
+pub(crate) fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
+
+/// Friends by name, then list A before list B, then slot.
+fn sort_entries(entries: &mut [Friend]) {
     entries.sort_by_cached_key(|f| (f.name.to_lowercase(), f.alternate, f.slot));
-    let blob = records.to_blob();
-    let mut line = Vec::with_capacity(64 + blob.len().div_ceil(3) * 4);
-    line.extend_from_slice(br#"{"type":"friends_result","ok":true,"friends":""#);
-    crate::pol_less::pipe::base64_into(&mut line, &blob);
-    line.extend_from_slice(b"\"}\n");
-    let line = Zeroizing::new(String::from_utf8(line).expect("base64 is ASCII"));
-    Fetched { snapshot: Snapshot { entries, fetched_at: now(), ..Snapshot::default() }, line }
 }
 
-pub(crate) fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
+/// A NUL-terminated CP932 field (the whole field when it has no NUL).
+pub(crate) fn c_name(field: &[u8]) -> String {
+    decode_name(&field[..field.iter().position(|b| *b == 0).unwrap_or(field.len())])
+}
 
 pub(crate) fn decode_name(bytes: &[u8]) -> String {
     if bytes.is_ascii() { return String::from_utf8_lossy(bytes).into_owned(); }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Globalization::MultiByteToWideChar;
-        let n = unsafe { MultiByteToWideChar(932, 0, bytes.as_ptr(), bytes.len() as i32, std::ptr::null_mut(), 0) };
-        if n > 0 {
-            let mut text = vec![0; n as usize];
-            if unsafe { MultiByteToWideChar(932, 0, bytes.as_ptr(), bytes.len() as i32, text.as_mut_ptr(), n) } == n {
-                return String::from_utf16_lossy(&text);
-            }
-        }
-    }
-    String::from_utf8_lossy(bytes).into_owned()
+    crate::win::codepage::decode(crate::win::codepage::SHIFT_JIS, bytes, false)
+        .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// What the Friends page's right side shows.
@@ -231,8 +206,8 @@ pub(crate) struct State {
     pub query: String,
     pub error: String,
     pub pane: Option<Pane>,
-    /// Online [0] / Offline [1] sections folded away.
-    pub collapsed: [bool; 2],
+    /// Online [0] / Offline [1] / Waiting [2] sections folded away.
+    pub collapsed: [bool; 3],
     /// The status options (groups, Auto-Away) are open under the status.
     pub status_options: bool,
     pub composer: Option<Composer>,
@@ -252,16 +227,6 @@ impl std::fmt::Display for AutoAway {
         if self.0 == 0 { f.write_str(t("Auto-Away off")) } else { f.write_str(&tf("Auto-Away after {minutes} min", &[("minutes", &self.0)])) }
     }
 }
-pub(crate) const AUTO_AWAY_OPTIONS: [AutoAway; 7] = {
-    let mut options = [AutoAway(0); 7];
-    let mut index = 0;
-    while index < 7 {
-        options[index] = AutoAway(crate::pol_less::AUTO_AWAY_CHOICES[index]);
-        index += 1;
-    }
-    options
-};
-
 /// Friends (list A) first, then the block list (list B, core 100236a0).
 pub(crate) fn split_lists<'a>(entries: &'a [Friend], query: &str) -> (Vec<&'a Friend>, Vec<&'a Friend>) {
     let query = query.to_lowercase();
@@ -271,13 +236,13 @@ pub(crate) fn split_lists<'a>(entries: &'a [Friend], query: &str) -> (Vec<&'a Fr
 pub(crate) struct Composer {
     pub recipient: Friend,
     pub subject: String,
-    pub text: iced::widget::text_editor::Content,
+    pub text: String,
     /// The optional subject line is open.
     pub show_subject: bool,
 }
 impl Composer {
     pub fn new(recipient: Friend) -> Self {
-        Self { recipient, subject: String::new(), text: iced::widget::text_editor::Content::new(), show_subject: false }
+        Self { recipient, subject: String::new(), text: String::new(), show_subject: false }
     }
 }
 
@@ -292,21 +257,16 @@ pub(crate) fn cp932_len(text: &str) -> Option<usize> {
     if text.is_empty() {
         return Some(0);
     }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Globalization::{WideCharToMultiByte, WC_NO_BEST_FIT_CHARS};
-        let wide: Vec<u16> = text.encode_utf16().collect();
-        let mut substituted = 0;
-        let n = unsafe {
-            WideCharToMultiByte(932, WC_NO_BEST_FIT_CHARS, wide.as_ptr(), wide.len() as i32, std::ptr::null_mut(), 0, std::ptr::null(), &mut substituted)
-        };
-        if n <= 0 || substituted != 0 {
-            return None;
-        }
-        Some(n as usize)
+    use windows_sys::Win32::Globalization::{WideCharToMultiByte, WC_NO_BEST_FIT_CHARS};
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let mut substituted = 0;
+    let n = unsafe {
+        WideCharToMultiByte(932, WC_NO_BEST_FIT_CHARS, wide.as_ptr(), wide.len() as i32, std::ptr::null_mut(), 0, std::ptr::null(), &mut substituted)
+    };
+    if n <= 0 || substituted != 0 {
+        return None;
     }
-    #[cfg(not(windows))]
-    Some(text.chars().map(|c| if c.is_ascii() || ('\u{ff61}'..='\u{ff9f}').contains(&c) { 1 } else { 2 }).sum())
+    Some(n as usize)
 }
 
 /// A header stamp as a local time, when it reads as a plausible Unix time
@@ -388,12 +348,16 @@ impl State {
             || social.busy
             || self.pending.is_some()
             || self.mail.stalled
+            // A Remove awaiting confirmation goes first.
+            || self.remove.is_some()
             || self.pane == Some(Pane::Mailbox)
         {
             return None;
         }
         let list = |folder| Some(Request::Inbox { folder, page: 0 });
-        if self.mail.listed[0].is_none() || social.inbox_changed {
+        // No unread count yet: a fresh session (sign-in, back from FFXI) whose
+        // new mail arrived before the launcher could hear about it.
+        if self.mail.listed[0].is_none() || social.inbox_changed || social.inbox_unread.is_none() {
             return list(0);
         }
         let friend = self.friend().filter(|f| f.uid.is_some())?;
@@ -415,8 +379,9 @@ impl State {
     /// body, a send's result.
     pub fn completed(&mut self, snapshot: &Snapshot) {
         let social = &snapshot.social;
-        match social.action.as_deref() {
-            Some("inbox" | "check") => {
+        use crate::social::Action;
+        match social.action {
+            Some(Action::Inbox | Action::Check) => {
                 if social.error.is_some() {
                     self.mail.stalled = true;
                 } else if social.page == 0 && social.folder != 1 {
@@ -426,7 +391,7 @@ impl State {
                     self.mail.listed[folder as usize] = Some(entries);
                 }
             }
-            Some("read") => {
+            Some(Action::Read) => {
                 if let Some(key) = self.mail.reading.take() {
                     match (&social.error, &social.opened) {
                         (None, Some(opened)) => {
@@ -441,14 +406,14 @@ impl State {
                     }
                 }
             }
-            Some("send") => {
+            Some(Action::Send) => {
                 if social.error.is_none() {
                     // Sent has a new message: list it again.
                     self.mail.listed[2] = None;
                     let clear_draft = self.outgoing.as_ref().zip(self.composer.as_ref())
                         .is_some_and(|(outgoing, composer)| {
                             composer.recipient.uid == Some(outgoing.uid)
-                                && composer.text.text().trim_end_matches('\n') == outgoing.message
+                                && composer.text.trim_end_matches('\n') == outgoing.message
                                 && (if composer.show_subject { composer.subject.as_str() } else { "" }) == outgoing.subject
                         });
                     if let Some(outgoing) = &mut self.outgoing {
@@ -457,7 +422,7 @@ impl State {
                     // A late result belongs only to the draft that was sent.
                     // Selection or queued edits may have replaced that draft.
                     if let Some(composer) = self.composer.as_mut().filter(|_| clear_draft) {
-                        composer.text = iced::widget::text_editor::Content::new();
+                        composer.text.clear();
                         composer.subject.clear();
                         composer.show_subject = false;
                     }
@@ -465,7 +430,17 @@ impl State {
                     self.outgoing = None;
                 }
             }
-            Some("remove") if social.error.is_none() => self.select(None),
+            Some(Action::Remove) if social.error.is_none() => {
+                // Close only the removed friend's conversation. An unblock, or
+                // another pane opened meanwhile, stays open with its draft.
+                let removed = social.pending_remove.is_some_and(|(slot, uid)| {
+                    matches!(&self.pane, Some(Pane::Friend { slot: open, .. }) if *open == slot)
+                        && self.friend().is_none_or(|f| f.uid == Some(uid))
+                });
+                if removed {
+                    self.select(None);
+                }
+            }
             _ => {}
         }
     }
@@ -474,7 +449,7 @@ impl State {
     pub fn send_request(&self) -> Option<crate::social::Request> {
         let draft = self.composer.as_ref()?;
         let uid = draft.recipient.uid?;
-        let message = draft.text.text();
+        let message = draft.text.clone();
         let message = message.trim_end_matches('\n').to_owned();
         let subject = if draft.show_subject { draft.subject.clone() } else { String::new() };
         let fits = cp932_len(&message).is_some_and(|n| n <= TEXT_MAX) && cp932_len(&subject).is_some_and(|n| n <= SUBJECT_MAX);
@@ -483,8 +458,6 @@ impl State {
     }
 }
 
-pub(crate) use view::view;
-mod view;
 
 #[cfg(test)]
 mod tests {
@@ -523,26 +496,6 @@ mod tests {
     fn utf8_names_are_not_fabricated_from_arbitrary_bytes() {
         assert_eq!(decode_name(b"Alice"), "Alice");
         assert_eq!(decode_name(&[0x82,0xa0]), "あ");
-    }
-
-    #[test]
-    fn real_friend_conversion_uses_the_standard_pipe_encoding() {
-        use crystal_pol::catalog::{ContentCatalog, ContentRecord, CONTENT_RECORD_LEN};
-        let mut raw = [0u8; CONTENT_RECORD_LEN];
-        raw[0] = 0x20;
-        raw[8] = 199;
-        raw[0x18..0x1d].copy_from_slice(b"Alice");
-        let catalog = ContentCatalog { prefix: Zeroizing::new([0; 8]), records: vec![ContentRecord::parse(&raw).unwrap()] };
-        let records = crystal_pol::friends::Friends::from_catalog(&catalog, 0);
-        let fetched = fetched(&records);
-        assert_eq!(fetched.snapshot.entries[0].name, "Alice");
-        assert_eq!(fetched.snapshot.entries[0].online,None);
-        assert_eq!(fetched.snapshot.entries[0].location,None);
-        let value: serde_json::Value = serde_json::from_str(&fetched.line).unwrap();
-        let bytes = crate::pol_less::pipe::base64_decode(value["friends"].as_str().unwrap()).unwrap();
-        assert_eq!(bytes.len(), crystal_pol::friends::BLOB_LEN);
-        assert_eq!(bytes, *records.to_blob());
-        assert!(!format!("{:?}", fetched.snapshot).contains("Alice"));
     }
 
     #[test]
@@ -613,10 +566,14 @@ mod tests {
         use crate::social::Request;
         let mut snapshot = state.snapshot.clone().unwrap();
         let social = &mut snapshot.social;
-        social.action = Some(request.action().into());
+        social.action = Some(request.action());
         social.error = None;
         match request {
-            Request::Inbox { folder, page } => { social.folder = *folder; social.page = *page; social.headers = headers.to_vec(); }
+            Request::Inbox { folder, page } => {
+                social.folder = *folder; social.page = *page; social.headers = headers.to_vec();
+                if *folder == 0 { social.inbox_unread = Some(headers.iter().filter(|h| h.unread).count() as u32); social.inbox_changed = false; }
+            }
+            Request::Remove { .. } => { social.begin("0".repeat(32), request); social.busy = false; }
             Request::Read { .. } => {
                 state.mail.reading = match request { Request::Read { header } => Some(crate::social::message_key(header)), _ => None };
                 social.opened = opened.map(|m| crate::social::Opened { sender: String::new(), subject: String::new(), message: m.into(), recipient: None });
@@ -682,13 +639,13 @@ mod tests {
         // A failed read is not asked again.
         state.mail.reading = Some(crate::social::message_key(&inbox[0].raw));
         let mut snapshot = state.snapshot.clone().unwrap();
-        snapshot.social.action = Some("read".into());
+        snapshot.social.action = Some(crate::social::Action::Read);
         snapshot.social.error = Some("PlayOnline read failed (-5326).".into());
         state.completed(&snapshot);
         assert!(state.mail.failed.contains(&crate::social::message_key(&inbox[0].raw)));
         assert!(!matches!(state.next_sync(), Some(Request::Read { ref header }) if *header == inbox[0].raw));
         // A failed listing stalls the conversation until the user acts.
-        snapshot.social.action = Some("inbox".into());
+        snapshot.social.action = Some(crate::social::Action::Inbox);
         state.completed(&snapshot);
         assert!(state.mail.stalled && state.next_sync().is_none());
         state.select(Some(Pane::Friend { slot: 1, name: "Bob".into() }));
@@ -720,7 +677,7 @@ mod tests {
         let mut state = signed_in();
         state.select(Some(Pane::Friend { slot: 0, name: "Alyria".into() }));
         assert!(state.send_request().is_none(), "empty");
-        state.composer.as_mut().unwrap().text = iced::widget::text_editor::Content::with_text("Hello\n");
+        state.composer.as_mut().unwrap().text = String::from("Hello\n");
         state.composer.as_mut().unwrap().subject = "ignored unless shown".into();
         match &state.send_request() {
             Some(Request::Send { uid: 1, slot: 0, alternate: false, subject, message }) => {
@@ -728,25 +685,25 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        state.composer.as_mut().unwrap().text = iced::widget::text_editor::Content::with_text(&"あ".repeat(TEXT_MAX / 2 + 1));
+        state.composer.as_mut().unwrap().text = "あ".repeat(TEXT_MAX / 2 + 1);
         assert!(state.send_request().is_none(), "over the CP932 limit");
         assert_eq!(cp932_len("aあ｡"), Some(4));
         assert_eq!(cp932_len("😀"), None, "no CP932 form");
-        state.composer.as_mut().unwrap().text = iced::widget::text_editor::Content::with_text("Hi");
+        state.composer.as_mut().unwrap().text = String::from("Hi");
         state.outgoing = Some(Outgoing { uid: 1, subject: String::new(), message: "Hi".into(), sent: false });
         state.mail.listed[2] = Some(Vec::new());
         finish(&mut state, &Request::Check {}, &[], None);
         let mut snapshot = state.snapshot.clone().unwrap();
-        snapshot.social.action = Some("send".into());
+        snapshot.social.action = Some(crate::social::Action::Send);
         state.completed(&snapshot);
-        assert!(state.composer.as_ref().unwrap().text.text().trim().is_empty());
+        assert!(state.composer.as_ref().unwrap().text.trim().is_empty());
         assert!(state.outgoing.as_ref().unwrap().sent);
         assert!(state.mail.listed[2].is_none(), "Sent is listed again");
         // A failed send keeps the draft and drops the pending bubble.
-        state.composer.as_mut().unwrap().text = iced::widget::text_editor::Content::with_text("Again");
+        state.composer.as_mut().unwrap().text = String::from("Again");
         snapshot.social.error = Some("PlayOnline send failed (-1).".into());
         state.completed(&snapshot);
-        assert_eq!(state.composer.as_ref().unwrap().text.text().trim(), "Again");
+        assert_eq!(state.composer.as_ref().unwrap().text.trim(), "Again");
         assert!(state.outgoing.is_none());
     }
 
@@ -757,20 +714,20 @@ mod tests {
             state.select(Some(Pane::Friend { slot: 0, name: "Alyria".into() }));
             state.outgoing = Some(Outgoing { uid: 1, subject: String::new(), message: "Sent text".into(), sent: false });
             let draft = state.composer.as_mut().unwrap();
-            draft.text = iced::widget::text_editor::Content::with_text("Sent text");
+            draft.text = String::from("Sent text");
             match change {
                 "recipient" => draft.recipient.uid = Some(2),
-                "message" => draft.text = iced::widget::text_editor::Content::with_text("New text"),
+                "message" => draft.text = String::from("New text"),
                 "subject" => { draft.show_subject = true; draft.subject = "New subject".into(); }
                 "selection" => state.outgoing = None,
                 _ => unreachable!(),
             }
-            let before = state.composer.as_ref().unwrap().text.text();
+            let before = state.composer.as_ref().unwrap().text.clone();
             let subject = state.composer.as_ref().unwrap().subject.clone();
             let mut snapshot = state.snapshot.clone().unwrap();
-            snapshot.social.action = Some("send".into());
+            snapshot.social.action = Some(crate::social::Action::Send);
             state.completed(&snapshot);
-            assert_eq!(state.composer.as_ref().unwrap().text.text(), before, "{change}");
+            assert_eq!(state.composer.as_ref().unwrap().text.clone(), before, "{change}");
             assert_eq!(state.composer.as_ref().unwrap().subject, subject, "{change}");
         }
     }
@@ -780,13 +737,45 @@ mod tests {
         let mut state = signed_in();
         state.select(Some(Pane::Friend { slot: 0, name: "Alyria".into() }));
         for text in ["hello\0there", "hello\u{7}there"] {
-            state.composer.as_mut().unwrap().text = iced::widget::text_editor::Content::with_text(text);
+            state.composer.as_mut().unwrap().text = String::from(text);
             assert!(state.send_request().is_none(), "control characters are rejected before Send is enabled");
         }
-        state.composer.as_mut().unwrap().text = iced::widget::text_editor::Content::with_text("Hello\nworld\t!");
+        state.composer.as_mut().unwrap().text = String::from("Hello\nworld\t!");
         assert!(state.send_request().is_some());
         state.composer.as_mut().unwrap().recipient.uid = Some(0);
         assert!(state.send_request().is_none());
+    }
+
+    #[test]
+    fn a_fresh_session_relists_the_inbox_for_mail_that_arrived_unheard() {
+        use crate::social::Request;
+        let mut state = signed_in();
+        let inbox = [header(1, 1, 9, "Alyria", false, 1)];
+        finish(&mut state, &Request::Inbox { folder: 0, page: 0 }, &inbox, None);
+        state.select(Some(Pane::Friend { slot: 0, name: "Alyria".into() }));
+        assert!(!matches!(state.next_sync(), Some(Request::Inbox { folder: 0, .. })));
+        // Back from FFXI (or signed in again): the session starts a new social state.
+        state.snapshot.as_mut().unwrap().social = crate::social::State { ready: true, ..Default::default() };
+        assert!(matches!(state.next_sync(), Some(Request::Inbox { folder: 0, page: 0 })));
+    }
+
+    #[test]
+    fn a_remove_closes_only_the_removed_friends_conversation() {
+        use crate::social::Request;
+        // Unblocking from the Blocked pane keeps the pane (and its notice).
+        let mut state = signed_in();
+        state.select(Some(Pane::Blocked));
+        finish(&mut state, &Request::Remove { alternate: true, slot: 0, uid: 5 }, &[], None);
+        assert_eq!(state.pane, Some(Pane::Blocked));
+        // Moving on to Bob while Alyria's remove runs keeps Bob's draft.
+        state.select(Some(Pane::Friend { slot: 1, name: "Bob".into() }));
+        state.composer.as_mut().unwrap().text = String::from("draft");
+        finish(&mut state, &Request::Remove { alternate: false, slot: 0, uid: 1 }, &[], None);
+        assert_eq!(state.pane, Some(Pane::Friend { slot: 1, name: "Bob".into() }));
+        assert_eq!(state.composer.as_ref().unwrap().text.trim(), "draft");
+        // Removing the open friend closes the conversation.
+        finish(&mut state, &Request::Remove { alternate: false, slot: 1, uid: 2 }, &[], None);
+        assert_eq!(state.pane, None);
     }
 
     #[test]
@@ -798,7 +787,7 @@ mod tests {
 
     #[test]
     fn auto_away_offers_exactly_the_viewer_choices() {
-        assert_eq!(AUTO_AWAY_OPTIONS.map(|o| o.0), [0, 10, 20, 30, 40, 50, 60]);
+        assert_eq!(crate::pol_less::AUTO_AWAY_CHOICES, [0, 10, 20, 30, 40, 50, 60]);
         assert_eq!(AutoAway(0).to_string(), "Auto-Away off");
         assert_eq!(AutoAway(10).to_string(), "Auto-Away after 10 min");
     }

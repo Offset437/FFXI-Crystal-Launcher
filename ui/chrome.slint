@@ -1,0 +1,113 @@
+// The window's own title bar and resize edges.
+// The bar sits on the chrome colour and ends in a full-width hairline; every empty part of it
+// drags the window, and a double click there maximises or restores (the core decides which:
+// title-pressed / title-moved / title-released are Message::TitlePressed / Moved / Released).
+import { Theme } from "theme.slint";
+
+/// A full-height Windows 11 caption button: a thin 10 px glyph on a 46 x 48 hit area.
+/// Close turns red on hover, like the system's own.
+export enum CaptionKind { minimize, maximize, restore, close }
+
+component CaptionButton inherits Rectangle {
+    in property <CaptionKind> kind;
+    in property <string> label;
+    callback clicked();
+    width: Theme.caption-w;
+    height: Theme.bar-h;
+    private property <bool> close: root.kind == CaptionKind.close;
+    background: !hit.has-hover ? transparent
+        : root.close ? (hit.pressed ? Theme.close-pressed : Theme.close-hot)
+        : Theme.select;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.clicked(); }
+    private property <color> ink: hit.has-hover ? (root.close ? #FFFFFF : Theme.ink) : Theme.sub;
+    Path {
+        x: (parent.width - 16px) / 2;
+        y: (parent.height - 16px) / 2;
+        width: 16px;
+        height: 16px;
+        viewbox-width: 16;
+        viewbox-height: 16;
+        stroke: root.ink;
+        stroke-width: 1px;
+        fill: transparent;
+        commands: root.kind == CaptionKind.minimize ? "M3 8.5h10"
+            : root.kind == CaptionKind.maximize ? "M5 3.5h6a1.5 1.5 0 0 1 1.5 1.5v6a1.5 1.5 0 0 1 -1.5 1.5h-6a1.5 1.5 0 0 1 -1.5 -1.5v-6a1.5 1.5 0 0 1 1.5 -1.5z"
+            : root.kind == CaptionKind.restore ? "M4.75 5.5h4.5a1.25 1.25 0 0 1 1.25 1.25v4.5a1.25 1.25 0 0 1 -1.25 1.25h-4.5a1.25 1.25 0 0 1 -1.25 -1.25v-4.5a1.25 1.25 0 0 1 1.25 -1.25z M5.5 3.5h5.5a1.5 1.5 0 0 1 1.5 1.5v5.5"
+            : "M3.5 3.5l9 9M12.5 3.5l-9 9";
+    }
+    hit := TouchArea { clicked => { root.clicked(); } }
+}
+
+/// The title bar's chrome strip: whatever reaches it is the title bar itself (its children
+/// take their own presses). `content` goes between the brand and the caption buttons.
+export component ChromeBar inherits Rectangle {
+    in property <bool> maximized;
+    in property <string> minimize-label;
+    in property <string> maximize-label;
+    in property <string> restore-label;
+    in property <string> close-label;
+    callback minimize-clicked();
+    callback maximize-clicked();
+    callback close-clicked();
+    callback title-pressed();
+    callback title-moved();
+    callback title-released();
+    height: Theme.bar-h + 1px;
+    background: Theme.chrome;
+    // The title area: behind everything else in the bar.
+    TouchArea {
+        pointer-event(event) => {
+            if event.button == PointerEventButton.left {
+                if event.kind == PointerEventKind.down { root.title-pressed(); }
+                if event.kind == PointerEventKind.up { root.title-released(); }
+            }
+        }
+        moved => { if self.pressed { root.title-moved(); } }
+    }
+    HorizontalLayout {
+        height: Theme.bar-h;
+        alignment: stretch;
+        @children
+        CaptionButton { kind: CaptionKind.minimize; label: root.minimize-label; clicked => { root.minimize-clicked(); } }
+        CaptionButton {
+            kind: root.maximized ? CaptionKind.restore : CaptionKind.maximize;
+            label: root.maximized ? root.restore-label : root.maximize-label;
+            clicked => { root.maximize-clicked(); }
+        }
+        CaptionButton { kind: CaptionKind.close; label: root.close-label; clicked => { root.close-clicked(); } }
+    }
+    Rectangle { y: Theme.bar-h; height: 1px; background: Theme.chrome-line; }
+}
+
+component Zone inherits TouchArea {
+    in property <int> which;
+    callback grabbed(int);
+    pointer-event(event) => {
+        if event.kind == PointerEventKind.down && event.button == PointerEventButton.left { root.grabbed(self.which); }
+    }
+}
+
+/// Invisible grab strips along the borderless window's edges and corners that resize it,
+/// with the matching cursors (`which` is effect::Edge's order: N, S, E, W, NE, NW, SE, SW).
+/// Leave it out while maximised.
+export component ResizeEdges inherits Rectangle {
+    callback resize-pressed(int);
+    private property <length> edge: 5px;
+    private property <length> corner: 14px;
+    // Edges.
+    Zone { which: 0; x: root.corner; y: 0; width: root.width - 2 * root.corner; height: root.edge; mouse-cursor: ns-resize; grabbed(w) => { root.resize-pressed(w); } }
+    Zone { which: 1; x: root.corner; y: root.height - root.edge; width: root.width - 2 * root.corner; height: root.edge; mouse-cursor: ns-resize; grabbed(w) => { root.resize-pressed(w); } }
+    Zone { which: 2; x: root.width - root.edge; y: root.corner; width: root.edge; height: root.height - 2 * root.corner; mouse-cursor: ew-resize; grabbed(w) => { root.resize-pressed(w); } }
+    Zone { which: 3; x: 0; y: root.corner; width: root.edge; height: root.height - 2 * root.corner; mouse-cursor: ew-resize; grabbed(w) => { root.resize-pressed(w); } }
+    // Corners: an L of edge-thick strips, corner long.
+    Zone { which: 4; x: root.width - root.corner; y: 0; width: root.corner; height: root.edge; mouse-cursor: nesw-resize; grabbed(w) => { root.resize-pressed(w); } }
+    Zone { which: 4; x: root.width - root.edge; y: 0; width: root.edge; height: root.corner; mouse-cursor: nesw-resize; grabbed(w) => { root.resize-pressed(w); } }
+    Zone { which: 5; x: 0; y: 0; width: root.corner; height: root.edge; mouse-cursor: nwse-resize; grabbed(w) => { root.resize-pressed(w); } }
+    Zone { which: 5; x: 0; y: 0; width: root.edge; height: root.corner; mouse-cursor: nwse-resize; grabbed(w) => { root.resize-pressed(w); } }
+    Zone { which: 6; x: root.width - root.corner; y: root.height - root.edge; width: root.corner; height: root.edge; mouse-cursor: nwse-resize; grabbed(w) => { root.resize-pressed(w); } }
+    Zone { which: 6; x: root.width - root.edge; y: root.height - root.corner; width: root.edge; height: root.corner; mouse-cursor: nwse-resize; grabbed(w) => { root.resize-pressed(w); } }
+    Zone { which: 7; x: 0; y: root.height - root.edge; width: root.corner; height: root.edge; mouse-cursor: nesw-resize; grabbed(w) => { root.resize-pressed(w); } }
+    Zone { which: 7; x: 0; y: root.height - root.corner; width: root.edge; height: root.corner; mouse-cursor: nesw-resize; grabbed(w) => { root.resize-pressed(w); } }
+}

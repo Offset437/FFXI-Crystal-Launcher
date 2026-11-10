@@ -1,11 +1,9 @@
 //! The pipe after the handshake. Loader -> launcher lines are queued and
-//! written by one thread, so a slow launcher never stalls the game thread
-//! (slot 195 posts `presence` from inside FFXiMain's frame loop). A second
-//! thread reads the launcher's `presence_result` replies for slot 196.
+//! written by one thread, so a slow launcher never stalls the owner or a game
+//! callback. A second thread reads the launcher's commands.
 //!
-//! Both threads share one synchronous handle. The reader only calls ReadFile
-//! for bytes PeekNamedPipe reports as waiting, so it never blocks inside
-//! ReadFile and never holds up a write.
+//! Both threads share one overlapped handle, each operation with its own
+//! OVERLAPPED, so a pending read never holds up a write.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -50,7 +48,7 @@ pub(crate) fn set_closed_for_test(closed: bool) { TEST_CLOSED.with(|c| c.set(clo
 
 fn mark_closed(why: &str) {
     if !CLOSED.swap(true, Ordering::AcqRel) {
-        log!("launcher pipe closed ({why}); pending presence requests fail");
+        log!("launcher pipe closed ({why})");
     }
 }
 
@@ -86,12 +84,6 @@ pub fn start(pipe: Pipe, mut reader: LineReader) {
             while !STOP_READER.load(Ordering::Acquire) {
                 match reader.read_parsed(&pipe, Some(Duration::from_millis(250)), proto::parse_service_event) {
                     Ok(parsed) => match parsed {
-                        Ok(Some(proto::ServiceEvent::Presence(result))) => crate::slots::presence_result(result),
-                        Ok(Some(proto::ServiceEvent::Credentials(credentials))) => crate::slots::update_credentials(credentials),
-                        Ok(Some(proto::ServiceEvent::Friends(records))) => crate::slots::friends_result(Some(records)),
-                        Ok(Some(proto::ServiceEvent::FriendsFailed)) => crate::slots::friends_result(None),
-                        Ok(Some(proto::ServiceEvent::SessionStatus(code))) => crate::slots::session_status(code),
-                        Ok(Some(proto::ServiceEvent::NativeFriendsRefresh)) => crate::native_auth::refuse_friends_refresh(),
                         Ok(Some(proto::ServiceEvent::NativeActivity)) => crate::native_auth::note_activity(),
                         Ok(Some(proto::ServiceEvent::NativeStartGame)) => crate::native_auth::request_start_game(),
                         Ok(Some(proto::ServiceEvent::NativeBatchGame(token))) => crate::native_auth::request_batch_game(&token),
@@ -101,6 +93,7 @@ pub fn start(pipe: Pipe, mut reader: LineReader) {
                         Ok(Some(proto::ServiceEvent::ViewerCheck(result))) => crate::native_auth::viewer_check_result(result),
                         Ok(Some(proto::ServiceEvent::NativePlayPending)) => crate::native_auth::note_play_pending(),
                         Ok(Some(proto::ServiceEvent::ControllerSettings { id, settings, deadline_ms })) => crate::controller_settings::submit(id, settings, deadline_ms),
+                        Ok(Some(proto::ServiceEvent::GameShutdown { id, game, deadline_ms })) => crate::game_shutdown::submit(id, game, deadline_ms),
                         Ok(None) => {}
                         Err(e) => log!("ignoring a malformed launcher line: {e}"),
                     },

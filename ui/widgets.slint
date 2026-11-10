@@ -1,0 +1,1151 @@
+// Crystal's shared controls: icons, buttons, links, checkboxes,
+// fields, dropdowns and segmented controls in the "Refined" tokens. Every interactive control
+// is focusable, names itself to accessibility and activates on Return or Space, so a spatial
+// controller walker can drive it later.
+import { Theme } from "theme.slint";
+
+/// Whether focus last moved by keyboard: the focus ring shows only then.
+export global Nav {
+    in-out property <bool> keyboard;
+    /// A modal dialog or sheet is open: only controls with `modal: true` take the focus, so Tab
+    /// and the controller walker stay inside it.
+    in-out property <bool> modal;
+}
+
+/// Crystal's icon set (src/icons.rs), drawn on its 24-unit grid with beveled outlines.
+export enum Glyph {
+    none, sun, moon, close, plus, chevron-down, arrow-right, external-link, search, rss, refresh,
+    check-circle, alert-circle, wrench, play, power, help, download, folder, edit, eye, eye-off,
+    users, grip, check, play-solid, user, send, inbox, ban, user-minus, message, chevron-right,
+    settings, gamepad, trash
+}
+
+/// One icon at `size`, tinted `tint`.
+export component Icon inherits Rectangle {
+    in property <Glyph> glyph;
+    in property <length> size: 15px;
+    in property <color> tint: Theme.sub;
+    /// Stroke width in grid units (src/icons.rs draws at 1.7).
+    in property <float> weight: 1.7;
+    width: root.size;
+    height: root.size;
+    private property <string> line:
+        root.glyph == Glyph.sun ? "M10 8H14L16 10V14L14 16H10L8 14V10Z M12 3V5.5M12 18.5V21M3 12H5.5M18.5 12H21M5.5 5.5 7 7M17 17 18.5 18.5M5.5 18.5 7 17M17 7 18.5 5.5"
+        : root.glyph == Glyph.moon ? "M15.5 3.5C9.5 2.5 4 7 4 12.5C4 18 9 21.5 14 20C17 19.5 19.5 17 20 14C16 15.5 11.5 12.5 11.5 8.5C11.5 6.5 13 4.5 15.5 3.5Z"
+        : root.glyph == Glyph.close ? "M7 7 17 17M7 17 17 7"
+        : root.glyph == Glyph.plus ? "M7 12H17M12 7V17"
+        : root.glyph == Glyph.chevron-down ? "M6.5 9.5 12 15 17.5 9.5"
+        : root.glyph == Glyph.chevron-right ? "M8.5 6.5 14 12 8.5 17.5"
+        : root.glyph == Glyph.arrow-right ? "M5.5 12H18.5M14 7.5 18.5 12 14 16.5"
+        : root.glyph == Glyph.external-link ? "M11 5H6L4.5 6.5V18L6 19.5H17.5L19 18V13M13 4.5H19.5V11M19.5 4.5 10.5 13.5"
+        : root.glyph == Glyph.search ? "M8 4H13L17 8V13L13 17H8L4 13V8ZM16 16 20.5 20.5"
+        : root.glyph == Glyph.rss ? "M5 11C9.4 11 13 14.6 13 19M5 4.5C13 4.5 19.5 11 19.5 19"
+        : root.glyph == Glyph.refresh ? "M19.5 9 17 5.5H9L5.5 9V11M19.5 4.5V9H15M4.5 15 7 18.5H15L18.5 15V13M4.5 19.5V15H9"
+        : root.glyph == Glyph.check-circle ? "M7 3.5H17L20.5 7V17L17 20.5H7L3.5 17V7ZM7.5 12 10.5 15 16.5 8.5"
+        : root.glyph == Glyph.alert-circle ? "M7 3.5H17L20.5 7V17L17 20.5H7L3.5 17V7ZM12 7.5V12.5"
+        : root.glyph == Glyph.wrench ? "M15 3.5 12 6.5V10L4 18V20H6L14 12H17.5L20.5 9V4.5L16.5 8.5 15 7 18.5 3.5Z"
+        : root.glyph == Glyph.power ? "M12 3V12M7.5 5.5 4.5 8.5V16L8 19.5H16L19.5 16V8.5L16.5 5.5"
+        : root.glyph == Glyph.help ? "M7 3.5H17L20.5 7V17L17 20.5H7L3.5 17V7ZM8.5 8.5 10 7H13.5L15.5 9V11L12 13V14"
+        : root.glyph == Glyph.download ? "M12 3.5V14.5M7.5 10 12 14.5 16.5 10M4 16.5V19L6 21H18L20 19V16.5"
+        : root.glyph == Glyph.folder ? "M3.5 6H10L12 8H20.5V18L18.5 20H5.5L3.5 18ZM3.5 11H20.5"
+        : root.glyph == Glyph.edit ? "M4 16.5 16.5 4H19L20 5V7.5L7.5 20H4ZM14 6.5 17.5 10M4 16.5 7.5 20"
+        : root.glyph == Glyph.eye ? "M3 12 7 7H17L21 12 17 17H7ZM12 9 15 12 12 15 9 12Z"
+        : root.glyph == Glyph.eye-off ? "M3 12 6.5 7.5M9 7H17L21 12 18.5 15M16 17H7L3 12M11 10 9 12 12 15 13.5 13.5M4 4 20 20"
+        : root.glyph == Glyph.users ? "M6 4H10L11.5 5.5V9L10 10.5H6L4.5 9V5.5ZM2.5 20V17L6 13.5H11L14.5 17V20M15.5 5H18L19.5 6.5V9L18 10.5H15.5M16.5 13.5H18L21.5 17V20"
+        : root.glyph == Glyph.check ? "M4.4 12.6 9.6 17.8 19.8 7.6"
+        : root.glyph == Glyph.user ? "M10 3.5H14L16 5.5V9L14 11H10L8 9V5.5ZM4.5 20V17L8 13.5H16L19.5 17V20"
+        : root.glyph == Glyph.send ? "M3.5 9.5 20.5 3.5 14.5 20.5 11 13ZM11 13 20.5 3.5"
+        : root.glyph == Glyph.inbox ? "M6 4.5H18L21 13V18.5L19 20.5H5L3 18.5V13ZM3 13H8L10 16H14L16 13H21"
+        : root.glyph == Glyph.ban ? "M7 3.5H17L20.5 7V17L17 20.5H7L3.5 17V7ZM7 7 17 17"
+        : root.glyph == Glyph.user-minus ? "M6.5 3.5H10.5L12 5V8.5L10.5 10H6.5L5 8.5V5ZM3.5 20V16.5L7 13H12L15.5 16.5V20M16 9.5H21"
+        : root.glyph == Glyph.message ? "M6 4.5H18L20.5 7V15L18 17.5H10L5 20.5V17L3.5 15.5V7ZM7 10.5H17"
+        : root.glyph == Glyph.settings ? "M6 3.5V8M6 12V20.5M12 3.5V14M12 18V20.5M18 3.5V6M18 10V20.5M4 8H8L9 9V11L8 12H4L3 11V9ZM10 14H14L15 15V17L14 18H10L9 17V15ZM16 6H20L21 7V9L20 10H16L15 9V7Z"
+        : root.glyph == Glyph.gamepad ? "M7 6.5H17L19.5 9 21 17.5 19.5 19H17.5L14.5 15.5H9.5L6.5 19H4.5L3 17.5 4.5 9ZM6 10.5H10M8 8.5V12.5"
+        : root.glyph == Glyph.trash ? "M4.5 7H19.5M9 7V4.5H15V7M6 7 7 19.5 8.5 21H15.5L17 19.5 18 7M10 10.5V17.5M14 10.5V17.5"
+        : "";
+    private property <string> solid:
+        root.glyph == Glyph.rss ? "M5 17.5 6.5 19 5 20.5 3.5 19Z"
+        : root.glyph == Glyph.alert-circle ? "M12 15 13.25 16.25 12 17.5 10.75 16.25Z"
+        : root.glyph == Glyph.help ? "M12 16.5 13 17.5 12 18.5 11 17.5Z"
+        : root.glyph == Glyph.play ? "M7 5.5H8.5L19 12 8.5 18.5H7Z"
+        : root.glyph == Glyph.play-solid ? "M3 2 21 12 3 22Z"
+        : root.glyph == Glyph.grip ? "M8 5 9.5 6.5 8 8 6.5 6.5ZM16 5 17.5 6.5 16 8 14.5 6.5ZM8 10.5 9.5 12 8 13.5 6.5 12ZM16 10.5 17.5 12 16 13.5 14.5 12ZM8 16 9.5 17.5 8 19 6.5 17.5ZM16 16 17.5 17.5 16 19 14.5 17.5Z"
+        : root.glyph == Glyph.gamepad ? "M15 10.5 16 11.5 15 12.5 14 11.5ZM18 8.5 19 9.5 18 10.5 17 9.5Z"
+        : "";
+    if root.line != "": Path {
+        width: root.size;
+        height: root.size;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: root.line;
+        stroke: root.tint;
+        stroke-width: max(1px, root.size * root.weight / 24);
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        fill: transparent;
+    }
+    if root.solid != "": Path {
+        width: root.size;
+        height: root.size;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: root.solid;
+        fill: root.tint;
+        stroke: transparent;
+        stroke-width: 0px;
+    }
+}
+
+/// The busy ring: a three-quarter beveled ring that turns only while the window has focus.
+export component Spinner inherits Rectangle {
+    in property <length> size: 15px;
+    in property <color> tint: Theme.sub;
+    width: root.size;
+    height: root.size;
+    accessible-role: progress-indicator;
+    turn := Rectangle {
+        width: root.size;
+        height: root.size;
+        // One turn a second; no frames are asked for while unfocused.
+        transform-rotation: Theme.animate ? mod(animation-tick() / 1ms, 1000) * 0.36deg : 0deg;
+        Path {
+            width: root.size;
+            height: root.size;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: "M12 3.5H7L3.5 7V17L7 20.5H17L20.5 17V12";
+            stroke: root.tint;
+            stroke-width: max(1px, root.size * 1.7 / 24);
+            stroke-line-cap: round;
+            stroke-line-join: round;
+            fill: transparent;
+            opacity: 0.95;
+        }
+        Path {
+            width: root.size;
+            height: root.size;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: "M15 3.5H17L20.5 7V9";
+            stroke: root.tint;
+            stroke-width: max(1px, root.size * 1.7 / 24);
+            stroke-line-cap: round;
+            stroke-line-join: round;
+            fill: transparent;
+            opacity: 0.35;
+        }
+    }
+}
+
+/// A round status dot.
+export component Dot inherits Rectangle {
+    in property <color> tint;
+    in property <length> size: 8px;
+    width: root.size;
+    height: root.size;
+    border-radius: root.size / 2;
+    background: root.tint;
+    animate background { duration: Theme.calm; }
+}
+
+/// The base of every pressable control: hover and press state, Return/Space activation,
+/// accessibility, and a focus ring shown when focus came from the keyboard. `modal` marks a
+/// control inside a modal dialog or sheet: while one is open (Nav.modal) only those take focus.
+export component Pressable inherits Rectangle {
+    in property <bool> enabled: true;
+    in property <string> label;
+    in property <bool> modal;
+    out property <bool> hot: hit.has-hover && root.enabled;
+    out property <bool> down: hit.pressed && root.enabled;
+    out property <bool> focused: focus.has-focus;
+    callback clicked();
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+    forward-focus: focus;
+    /// Whether it can take the focus and be pressed from the keyboard now.
+    private property <bool> live: root.enabled && root.modal == Nav.modal;
+    focus := FocusScope {
+        enabled: root.live;
+        focus-on-click: false;
+        focus-gained(reason) => { Nav.keyboard = reason == FocusReason.tab-navigation; }
+        key-pressed(event) => {
+            if root.live && (event.text == Key.Return || event.text == " ") {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    hit := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+    @children
+    if root.focused && Nav.keyboard: Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: root.border-radius + 3px;
+        border-width: 2px;
+        border-color: Theme.accent;
+    }
+}
+
+/// A CONTROL_SM_H list button: `soft` is the soft accent fill of a row's
+/// main action, otherwise bordered and quiet; `danger` is a bordered destructive action. `busy`
+/// turns the ring in the glyph's place. `scale` is Home's layout scale (1 in the sheet).
+export component SmallButton inherits Pressable {
+    in property <string> text;
+    in property <Glyph> glyph: Glyph.none;
+    in property <bool> soft;
+    in property <bool> danger;
+    in property <bool> busy;
+    in property <float> scale: Theme.scale;
+    label: root.text;
+    height: 28px * root.scale;
+    min-width: row.preferred-width + 22px * root.scale;
+    preferred-width: self.min-width;
+    horizontal-stretch: 0;
+    border-radius: Theme.radius-inner;
+    background: root.soft ? (!root.enabled ? Theme.tint : root.hot ? Theme.select-ink.mix(Theme.select, 0.12) : Theme.select)
+        : root.danger && root.hot ? Theme.danger.with-alpha(0.12)
+        : root.hot ? Theme.tint : transparent;
+    border-width: root.soft ? 0px : 1px;
+    border-color: root.danger && root.enabled ? Theme.danger : root.hot ? Theme.accent : Theme.line;
+    private property <color> ink: !root.enabled ? Theme.faint : root.soft ? Theme.select-ink : root.danger ? Theme.danger : Theme.ink2;
+    row := HorizontalLayout {
+        x: (parent.width - self.preferred-width) / 2;
+        width: self.preferred-width;
+        spacing: 6px * root.scale;
+        if root.busy: Spinner {
+            cross-axis-self-alignment: center;
+            size: 13px * root.scale;
+            tint: root.ink;
+        }
+        if !root.busy && root.glyph != Glyph.none: Icon {
+            cross-axis-self-alignment: center;
+            glyph: root.glyph;
+            size: 13px * root.scale;
+            tint: root.ink;
+        }
+        Text {
+            text: root.text;
+            font-size: Theme.type-small * root.scale;
+            font-weight: 600;
+            color: root.ink;
+            vertical-alignment: center;
+        }
+    }
+}
+
+/// The shared button tones.
+export enum Tone { primary, secondary, danger, danger-link }
+
+/// A CONTROL_H button in one of the shared tones, with an optional leading icon.
+export component Control inherits Pressable {
+    in property <string> text;
+    in property <Glyph> glyph: Glyph.none;
+    in property <bool> busy;
+    in property <Tone> tone: Tone.secondary;
+    in property <float> scale: 1;
+    label: root.text;
+    height: 36px * root.scale;
+    private property <length> pad: (root.tone == Tone.danger-link ? 10px : 14px) * root.scale;
+    min-width: row.preferred-width + 2 * root.pad;
+    preferred-width: self.min-width;
+    horizontal-stretch: 0;
+    border-radius: Theme.radius-inner;
+    background: root.tone == Tone.primary ? (!root.enabled ? Theme.tint : root.hot ? Theme.play-text.mix(Theme.play, 0.1) : Theme.play)
+        : root.tone == Tone.secondary ? (root.hot ? Theme.tint : transparent)
+        : root.tone == Tone.danger ? (root.hot ? Theme.bg.mix(Theme.danger, 0.12) : Theme.danger)
+        : (root.hot ? Theme.danger.with-alpha(0.12) : transparent);
+    border-width: root.tone == Tone.secondary || (root.tone == Tone.primary && !root.enabled) ? 1px : 0px;
+    border-color: root.tone == Tone.primary ? Theme.hairline : root.hot ? Theme.accent : Theme.line;
+    private property <color> ink: root.tone == Tone.primary ? (root.enabled ? Theme.play-text : Theme.sub)
+        : root.tone == Tone.danger ? (Theme.light ? #FFFFFF : #2A0E06)
+        : root.tone == Tone.danger-link ? Theme.danger
+        : root.enabled ? Theme.ink2 : Theme.faint;
+    row := HorizontalLayout {
+        x: (parent.width - self.preferred-width) / 2;
+        width: self.preferred-width;
+        spacing: Theme.sp-s * root.scale;
+        if root.busy: Spinner {
+            cross-axis-self-alignment: center;
+            size: 15px * root.scale;
+            tint: root.ink;
+        }
+        if !root.busy && root.glyph != Glyph.none: Icon {
+            cross-axis-self-alignment: center;
+            glyph: root.glyph;
+            size: 15px * root.scale;
+            tint: root.ink;
+        }
+        Text {
+            text: root.text;
+            font-size: Theme.type-body * root.scale;
+            font-weight: 600;
+            color: root.ink;
+            vertical-alignment: center;
+        }
+    }
+}
+
+/// A hint in a small panel, for a Tooltip.
+export component Hint inherits Rectangle {
+    in property <string> caption;
+    background: Theme.panel;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Theme.line;
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        Text { text: root.caption; font-size: Theme.type-caption; color: Theme.ink; }
+    }
+}
+
+/// A square icon button: bordered (secondary) or bare (ghost). `hint`
+/// names it and shows as a tooltip.
+export component IconButton inherits Pressable {
+    in property <Glyph> glyph;
+    in property <bool> bordered;
+    in property <length> side: Theme.control-h;
+    in property <length> glyph-size: 15px;
+    in property <string> hint;
+    label: root.hint;
+    width: root.side;
+    height: root.side;
+    border-radius: Theme.radius-inner;
+    background: root.bordered ? (root.hot ? Theme.tint : transparent) : (root.hot ? Theme.select.with-alpha(0.8) : transparent);
+    border-width: root.bordered ? 1px : 0px;
+    border-color: root.hot ? Theme.accent : Theme.line;
+    Icon {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        glyph: root.glyph;
+        size: root.glyph-size;
+        tint: !root.enabled ? Theme.faint : root.bordered ? Theme.ink2 : Theme.sub;
+    }
+    if root.hint != "": Tooltip { Hint { caption: root.hint; } }
+}
+
+/// A text link in the accent colour, ink on hover.
+export component Link inherits Pressable {
+    in property <string> text;
+    in property <length> size: Theme.type-small;
+    in property <int> weight: 500;
+    in property <color> ink: Theme.accent;
+    in property <color> hot-ink: Theme.ink;
+    in property <length> pad-x: 0px;
+    in property <length> pad-y: 0px;
+    /// The baseline to sit on, below the centre line (a neighbouring heading's), for one row baseline.
+    in property <length> baseline: (caption.font-metrics.ascent + caption.font-metrics.descent) / 2;
+    label: root.text;
+    min-width: caption.preferred-width + 2 * root.pad-x;
+    preferred-width: self.min-width;
+    min-height: caption.preferred-height + 2 * root.pad-y;
+    horizontal-stretch: 0;
+    caption := Text {
+        x: root.pad-x;
+        y: (parent.height - self.height) / 2 + root.baseline - (self.font-metrics.ascent + self.font-metrics.descent) / 2;
+        text: root.text;
+        font-size: root.size;
+        font-weight: root.weight;
+        color: root.hot ? root.hot-ink : root.ink;
+        vertical-alignment: center;
+    }
+}
+
+/// A checkbox: accent fill and check mark when ticked; `text` is its optional label.
+export component Check inherits Pressable {
+    in property <bool> checked;
+    in property <string> text;
+    in property <length> box: 16px;
+    callback toggled(bool);
+    accessible-role: checkbox;
+    label: root.text;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    min-width: root.text == "" ? root.box : root.box + 10px + caption.preferred-width;
+    preferred-width: self.min-width;
+    min-height: max(root.box, caption.preferred-height);
+    horizontal-stretch: root.text == "" ? 0 : 1;
+    clicked => { root.toggled(!root.checked); }
+    mark := Rectangle {
+        x: 0;
+        y: (parent.height - root.box) / 2;
+        width: root.box;
+        height: root.box;
+        border-radius: 3px;
+        border-width: 1px;
+        background: root.checked ? (root.enabled ? Theme.accent : Theme.accent.with-alpha(0.45)) : Theme.field;
+        border-color: root.checked || root.hot ? Theme.accent : Theme.faint;
+        if root.checked: Icon {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            glyph: Glyph.check;
+            size: root.box * 0.8;
+            tint: Theme.light ? #FFFFFF : Theme.play-text;
+        }
+    }
+    caption := Text {
+        x: root.box + 10px;
+        width: parent.width - self.x;
+        visible: root.text != "";
+        text: root.text;
+        font-size: Theme.type-body;
+        color: root.enabled ? Theme.ink : Theme.faint;
+        vertical-alignment: center;
+        wrap: word-wrap;
+    }
+}
+
+/// The one text field: CONTROL_H tall, field fill, a border that turns accent
+/// on focus. `password` masks the value; `glyph` puts an icon before the text; `modal` as on
+/// Pressable.
+export component Field inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder;
+    in property <bool> enabled: true;
+    in property <bool> modal;
+    in property <string> font-family: Theme.sans;
+    in property <bool> password;
+    in property <Glyph> glyph: Glyph.none;
+    in property <length> font-size: Theme.type-body;
+    in property <length> pad-x: 11px;
+    in property <bool> framed: true;
+    in property <string> label: root.placeholder;
+    out property <bool> focused: input.has-focus;
+    callback edited(string);
+    callback accepted();
+    height: Theme.control-h;
+    min-width: 40px;
+    horizontal-stretch: 1;
+    border-radius: Theme.radius-inner;
+    border-width: root.framed ? 1px : 0px;
+    background: !root.framed ? transparent : root.enabled ? Theme.field : Theme.tint;
+    border-color: input.has-focus ? Theme.accent : hit.has-hover && root.enabled ? Theme.line.mix(Theme.accent, 0.5) : Theme.line;
+    forward-focus: input;
+    private property <length> lead: root.glyph == Glyph.none ? root.pad-x : root.pad-x + 15px * Theme.scale + 8px * Theme.scale;
+    hit := TouchArea { mouse-cursor: root.enabled ? MouseCursor.text : default; clicked => { if root.enabled { input.focus(); } } }
+    if root.glyph != Glyph.none: Icon {
+        x: root.pad-x;
+        y: (parent.height - self.height) / 2;
+        glyph: root.glyph;
+        size: 15px * Theme.scale;
+        tint: Theme.faint;
+    }
+    if root.text == "": Text {
+        x: root.lead;
+        width: parent.width - root.lead - root.pad-x;
+        text: root.placeholder;
+        color: Theme.faint;
+        font-size: root.font-size;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    input := TextInput {
+        x: root.lead;
+        width: parent.width - root.lead - root.pad-x;
+        text <=> root.text;
+        enabled: root.enabled && root.modal == Nav.modal;
+        single-line: true;
+        input-type: root.password ? InputType.password : InputType.text;
+        font-family: root.font-family;
+        font-size: root.font-size;
+        color: root.enabled ? Theme.ink : Theme.sub;
+        vertical-alignment: center;
+        selection-background-color: Theme.accent.with-alpha(0.3);
+        selection-foreground-color: Theme.ink;
+        accessible-label: root.label;
+        edited => { root.edited(self.text); }
+        accepted => { root.accepted(); }
+    }
+}
+
+/// A dropdown's menu of `items`, placed by its owner; the current one is selected, and a pick
+/// closes it. Each entry is a Pressable, so the controller reaches it.
+export component Menu inherits PopupWindow {
+    in property <[string]> items;
+    in property <int> current: -1;
+    in property <length> font-size: Theme.type-small;
+    in property <float> scale: 1;
+    callback picked(int);
+    close-policy: close-on-click-outside;
+    height: min(list.preferred-height, 320px);
+    Rectangle {
+        background: Theme.panel;
+        border-radius: Theme.radius-inner;
+        border-width: 1px;
+        border-color: Theme.line;
+        drop-shadow-blur: 18px;
+        drop-shadow-offset-y: 6px;
+        drop-shadow-color: Theme.shadow;
+    }
+    Flickable {
+        content-height: list.preferred-height;
+        list := VerticalLayout {
+            padding: Theme.sp-xs;
+            for item[index] in root.items: Pressable {
+                height: 32px * root.scale;
+                label: item;
+                accessible-role: list-item;
+                accessible-checked: index == root.current;
+                border-radius: 4px;
+                background: index == root.current ? Theme.select : self.hot ? Theme.tint : transparent;
+                clicked => {
+                    root.picked(index);
+                    root.close();
+                }
+                Text {
+                    x: 10px;
+                    width: parent.width - 20px;
+                    text: item;
+                    font-size: root.font-size;
+                    color: index == root.current ? Theme.select-ink : Theme.ink;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+        }
+    }
+}
+
+/// A dropdown: the value at TYPE_SMALL on a CONTROL_H box with the chevron; its
+/// menu lists `items` and `picked` gets the chosen index. `current` -1 shows `placeholder`.
+/// Unframed, it is a quiet menu button (a soft fill on hover, `placeholder-ink` words).
+/// Opened, the chosen entry (or the first) takes the focus: Tab or the controller's D-pad moves
+/// through the entries and Return or A picks one.
+export component Select inherits Pressable {
+    in property <[string]> items;
+    in property <int> current: -1;
+    in property <string> placeholder;
+    in property <color> fill: Theme.field;
+    in property <bool> framed: true;
+    in property <length> font-size: Theme.type-small * root.scale;
+    in property <int> weight: 400;
+    in property <color> ink: Theme.ink;
+    in property <color> placeholder-ink: Theme.faint;
+    in property <color> glyph-ink: Theme.faint;
+    in property <color> hot-fill: transparent;
+    in property <length> menu-width: root.width;
+    in property <float> scale: 1;
+    in property <bool> up;
+    callback picked(int);
+    /// Its words, the gap and the chevron, with the usual insets: an unframed menu button's width.
+    out property <length> fit-width: shown.preferred-width + (11px + 30px) * root.scale;
+    accessible-role: combobox;
+    accessible-value: root.current >= 0 && root.current < root.items.length ? root.items[root.current] : root.placeholder;
+    height: 36px * root.scale;
+    border-radius: Theme.radius-inner;
+    border-width: root.framed ? 1px : 0px;
+    border-color: root.hot ? Theme.line.mix(Theme.accent, 0.5) : Theme.line;
+    background: root.framed ? root.fill : root.hot ? root.hot-fill : transparent;
+    clicked => { menu.show(); }
+    function choose(index: int) {
+        root.picked(index);
+        menu.close();
+        root.focus();
+    }
+    shown := Text {
+        x: 11px * root.scale;
+        width: parent.width - 11px * root.scale - 30px * root.scale;
+        text: root.current >= 0 && root.current < root.items.length ? root.items[root.current] : root.placeholder;
+        color: root.current >= 0 ? root.ink : root.placeholder-ink;
+        font-size: root.font-size;
+        font-weight: root.weight;
+        overflow: elide;
+        vertical-alignment: center;
+    }
+    Icon {
+        x: parent.width - self.width - 11px * root.scale;
+        y: (parent.height - self.height) / 2;
+        glyph: Glyph.chevron-down;
+        size: 13px * root.scale;
+        tint: root.glyph-ink;
+    }
+    menu := PopupWindow {
+        x: 0;
+        y: root.up ? -self.height - 4px : root.height + 4px;
+        width: root.menu-width;
+        height: min(list.preferred-height, 320px);
+        close-policy: close-on-click-outside;
+        Rectangle {
+            background: Theme.panel;
+            border-radius: Theme.radius-inner;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 18px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: Theme.shadow;
+        }
+        Flickable {
+            content-height: list.preferred-height;
+            list := VerticalLayout {
+                padding: 4px;
+                for item[index] in root.items: Rectangle {
+                    height: 32px * root.scale;
+                    border-radius: Theme.radius-inner - 2px;
+                    background: index == root.current ? Theme.select : touch.has-hover || entry.has-focus ? Theme.tint : transparent;
+                    accessible-role: list-item;
+                    accessible-label: item;
+                    accessible-item-selectable: true;
+                    accessible-item-selected: index == root.current;
+                    accessible-action-default => { root.choose(index); }
+                    Text {
+                        x: 10px * root.scale;
+                        width: parent.width - 20px * root.scale;
+                        text: item;
+                        font-size: root.font-size;
+                        color: index == root.current ? Theme.select-ink : Theme.ink;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.choose(index); }
+                    }
+                    entry := FocusScope {
+                        focus-on-click: false;
+                        init => { if index == max(0, root.current) { self.focus(); } }
+                        focus-gained(reason) => { Nav.keyboard = reason == FocusReason.tab-navigation; }
+                        key-pressed(event) => {
+                            if event.text == Key.Return || event.text == " " {
+                                root.choose(index);
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A segmented control: a CONTROL_H track holding one choice.
+/// `quiet` is the game options' region switch: segments sized to their words on a field-filled
+/// track, the chosen one raised on the card fill in accent ink; `locked` holds the choice.
+export component Segmented inherits Rectangle {
+    in property <[string]> items;
+    in property <int> current;
+    in property <bool> modal;
+    in property <bool> quiet;
+    in property <bool> locked;
+    in property <float> scale: 1;
+    callback picked(int);
+    // A quiet switch with one choice has nothing to switch: the chip alone, one outline.
+    private property <bool> single: root.quiet && root.items.length == 1;
+    min-height: root.quiet ? row.min-height : Theme.control-h * root.scale;
+    preferred-height: root.quiet ? row.preferred-height : Theme.control-h * root.scale;
+    max-height: root.quiet ? row.preferred-height : Theme.control-h * root.scale;
+    horizontal-stretch: root.quiet ? 0 : 1;
+    border-radius: (root.quiet ? 8px : Theme.radius-mid) * root.scale;
+    border-width: root.single ? 0px : 1px;
+    border-color: root.quiet ? Theme.line : Theme.hairline;
+    background: root.single ? transparent : root.quiet ? Theme.field : Theme.tint;
+    accessible-role: tab-list;
+    row := HorizontalLayout {
+        padding: root.single ? 0px : 3px * root.scale;
+        spacing: 2px * root.scale;
+        for item[index] in root.items: Pressable {
+            accessible-role: tab;
+            label: item;
+            modal: root.modal;
+            accessible-checked: index == root.current;
+            enabled: !root.quiet || (index != root.current && !root.locked);
+            horizontal-stretch: root.quiet ? 0 : 1;
+            min-width: root.quiet ? caption.preferred-width + 24px * root.scale : 0;
+            min-height: root.quiet ? caption.preferred-height + 12px * root.scale : 0;
+            border-radius: root.quiet ? 6px * root.scale : (Theme.radius-mid - 3px) * root.scale;
+            border-width: root.quiet && index == root.current ? 1px : 0px;
+            border-color: Theme.line;
+            background: root.quiet
+                ? (index == root.current ? Theme.card : self.hot ? Theme.select : transparent)
+                : (index == root.current ? (Theme.light ? #FFFFFF : Theme.select) : self.hot ? Theme.card : transparent);
+            drop-shadow-color: index != root.current ? transparent
+                : root.quiet ? (Theme.light ? #0000000F : #00000040)
+                : Theme.light ? #1421301F : transparent;
+            drop-shadow-offset-y: 1px;
+            drop-shadow-blur: root.quiet ? 3px : 2px;
+            clicked => { root.picked(index); }
+            caption := Text {
+                text: item;
+                font-size: root.quiet ? Theme.type-detail * root.scale : Theme.type-small * root.scale;
+                font-weight: root.quiet && index != root.current ? 400 : 600;
+                color: root.quiet
+                    ? (index == root.current ? Theme.accent : !parent.enabled ? Theme.sub.with-alpha(0.55) : Theme.sub)
+                    : (index == root.current ? Theme.select-ink : parent.hot ? Theme.ink : Theme.sub);
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+/// The one switch: the Play fill when on, an outlined field when off.
+export component Switch inherits Pressable {
+    in property <bool> on;
+    in property <string> text;
+    callback toggled(bool);
+    accessible-role: switch;
+    accessible-checkable: true;
+    accessible-checked: root.on;
+    label: root.text;
+    min-height: 20px;
+    min-width: 50px + caption.preferred-width;
+    clicked => { root.toggled(!root.on); }
+    track := Rectangle {
+        x: 0;
+        y: (parent.height - self.height) / 2;
+        width: 40px;
+        height: 20px;
+        border-radius: 10px;
+        border-width: 1px;
+        background: root.on ? (root.hot ? Theme.play.mix(Theme.play-text, 0.9) : Theme.play) : Theme.field;
+        border-color: root.on ? Theme.play : root.hot ? Theme.sub : Theme.line;
+        Rectangle {
+            x: root.on ? parent.width - self.width - 4px : 4px;
+            animate x { duration: Theme.quick; }
+            y: (parent.height - self.height) / 2;
+            width: 12px;
+            height: 12px;
+            border-radius: 6px;
+            background: root.on ? Theme.play-text : Theme.sub;
+        }
+    }
+    caption := Text {
+        x: 50px;
+        width: parent.width - 50px;
+        text: root.text;
+        font-size: Theme.type-body;
+        color: Theme.ink;
+        vertical-alignment: center;
+        wrap: word-wrap;
+    }
+}
+
+/// A progress bar: accent on `track`, rounded to its girth. `indeterminate`
+/// draws the full bar faint (a step with no known fraction).
+export component Bar inherits Rectangle {
+    in property <float> fraction;
+    in property <length> girth: 8px;
+    in property <color> track: Theme.track;
+    in property <bool> indeterminate;
+    height: root.girth;
+    border-radius: root.girth / 2;
+    background: root.track;
+    accessible-role: progress-indicator;
+    accessible-value: root.indeterminate ? "" : round(clamp(root.fraction, 0, 1) * 100) + "%";
+    Rectangle {
+        x: 0;
+        width: parent.width * (root.indeterminate ? 1 : clamp(root.fraction, 0, 1));
+        border-radius: root.girth / 2;
+        background: root.indeterminate ? Theme.accent.with-alpha(0.35) : Theme.accent;
+    }
+}
+
+/// The form label over a field: TYPE_SMALL in ink2, or a page's own ink;
+/// `scale` is the page's layout scale (1 in the sheet and dialogs drawn at their own size).
+export component FormLabel inherits Text {
+    in property <float> scale: 1;
+    font-size: Theme.type-small * root.scale;
+    color: Theme.ink2;
+}
+
+/// A muted line under a heading or a control (TYPE_CAPTION), with an optional icon before it
+/// (with a glyph); `scale` as on FormLabel.
+export component Note inherits HorizontalLayout {
+    in property <string> text;
+    in property <Glyph> glyph: Glyph.none;
+    in property <float> scale: 1;
+    spacing: 10px * root.scale;
+    if root.glyph != Glyph.none: VerticalLayout {
+        padding-top: 2px * root.scale;
+        alignment: start;
+        Icon { glyph: root.glyph; size: 13px * root.scale; tint: Theme.sub; }
+    }
+    Text { text: root.text; font-size: Theme.type-caption * root.scale; color: Theme.sub; wrap: word-wrap; horizontal-stretch: 1; }
+}
+
+/// A one-pixel rule.
+export component Rule inherits Rectangle {
+    in property <color> tint: Theme.hairline;
+    height: 1px;
+    background: root.tint;
+}
+
+/// A glyph (or the busy ring) on a soft round tile: empty states and pane identities.
+export component RoundGlyph inherits Rectangle {
+    in property <Glyph> glyph;
+    in property <length> size: 38px;
+    in property <length> glyph-size: root.size * 0.42;
+    in property <color> ink: Theme.accent;
+    in property <bool> busy;
+    width: root.size;
+    height: root.size;
+    border-radius: root.size / 2;
+    background: Theme.tint;
+    accessible-role: none;
+    if root.busy: Spinner { size: root.glyph-size; tint: root.ink; }
+    if !root.busy: Icon { glyph: root.glyph; size: root.glyph-size; tint: root.ink; }
+}
+
+/// A one-line message in a tinted tile with its glyph; the content goes after the glyph. The
+/// fill and border are solid mixes of `tone` into the background (a thin
+/// alpha tint reads far stronger on dark). `edge` is the border's mix: the Friends notices use
+/// 0.3, the Windows components strip 0.38.
+export component Banner inherits Rectangle {
+    in property <color> tone: Theme.accent;
+    in property <Glyph> glyph;
+    in property <length> glyph-size: 16px;
+    in property <float> edge: 0.3;
+    in property <length> pad-left: 14px;
+    in property <length> pad-right: 14px;
+    in property <length> pad-y: 10px;
+    in property <length> gap: 10px;
+    border-radius: Theme.radius-inner;
+    border-width: 1px;
+    background: root.tone.mix(Theme.bg, Theme.light ? 0.08 : 0.07);
+    border-color: root.tone.mix(Theme.bg, root.edge);
+    HorizontalLayout {
+        padding-left: root.pad-left;
+        padding-right: root.pad-right;
+        padding-top: root.pad-y;
+        padding-bottom: root.pad-y;
+        spacing: root.gap;
+        if root.glyph != Glyph.none: Icon {
+            cross-axis-self-alignment: center;
+            glyph: root.glyph;
+            size: root.glyph-size;
+            tint: root.tone;
+        }
+        @children
+    }
+}
+
+/// A calm empty state: a soft round glyph, a line saying what is missing, what
+/// to do about it, and the action that does it.
+export component EmptyState inherits HorizontalLayout {
+    in property <Glyph> glyph;
+    in property <bool> busy;
+    in property <string> title;
+    in property <string> body;
+    in property <string> action;
+    in property <Glyph> action-glyph: Glyph.none;
+    in property <bool> action-soft;
+    in property <bool> action-enabled: true;
+    callback act();
+    spacing: Theme.sp-l * Theme.scale;
+    padding-top: Theme.sp-l * Theme.scale;
+    padding-bottom: Theme.sp-l * Theme.scale;
+    padding-left: 8px;
+    padding-right: 8px;
+    alignment: start;
+    VerticalLayout {
+        alignment: center;
+        RoundGlyph {
+            size: 40px * Theme.scale;
+            glyph-size: 18px * Theme.scale;
+            ink: Theme.sub;
+            busy: root.busy;
+            glyph: root.glyph;
+            border-width: 1px;
+            border-color: Theme.hairline;
+        }
+    }
+    VerticalLayout {
+        alignment: center;
+        spacing: 2px * Theme.scale;
+        Text { text: root.title; font-size: Theme.type-body * Theme.scale; font-weight: 600; color: Theme.ink; }
+        if root.body != "": Text { text: root.body; font-size: Theme.type-small * Theme.scale; color: Theme.sub; wrap: word-wrap; }
+        if root.action != "": HorizontalLayout {
+            padding-top: Theme.sp-s * Theme.scale;
+            alignment: start;
+            SmallButton {
+                text: root.action;
+                glyph: root.action-glyph;
+                soft: root.action-soft;
+                enabled: root.action-enabled;
+                clicked => { root.act(); }
+            }
+        }
+    }
+}
+
+/// A thin, rail-less scroller for a Flickable: shown only while the content
+/// overflows.
+export component ScrollThumb inherits Rectangle {
+    in property <length> content-y;
+    in property <length> content-height;
+    in property <length> visible-height;
+    width: 4px;
+    private property <float> ratio: root.visible-height / max(1px, root.content-height);
+    visible: root.content-height > root.visible-height + 1px;
+    Rectangle {
+        y: -root.content-y * root.ratio;
+        height: max(24px, root.visible-height * root.ratio);
+        width: 4px;
+        border-radius: 2px;
+        background: Theme.sub.with-alpha(0.28);
+    }
+}
+
+/// The one switch: a 2:1 track in the Play
+/// fill when on, an outlined field when off, a brighter outline on hover, faded when disabled;
+/// `text` is its optional label, CHECK_GAP after the track. Track, gap and label follow the
+/// layout scale (TOGGLE_SIZE, CHECK_GAP and TYPE_BODY at 1); `label-x` is where the label
+/// starts, for notes set under it.
+export component Toggle inherits Pressable {
+    in property <bool> on;
+    in property <string> text;
+    in property <length> size: 20px * Theme.scale;
+    in property <length> gap: 10px * Theme.scale;
+    in property <length> font-size: Theme.type-body * Theme.scale;
+    in property <color> ink: Theme.ink;
+    out property <length> label-x: 2 * root.size + root.gap;
+    callback toggled(bool);
+    accessible-role: checkbox;
+    label: root.text;
+    accessible-checkable: true;
+    accessible-checked: root.on;
+    min-width: root.text == "" ? 2 * root.size : root.label-x + caption.min-width;
+    preferred-width: root.text == "" ? 2 * root.size : root.label-x + caption.preferred-width;
+    min-height: max(root.size, caption.preferred-height);
+    horizontal-stretch: root.text == "" ? 0 : 1;
+    clicked => { root.toggled(!root.on); }
+    track := Rectangle {
+        x: 0;
+        y: (parent.height - root.size) / 2;
+        width: 2 * root.size;
+        height: root.size;
+        border-radius: root.size / 2;
+        border-width: 1px;
+        opacity: root.enabled ? 1 : 0.45;
+        background: root.on ? (root.hot ? Theme.play.mix(Theme.play-text, 0.9) : Theme.play) : Theme.field;
+        border-color: root.on ? Theme.play : root.hot ? Theme.sub : Theme.line;
+        knob := Rectangle {
+            width: root.size * 0.6;
+            height: root.size * 0.6;
+            y: root.size * 0.2;
+            x: root.on ? parent.width - self.width - root.size * 0.2 : root.size * 0.2;
+            animate x { duration: Theme.quick; }
+            border-radius: self.width / 2;
+            background: root.on ? Theme.play-text : Theme.sub;
+        }
+    }
+    caption := Text {
+        x: root.label-x;
+        width: parent.width - self.x;
+        visible: root.text != "";
+        text: root.text;
+        font-size: root.font-size;
+        color: root.enabled ? root.ink : Theme.faint;
+        vertical-alignment: center;
+        wrap: word-wrap;
+    }
+}
+
+/// A small rounded status chip: tinted fill, tone text.
+export component Chip inherits Rectangle {
+    in property <string> text;
+    in property <color> tone: Theme.sub;
+    in property <float> scale: 1;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    width: caption.preferred-width + 18px * root.scale;
+    height: caption.preferred-height + 4px * root.scale;
+    border-radius: 10px * root.scale;
+    border-width: 1px;
+    background: root.tone.with-alpha(0.13);
+    border-color: root.tone.with-alpha(0.32);
+    caption := Text {
+        text: root.text;
+        font-size: 11.5px * root.scale;
+        font-weight: 600;
+        color: root.tone;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+/// A value slider (the game options' gamma and sound count): a Play-coloured rail up to the
+/// value, a round handle that grows under the pointer. Arrow keys step it; a double-click or a
+/// Ctrl+click restores `reset` when there is one. Like controller_nav::slider, Return (the
+/// controller's A) engages it, the D-pad then adjusts it, and Return or Escape finishes; an
+/// engaged slider says so as `accessible-expanded`, which the controller walker reads to send it
+/// the D-pad.
+export component ValueSlider inherits Rectangle {
+    in property <float> value;
+    in property <float> minimum;
+    in property <float> maximum: 1;
+    in property <float> step: 1;
+    in property <bool> has-reset;
+    in property <float> reset;
+    in property <bool> enabled: true;
+    in property <string> label;
+    in property <float> scale: 1;
+    callback changed(float);
+    height: 20px * root.scale;
+    min-width: 60px;
+    horizontal-stretch: 1;
+    accessible-role: slider;
+    accessible-label: root.label;
+    accessible-value: root.value;
+    accessible-value-minimum: root.minimum;
+    accessible-value-maximum: root.maximum;
+    accessible-value-step: root.step;
+    accessible-action-increment => { root.nudge(1); }
+    accessible-action-decrement => { root.nudge(-1); }
+    accessible-expandable: true;
+    accessible-expanded: root.engaged;
+    forward-focus: focus;
+    private property <bool> engaged;
+    /// The press is a Ctrl+click reset: dragging it moves nothing.
+    private property <bool> resetting;
+    private property <float> ratio: root.maximum > root.minimum ? clamp((root.value - root.minimum) / (root.maximum - root.minimum), 0, 1) : 0;
+    private property <length> r: (hit.has-hover || hit.pressed ? 8.5px : 7.5px) * root.scale;
+    // The rail spans the whole width, so it lines up with the fields above and below it; the
+    // handle overhangs the ends by its radius.
+    private property <length> lane: root.width;
+    function snap(v: float) -> float {
+        return clamp(root.minimum + round((v - root.minimum) / root.step) * root.step, root.minimum, root.maximum);
+    }
+    function set-at(at: length) {
+        if !root.enabled { return; }
+        let v = root.snap(root.minimum + clamp(at / max(1px, root.lane), 0, 1) * (root.maximum - root.minimum));
+        if abs(v - root.value) > root.step / 1000 { root.changed(v); }
+    }
+    function nudge(steps: int) {
+        if !root.enabled { return; }
+        let v = root.snap(root.value + steps * root.step);
+        if abs(v - root.value) > root.step / 1000 { root.changed(v); }
+    }
+    Rectangle {
+        x: 0;
+        y: (parent.height - self.height) / 2;
+        width: root.lane;
+        height: 4px * root.scale;
+        border-radius: 2px * root.scale;
+        background: Theme.line;
+        Rectangle {
+            x: 0;
+            width: parent.width * root.ratio;
+            height: parent.height;
+            border-radius: parent.border-radius;
+            background: Theme.play;
+        }
+    }
+    handle := Rectangle {
+        x: root.lane * root.ratio - root.r;
+        y: (parent.height - self.height) / 2;
+        width: 2 * root.r;
+        height: 2 * root.r;
+        border-radius: root.r;
+        background: Theme.play;
+        border-width: 2.5px * root.scale;
+        border-color: Theme.panel;
+        opacity: root.enabled ? 1 : 0.45;
+    }
+    hit := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                // Ctrl+click restores the reset value and sets nothing else .
+                root.resetting = root.has-reset && (event.modifiers.control || event.modifiers.meta);
+                if root.resetting { root.changed(root.reset); } else { root.set-at(self.mouse-x); }
+            }
+        }
+        moved => { if self.pressed && !root.resetting { root.set-at(self.mouse-x); } }
+        double-clicked => { if root.has-reset && root.enabled { root.changed(root.reset); } }
+    }
+    focus := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: false;
+        focus-gained(reason) => { Nav.keyboard = reason == FocusReason.tab-navigation; }
+        focus-lost => { root.engaged = false; }
+        key-pressed(event) => {
+            if event.text == Key.Return || event.text == " " { root.engaged = !root.engaged && root.enabled; return accept; }
+            if event.text == Key.Escape && root.engaged { root.engaged = false; return accept; }
+            if event.text == Key.LeftArrow || event.text == Key.DownArrow { root.nudge(-1); return accept; }
+            if event.text == Key.RightArrow || event.text == Key.UpArrow { root.nudge(1); return accept; }
+            return reject;
+        }
+    }
+    if root.engaged || (focus.has-focus && Nav.keyboard): Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: Theme.radius-inner;
+        border-width: 2px;
+        border-color: root.engaged ? Theme.play : Theme.accent;
+        background: root.engaged ? Theme.play.with-alpha(0.08) : transparent;
+    }
+}
+/// A quiet text button: accent words, a soft fill on hover, an optional glyph
+/// before them (or after them, `trailing`).
+export component QuietButton inherits Pressable {
+    in property <string> text;
+    in property <Glyph> glyph: Glyph.none;
+    in property <bool> trailing;
+    in property <color> glyph-tint: Theme.accent;
+    in property <length> font-size: Theme.type-small * Theme.scale;
+    in property <int> weight: 400;
+    in property <length> pad-x: 12px * Theme.scale;
+    in property <length> pad-y: 7px * Theme.scale;
+    label: root.text;
+    border-radius: Theme.radius-inner;
+    background: root.hot ? Theme.select : transparent;
+    min-width: row.preferred-width + 2 * root.pad-x;
+    preferred-width: self.min-width;
+    min-height: row.preferred-height + 2 * root.pad-y;
+    horizontal-stretch: 0;
+    row := HorizontalLayout {
+        x: root.pad-x;
+        width: self.preferred-width;
+        spacing: (root.trailing ? 6px : 7px) * Theme.scale;
+        if root.glyph != Glyph.none && !root.trailing: Icon {
+            cross-axis-self-alignment: center;
+            glyph: root.glyph;
+            size: 14px * Theme.scale;
+            tint: root.enabled ? root.glyph-tint : Theme.sub;
+        }
+        Text {
+            text: root.text;
+            font-size: root.font-size;
+            font-weight: root.weight;
+            color: root.enabled ? Theme.accent : Theme.sub;
+            vertical-alignment: center;
+        }
+        if root.glyph != Glyph.none && root.trailing: Icon {
+            cross-axis-self-alignment: center;
+            glyph: root.glyph;
+            size: 14px * Theme.scale;
+            tint: root.enabled ? root.glyph-tint : Theme.sub;
+        }
+    }
+}
+
+/// A tooltip's body (put it in a Tooltip): one line on the panel fill.
+export component TipBody inherits Rectangle {
+    in property <string> text;
+    background: Theme.panel;
+    border-radius: Theme.radius-inner;
+    border-width: 1px;
+    border-color: Theme.line;
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        Text { text: root.text; font-size: Theme.type-caption; color: Theme.ink; }
+    }
+}

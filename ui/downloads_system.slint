@@ -1,0 +1,253 @@
+// The two Settings → System cards this screen owns: Launcher updates (self_update::view) and
+// Windows components (prereqs::view: a header card and one card per component with its fix,
+// confirmation, progress, result and DirectPlay's manual route). Exported for the Settings page
+// to place; their state lives in the Downloads view model.
+import { Theme } from "theme.slint";
+import { View } from "state.slint";
+import { Downloads, PrereqButton, PrereqCard } from "downloads_state.slint";
+import { Glyph, Icon, Pressable, Control, Tone, Rule, Switch, Bar } from "widgets.slint";
+
+/// The Settings card frame: 20 × 24 inside at the layout scale.
+component SectionCard inherits Rectangle {
+    background: Theme.card;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.hairline;
+    VerticalLayout {
+        padding-top: Theme.sp-xl * Theme.scale;
+        padding-bottom: Theme.sp-xl * Theme.scale;
+        padding-left: Theme.gutter * Theme.scale;
+        padding-right: Theme.gutter * Theme.scale;
+        @children
+    }
+}
+
+/// Launcher updates: the version, the state with its one action, and the open-time check switch.
+export component LauncherUpdatesCard inherits SectionCard {
+    VerticalLayout {
+        spacing: Theme.sp-m * Theme.scale;
+        HorizontalLayout {
+            Text { horizontal-stretch: 1; text: Downloads.strings.launcher-updates; font-size: Theme.type-heading * Theme.scale; font-weight: 600; color: Theme.ink; }
+            Text { text: Downloads.strings.version; font-size: Theme.type-small; color: Theme.sub; vertical-alignment: center; }
+        }
+        HorizontalLayout {
+            spacing: Theme.sp-l;
+            Text { horizontal-stretch: 1; text: Downloads.update-card.text; font-size: Theme.type-small; color: Theme.sub; vertical-alignment: center; wrap: word-wrap; }
+            if Downloads.update-card.action != "": Control { text: Downloads.update-card.action; clicked => { Downloads.update-card-clicked(); } }
+        }
+        VerticalLayout {
+            spacing: Theme.sp-xs * Theme.scale;
+            Switch {
+                text: Downloads.strings.auto-check;
+                on: Downloads.auto-check;
+                toggled(on) => { Downloads.auto-check-toggled(on); }
+            }
+            HorizontalLayout {
+                padding-left: 50px * Theme.scale;
+                Text { text: Downloads.strings.auto-check-note; font-size: Theme.type-caption * Theme.scale; color: Theme.sub; wrap: word-wrap; }
+            }
+        }
+    }
+}
+
+/// A card button: primary when it is the emphasised one.
+component Action inherits Control {
+    in property <PrereqButton> button;
+    text: root.button.label;
+    glyph: root.button.glyph;
+    tone: root.button.emphasis ? Tone.primary : Tone.secondary;
+    enabled: root.button.enabled;
+}
+
+/// An icon and a line of ink beside it (prereqs::note).
+component ResultNote inherits HorizontalLayout {
+    in property <Glyph> glyph;
+    in property <color> tone;
+    in property <string> text;
+    spacing: 10px;
+    VerticalLayout { padding-top: 2px; alignment: start; Icon { glyph: root.glyph; size: 14px; tint: root.tone; } }
+    Text { horizontal-stretch: 1; text: root.text; font-size: Theme.type-small; color: Theme.ink; wrap: word-wrap; }
+}
+
+/// One component's card.
+component ComponentCard inherits SectionCard {
+    in property <PrereqCard> card;
+    in property <int> index;
+    private property <color> tone: View.tone(root.card.tone);
+    VerticalLayout {
+        spacing: Theme.sp-l * Theme.scale;
+        HorizontalLayout {
+            spacing: Theme.sp-l;
+            // The 38 px status badge.
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 38px;
+                    height: 38px;
+                    border-radius: 19px;
+                    border-width: 1px;
+                    background: root.tone.with-alpha(0.12);
+                    border-color: root.tone.with-alpha(0.28);
+                    Icon { glyph: root.card.badge-glyph; size: 19px; tint: root.tone; }
+                }
+            }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 5px;
+                alignment: center;
+                HorizontalLayout {
+                    spacing: 10px;
+                    alignment: start;
+                    Text { text: root.card.name; font-size: Theme.type-heading; font-weight: 600; color: Theme.ink; vertical-alignment: center; }
+                    VerticalLayout {
+                        alignment: center;
+                        // The status chip, a pill.
+                        Rectangle {
+                            border-radius: Theme.radius;
+                            border-width: 1px;
+                            background: root.tone.with-alpha(0.13);
+                            border-color: root.tone.with-alpha(0.32);
+                            HorizontalLayout {
+                                padding-left: 9px;
+                                padding-right: 9px;
+                                padding-top: 2px;
+                                padding-bottom: 2px;
+                                Text { text: root.card.chip; font-size: Theme.type-fine; font-weight: 600; color: root.tone; }
+                            }
+                        }
+                    }
+                    if root.card.version != "": Text { text: root.card.version; font-family: Theme.mono; font-size: Theme.type-caption; color: Theme.sub; vertical-alignment: center; }
+                }
+                Text { text: root.card.why; font-size: Theme.type-small; color: Theme.sub; wrap: word-wrap; }
+                if root.card.evidence != "": Text { text: root.card.evidence; font-size: Theme.type-fine; color: Theme.sub.with-alpha(0.8); wrap: word-wrap; }
+            }
+            if root.card.button.show: VerticalLayout {
+                alignment: center;
+                Action { button: root.card.button; clicked => { Downloads.prereq-act(root.index, 0); } }
+            }
+        }
+        // Confirmation: exactly what will run.
+        if root.card.confirm: Rule { tint: Theme.hairline; }
+        if root.card.confirm: VerticalLayout {
+            spacing: Theme.sp-m;
+            Text { text: root.card.heading; font-size: Theme.type-body; font-weight: 600; color: Theme.ink; wrap: word-wrap; }
+            Text { text: root.card.steps; font-size: Theme.type-small; color: Theme.ink; wrap: word-wrap; }
+            VerticalLayout {
+                spacing: 6px;
+                Text { text: root.card.will-run; font-size: Theme.type-caption; color: Theme.sub; }
+                Rectangle {
+                    border-radius: Theme.radius-inner;
+                    border-width: 1px;
+                    background: Theme.field;
+                    border-color: Theme.line;
+                    HorizontalLayout {
+                        padding-left: Theme.sp-m;
+                        padding-right: Theme.sp-m;
+                        padding-top: Theme.sp-s;
+                        padding-bottom: Theme.sp-s;
+                        Text { text: root.card.command; font-family: Theme.mono; font-size: Theme.type-caption; color: Theme.ink; wrap: word-wrap; }
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 10px;
+                Text { horizontal-stretch: 1; text: root.card.permission; font-size: Theme.type-caption; color: Theme.sub; vertical-alignment: center; wrap: word-wrap; }
+                Action { button: root.card.dismiss; clicked => { Downloads.prereq-act(root.index, 1); } }
+                Action { button: root.card.install; clicked => { Downloads.prereq-act(root.index, 2); } }
+            }
+        }
+        // Progress.
+        if root.card.running: Rule { tint: Theme.hairline; }
+        if root.card.running: VerticalLayout {
+            spacing: 10px;
+            HorizontalLayout {
+                spacing: Theme.sp-m;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 3px;
+                    Text { text: root.card.progress-head; font-size: Theme.type-body; color: Theme.ink; wrap: word-wrap; }
+                    Text { text: root.card.progress-detail; font-size: Theme.type-caption; color: Theme.sub; wrap: word-wrap; }
+                }
+                if root.card.cancel.show: VerticalLayout {
+                    alignment: center;
+                    Action { button: root.card.cancel; clicked => { Downloads.prereq-act(root.index, 3); } }
+                }
+            }
+            // On the selection fill (the page's bars use the track).
+            Bar { fraction: root.card.progress; girth: 6px; track: Theme.select; indeterminate: root.card.progress < 0; }
+        }
+        // Last result.
+        if root.card.has-result: ResultNote { glyph: root.card.result-glyph; tone: View.tone(root.card.result-tone); text: root.card.result; }
+        // DirectPlay's manual route.
+        if root.card.manual: VerticalLayout {
+            spacing: 10px;
+            HorizontalLayout {
+                alignment: start;
+                toggle := Pressable {
+                    label: root.card.manual-toggle;
+                    accessible-expandable: true;
+                    accessible-expanded: root.card.manual-open;
+                    min-width: toggle-row.preferred-width + 12px;
+                    min-height: toggle-row.preferred-height + 8px;
+                    horizontal-stretch: 0;
+                    border-radius: Theme.radius-inner;
+                    background: self.hot ? Theme.select : transparent;
+                    clicked => { Downloads.prereq-act(root.index, 4); }
+                    toggle-row := HorizontalLayout {
+                        x: 6px;
+                        y: 4px;
+                        spacing: 6px;
+                        Text { text: root.card.manual-toggle; font-size: Theme.type-small; color: Theme.accent; vertical-alignment: center; }
+                        Icon { cross-axis-self-alignment: center; glyph: Glyph.chevron-down; size: 14px; tint: Theme.accent; }
+                    }
+                }
+            }
+            if root.card.manual-open: HorizontalLayout {
+                padding-left: 6px;
+                Text { text: root.card.manual-steps; font-size: Theme.type-small; color: Theme.ink; wrap: word-wrap; }
+            }
+            if root.card.manual-open: HorizontalLayout {
+                padding-left: 6px;
+                alignment: start;
+                Action { button: root.card.open-features; clicked => { Downloads.prereq-act(root.index, 5); } }
+            }
+        }
+    }
+}
+
+/// Windows components: the header card (state, when it was checked, Check again, what checking
+/// does), then one card per component.
+export component WindowsComponents inherits VerticalLayout {
+    spacing: 14px * Theme.scale;
+    SectionCard {
+        VerticalLayout {
+            spacing: 14px * Theme.scale;
+            HorizontalLayout {
+                spacing: Theme.sp-l;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 6px;
+                    Text { text: Downloads.prereq-summary.title; font-size: Theme.type-section; font-weight: 600; color: Theme.ink; }
+                    HorizontalLayout {
+                        spacing: Theme.sp-s;
+                        alignment: start;
+                        Icon { cross-axis-self-alignment: center; glyph: Downloads.prereq-summary.glyph; size: 15px; tint: View.tone(Downloads.prereq-summary.tone); }
+                        Text { text: Downloads.prereq-summary.summary; font-size: Theme.type-small; color: View.tone(Downloads.prereq-summary.tone); vertical-alignment: center; }
+                        if Downloads.prereq-summary.when != "": Text { text: "·  " + Downloads.prereq-summary.when; font-size: Theme.type-small; color: Theme.sub; vertical-alignment: center; }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Action { button: Downloads.prereq-summary.check-again; clicked => { Downloads.prereq-check-again(); } }
+                }
+            }
+            Rule { tint: Theme.hairline; }
+            HorizontalLayout {
+                spacing: 10px;
+                VerticalLayout { padding-top: 2px; alignment: start; Icon { glyph: Glyph.help; size: 14px; tint: Theme.sub; } }
+                Text { horizontal-stretch: 1; text: Downloads.prereq-summary.intro; font-size: Theme.type-note; color: Theme.sub; wrap: word-wrap; }
+            }
+        }
+    }
+    for card[index] in Downloads.prereq-cards: ComponentCard { card: card; index: index; }
+}

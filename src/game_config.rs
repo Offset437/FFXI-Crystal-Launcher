@@ -5,16 +5,16 @@
 //! only on Apply - after the values being replaced are backed up. See
 //! `store` for where each launch target reads them.
 mod display;
+/// The tabs as plain data for the Slint front end.
+pub(crate) mod front;
 mod model;
-mod page;
 mod store;
 
 use crate::i18n::{t, tf};
-use crate::{App, Message};
-use iced::{Element, Subscription, Task};
+use crate::effect::Effect;
 use model::{Data, Values};
 use std::path::PathBuf;
-use store::{BackupEntry, Paths, Region, Target};
+use store::{BackupEntry, Paths, Region};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Section {
@@ -32,10 +32,9 @@ pub(crate) enum Tone {
 
 pub(crate) struct State {
     preview: bool,
-    requested: bool,
     loaded: bool,
     paths: Paths,
-    target: Target,
+    region: Region,
     /// Regions whose registry key holds game settings.
     regions: Vec<Region>,
     writable: bool,
@@ -50,19 +49,20 @@ pub(crate) struct State {
     modes: Vec<(u32, u32)>,
     desktop: (u32, u32),
     backups: Vec<BackupEntry>,
-    /// Targets backed up this session (a backup precedes the first write).
-    backed_up: Vec<Target>,
+    /// Regions backed up this session (a backup precedes the first write).
+    backed_up: Vec<Region>,
     notice: Option<(Tone, String)>,
+    /// Bumped by every update: a front end rebuilds the page only when it moved.
+    revision: u64,
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
-            preview: std::env::args().any(|a| a.starts_with("--preview")),
-            requested: false,
+            preview: crate::preview::flags().is_some(),
             loaded: false,
             paths: Paths::from_config(&crate::backend::Config::default()),
-            target: Target::Retail(Region::Us),
+            region: Region::Us,
             regions: Vec::new(),
             writable: true,
             original: Values::new(),
@@ -75,6 +75,7 @@ impl Default for State {
             backups: Vec::new(),
             backed_up: Vec::new(),
             notice: None,
+            revision: 0,
         }
     }
 }
@@ -82,7 +83,7 @@ impl Default for State {
 #[derive(Clone, Debug)]
 pub(crate) enum Msg {
     Load,
-    Target(Target),
+    Region(Region),
     Set(&'static str, u32),
     Window(u32, u32),
     Menu(u32, u32),
@@ -97,6 +98,9 @@ pub(crate) enum Msg {
 }
 
 impl State {
+    /// Moves with every update (`front` reads nothing else that changes).
+    pub(crate) fn revision(&self) -> u64 { self.revision }
+
     fn pending(&self) -> Vec<&'static str> {
         let mut keys = model::changed_keys(&self.original, &self.edits);
         if self.menu_selected {
@@ -114,6 +118,10 @@ impl State {
             Some(Data::Dword(v)) => *v,
             _ => 0,
         }
+    }
+    /// The stored-as-automatic (0, 0) menu pair, as edited.
+    fn automatic_menu(&self) -> bool {
+        (self.dword(model::MENU_W), self.dword(model::MENU_H)) == (0, 0)
     }
     fn menu_size(&self) -> (u32, u32) {
         let size = (self.dword(model::MENU_W), self.dword(model::MENU_H));
@@ -136,26 +144,17 @@ impl State {
     /// Sets an entry; one missing from storage stays missing while it shows
     /// its fallback, so merely looking never makes a change pending.
     fn set(&mut self, key: &str, data: Data) {
-        if self.original.get(key).is_none() && self.fallback.get(key) == Some(&data) {
+        if !self.original.contains_key(key) &&self.fallback.get(key) == Some(&data) {
             self.edits.remove(key);
         } else {
             self.edits.insert(key.into(), data);
         }
     }
     fn set_dword(&mut self, key: &str, value: u32) {
-        if self.target == Target::Native && !model::native_supports(key, value) {
-            return;
-        }
         self.set(key, Data::Dword(value));
-    }
-    /// For the native client, replaces edited values it cannot start with
-    /// (see `model::NATIVE_FONT_TYPE`); true when something changed.
-    fn guard_native(&mut self) -> bool {
-        self.target == Target::Native && !model::guard_native(&mut self.edits).is_empty()
     }
 
     fn load(&mut self) {
-        self.requested = true;
         if self.preview {
             self.load_preview();
             return;
@@ -165,8 +164,8 @@ impl State {
         self.modes = modes;
         self.fallback = model::defaults(self.desktop);
         self.regions = store::retail_regions();
-        if !self.regions.iter().any(|region| self.target == Target::Retail(*region)) {
-            self.target = Target::Retail(self.regions.first().copied().unwrap_or(Region::Us));
+        if !self.regions.contains(&self.region) {
+            self.region = self.regions.first().copied().unwrap_or(Region::Us);
         }
         self.read_target();
     }
@@ -174,22 +173,13 @@ impl State {
     fn read_target(&mut self) {
         self.loaded = true;
         self.menu_selected = false;
-        self.menu_retained = match self.target {
-            Target::Retail(region) => store::menu_override(&self.paths, region).ok().flatten().is_some(),
-            Target::Native => false,
-        };
-        self.writable = store::writable(self.target);
-        self.backups = store::list_backups(&self.paths.backups(), self.target);
-        match store::read(&self.paths, self.target) {
+        self.menu_retained = store::menu_override(&self.paths, self.region).ok().flatten().is_some();
+        self.writable = store::writable(self.region);
+        self.backups = store::list_backups(&self.paths.backups(), self.region);
+        match store::read(&self.paths, self.region) {
             Ok(values) => {
                 self.original = values;
                 self.edits = self.original.clone();
-                if self.guard_native() {
-                    self.notice = Some((
-                        Tone::Warning,
-                        t("The saved font type stops the native client at startup, so it was changed to Compressed. Apply to save the fix.").into(),
-                    ));
-                }
             }
             Err(e) => {
                 self.original = Values::new();
@@ -218,7 +208,7 @@ impl State {
             (model::TEXTURE_COMPRESSION, 2),
             (model::ENV_ANIMATION, 1),
             (model::MAX_SOUNDS, 16),
-            (model::FONT_TYPE, model::NATIVE_FONT_TYPE),
+            (model::FONT_TYPE, 0),
             (model::OPENING_MOVIE, 0),
             (model::SCREENSHOT_SCREEN_RES, 1),
             (model::GAMMA, model::gamma_bits(0.1)),
@@ -226,7 +216,7 @@ impl State {
             v.insert(k.into(), Data::Dword(x));
         }
         v.insert(model::SCREENSHOT_DIR.into(), Data::Text("D:\\Pictures\\Vana'diel".into()));
-        if std::env::args().any(|a| a == "--preview-menu-auto") {
+        if crate::preview::has("--preview-menu-auto") {
             v.insert(model::MENU_W.into(), Data::Dword(0));
             v.insert(model::MENU_H.into(), Data::Dword(0));
         }
@@ -257,25 +247,13 @@ impl State {
             self.notice = Some((Tone::Info, t("Design preview: nothing was written.").into()));
             return;
         }
-        let mut proposed = self.edits.clone();
-        // The native file gets every managed entry, so fill in fallbacks.
-        if self.target == Target::Native {
-            for key in model::MANAGED {
-                if !proposed.contains_key(key) {
-                    if let Some(d) = self.fallback.get(key) {
-                        proposed.insert(key.into(), d.clone());
-                    }
-                }
-            }
-            model::guard_native(&mut proposed);
-        }
-        if let Err(e) = model::validate(&proposed, self.target == Target::Native) {
+        if let Err(e) = model::validate(&self.edits) {
             self.notice = Some((Tone::Error, e));
             return;
         }
         // Re-read: something else (the game, the official Config tool) may
         // have changed the values since they were loaded.
-        let current = match store::read(&self.paths, self.target) {
+        let current = match store::read(&self.paths, self.region) {
             Ok(v) => v,
             Err(e) => {
                 self.notice = Some((Tone::Error, e));
@@ -283,14 +261,16 @@ impl State {
             }
         };
         if !model::changed_keys(&self.original, &current).is_empty() {
-            self.original = current;
+            self.rebase(current);
+            self.menu_retained = store::menu_override(&self.paths, self.region).ok().flatten().is_some();
+            self.backups = store::list_backups(&self.paths.backups(), self.region);
             self.notice = Some((
                 Tone::Warning,
                 t("These settings were changed outside the launcher since they were loaded. The page now compares against the new values; review your changes and apply again.").into(),
             ));
             return;
         }
-        if !store::writable(self.target) {
+        if !store::writable(self.region) {
             self.writable = false;
             self.notice = Some((
                 Tone::Error,
@@ -298,17 +278,17 @@ impl State {
             ));
             return;
         }
-        if !self.backed_up.contains(&self.target) {
-            let location = self.paths.location(self.target);
-            match store::save_backup(&self.paths.backups(), self.target, &location, &current, chrono::Local::now().naive_local()) {
-                Ok(_) => self.backed_up.push(self.target),
+        if !self.backed_up.contains(&self.region) {
+            let location = self.region.location();
+            match store::save_backup(&self.paths.backups(), self.region, &location, &current, chrono::Local::now().naive_local()) {
+                Ok(_) => self.backed_up.push(self.region),
                 Err(e) => {
                     self.notice = Some((Tone::Error, tf("{e} Nothing was changed.", &[("e", &e)])));
                     return;
                 }
             }
         }
-        match store::write(&self.paths, self.target, &self.original, &proposed, self.menu_selected) {
+        match store::write(&self.paths, self.region, &self.original, &self.edits, self.menu_selected) {
             Ok(()) => {
                 let count = pending.len();
                 self.read_target();
@@ -324,7 +304,7 @@ impl State {
             Err(e) => {
                 self.notice = Some((Tone::Error, e));
                 // Show what is actually stored now; the edits stay pending.
-                if let Ok(v) = store::read(&self.paths, self.target) {
+                if let Ok(v) = store::read(&self.paths, self.region) {
                     self.original = v;
                 }
             }
@@ -337,20 +317,31 @@ impl State {
                 self.set(key, d.clone());
             }
         }
-        self.guard_native();
+    }
+
+    /// Takes stored values that changed since they were read as the new base.
+    /// Keys the user did not edit follow the stored value, so the next Apply
+    /// does not write the old ones back over the outside change.
+    fn rebase(&mut self, current: Values) {
+        for key in model::MANAGED {
+            if self.edits.get(key) == self.original.get(key) {
+                match current.get(key) {
+                    Some(d) => self.edits.insert(key.into(), d.clone()),
+                    None => self.edits.remove(key),
+                };
+            }
+        }
+        self.original = current;
     }
 }
 
-pub(crate) fn update(state: &mut State, msg: Msg) -> Task<Msg> {
+pub(crate) fn update(state: &mut State, msg: Msg) -> Effect<Msg> {
+    state.revision = state.revision.wrapping_add(1);
     match msg {
-        Msg::Load => {
-            if !state.requested {
-                state.load();
-            }
-        }
-        Msg::Target(target) => {
-            if target != Target::Native && target != state.target && state.pending().is_empty() {
-                state.target = target;
+        Msg::Load => state.load(),
+        Msg::Region(region) => {
+            if region != state.region && state.pending().is_empty() {
+                state.region = region;
                 state.notice = None;
                 if state.preview {
                     state.writable = true;
@@ -361,13 +352,17 @@ pub(crate) fn update(state: &mut State, msg: Msg) -> Task<Msg> {
         }
         Msg::Set(key, value) => state.set_dword(key, value),
         Msg::Window(w, h) => {
-            // Keep the interface's magnification as the window changes.
+            // Keep the interface's magnification as the window changes. An
+            // automatic (0, 0) menu already follows the window: leave it so.
+            let automatic = state.automatic_menu();
             let scale = model::scale_of(state.dword(model::WINDOW_H), state.menu_size().1).max(1.0);
             state.set_dword(model::WINDOW_W, w);
             state.set_dword(model::WINDOW_H, h);
-            let (mw, mh) = model::menu_for(w, h, scale);
-            state.set_dword(model::MENU_W, mw.max(model::MIN_MENU.0));
-            state.set_dword(model::MENU_H, mh.max(model::MIN_MENU.1));
+            if !automatic {
+                let (mw, mh) = model::menu_for(w, h, scale);
+                state.set_dword(model::MENU_W, mw.max(model::MIN_MENU.0));
+                state.set_dword(model::MENU_H, mh.max(model::MIN_MENU.1));
+            }
         }
         Msg::Menu(w, h) => {
             // An explicit choice must be stored even when a missing registry
@@ -377,7 +372,7 @@ pub(crate) fn update(state: &mut State, msg: Msg) -> Task<Msg> {
             state.edits.insert(model::MENU_H.into(), Data::Dword(h));
             // Selecting the currently displayed registry size still establishes
             // a preference when no Crystal menu size has been saved yet.
-            state.menu_selected = matches!(state.target, Target::Retail(_)) && !state.menu_retained && (w, h) != (0, 0);
+            state.menu_selected = !state.menu_retained && (w, h) != (0, 0);
         }
         Msg::Background(w, h) => {
             state.set_dword(model::BACKGROUND_W, w);
@@ -390,11 +385,15 @@ pub(crate) fn update(state: &mut State, msg: Msg) -> Task<Msg> {
             state.edits = state.original.clone();
             state.menu_selected = false;
             state.notice = None;
-            // A stored value the native client cannot start with stays corrected.
-            state.guard_native();
         }
         Msg::Defaults => {
-            let defaults = state.fallback.clone();
+            let automatic = state.automatic_menu();
+            let mut defaults = state.fallback.clone();
+            if automatic {
+                // Keep "Automatic · use launch profile"; defaults never pin a menu size.
+                defaults.remove(model::MENU_W);
+                defaults.remove(model::MENU_H);
+            }
             state.load_values(&defaults);
             state.notice = Some((
                 Tone::Info,
@@ -419,24 +418,27 @@ pub(crate) fn update(state: &mut State, msg: Msg) -> Task<Msg> {
         }
         Msg::DismissNotice => state.notice = None,
     }
-    Task::none()
-}
-
-pub(crate) fn subscription(state: &State) -> Subscription<Msg> {
-    // Read once, as soon as the app runs (a few registry values: cheap).
-    if state.requested {
-        Subscription::none()
-    } else {
-        iced::time::every(std::time::Duration::from_millis(10)).map(|_| Msg::Load)
-    }
-}
-
-pub(crate) fn view(app: &App, section: Section) -> Element<'_, Message> {
-    page::view(app, section)
+    Effect::none()
 }
 
 pub(crate) fn retail_menu(config: &crate::backend::Config) -> Result<Option<(u32, u32)>, String> {
     store::menu_override(&Paths::from_config(config), Region::Us)
+}
+
+pub(crate) use model::{Data as RegData, Values as RegValues};
+
+/// The vendor key ("PlayOnlineUS", ...) controller settings are read from and
+/// written to; one rule for the whole app (see `store::controller_region`).
+pub(crate) fn controller_region() -> Option<&'static str> {
+    store::controller_region().map(Region::vendor)
+}
+
+pub(crate) fn read_retail(vendor: &str) -> Result<Option<RegValues>, String> {
+    store::read_key(vendor)
+}
+
+pub(crate) fn write_retail(vendor: &str, changes: &[(&str, &RegData)]) -> Result<(), String> {
+    store::write_key(vendor, changes)
 }
 
 #[cfg(test)]
@@ -463,12 +465,32 @@ mod tests {
         s.edits = s.original.clone();
         assert_eq!(s.menu_size(), (2560, 1440));
         assert!(s.pending().is_empty());
-        assert!(model::validate(&s.edits, false).is_ok());
-        assert!(model::validate(&s.edits, true).is_err());
+        assert!(model::validate(&s.edits).is_ok());
         let _ = update(&mut s, Msg::Set(model::MAX_SOUNDS, 20));
         assert_eq!(s.pending(), vec![model::MAX_SOUNDS]);
         let _ = update(&mut s, Msg::Window(1920, 1080));
         assert_eq!(s.menu_size(), (1920, 1080));
+    }
+
+    /// A window change must not turn the automatic menu into a fixed size
+    /// (which Apply would also save as Crystal's menu override).
+    #[test]
+    fn window_change_keeps_an_automatic_menu_automatic() {
+        let mut s = loaded();
+        for key in [model::MENU_W, model::MENU_H] {
+            s.original.insert(key.into(), Data::Dword(0));
+        }
+        s.edits = s.original.clone();
+        let _ = update(&mut s, Msg::Window(2560, 1440));
+        let _ = update(&mut s, Msg::Window(3840, 2160));
+        assert_eq!(model::dword(&s.edits, model::MENU_W), Some(0));
+        assert_eq!(model::dword(&s.edits, model::MENU_H), Some(0));
+        assert_eq!(s.pending(), vec![model::WINDOW_W, model::WINDOW_H]);
+        // Defaults keep it automatic too.
+        let _ = update(&mut s, Msg::Defaults);
+        assert_eq!(model::dword(&s.edits, model::MENU_W), Some(0));
+        assert_eq!(model::dword(&s.edits, model::MENU_H), Some(0));
+        assert!(!s.pending().contains(&model::MENU_W));
     }
 
     #[test]
@@ -557,70 +579,27 @@ mod tests {
         assert_eq!(s.edits.get("0031"), Some(&Data::Dword(0x3bc4_9ba6)));
     }
 
-    #[test]
-    fn game_config_native_never_offers_a_crashing_font_type() {
-        let mut s = loaded();
-        s.target = Target::Native; // Legacy-file compatibility, not a UI target.
-        assert_eq!(s.target, Target::Native);
-        let _ = update(&mut s, Msg::Set(model::FONT_TYPE, 2));
-        let _ = update(&mut s, Msg::Set(model::FONT_TYPE, 1));
-        assert!(s.pending().is_empty());
-        assert_eq!(s.dword(model::FONT_TYPE), model::NATIVE_FONT_TYPE);
-        // A backup or defaults holding High quality load as Compressed.
-        let mut backup = s.original.clone();
-        backup.insert(model::FONT_TYPE.into(), Data::Dword(2));
-        s.load_values(&backup);
-        assert_eq!(s.dword(model::FONT_TYPE), model::NATIVE_FONT_TYPE);
-        // The registry targets keep every font type.
-        let _ = update(&mut s, Msg::Discard);
-        let _ = update(&mut s, Msg::Target(Target::Retail(Region::Us)));
-        let _ = update(&mut s, Msg::Set(model::FONT_TYPE, 2));
-        assert_eq!(s.dword(model::FONT_TYPE), 2);
-    }
 
+    /// Settings changed outside the launcher become the new base; they never
+    /// turn into pending edits that a second Apply would revert.
     #[test]
-    fn game_config_native_read_corrects_a_stored_crashing_font_type() {
-        let root = std::env::temp_dir().join(format!("game-config-test-state-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let launcher = root.join("iced-launcher");
-        std::fs::create_dir_all(&launcher).unwrap();
-        std::fs::write(
-            launcher.join("game-settings.reg"),
-            "REGEDIT4\r\n\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\PlayOnlineUS\\SquareEnix\\FinalFantasyXI]\r\n\"0001\"=dword:00000f00\r\n\"0036\"=dword:00000002\r\n",
-        )
-        .unwrap();
-        let mut s = State {
-            target: Target::Native,
-            paths: store::Paths {
-                base_reg: root.join("repo/ffxi.reg"),
-                accounts: root.join("test-launcher/data"),
-                launcher,
-            },
-            ..State::default()
-        };
-        s.read_target();
-        assert_eq!(model::dword(&s.original, model::FONT_TYPE), Some(2));
-        assert_eq!(s.dword(model::FONT_TYPE), model::NATIVE_FONT_TYPE);
-        assert_eq!(s.pending(), vec![model::FONT_TYPE]);
-        assert_eq!(s.notice.as_ref().map(|n| n.0), Some(Tone::Warning));
-        // Discarding keeps the correction pending; it is never offered back.
-        let _ = update(&mut s, Msg::Discard);
-        assert_eq!(s.pending(), vec![model::FONT_TYPE]);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn game_config_target_switch_waits_for_pending_changes() {
+    fn outside_changes_rebase_untouched_keys_and_keep_the_users_edits() {
         let mut s = loaded();
         let _ = update(&mut s, Msg::Set(model::SOUND, 0));
-        let _ = update(&mut s, Msg::Target(Target::Retail(Region::Eu)));
-        assert_eq!(s.target, Target::Retail(Region::Us));
+        let mut current = s.original.clone();
+        current.insert(model::WINDOW_MODE.into(), Data::Dword(2)); // the game saved Borderless
+        current.remove(model::OPENING_MOVIE);
+        s.rebase(current);
+        assert_eq!(s.pending(), vec![model::SOUND]);
+        assert_eq!(s.dword(model::WINDOW_MODE), 2);
+        assert!(!s.edits.contains_key(model::OPENING_MOVIE));
     }
 
     #[test]
-    fn game_config_does_not_offer_the_disabled_native_target() {
+    fn game_config_region_switch_waits_for_pending_changes() {
         let mut s = loaded();
-        let _ = update(&mut s, Msg::Target(Target::Native));
-        assert_eq!(s.target, Target::Retail(Region::Us));
+        let _ = update(&mut s, Msg::Set(model::SOUND, 0));
+        let _ = update(&mut s, Msg::Region(Region::Eu));
+        assert_eq!(s.region, Region::Us);
     }
 }

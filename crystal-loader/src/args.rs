@@ -10,11 +10,6 @@ pub struct Args {
     /// Full local pipe path, `\\.\pipe\<name>`.
     pub pipe: String,
     pub launcher_pid: u32,
-    /// Offline harness mode: the lobby host name resolves to 127.0.0.1 and a
-    /// watchdog ends the process, so nothing ever reaches Square Enix.
-    pub selftest_offline: bool,
-    /// Log the first call of every polcore table slot (diagnostics; implied by selftest).
-    pub trace_slots: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,8 +41,6 @@ where
 {
     let mut pipe: Option<String> = None;
     let mut pid: Option<u32> = None;
-    let mut selftest = false;
-    let mut trace = false;
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         let arg = arg.as_ref();
@@ -68,16 +61,12 @@ where
                 }
                 pid = Some(n);
             }
-            "--selftest-offline" => selftest = true,
-            "--trace-slots" => trace = true,
             _ => {} // unknown: ignored on purpose
         }
     }
     Ok(Args {
         pipe: pipe.ok_or(ArgError::MissingPipe)?,
         launcher_pid: pid.ok_or(ArgError::MissingLauncherPid)?,
-        selftest_offline: selftest,
-        trace_slots: trace || selftest,
     })
 }
 
@@ -123,7 +112,6 @@ mod tests {
         let a = parse(["--crystal-pipe", "crystal-loader-0123abcd", "--crystal-launcher-pid", "4242", "--lang", "US"]).unwrap();
         assert_eq!(a.pipe, r"\\.\pipe\crystal-loader-0123abcd");
         assert_eq!(a.launcher_pid, 4242);
-        assert!(!a.selftest_offline);
     }
 
     #[test]
@@ -137,8 +125,7 @@ mod tests {
     fn ignores_unknown_args_anywhere() {
         let a = parse(["/game", "eAZcFcB", "--ashita-thing", "x", "--crystal-pipe", "p", "-net", "3", "--crystal-launcher-pid", "9", "--selftest-offline"]).unwrap();
         assert_eq!(a.pipe, r"\\.\pipe\p");
-        assert_eq!(a.launcher_pid, 9);
-        assert!(a.selftest_offline);
+        assert_eq!(a.launcher_pid, 9, "the retired --selftest-offline is an ignored unknown flag");
     }
 
     #[test]

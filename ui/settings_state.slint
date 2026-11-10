@@ -1,0 +1,533 @@
+// The Settings page's and its dialogs' view model (src/slint_host/settings.rs fills it from the
+// core after every batch of messages, setting only what changed, and turns its callbacks into
+// core messages). Colours are named (`Shade`), never passed
+// from Rust, so a theme switch recolours everything without a sync.
+import { Theme } from "theme.slint";
+import { Glyph } from "widgets.slint";
+
+/// A settings status colour: the ok, warn and danger tones, the accent, the muted ink,
+/// the Graphics tab's own success, warning and error tones, and the theme palette's success,
+/// warning and danger (the
+/// controller page's notes).
+export enum Shade { sub, ok, warn, danger, accent, gfx-ok, gfx-warn, gfx-error, pal-ok, pal-warn, pal-danger }
+
+/// The words that change only with the language.
+export struct SettingsStrings {
+    title: string,
+    description: string,
+    privacy: string,
+    privacy-tip: string,
+    language: string,
+    // System
+    updates-title: string,
+    updates-auto: string,
+    updates-note: string,
+    nav-label: string,
+    nav-note-1: string,
+    nav-note-2: string,
+    sign-in-label: string,
+    sign-in-note: string,
+    keep-label: string,
+    keep-note: string,
+    start-label: string,
+    tray-label: string,
+    tray-note: string,
+    tools-title: string,
+    tools-sub: string,
+    detect-again: string,
+    default-launcher: string,
+    default-note: string,
+    boot-label: string,
+    boot-placeholder: string,
+    profile-label: string,
+    profile-placeholder: string,
+    edit-profiles: string,
+    profile-note: string,
+    admin-note: string,
+    found: string,
+    not-found: string,
+    owg-title: string,
+    owg-sub: string,
+    program-path: string,
+    arguments: string,
+    enabled: string,
+    remove: string,
+    add-program: string,
+    compat-title: string,
+    compat-none: string,
+    components-title: string,
+    check-again: string,
+    components-intro: string,
+    will-run: string,
+    manual-toggle: string,
+    open-features: string,
+    about-name: string,
+    about-version: string,
+    about-1: string,
+    about-2: string,
+    about-3: string,
+    about-4: string,
+    // Graphics
+    dg-title: string,
+    dg-body: string,
+    dg-open: string,
+    try-again: string,
+    rs-body: string,
+    rs-setup: string,
+    rs-preset: string,
+    rs-folder: string,
+    rs-website: string,
+    gc-reading: string,
+    gc-for: string,
+    gc-defaults: string,
+    gc-no-backups: string,
+    gc-restore: string,
+    gc-discard: string,
+    gc-apply: string,
+    gc-clean: string,
+    gc-menu-note: string,
+    gc-locked-note: string,
+    gc-admin: string,
+    gc-use-default: string,
+    gc-folder-placeholder: string,
+    // Controller
+    pad-retry: string,
+    pad-live: string,
+    pad-vibrate: string,
+    pad-bindings: string,
+    pad-reset: string,
+    pad-unbind: string,
+    pad-options: string,
+    // Dialogs
+    close-title: string,
+    close-body: string,
+    close-keep: string,
+    close-now: string,
+    import-title: string,
+    import-sub: string,
+    import-intro: string,
+    import-note: string,
+    import-detected: string,
+    import-file: string,
+    import-file-placeholder: string,
+    browse: string,
+    region: string,
+    import-companion: string,
+    import-companion-file: string,
+    import-empty: string,
+    import-review: string,
+    close: string,
+}
+
+/// A card button: its label, glyph and tone, and whether it takes clicks.
+export struct Act {
+    text: string,
+    glyph: Glyph,
+    primary: bool,
+    enabled: bool,
+}
+
+/// The switches and choices of System and the page header.
+export struct SystemState {
+    privacy: bool,
+    language: int,
+    updates-status: string,
+    updates-action: string,
+    updates-auto: bool,
+    nav: bool,
+    sign-in: bool,
+    keep: bool,
+    start: bool,
+    start-enabled: bool,
+    tray: bool,
+}
+
+/// One launch tool's folder or file (launch_tools::tool_row).
+export struct ToolRow {
+    name: string,
+    found: bool,
+    placeholder: string,
+    editable: bool,
+    /// Under the field: where the tool was found (a path) or what to do (a warning).
+    caption: string,
+    caption-path: bool,
+}
+
+export struct ToolsState {
+    default-current: int,
+    ashita: ToolRow,
+    windower: ToolRow,
+    loader: ToolRow,
+    boot-current: int,
+    boot-note: string,
+    profile-current: int,
+    edit-enabled: bool,
+}
+
+/// One program in Open with the game.
+export struct Program {
+    path: string,
+    args: string,
+    enabled: bool,
+}
+
+/// The loader's feature check (feature_check::view).
+export struct Compat {
+    has: bool,
+    builds: string,
+    chip: string,
+    ok: bool,
+}
+
+export struct FeatureOff {
+    name: string,
+    reason: string,
+}
+
+/// The Windows components summary card.
+export struct Components {
+    summary: string,
+    shade: Shade,
+    glyph: Glyph,
+    when: string,
+    check-enabled: bool,
+}
+
+/// One Windows component's card (prereqs::component_card).
+export struct ComponentCard {
+    name: string,
+    glyph: Glyph,
+    shade: Shade,
+    label: string,
+    version: string,
+    why: string,
+    checked: string,
+    has-button: bool,
+    button: Act,
+    confirm: bool,
+    heading: string,
+    steps: [string],
+    command: string,
+    permission: string,
+    not-now: Act,
+    confirm-act: Act,
+    progress: bool,
+    head: string,
+    detail: string,
+    /// -1 indeterminate.
+    fraction: float,
+    can-cancel: bool,
+    cancel: Act,
+    has-result: bool,
+    result-glyph: Glyph,
+    result-shade: Shade,
+    result: string,
+    has-manual: bool,
+    manual-open: bool,
+    manual-steps: [string],
+}
+
+/// The dgVoodoo card.
+export struct Dg {
+    on: bool,
+    chip: string,
+    chip-shade: Shade,
+    progress: bool,
+    progress-label: string,
+    progress-detail: string,
+    fraction: float,
+    error: string,
+    /// 0 none, 1 installed (settings, remove), 2 try again.
+    actions: int,
+    remove-enabled: bool,
+    note: string,
+}
+
+/// The ReShade card.
+export struct Rs {
+    on: bool,
+    enabled: bool,
+    setup-enabled: bool,
+    preset-enabled: bool,
+    folder-enabled: bool,
+    detail: string,
+    preset: string,
+    error: string,
+}
+
+/// The game options' action bar and notice.
+export struct GcBar {
+    loaded: bool,
+    region: int,
+    locked: bool,
+    pending: bool,
+    pending-text: string,
+    has-backups: bool,
+    discard-enabled: bool,
+    apply-enabled: bool,
+    location: string,
+    locked-note: bool,
+    not-writable: bool,
+    notice: bool,
+    notice-shade: Shade,
+    notice-success: bool,
+    notice-text: string,
+}
+
+/// One game option row: 0 dropdown, 1 switch, 2 slider, 3 information, 4 folder.
+export struct GcRow {
+    id: int,
+    kind: int,
+    label: string,
+    help: string,
+    changed: bool,
+    items: [string],
+    current: int,
+    on: bool,
+    value: float,
+    minimum: float,
+    maximum: float,
+    step: float,
+    has-reset: bool,
+    reset: float,
+    shown: string,
+    text: string,
+    editable: bool,
+    filled: bool,
+}
+
+export struct GcCard {
+    title: string,
+    subtitle: string,
+    rows: [GcRow],
+}
+
+/// Settings > Controller: the device bar, the live test and the options.
+export struct PadState {
+    badge: image,
+    title: string,
+    sub: string,
+    status: string,
+    retry: bool,
+    picture: image,
+    connected: bool,
+    caption: string,
+    lt-label: string,
+    lt: float,
+    rt-label: string,
+    rt: float,
+    left-stick: string,
+    right-stick: string,
+    rumble: bool,
+    bindings-sub: string,
+}
+
+/// Another connected controller to pick (shown when there are several).
+export struct PadChoice {
+    id: int,
+    name: string,
+    active: bool,
+}
+
+/// A PlayStation extra's keycap in the live test.
+export struct PadKey {
+    label: string,
+    lit: bool,
+}
+
+/// One binding row: `kind` 0 muted words, 1 a keycap, 2 a drawn chip (with `text` beside it
+/// when there is any). `id` is the row's place in the list.
+export struct PadBinding {
+    id: int,
+    label: string,
+    changed: bool,
+    capturing: bool,
+    prompt: string,
+    kind: int,
+    text: string,
+    lit: bool,
+    picture: image,
+    live: bool,
+}
+
+/// One of the game options' switches.
+export struct PadSwitch {
+    label: string,
+    on: bool,
+    enabled: bool,
+}
+
+export struct PadNote {
+    text: string,
+    shade: Shade,
+}
+
+/// The import dialog.
+export struct ImportState {
+    busy: bool,
+    show-sources: bool,
+    source-current: int,
+    editable: bool,
+    region: int,
+    use-companion: bool,
+    error: string,
+    no-drafts: bool,
+    read-label: string,
+    read-enabled: bool,
+}
+
+export struct Draft {
+    label: string,
+    detail: string,
+    notes: [string],
+}
+
+export global SettingsView {
+    in property <SettingsStrings> strings;
+    /// settings_page::Tab's order: Graphics, Sound & interface, Controller, System.
+    in property <[string]> tabs;
+    in property <int> tab;
+    in property <[string]> languages;
+    in property <SystemState> system;
+    callback pick-tab(int);
+    callback set-privacy(bool);
+    callback set-language(int);
+
+    // ---- System ----
+    in property <string> version;
+    callback update-action();
+    callback update-auto(bool);
+    callback set-nav(bool);
+    callback set-sign-in(bool);
+    callback set-keep(bool);
+    callback set-start(bool);
+    callback set-tray(bool);
+
+    in property <ToolsState> tools;
+    in property <[string]> launchers;
+    in property <[string]> boot-items;
+    in property <[string]> profile-items;
+    in-out property <string> ashita-path;
+    in-out property <string> windower-path;
+    in-out property <string> loader-path;
+    callback tools-detect();
+    callback tools-default(int);
+    /// 0 Ashita, 1 Windower, 2 the loader.
+    callback tools-path(int, string);
+    callback tools-browse(int);
+    callback tools-boot(int);
+    callback tools-profile(int);
+    callback edit-profiles();
+
+    in property <[Program]> programs;
+    in property <bool> programs-editable;
+    callback program-path(int, string);
+    callback program-args(int, string);
+    callback program-enabled(int, bool);
+    callback program-browse(int);
+    callback program-remove(int);
+    callback program-add();
+
+    in property <Compat> compat;
+    in property <[FeatureOff]> features-off;
+
+    in property <Components> components;
+    in property <[ComponentCard]> component-cards;
+    callback components-check();
+    /// A card's button, its confirmation's Not now and confirm, and its download's Cancel.
+    callback component-button(int);
+    callback component-not-now(int);
+    callback component-confirm(int);
+    callback component-cancel(int);
+    callback components-manual();
+    callback components-features();
+
+    // ---- Graphics, Sound & interface ----
+    in property <Dg> dg;
+    callback dg-toggle(bool);
+    callback dg-open();
+    callback dg-remove();
+    callback dg-retry();
+    in property <Rs> rs;
+    callback rs-toggle(bool);
+    callback rs-setup();
+    callback rs-preset();
+    callback rs-folder();
+    callback rs-website();
+
+    in property <GcBar> gc;
+    in property <[string]> gc-regions;
+    in property <[string]> gc-backups;
+    in property <[GcCard]> gc-left;
+    in property <[GcCard]> gc-right;
+    callback gc-region(int);
+    callback gc-defaults();
+    callback gc-backup(int);
+    callback gc-discard();
+    callback gc-apply();
+    callback gc-dismiss();
+    /// A row's choice, switch and slider, by the row's id.
+    callback gc-pick(int, int);
+    callback gc-toggle(int, bool);
+    callback gc-slide(int, float);
+    callback gc-folder(string);
+    callback gc-folder-default();
+
+    // ---- Controller ----
+    in property <PadState> pad;
+    in property <[PadChoice]> pad-choices;
+    in property <[PadKey]> pad-keys;
+    in property <[PadBinding]> pad-left;
+    in property <[PadBinding]> pad-right;
+    in property <[PadSwitch]> pad-switches;
+    in property <[PadNote]> pad-notes;
+    callback pad-select(int);
+    callback pad-retry();
+    callback pad-rumble();
+    callback pad-reset();
+    /// A binding row's press (capture, or stop capturing) and its Unbind, by the row's id.
+    callback pad-press(int);
+    callback pad-unbind(int);
+    /// A game option switch, by its place in `pad-switches`.
+    callback pad-switch(int, bool);
+
+    // ---- dialogs ----
+    /// Tab (true) or Shift+Tab inside an open dialog: the focus moves to its next control.
+    callback dialog-tab(bool);
+    in property <bool> close-open;
+    callback close-keep();
+    callback close-now();
+
+    in property <bool> import-open;
+    in property <ImportState> import;
+    in property <[string]> import-sources;
+    in property <[string]> import-warnings;
+    in property <[Draft]> import-drafts;
+    in property <[string]> regions;
+    in-out property <string> import-path;
+    in-out property <string> import-companion;
+    callback import-close();
+    callback import-source(int);
+    callback import-path-edited(string);
+    callback import-companion-edited(string);
+    /// false the account file, true the PlayOnline member file.
+    callback import-browse(bool);
+    callback import-region(int);
+    callback import-use-companion(bool);
+    callback import-review(int);
+    callback import-read();
+
+    public pure function shade(which: Shade) -> color {
+        which == Shade.ok ? (Theme.light ? #2E7A5E : #82CBA8)
+            : which == Shade.warn ? (Theme.light ? #9A6519 : #E2B866)
+            : which == Shade.danger ? (Theme.light ? #B24A4A : #E59494)
+            : which == Shade.accent ? Theme.accent
+            : which == Shade.gfx-ok ? (Theme.light ? #2F7A5F : #7CC4A6)
+            : which == Shade.gfx-warn ? (Theme.light ? #8F6420 : #E0B466)
+            : which == Shade.gfx-error ? (Theme.light ? #B03E3E : #E88A8A)
+            : which == Shade.pal-ok ? #4F947C
+            : which == Shade.pal-warn ? #BC8D40
+            : which == Shade.pal-danger ? #CB6262
+            : Theme.sub
+    }
+}

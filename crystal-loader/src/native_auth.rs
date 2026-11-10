@@ -25,97 +25,6 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-// Verified against polcore 73b1864b / timestamp 4e4e5917, preferred base
-// 10000000 (pol-spec/evidence/verify-handoff/slotmap.txt).
-const ENTRY_RVAS: &[(usize, usize)] = &[
-    (125, 0x48a40),
-    (126, 0x48be0),
-    (367, 0x49d40),
-    (807, 0x46410),
-    (809, 0x44720),
-    (814, 0x448a0),
-    (815, 0x44a50),
-    (816, 0x452f0),
-    (817, 0x45350),
-    (818, 0x45480),
-    (819, 0x45930),
-    (823, 0x459f0),
-    (824, 0x45a20),
-    (825, 0x45a50),
-    (826, 0x45ad0),
-    (828, 0x45b90),
-    (835, 0x46190),
-    (838, 0x46010),
-    (845, 0x467c0),
-    (846, 0x46a70),
-    (849, 0x46cb0),
-    (851, 0x46d90),
-    (852, 0x46df0),
-    (853, 0x46e50),
-    (854, 0x46e70),
-    (856, 0x46eb0),
-    (858, 0x47340),
-    (868, 0x47390),
-    (870, 0x473c0),
-    (871, 0x473e0),
-    (872, 0x47550),
-    (884, 0x475e0),
-    (886, 0x46e30),
-    (891, 0x47720),
-    (892, 0x47390),
-    (914, 0x30d70),
-    (915, 0x30d90),
-    (920, 0x2e910),
-    (965, 0x181b0),
-    (969, 0x4a440),
-    (1032, 0x1b4f0),
-    (1103, 0x45920),
-    (1140, 0x464f0),
-    (1149, 0x46720),
-    (1175, 0x4a510),
-    (1502, 0x1e4b0),
-    (1309, 0x19880),
-    (1527, 0x4db30),
-    (1528, 0x181d0),
-    (1072, 0x1ada0),
-    (1074, 0x19560),
-    (1075, 0x19550),
-    (1302, 0x1b100),
-    (163, 0x23440),
-    (164, 0x255c0),
-    (167, 0x23da0),
-    (169, 0x23f90),
-    (199, 0x25280),
-    (195, 0x1db60),
-    (196, 0x1df10),
-    (206, 0x1cb20),
-    (207, 0x1cb50),
-    (171, 0x1e470),
-    (172, 0x1e490),
-    (175, 0x23440),
-    (176, 0x23460),
-    (334, 0x1b6f0),
-    (374, 0x1d400),
-    (375, 0x1d490),
-    (376, 0x1db60),
-    (377, 0x1db90),
-    (383, 0x28330),
-    (384, 0x28380),
-    (385, 0x28040),
-    (401, 0x2af70),
-    (404, 0x29ff0),
-    (405, 0x2a0e0),
-    (434, 0x2a760),
-    (463, 0x48020),
-    (288, 0x1b500),
-    (921, 0x2ec30),
-    (922, 0x2e920),
-    (923, 0x2eeb0),
-    (928, 0x2ee60),
-    (929, 0x2edc0),
-    (932, 0x2e850),
-    (933, 0x2e8b0),
-];
 // Commands are accepted only while the COM owner is idle. A click during
 // GameStart must never become a queued second game or sign out beneath FFXI.
 const GAME: u8 = 0;
@@ -159,9 +68,21 @@ fn finish_startup() -> bool {
     with_startup_state(|state| state.swap(STARTUP_FINISHED, Ordering::AcqRel) != CANCELLING_SIGN_IN)
 }
 
+/// The launcher-protocol refusal: the command was not accepted now.
+pub(crate) const BUSY: i32 = -256;
+/// `native_pol_status`: the member session is gone (or not connected).
+const SESSION_LOST: i32 = -1025;
+
+fn control_result(action: &str, code: i32) {
+    events::send(format!("{{\"type\":\"native_control_result\",\"action\":\"{action}\",\"code\":{code}}}\n"));
+}
+fn pol_status(code: i32) {
+    events::send(format!("{{\"type\":\"native_pol_status\",\"code\":{code}}}\n"));
+}
+
 fn cancel_startup(state: &AtomicU8, pending_play: bool) -> Option<i32> {
     if state.load(Ordering::Acquire) == STARTUP_FINISHED { return None; }
-    if pending_play { return Some(-256); }
+    if pending_play { return Some(BUSY); }
     match state.compare_exchange(SIGNING_IN, CANCELLING_SIGN_IN, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) | Err(CANCELLING_SIGN_IN) => Some(0),
         Err(_) => None,
@@ -208,9 +129,10 @@ const FFXI_APP: usize = 1;
 /// The Viewer application id it publishes on return (app 101cf603).
 const VIEWER_APP: i32 = 1000;
 /// app 1001b13f: the auto-away check runs when the gated counter exceeds 3600
-/// stock frames, 112.5 s at the cold 31.25 ms frame: 5625 frames of 20 ms
-/// (pol-spec 08 §4 item 7, 07d §6 S1 D).
-const AUTO_AWAY_FRAMES: u32 = native_jobs::stock_frames(3600);
+/// stock frames: 112.5 s at the 1.18.15e Viewer's cold 31.25 ms frame (5625
+/// frames of 20 ms), about 61 s at the 1.18.15f Viewer's ~17 ms frame (3060);
+/// the installed app.dll decides (pol-spec 08 §4 item 7, 07d §6 S1 D).
+fn auto_away_frames() -> u32 { native_jobs::stock_frames(3600) }
 /// 101983fb polls 817 at least 100 ms apart (696 clock) and never pumps.
 const CLOSE_POLL: Duration = Duration::from_millis(100);
 /// The Viewer polls without a limit; Crystal logs and stops after this.
@@ -223,7 +145,7 @@ const ABORT_LIMIT: Duration = Duration::from_secs(30);
 const SLOTS_FULL: i32 = -256;
 /// The four sign-in/return lists in the Viewer's start order (app 10040650,
 /// 10040822): friends, handles, characters, groups.
-const LISTS: [(&'static str, usize, usize); 4] =
+const LISTS: [(&str, usize, usize); 4] =
     [("friends", 163, 164), ("handles", 171, 172), ("characters", 175, 176), ("groups", 383, 384)];
 
 /// Longest wait for the launcher's W2U answer. It must cover the launcher's
@@ -271,8 +193,7 @@ thread_local! { static TEST_PLAY_PENDING: std::cell::Cell<bool> = const { std::c
 pub(crate) fn play_pending() -> bool { TEST_PLAY_PENDING.with(|p| p.get()) }
 
 pub fn request_start_game() {
-    let code = accept_play(&CONTROL, &PLAY_LATCH);
-    events::send(format!("{{\"type\":\"native_control_result\",\"action\":\"start_game\",\"code\":{code}}}\n"));
+    control_result("start_game", accept_play(&CONTROL, &PLAY_LATCH));
 }
 static START_GATE: std::sync::Mutex<Option<crate::start_gate::Participant>> = std::sync::Mutex::new(None);
 pub fn request_batch_game(token: &str) {
@@ -285,9 +206,9 @@ pub fn request_batch_game(token: &str) {
             if code != 0 { *gate = None; }
             code
         }
-        _ => -256,
+        _ => BUSY,
     };
-    events::send(format!("{{\"type\":\"native_control_result\",\"action\":\"start_game\",\"code\":{code}}}\n"));
+    control_result("start_game", code);
 }
 pub fn wait_batch_game() -> Result<(), String> {
     let gate = START_GATE.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -297,7 +218,7 @@ pub fn wait_batch_game() -> Result<(), String> {
 pub fn request_sign_out() {
     let code = with_startup_state(|state| cancel_startup(state, play_pending()))
         .unwrap_or_else(|| accept_control(&CONTROL, &PLAY_LATCH, SIGN_OUT));
-    events::send(format!("{{\"type\":\"native_control_result\",\"action\":\"sign_out\",\"code\":{code}}}\n"));
+    control_result("sign_out", code);
 }
 pub fn request_status(mode: i32, groups: bool) {
     let flag = if groups { GROUPS } else { 0 };
@@ -309,21 +230,20 @@ pub fn request_status(mode: i32, groups: bool) {
     }
 }
 fn request_control(command: u8, name: &str) {
-    let code = accept_control(&CONTROL, &PLAY_LATCH, command);
-    events::send(format!("{{\"type\":\"native_control_result\",\"action\":\"{name}\",\"code\":{code}}}\n"));
+    control_result(name, accept_control(&CONTROL, &PLAY_LATCH, command));
 }
 /// Every non-Play command starts only from the idle Viewer with no Play queued.
 fn accept_control(control: &AtomicU8, latch: &AtomicBool, command: u8) -> i32 {
-    if latch.load(Ordering::Acquire) { return -256; }
-    if control.compare_exchange(SOCIAL, command, Ordering::AcqRel, Ordering::Acquire).is_ok() { 0 } else { -256 }
+    if latch.load(Ordering::Acquire) { return BUSY; }
+    if control.compare_exchange(SOCIAL, command, Ordering::AcqRel, Ordering::Acquire).is_ok() { 0 } else { BUSY }
 }
 /// Play from the idle Viewer, or latched behind a running user command. Never
 /// during a game, a sign-out or a second Play.
 fn accept_play(control: &AtomicU8, latch: &AtomicBool) -> i32 {
-    if latch.load(Ordering::Acquire) { return -256; }
+    if latch.load(Ordering::Acquire) { return BUSY; }
     if control.compare_exchange(SOCIAL, START_GAME, Ordering::AcqRel, Ordering::Acquire).is_ok() { return 0; }
     let user_command = matches!(control.load(Ordering::Acquire) & !GROUPS, SOCIAL_REQUEST | VISIBLE | AWAY | INVISIBLE);
-    if user_command && latch.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() { 0 } else { -256 }
+    if user_command && latch.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() { 0 } else { BUSY }
 }
 /// The owner finished a user command: a latched Play starts now.
 fn release_command(control: &AtomicU8, latch: &AtomicBool) {
@@ -337,13 +257,6 @@ fn take_latched_play(control: &AtomicU8, latch: &AtomicBool) {
     }
 }
 
-/// The Viewer has no manual friend refresh: Get Friend List (163) runs only at
-/// sign-in and on return from a game (03 §6, 04 D14). The launcher's request is
-/// answered and nothing is sent.
-pub fn refuse_friends_refresh() {
-    log!("native POL friend refresh refused (the Viewer has none)");
-    events::send("{\"type\":\"native_friends_refresh_result\",\"code\":-256}\n".into());
-}
 /// Launcher-window input counts as Viewer input (owner decision 2): it resets
 /// the idle clock the auto-away check reads (app [obj+0x2c0], 10060039).
 pub fn note_activity() {
@@ -361,39 +274,41 @@ fn idle_time() -> Duration {
 pub fn request_social(request: proto::NativeSocialRequest) {
     let mut pending = crate::native_social::REQUEST.lock().unwrap_or_else(|e| e.into_inner());
     if pending.is_some() || accept_control(&CONTROL, &PLAY_LATCH, SOCIAL_REQUEST) != 0 {
-        events::send(format!("{{\"type\":\"native_social_result\",\"id\":\"{}\",\"action\":\"{}\",\"code\":-256}}\n", request.id(), request.action()));
+        crate::native_social::result(&request, BUSY, None);
     } else { *pending = Some(request); }
 }
 
-pub fn validate_entries(table: &[usize], base: usize) -> Result<(), String> {
-    for &(slot, rva) in ENTRY_RVAS.iter().chain(crate::native_social::ENTRY_RVAS).chain(crate::native_jobs::ENTRY_RVAS) {
-        if table.get(slot).copied() != base.checked_add(rva) {
-            return Err(format!(
-                "PlayOnline service entry {slot} differs from the verified native core."
-            ));
-        }
-    }
-    Ok(())
-}
-
+/// The core's common function table, checked by `pol_core::check_table`.
+/// Every call names the number of word arguments it passes; debug builds
+/// (every test) assert that it is the count `pol_core::SERVICES` records for
+/// that slot, so the validated registry and the calls cannot drift apart.
 #[derive(Clone)]
 pub(crate) struct Api(Box<[usize]>);
 impl Api {
+    /// A table `pol_core::check_table` accepted.
+    pub(crate) fn new(table: &[usize]) -> Self { Self(table.into()) }
     #[cfg(test)]
     pub(crate) fn test_table(table: &[usize]) -> Self { Self(table.into()) }
-    // All signatures below are verified cdecl wrappers from this exact image.
-    pub(crate) unsafe fn f<F: Copy>(&self, slot: usize) -> F {
+    /// cdecl entry `slot`, called with `args` word arguments as `F`.
+    pub(crate) unsafe fn f<F: Copy>(&self, slot: usize, args: u8) -> F {
+        debug_assert_eq!(crate::pol_core::service(slot).and_then(|s| s.args), Some(args),
+            "service {slot} is called with {args} arguments but pol_core::SERVICES records otherwise");
         std::mem::transmute_copy(&self.0[slot])
     }
+    /// The table's entry `slot`, handed back to the core as a callback.
+    pub(crate) fn entry(&self, slot: usize) -> usize {
+        debug_assert!(crate::pol_core::service(slot).is_some(), "entry {slot} is not in pol_core::SERVICES");
+        self.0[slot]
+    }
     pub(crate) fn zero(&self, slot: usize) -> i32 {
-        unsafe { self.f::<unsafe extern "C" fn() -> i32>(slot)() }
+        unsafe { self.f::<unsafe extern "C" fn() -> i32>(slot, 0)() }
     }
     pub(crate) fn one(&self, slot: usize, argument: usize) -> i32 {
-        unsafe { self.f::<unsafe extern "C" fn(usize) -> i32>(slot)(argument) }
+        unsafe { self.f::<unsafe extern "C" fn(usize) -> i32>(slot, 1)(argument) }
     }
     pub(crate) fn two(&self, slot: usize, a: usize, b: usize) {
         // Credential/string setters have no return value.
-        unsafe { self.f::<unsafe extern "C" fn(usize, usize)>(slot)(a, b) }
+        unsafe { self.f::<unsafe extern "C" fn(usize, usize)>(slot, 2)(a, b) }
     }
     /// cdecl call with up to six word arguments (signed values as two's
     /// complement). The caller pops, so void entries just return garbage eax.
@@ -405,13 +320,13 @@ impl Api {
         type W = usize;
         unsafe {
             match *a {
-                [] => self.f::<unsafe extern "C" fn() -> W>(slot)(),
-                [p] => self.f::<unsafe extern "C" fn(W) -> W>(slot)(p),
-                [p, q] => self.f::<unsafe extern "C" fn(W, W) -> W>(slot)(p, q),
-                [p, q, r] => self.f::<unsafe extern "C" fn(W, W, W) -> W>(slot)(p, q, r),
-                [p, q, r, s] => self.f::<unsafe extern "C" fn(W, W, W, W) -> W>(slot)(p, q, r, s),
-                [p, q, r, s, t] => self.f::<unsafe extern "C" fn(W, W, W, W, W) -> W>(slot)(p, q, r, s, t),
-                [p, q, r, s, t, u] => self.f::<unsafe extern "C" fn(W, W, W, W, W, W) -> W>(slot)(p, q, r, s, t, u),
+                [] => self.f::<unsafe extern "C" fn() -> W>(slot, 0)(),
+                [p] => self.f::<unsafe extern "C" fn(W) -> W>(slot, 1)(p),
+                [p, q] => self.f::<unsafe extern "C" fn(W, W) -> W>(slot, 2)(p, q),
+                [p, q, r] => self.f::<unsafe extern "C" fn(W, W, W) -> W>(slot, 3)(p, q, r),
+                [p, q, r, s] => self.f::<unsafe extern "C" fn(W, W, W, W) -> W>(slot, 4)(p, q, r, s),
+                [p, q, r, s, t] => self.f::<unsafe extern "C" fn(W, W, W, W, W) -> W>(slot, 5)(p, q, r, s, t),
+                [p, q, r, s, t, u] => self.f::<unsafe extern "C" fn(W, W, W, W, W, W) -> W>(slot, 6)(p, q, r, s, t, u),
                 _ => unreachable!("no common-table entry takes more than six arguments here"),
             }
         }
@@ -426,7 +341,7 @@ impl Api {
             )
         });
         unsafe {
-            self.f::<unsafe extern "C" fn(i32, usize, usize, usize)>(1502)(mode, name, secret, otp)
+            self.f::<unsafe extern "C" fn(i32, usize, usize, usize)>(1502, 4)(mode, name, secret, otp)
         }
     }
     /// ChangeMyStatus (376 = the same code as 195) with the Viewer's tuple
@@ -442,7 +357,7 @@ impl Api {
         // to restore stock behavior; native transfer and errors remain intact.
         let before = self.zero(1074);
         if before != 0 {
-            unsafe { self.f::<unsafe extern "C" fn(i32)>(1075)(0) };
+            unsafe { self.f::<unsafe extern "C" fn(i32)>(1075, 1)(0) };
         }
         if self.zero(1074) != 0 {
             return Err("The native PlayOnline viewer policy could not be restored.".into());
@@ -453,7 +368,7 @@ impl Api {
 }
 
 /// Runs a status-job request (376/377) under the Viewer's Normal policy.
-fn status_request(api: &Api, name: &'static str, tuple: [i32; 6], frame: &mut dyn FnMut() -> bool) -> i32 {
+pub(crate) fn status_request(api: &Api, name: &'static str, tuple: [i32; 6], frame: &mut dyn FnMut() -> bool) -> i32 {
     native_jobs::run(api, Request { name, start: &mut || api.begin_status(tuple), poll: 377, policy: Policy::Normal }, frame)
 }
 
@@ -494,7 +409,7 @@ impl AutoAway {
             return false;
         }
         self.frames += 1;
-        if self.frames <= AUTO_AWAY_FRAMES {
+        if self.frames <= auto_away_frames() {
             return false;
         }
         self.frames = 0;
@@ -530,7 +445,7 @@ impl ViewerStatus {
         // session error until attach_game's state line clears it, and a batch
         // release reads that window as a dead session.
         if code >= 0 || code == -261 || !play_requested() {
-            events::send(format!("{{\"type\":\"native_control_result\",\"action\":\"{action}\",\"code\":{code}}}\n"));
+            control_result(action, code);
         }
         self.pending = None;
     }
@@ -619,11 +534,16 @@ impl NativeSession {
     pub fn set_viewer_gaps(&mut self, gaps: bool) { self.viewer_gaps = gaps; }
 
     /// pol.exe → app.dll startup on a fresh core, before any 815/814 (A1/A2/A8).
-    /// The caller keeps the verified core alive through this object's lifetime;
-    /// `viewer_c` and `regkey` must outlive it (the core keeps the pointers).
-    pub unsafe fn bootstrap(
+    ///
+    /// # Safety
+    /// `table` is the core's live function table that `pol_core::check_table`
+    /// accepted (`_checked`). The caller keeps that core alive through this
+    /// object's lifetime; `viewer_c` and `regkey` must outlive it (the core
+    /// keeps the pointers).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn bootstrap(
         table: &[usize],
-        base: usize,
+        _checked: &crate::pol_core::Table,
         viewer: &Path,
         viewer_c: &'static CStr,
         regkey: &'static CStr,
@@ -631,8 +551,7 @@ impl NativeSession {
         language: u32,
         auto_away_minutes: u32,
     ) -> Result<Self, String> {
-        validate_entries(table, base)?;
-        let mut session = Self::new(Api(table.into()), viewer, area, auto_away_minutes);
+        let mut session = Self::new(Api::new(table), viewer, area, auto_away_minutes);
         session.language = language;
         session.api.restore_viewer_policy()?;
         session.bootstrap_core(viewer_c, regkey)?;
@@ -670,7 +589,7 @@ impl NativeSession {
     fn region_settings(&self) {
         self.api.call(965, &[usize::from(self.area != 0)]);
         self.api.call(1527, &[usize::from(self.area == 0)]);
-        self.api.call(1309, &[b"01\0".as_ptr() as usize]);
+        self.api.call(1309, &[c"01".as_ptr() as usize]);
     }
 
     /// 871 as app 1019b8b9 / 10050fd9: entry 1 is the core's own dispatcher
@@ -681,9 +600,9 @@ impl NativeSession {
     fn register_callbacks(&self) {
         let set = [
             no_chat_window as *const () as usize,
-            self.api.0[334],
+            self.api.entry(334),
             no_chat_window as *const () as usize,
-            self.api.0[401],
+            self.api.entry(401),
             crate::native_social::mail_arrived as *const () as usize,
             no_service_view as *const () as usize,
         ];
@@ -731,7 +650,7 @@ impl NativeSession {
     }
 
     fn sign_in_core(&mut self, home: u32, c: &NativeCredentials) -> Result<(), String> {
-        if startup_cancelled() { return Err("PlayOnline sign-in was cancelled.".into()); }
+        if startup_cancelled() { return Err(SIGN_IN_CANCELLED.into()); }
         self.select_member(home, c);
         let name = native_profile::selected_name(&self.api, self.profiles)?;
         native_profile::connect(&self.api, &name)?; // connect screen 10199d02
@@ -739,8 +658,7 @@ impl NativeSession {
         // network level (838 == 2), then Open(1) for member login. Mode 1 skips
         // the core's own state-40 status request that Open(3) would add; the
         // live captures contain none. 1502 is set before member login.
-        self.open(0, 2)?;
-        self.network_opened = true;
+        self.open(0, 2)?; // sets network_opened once the network is open
         self.connect_viewer_check()?;
         self.api.se(Some(c));
         self.open(1, 3)?;
@@ -762,17 +680,19 @@ impl NativeSession {
             native_jobs::run(&api, Request { name: "status", start: &mut || api.zero(374), poll: 375, policy: Policy::Login }, &mut || cadence.frame(&api, &mut self.pushes))
         };
         log!("native POL status load result {status} in {:.2}s", status_started.elapsed().as_secs_f64());
-        if !(status > 0 || status == -261) {
-            return Err(format!("Native PlayOnline status loading failed ({status})."));
+        if !native_jobs::succeeded(status) {
+            return Err(startup_stop(LAUNCHER_CLOSED).unwrap_or_else(|| format!("Native PlayOnline status loading failed ({status}).")));
         }
         let results = {
             let mut cadence = StartupCadence::new("lists");
             cadence.frame(&api, &mut self.pushes); // the queued lists start on the next pump tick
             run_concurrent(&api, &LISTS, &mut || cadence.frame(&api, &mut self.pushes))
         };
-        if let Some((name, result)) = LISTS.iter().zip(&results).map(|((n, ..), r)| (n, *r)).find(|(_, r)| !(*r > 0 || *r == -261)) {
-            return Err(format!("Native PlayOnline {name} loading failed ({result})."));
+        if let Some((name, result)) = LISTS.iter().zip(&results).map(|((n, ..), r)| (n, *r)).find(|(_, r)| !native_jobs::succeeded(*r)) {
+            return Err(startup_stop(LAUNCHER_CLOSED).unwrap_or_else(|| format!("Native PlayOnline {name} loading failed ({result}).")));
         }
+        crate::native_handles::ensure(&api, &c.handle_names, &mut || owner_frame(&api, &mut self.pushes))
+            .map_err(|error| startup_stop(LAUNCHER_CLOSED).unwrap_or(error))?;
         events::send("{\"type\":\"authenticated\"}\n".into());
         log!("native POL authenticated; all game service callbacks are original");
         // Main menu entry: the mail list, then the Viewer presence about a
@@ -783,6 +703,12 @@ impl NativeSession {
         let listed = self.social.social_entry_with_list_frame(&api, STARTUP_FRAME,
             &mut |interval| owner_frame_at(&api, &mut self.pushes, interval));
         log!("native POL startup mail completed in {:.2}s", mail_started.elapsed().as_secs_f64());
+        // A Viewer closed or cancelled here publishes no presence (376) only to
+        // cancel it (337) ahead of the sign-out.
+        if owner_stopping(&api) {
+            return Err(startup_stop(LAUNCHER_CLOSED).unwrap_or_else(||
+                format!("Native PlayOnline connection failed during sign-in (POL result {}).", api.zero(1103))));
+        }
         // Stock mail response → publish SYN: 1.606 s (r2), ~1.63 s (r1) at sign-in,
         // counted from the list response so new-mail transfers fall inside it (07c §5.4).
         self.viewer_gap(&api, "mail → presence", listed, MAIL_TO_PUBLISH_FRAMES)?;
@@ -816,7 +742,7 @@ impl NativeSession {
             }
             if !owner_frame(api, &mut self.pushes) {
                 log!("native POL Viewer gap {stage} stopped after {frames} frame(s)");
-                if events::pipe_closed() || startup_cancelled() { return Err("The launcher closed the session during PlayOnline sign-in.".into()); }
+                if let Some(stop) = startup_stop(LAUNCHER_CLOSED) { return Err(stop); }
                 return Err(format!("Native PlayOnline connection failed during sign-in (POL result {}).", api.zero(1103)));
             }
             frames += 1;
@@ -838,7 +764,7 @@ impl NativeSession {
         if std::mem::replace(&mut self.viewer_checked, true) {
             return Err("The PlayOnline Viewer version check already ran for this sign-in.".into());
         }
-        if events::pipe_closed() || startup_cancelled() { return Err(VIEWER_CHECK_SILENT.into()); }
+        if let Some(stop) = startup_stop(VIEWER_CHECK_SILENT) { return Err(stop); }
         let api = self.api.clone();
         *VIEWER_CHECK.lock().unwrap_or_else(|e| e.into_inner()) = None; // only this request's answer counts
         events::send(proto::viewer_check_line());
@@ -880,8 +806,7 @@ impl NativeSession {
     /// An owner frame stopped a sign-in wait: the launcher is gone or the core
     /// latched a pump error.
     fn stopped_owner(&self, api: &Api) -> String {
-        if events::pipe_closed() { return VIEWER_CHECK_SILENT.into(); }
-        if startup_cancelled() { return "PlayOnline sign-in was cancelled.".into(); }
+        if let Some(stop) = startup_stop(VIEWER_CHECK_SILENT) { return stop; }
         format!("Native PlayOnline connection failed before member login (POL result {}).", api.zero(1103))
     }
 
@@ -898,10 +823,10 @@ impl NativeSession {
         api.two(856, password.as_mut_ptr() as usize, c.pol_password.as_ptr() as usize);
         api.two(852, password.as_ptr() as usize, 0);
         let mut none = [0u8; native_profile::NAME_LEN];
-        api.call(858, &[none.as_mut_ptr() as usize, b"\0".as_ptr() as usize]);
+        api.call(858, &[none.as_mut_ptr() as usize, c"".as_ptr() as usize]);
         api.call(886, &[none.as_ptr() as usize]);
         let mut host = [0u8; 0x42];
-        api.two(868, host.as_mut_ptr() as usize, b"ci000.pol.com\0".as_ptr() as usize);
+        api.two(868, host.as_mut_ptr() as usize, c"ci000.pol.com".as_ptr() as usize);
         api.one(853, host.as_ptr() as usize);
         let code = api.zero(891);
         if code != native_profile::PROFILE_NOT_FOUND {
@@ -914,10 +839,10 @@ impl NativeSession {
     /// (2 network, 3 member). 31..38 are transitional; failure is a negative
     /// state, reported with 823 (D18).
     fn open(&mut self, mode: usize, linked: i32) -> Result<(), String> {
-        if startup_cancelled() { return Err("PlayOnline sign-in was cancelled.".into()); }
+        if startup_cancelled() { return Err(SIGN_IN_CANCELLED.into()); }
         let name = if mode == 0 { "open-network" } else { "open-member" };
         let mut cadence = StartupCadence::new(name);
-        let api = &self.api;
+        let api = &self.api.clone();
         let connection = api.word(835, &[]);
         // 07d §4.7: start/end, one attempt, one poll per 815.
         let mut request = native_jobs::RequestLog::start(name);
@@ -965,7 +890,14 @@ impl NativeSession {
                 }
             }
             match connection_result(state, || api.zero(838), linked) {
-                Some(Ok(())) => return Ok(()),
+                Some(Ok(())) => {
+                    // The network is open and needs the native close, also
+                    // when the abort below came too late to fail the Open.
+                    if mode == 0 { self.network_opened = true; }
+                    if aborted.is_none() { return Ok(()); }
+                    return Err(startup_stop(LAUNCHER_CLOSED)
+                        .unwrap_or_else(|| format!("Native PlayOnline login timed out at state {state}.")));
+                }
                 Some(Err(())) => {
                     let error = api.zero(823); // non-consuming native error getter
                     return Err(open_failure(mode, state, error, aborted.is_some()));
@@ -1005,6 +937,10 @@ impl NativeSession {
             // 872 removing the callback. A push cannot land in a disabled sink.
             self.pushes.flush_pushed(&api, true);
         }
+        let dropped = self.pushes.abandon_receipts();
+        if dropped > 0 {
+            log!("native POL {dropped} mail receipt(s) not accepted before the game; dropped like the Viewer's");
+        }
         // Play (app 1019fe84 / 1019fec7): clear the arrival flag, hold delivery
         // off only around the version check, then back on. The live probe
         // shows 1032 at 1 throughout the game, so FFXI's 288 receiver gets
@@ -1032,15 +968,16 @@ impl NativeSession {
 
     /// pol.exe's next Viewer instance reusing the signed-in core (B4, 03 §3.4):
     /// startup registrations, 1032(1), post-login 871, the four lists without
-    /// 374, the app-1000 publish, then the social entry.
-    fn return_from_game(&mut self) -> Result<(), String> {
+    /// 374, the app-1000 publish, then the social entry. Ok(false): the owner
+    /// is stopping, so the rest of the return starts no request.
+    fn return_from_game(&mut self) -> Result<bool, String> {
         note_activity(); // 101abaf8 / 1019fde5 refresh the last-input stamp
         native_jobs::restart_request_clock();
         self.region_settings(); // 1001a175
         if self.api.zero(838) != 3 {
             self.signed_in = false;
             self.network_opened = false;
-            events::send("{\"type\":\"native_pol_status\",\"code\":-1025}\n".into());
+            pol_status(SESSION_LOST);
             return Err("PlayOnline is no longer signed in after the game. Sign in again to reconnect.".into());
         }
         self.register_host()?; // 1019b874 (871 is skipped at startup)
@@ -1052,12 +989,14 @@ impl NativeSession {
         for ((name, ..), result) in LISTS.iter().zip(&results) {
             log!("native POL {name} reload result {result}");
         }
+        if owner_stopping(&api) { return Ok(false); }
         // As at sign-in: the mail list first, then the Viewer presence.
         // (Return-path gaps, 0.9-1.06 s, are not restored: 07c §8.4.)
         self.social.social_entry(&api, &mut frame);
+        if owner_stopping(&api) { return Ok(false); }
         let published = Self::publish_viewer(&api, &mut frame);
         events::send(proto::main_menu_line(published, true));
-        Ok(())
+        Ok(true)
     }
 
     /// app 101cf603 → 10041342(1000) with no Viewer-own handle (10019224):
@@ -1085,8 +1024,10 @@ impl NativeSession {
         if events::pipe_closed() {
             return Ok(false);
         }
-        if std::mem::take(&mut self.returned) {
-            self.return_from_game()?;
+        if std::mem::take(&mut self.returned) && !self.return_from_game()? {
+            if events::pipe_closed() { return Ok(false); }
+            let error = self.api.zero(1103);
+            return Err(self.connection_lost(error));
         }
         PLAY_LATCH.store(false, Ordering::Release);
         CONTROL.store(SOCIAL, Ordering::Release);
@@ -1189,7 +1130,7 @@ impl NativeSession {
                 name: "groups-status", start: &mut || api.call(404, &[mode as usize]), poll: 405, policy: Policy::Normal,
             }, &mut || { running = frame(status); running });
             log!("native POL groups status mode={mode} result={code}");
-            events::send(format!("{{\"type\":\"native_control_result\",\"action\":\"groups\",\"code\":{code}}}\n"));
+            control_result("groups", code);
             if !running { status.cancel(api); return; }
         }
         while status.pending.is_some() {
@@ -1202,7 +1143,7 @@ impl NativeSession {
     /// re-login (B8).
     fn connection_lost(&mut self, error: i32) -> String {
         log!("native POL connection lost (POL result {error})");
-        events::send("{\"type\":\"native_pol_status\",\"code\":-1025}\n".into());
+        pol_status(SESSION_LOST);
         self.signed_in = false;
         self.network_opened = false;
         self.viewer_status.cancel(&self.api);
@@ -1221,6 +1162,7 @@ impl NativeSession {
         if !self.signed_in && !self.network_opened { return None; }
         self.signed_in = false;
         self.network_opened = false;
+        log!("native POL sign-out starting");
         self.api.call(816, &[1]);
         let started = Instant::now();
         let result = loop {
@@ -1301,18 +1243,34 @@ fn owner_frame_with(api: &Api, pushes: &mut crate::native_social::PushDelivery, 
     work();
     pushes.flush_pushed(api, api.zero(838) == 3);
     pause_owner(interval);
-    !events::pipe_closed() && !startup_cancelled() && api.zero(1103) >= 0
+    !owner_stopping(api)
 }
 
+/// The owner must stop: the launcher is gone, a startup sign-out was accepted,
+/// or the core latched a pump error (1103). No new request starts then.
+pub(crate) fn owner_stopping(api: &Api) -> bool {
+    events::pipe_closed() || startup_cancelled() || api.zero(1103) < 0
+}
+
+const SIGN_IN_CANCELLED: &str = "PlayOnline sign-in was cancelled.";
+const LAUNCHER_CLOSED: &str = "The launcher closed the session during PlayOnline sign-in.";
+
+/// Why a stopped sign-in ended, when it was not a POL failure: a startup
+/// sign-out, or a closed launcher (`closed` names that stage).
+fn startup_stop(closed: &str) -> Option<String> {
+    if startup_cancelled() { Some(SIGN_IN_CANCELLED.into()) }
+    else if events::pipe_closed() { Some(closed.into()) }
+    else { None }
+}
+
+/// The launcher's startup sign-out ended this sign-in (read before the
+/// session's Drop finishes startup).
+pub(crate) fn sign_in_cancelled() -> bool { startup_cancelled() }
+
 // Initial open/status/list/presence polls, including the wall-clock mail list,
-// use this cadence. The default build steps them one 818 per Viewer frame
-// (07b decision 2; 07a stock-faithful-pacing: 1 ms turnarounds are below any
-// stock timing). The opt-in comparison feature keeps the old 1 ms pilot.
-const STARTUP_FRAME: Duration = if cfg!(feature = "native-fast-login-poll") {
-    Duration::from_millis(1)
-} else {
-    FRAME
-};
+// step one 818 per Viewer frame (07b decision 2; 07a stock-faithful-pacing:
+// 1 ms turnarounds are below any stock timing).
+const STARTUP_FRAME: Duration = FRAME;
 /// The Viewer's screen transitions on a sign-in-only session (07a
 /// stock-faithful-pacing), counted in frames like the Viewer counts them
 /// (08 §4 item 5): op7 end → 374 (stock 1.05 s ≈ 34 frames of 31.25 ms) and
@@ -1385,7 +1343,7 @@ fn run_concurrent(api: &Api, jobs: &[(&'static str, usize, usize)], frame: &mut 
         let running = frame();
         max_frame = max_frame.max(frame_started.elapsed());
         running
-    }, &mut |_, _| {});
+    });
     let took = started.elapsed();
     log!("native POL concurrent loads completed in {:.2}s (longest owner frame {:.0}ms)", took.as_secs_f64(), max_frame.as_secs_f64() * 1000.0);
     // The four lists, start → last end (07d §4.5).
@@ -1424,10 +1382,7 @@ fn run_friend_observer(api: Api, stopping: mpsc::Receiver<()>, send: impl Fn(Str
         let connected = api.zero(838) == 3;
         let connection_changed = health.replace(connected) != Some(connected);
         if connection_changed {
-            send(format!(
-                "{{\"type\":\"native_pol_status\",\"code\":{}}}\n",
-                if connected { 0 } else { -1025 }
-            ));
+            send(format!("{{\"type\":\"native_pol_status\",\"code\":{}}}\n", if connected { 0 } else { SESSION_LOST }));
         }
         if connected {
             // Original locked getters; the word-returning class getter
@@ -1439,7 +1394,7 @@ fn run_friend_observer(api: Api, stopping: mpsc::Receiver<()>, send: impl Fn(Str
                 send(format!("{{\"type\":\"native_own_presence\",\"mode\":{}}}\n", presence.0));
             }
             let mut blob = Zeroizing::new(vec![0u8; proto::FRIENDS_LEN]);
-            blob[..8].copy_from_slice(b"XIPOLF\x01\0");
+            blob[..8].copy_from_slice(crate::wire::FRIENDS_MAGIC);
             for index in 0..proto::FRIEND_SLOTS {
                 let (getter, index_in_table) = if index < 200 {
                     (167, index)
@@ -1452,13 +1407,13 @@ fn run_friend_observer(api: Api, stopping: mpsc::Receiver<()>, send: impl Fn(Str
             }
             let locations = game_friends.snapshot(&blob);
             if *blob != *before || locations != locations_before || connection_changed {
-                let active = blob[8..].chunks_exact(proto::FRIEND_RECORD_LEN).filter(|r| {
+                let active = blob[8..].as_chunks::<{ proto::FRIEND_RECORD_LEN }>().0.iter().filter(|r| {
                     let flags = u64::from_le_bytes(r[8..16].try_into().unwrap());
                     r[0x98] & 1 != 0 && flags & (1 << 11) != 0 && (flags >> 33) & 0x3ff == 1
                 }).count();
                 let mut counts = [active, 0, 0, 0];
                 if let Some(extra) = &locations {
-                    for r in extra[8..].chunks_exact(crate::friend_locations::RECORD_LEN) {
+                    for r in extra[8..].as_chunks::<{ crate::friend_locations::RECORD_LEN }>().0 {
                         counts[1] += usize::from(r[0] != 0);
                         counts[2] += usize::from(r[16] != 0);
                         counts[3] += usize::from(r[80] != 0);
@@ -1491,7 +1446,8 @@ impl Drop for NativeSession {
     /// (920 file worker stop, 915 option.bin mutex). No 852 (B9).
     fn drop(&mut self) {
         // Cancellation stops startup work; teardown still pumps and signs out.
-        finish_startup();
+        let cancelled = !finish_startup();
+        log!("native POL cleanup: cancelling Viewer status and finishing push delivery");
         self.viewer_status.cancel(&self.api);
         crate::native_social::set_listening(false);
         if self.home {
@@ -1501,15 +1457,22 @@ impl Drop for NativeSession {
         }
         crate::native_social::discard_pushed();
         let sign_out = self.close_member();
+        log!("native POL cleanup: clearing member credentials and host registration");
         if self.home {
             self.api.se(None);
         }
         self.unregister_host();
         if self.files {
+            log!("native POL cleanup: stopping file worker");
             self.api.zero(920);
+            log!("native POL cleanup: closing options storage");
             self.api.zero(915);
         }
-        if let Some(code) = sign_out {
+        log!("native POL cleanup finished");
+        // A launcher startup sign-out that landed before any Open succeeded has
+        // nothing to close: report it as the completed sign-out it asked for,
+        // so the launcher records a sign-out rather than a startup exit.
+        if let Some(code) = sign_out.or(cancelled.then_some(0)) {
             events::send(format!("{{\"type\":\"native_sign_out_complete\",\"code\":{code}}}\n"));
         }
     }
@@ -1580,57 +1543,26 @@ fn claim_home(viewer: &Path, key: &str) -> Result<u32, String> {
             && fs::read_to_string(path).ok().as_deref() == Some(&expected)
     };
     // Prefer an existing owned store even when a lower-numbered store is free.
-    let existing = (50..100).find(|slot| {
-        let marker = public
-            .join(format!("home{slot:02}"))
-            .join(".crystal-profile");
-        let private = viewer.join("usr").join(format!("home{slot:02}"));
-        owned(&marker) && (!private.exists() || owned(&private.join(".crystal-profile")))
+    let existing = (50..100).find(|&slot| {
+        let (home, private) = slot_dirs(viewer, &public, slot);
+        owned(&home.join(MARKER)) && (!private.exists() || owned(&private.join(MARKER)))
     });
     let slot = if let Some(slot) = existing {
         slot
     } else {
-        let mut claimed = None;
-        for slot in 50..100 {
-            let home = public.join(format!("home{slot:02}"));
-            if viewer.join("usr").join(format!("home{slot:02}")).exists() {
-                continue;
-            }
-            if fs::create_dir(&home).is_err() {
-                continue;
-            }
-            let marker = home.join(".crystal-profile");
-            let created = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&marker)
-                .and_then(|mut file| {
-                    file.write_all(expected.as_bytes())?;
-                    file.sync_all()
-                });
-            if created.is_ok() {
-                claimed = Some(slot);
-                break;
-            }
-            // Preserve any uncertain contents; never adopt or recursively delete.
-        }
-        claimed.ok_or("No unused PlayOnline message store is available in home50–home99.")?
+        // Preserve any uncertain contents; never adopt or recursively delete.
+        (50..100).find(|&slot| {
+            let (home, private) = slot_dirs(viewer, &public, slot);
+            !private.exists() && fs::create_dir(&home).is_ok() && write_marker(&home.join(MARKER), &expected).is_ok()
+        }).ok_or("No unused PlayOnline message store is available in home50–home99.")?
     };
-    let home = public.join(format!("home{slot:02}"));
-    let private = viewer.join("usr").join(format!("home{slot:02}"));
+    let (home, private) = slot_dirs(viewer, &public, slot);
     if !private.exists() {
         fs::create_dir_all(&private)
             .map_err(|_| "Could not prepare the account's PlayOnline profile folder.")?;
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(private.join(".crystal-profile"))
-            .and_then(|mut file| {
-                file.write_all(expected.as_bytes())?;
-                file.sync_all()
-            })
+        write_marker(&private.join(MARKER), &expected)
             .map_err(|_| "Could not reserve the account's PlayOnline profile folder.")?;
-    } else if !owned(&private.join(".crystal-profile")) {
+    } else if !owned(&private.join(MARKER)) {
         return Err("The PlayOnline profile folder belongs to another client.".into());
     }
     for relative in [
@@ -1656,6 +1588,22 @@ fn claim_home(viewer: &Path, key: &str) -> Result<u32, String> {
             .map_err(|_| "Could not prepare the account's PlayOnline message folders.")?;
     }
     Ok(slot)
+}
+
+/// The ownership marker in each claimed message store and profile folder.
+const MARKER: &str = ".crystal-profile";
+
+/// (pub\homeNN, usr\homeNN) for a member home.
+fn slot_dirs(viewer: &Path, public: &Path, slot: u32) -> (PathBuf, PathBuf) {
+    let name = format!("home{slot:02}");
+    (public.join(&name), viewer.join("usr").join(name))
+}
+
+/// Create the marker atomically (never over an existing file) and flush it.
+fn write_marker(path: &Path, expected: &str) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(expected.as_bytes())?;
+    file.sync_all()
 }
 
 // The viewer's resource IDs, app.dll 10057911..10057a11. Read the installed
@@ -1706,14 +1654,20 @@ fn install_message_texts(api: &Api, viewer: &Path) -> Result<(), String> {
 /// Installed-core ABI check: host registration, the real profile list (read
 /// only), member select and connection choice with synthetic credentials.
 /// Never calls 814/815/816/818 or any request; nothing reaches the network.
+/// # Safety
+/// `table` is an installed, verified core's live table at `base`.
 #[cfg(test)]
 pub unsafe fn smoke_prepare(table: &[usize], base: usize, viewer: &Path) {
-    validate_entries(table, base).unwrap();
+    // The internal-global assertions below were read from the 1.18.15e core
+    // by hand; other builds run the same calls without them. Production
+    // never reads a core global.
+    let legacy = crate::pol_core::Layout::live(base).is_ok_and(|l| l.timestamp == 0x4E4E_5917);
+    let at = |offset: usize| (base + offset) as *const usize;
     let mut session = NativeSession::new(Api(table.into()), viewer, 1, 10);
     // Reproduce the injector's setting in this test's own core, then restore
     // the stock value through the production function. No remote operation.
     let before = table.to_vec();
-    session.api.f::<unsafe extern "C" fn(i32)>(1075)(1);
+    session.api.f::<unsafe extern "C" fn(i32)>(1075, 1)(1);
     assert_eq!(session.api.zero(1074), 1);
     session.api.restore_viewer_policy().unwrap();
     assert_eq!(session.api.zero(1074), 0);
@@ -1734,28 +1688,28 @@ pub unsafe fn smoke_prepare(table: &[usize], base: usize, viewer: &Path) {
     // Host registration as app 1019b874, the installed inet_w.bin through
     // 825/826 and its 884 validation, then the built-in default for comparison.
     session.register_callbacks();
-    assert_eq!(*((base + 0x99424) as *const usize), table[334], "871 routes pushes to the core dispatcher");
+    if legacy { assert_eq!(*at(0x99424), table[334], "871 routes pushes to the core dispatcher"); }
     session.api.call(819, &[0]);
     session.api.call(824, &[malloc as *const () as usize, free as *const () as usize, realloc as *const () as usize]);
     session.registered = true;
     let file = native_profile::read_file(viewer).expect("installed usr\\all\\inet_w.bin");
     let (header, from_file) = native_profile::load(&session.api, Some(&file)).unwrap();
     assert!(from_file, "the installed profile file must pass the Viewer's validation");
-    assert_eq!(*((base + 0x9926c) as *const usize), header);
-    let snapshot = |api: &Api| {
+    if legacy { assert_eq!(*at(0x9926c), header); }
+    let snapshot = |api: &Api, header: usize| {
         let record = api.word(849, &[0]);
-        let mut bytes = std::slice::from_raw_parts(header_of(base) as *const u8, native_profile::HEADER_LEN).to_vec();
+        let mut bytes = std::slice::from_raw_parts(header as *const u8, native_profile::HEADER_LEN).to_vec();
         bytes.extend_from_slice(std::slice::from_raw_parts(record as *const u8, native_profile::RECORD_LEN));
         bytes
     };
-    let installed = snapshot(&session.api);
+    let installed = snapshot(&session.api, header);
     session.api.zero(828);
-    let (_, from_file) = native_profile::load(&session.api, None).unwrap();
+    let (default_header, from_file) = native_profile::load(&session.api, None).unwrap();
     assert!(!from_file);
-    let built = snapshot(&session.api);
+    let built = snapshot(&session.api, default_header);
     assert_eq!(installed[..native_profile::HEADER_LEN], built[..native_profile::HEADER_LEN], "default header");
     assert_eq!(installed[native_profile::HEADER_LEN..], built[native_profile::HEADER_LEN..], "default WindowsNetWork record");
-    session.profiles = *((base + 0x9926c) as *const usize);
+    session.profiles = default_header;
     session.api.call(1149, &[no_inactivity_warning as *const () as usize, no_inactivity_expiry as *const () as usize]);
 
     // Member select (stock failure), then the connect screen's profile load.
@@ -1766,37 +1720,37 @@ pub unsafe fn smoke_prepare(table: &[usize], base: usize, viewer: &Path) {
         se_secret: [0x51; 20],
         otp: Some(*b"123456"),
         profile_key: "a".repeat(40),
+        handle_names: String::new(),
     };
     session.select_member(50, &credentials);
-    assert_eq!(*((base + 0x992e0) as *const u32), 50);
+    if legacy { assert_eq!(*(at(0x992e0) as *const u32), 50); }
     assert_eq!(session.api.zero(891), native_profile::PROFILE_NOT_FOUND, "Viewer members name no profile");
     let name = native_profile::selected_name(&session.api, session.profiles).unwrap();
     native_profile::connect(&session.api, &name).unwrap();
-    assert_eq!(*((base + 0x99c80) as *const i32), 1, "connection kind LAN");
+    if legacy { assert_eq!(*(at(0x99c80) as *const i32), 1, "connection kind LAN"); }
     assert_eq!(*(session.api.word(835, &[]) as *const i32), 1, "Open argument kind LAN");
     session.api.se(Some(&credentials));
-    assert_eq!(*((base + 0xaaa98) as *const u32), 2, "native SE + OTP mode");
-    assert_eq!(
-        std::slice::from_raw_parts((base + 0xaaaad) as *const u8, 20),
-        &[0xae; 20],
-        "native transformed secret retained"
-    );
+    if legacy {
+        assert_eq!(*(at(0xaaa98) as *const u32), 2, "native SE + OTP mode");
+        assert_eq!(std::slice::from_raw_parts(at(0xaaaad) as *const u8, 20), &[0xae; 20], "native transformed secret retained");
+    }
     assert_ne!(session.api.zero(838), 3);
     // Close teardown without a member session: 1502 clear, 828/824/819/872/1149.
     session.home = true;
     session.files = false; // smoke_message_files owns this test's file worker
     drop(session);
-    assert_eq!(*((base + 0xaaa98) as *const u32), 0, "native credentials cleared");
-    assert_eq!(*((base + 0x9926c) as *const usize), 0, "profile list freed");
-    assert_eq!(*((base + 0x9925c) as *const usize), 0, "host heap unregistered");
-    assert_eq!(*((base + 0x99424) as *const usize), table[334], "872 restores the core's defaults");
+    if legacy {
+        assert_eq!(*(at(0xaaa98) as *const u32), 0, "native credentials cleared");
+        assert_eq!(*at(0x9926c), 0, "profile list freed");
+        assert_eq!(*at(0x9925c), 0, "host heap unregistered");
+        assert_eq!(*at(0x99424), table[334], "872 restores the core's defaults");
+    }
 }
-#[cfg(test)]
-unsafe fn header_of(base: usize) -> usize { *((base + 0x9926c) as *const usize) }
 
+/// # Safety
+/// `table` is an installed, verified core's live table at `base`.
 #[cfg(test)]
-pub unsafe fn smoke_message_files(table: &[usize], base: usize) {
-    validate_entries(table, base).unwrap();
+pub unsafe fn smoke_message_files(table: &[usize]) {
     let api = Api(table.into());
     let root = std::env::temp_dir().join(format!(
         "crystal-native-mail-{}-{}",
@@ -1812,7 +1766,7 @@ pub unsafe fn smoke_message_files(table: &[usize], base: usize) {
     api.one(870, slot as usize);
     api.zero(932);
     let mut directory = [0u8; 512];
-    let get_path = api.f::<unsafe extern "C" fn(i32, *mut u8, i32, i32) -> i32>(126);
+    let get_path = api.f::<unsafe extern "C" fn(i32, *mut u8, i32, i32) -> i32>(126, 4);
     let length = get_path(6, directory.as_mut_ptr(), 512, 0);
     assert!(length > 0 && length < 512);
     let directory =
@@ -1820,7 +1774,7 @@ pub unsafe fn smoke_message_files(table: &[usize], base: usize) {
     assert_eq!(directory, root.join(format!("pub/home{slot:02}/msg/s/a")));
     let path = directory.join("offline-test.bin");
     let file = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    let open = api.f::<unsafe extern "C" fn(*const u8, u32) -> i32>(921);
+    let open = api.f::<unsafe extern "C" fn(*const u8, u32) -> i32>(921, 2);
     let ticket = open(file.as_ptr().cast(), 0x0e); // FFXI's failing friend-request mode
     assert!(ticket >= 0, "native message-file open failed: {ticket}");
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1831,9 +1785,9 @@ pub unsafe fn smoke_message_files(table: &[usize], base: usize) {
     }
     assert_eq!(ready, 1, "native message-file open completion");
     let bytes = b"Crystal native message storage check";
-    let write = api.f::<unsafe extern "C" fn(i32, *const u8, u32) -> i32>(928);
+    let write = api.f::<unsafe extern "C" fn(i32, *const u8, u32) -> i32>(928, 3);
     assert!(write(ticket, bytes.as_ptr(), bytes.len() as u32) >= 0);
-    let poll = api.f::<unsafe extern "C" fn(i32, *mut u32) -> i32>(929);
+    let poll = api.f::<unsafe extern "C" fn(i32, *mut u32) -> i32>(929, 2);
     let mut written = 0;
     let mut ready = poll(ticket, &mut written);
     while ready == 0 && Instant::now() < deadline {
@@ -1892,13 +1846,13 @@ fn resource_text(decoded: &[u8], id: u16) -> Option<Vec<u8>> {
     while at + 4 <= decoded.len() {
         let size = u16::from_le_bytes(decoded[at..at + 2].try_into().ok()?) as usize;
         let key = u16::from_le_bytes(decoded[at + 2..at + 4].try_into().ok()?);
-        if size < 4 || size % 2 != 0 || at.checked_add(size)? > decoded.len() {
+        if size < 4 || !size.is_multiple_of(2) || at.checked_add(size)? > decoded.len() {
             return None;
         }
         if key == id {
             let units: Vec<u16> = decoded[at + 4..at + size]
-                .chunks_exact(2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .as_chunks::<2>().0.iter()
+                .map(|b| u16::from_le_bytes(*b))
                 .collect();
             let end = units.iter().position(|u| *u == 0).unwrap_or(units.len());
             // Verified US templates are ASCII. Refuse unsupported encodings rather

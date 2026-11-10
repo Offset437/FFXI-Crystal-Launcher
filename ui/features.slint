@@ -1,0 +1,686 @@
+// The launcher features' screens (src/features/ui.rs; src/slint_host/features.rs fills them):
+// a side sheet with one section per feature (window layouts, hotkeys, crash recovery, backups,
+// per-client performance and launch profiles, notifications, Discord and play time), the
+// relaunch banner over the play bar, and the background-gamepad line of the account sheet.
+// Every string comes from Rust; every control sends a `Message::Feature` (or an existing core
+// message for an account's own settings).
+import { Theme } from "theme.slint";
+import { Glyph, Icon, Dot, SmallButton, Control, Tone, Check, Select, Segmented, Rule, Spinner } from "widgets.slint";
+import { Note, ErrorNote, Fieldset, Labelled, CheckNote, Card, CardRow, SavedField, SideSheet, SheetBody, SheetFooter } from "form.slint";
+
+/// The words that change only with the language.
+export struct FeatureStrings {
+    entry: string,
+    caption: string,
+    title: string,
+    close: string,
+    layouts: string,
+    remember: string,
+    remember-note: string,
+    restore: string,
+    restore-note: string,
+    launch-saved: string,
+    launch-saved-note: string,
+    order-windows: string,
+    order-windows-note: string,
+    arrange: string,
+    monitor: string,
+    grid: string,
+    main-large: string,
+    arrange-note: string,
+    remembered: string,
+    no-layouts: string,
+    forget: string,
+    switch-windows: string,
+    per-account: string,
+    hotkey-placeholder: string,
+    hotkey-note: string,
+    no-accounts: string,
+    recovery: string,
+    offer: string,
+    offer-note: string,
+    auto-relaunch: string,
+    auto-note: string,
+    pending: string,
+    no-pending: string,
+    backups: string,
+    back-up-now: string,
+    before-update: string,
+    keep: string,
+    saved-backups: string,
+    no-backups: string,
+    restore-action: string,
+    restore-question: string,
+    cancel: string,
+    background: string,
+    background-priority: string,
+    background-priority-note: string,
+    mute-background: string,
+    mute-background-note: string,
+    priority: string,
+    processors: string,
+    processors-placeholder: string,
+    mute-client: string,
+    edit-account: string,
+    running: string,
+    notifications: string,
+    notify: string,
+    notify-mail: string,
+    notify-friends: string,
+    discord: string,
+    discord-switch: string,
+    playtime: string,
+    record: string,
+    no-playtime: string,
+    relaunch: string,
+    dismiss: string,
+}
+
+/// A remembered window.
+export struct LayoutLine {
+    name: string,
+    detail: string,
+}
+
+/// A hotkey field: what it does, the chord, and why it doesn't work (empty when it does).
+export struct HotkeyLine {
+    name: string,
+    text: string,
+    problem: string,
+    /// Registered and working.
+    active: bool,
+}
+
+/// One account's client settings.
+export struct ClientLine {
+    name: string,
+    running: bool,
+    /// Index in `priorities` (0 is the Windows default).
+    priority: int,
+    processors: string,
+    processors-error: string,
+    mute: bool,
+    profile: string,
+    gamepad: string,
+    /// The profile is missing: a launch refuses it.
+    profile-missing: bool,
+}
+
+/// One saved backup.
+export struct BackupLine {
+    date: string,
+    detail: string,
+    confirming: bool,
+    /// This backup is being restored.
+    restoring: bool,
+}
+
+/// One client's play time.
+export struct PlayLine {
+    name: string,
+    total: string,
+    detail: string,
+}
+
+/// A relaunch the banner shows: scheduled (Cancel) or offered (Relaunch, Dismiss).
+export struct RelaunchLine {
+    text: string,
+    scheduled: bool,
+}
+
+export global Features {
+    in property <FeatureStrings> strings;
+    in property <bool> open;
+    in property <[string]> sections;
+    in property <int> section;
+    in property <string> notice;
+    in property <bool> notice-error;
+    // ---- windows ----
+    in property <bool> remember;
+    in property <bool> restore;
+    in property <bool> launch-saved;
+    in property <bool> order-windows;
+    in property <[string]> monitors;
+    in-out property <int> monitor;
+    in property <[LayoutLine]> layouts;
+    // ---- hotkeys: next and previous, then one per account ----
+    in property <[HotkeyLine]> cycle-hotkeys;
+    in property <[HotkeyLine]> account-hotkeys;
+    // ---- recovery ----
+    in property <bool> offer;
+    in property <bool> auto-relaunch;
+    in property <string> auto-note;
+    // ---- backups ----
+    /// A backup or a restore runs.
+    in property <bool> busy;
+    /// The running job is a backup (a restore shows on its row).
+    in property <bool> backing-up;
+    in property <bool> before-update;
+    in property <[string]> keep-items;
+    in property <int> keep;
+    /// The saved backups are being listed.
+    in property <bool> backups-loading;
+    in property <[BackupLine]> backups;
+    // ---- clients ----
+    in property <bool> background-priority;
+    in property <bool> mute-background;
+    in property <[string]> priorities;
+    in property <[ClientLine]> clients;
+    // ---- activity ----
+    in property <bool> notify;
+    in property <bool> notify-mail;
+    in property <bool> notify-friends;
+    in property <bool> discord;
+    in property <string> discord-status;
+    /// 0 off, 1 connected, 2 waiting (Discord not running), 3 problem.
+    in property <int> discord-state;
+    in property <bool> record;
+    in property <[PlayLine]> playtime;
+    // ---- the relaunch banner and the account sheet ----
+    in property <[RelaunchLine]> relaunches;
+    in property <string> sheet-gamepad;
+    /// Where the account sheet's body scrolls to (previews).
+    in property <length> sheet-scroll;
+
+    callback open-sheet(bool);
+    callback section-picked(int);
+    /// 0 remember, 1 restore, 2 launch at saved size, 3 offer relaunch, 4 automatic relaunch,
+    /// 5 back up before updates, 6 notifications, 7 mail, 8 friends online, 9 background
+    /// priority, 10 mute background clients, 11 record play time, 12 Discord, 13 order game windows.
+    callback toggle(int, bool);
+    /// 0 next window, 1 previous window, 2 + n the n-th account.
+    callback hotkey-entered(int, string);
+    /// 0 grid, 1 main large, on `monitor`.
+    callback arrange(int);
+    callback forget(int);
+    callback relaunch-cancel(int);
+    callback relaunch-now(int);
+    callback relaunch-dismiss(int);
+    callback back-up-now();
+    callback restore-ask(int);
+    callback restore-confirm();
+    callback restore-cancel();
+    callback keep-picked(int);
+    callback priority-picked(int, int);
+    callback processors-entered(int, string);
+    callback mute-client(int, bool);
+    callback edit-account(int);
+}
+
+/// A card row's two lines: a name and a quiet detail.
+component TwoLines inherits VerticalLayout {
+    in property <string> name;
+    in property <string> detail;
+    in property <bool> mono-name;
+    in property <bool> mono-detail;
+    horizontal-stretch: 1;
+    alignment: center;
+    spacing: 2px;
+    Text {
+        text: root.name;
+        font-family: root.mono-name ? Theme.mono : Theme.sans;
+        font-size: root.mono-name ? Theme.type-small : Theme.type-body;
+        font-weight: root.mono-name ? 400 : 600;
+        color: Theme.ink;
+        overflow: elide;
+    }
+    Text {
+        text: root.detail;
+        font-family: root.mono-detail ? Theme.mono : Theme.sans;
+        font-size: Theme.type-caption;
+        color: Theme.sub;
+        overflow: elide;
+    }
+}
+
+/// A hotkey row: what it does, the chord field (applied on Return) with why it doesn't work
+/// under it, and its state.
+component HotkeyRow inherits HorizontalLayout {
+    in property <HotkeyLine> line;
+    in property <string> placeholder;
+    callback entered(string);
+    spacing: Theme.sp-m;
+    VerticalLayout {
+        width: 40%;
+        alignment: start;
+        Text {
+            height: Theme.control-h;
+            text: root.line.name;
+            font-size: Theme.type-small;
+            color: Theme.ink2;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+    VerticalLayout {
+        horizontal-stretch: 1;
+        alignment: start;
+        spacing: Theme.sp-xs;
+        SavedField {
+            label: root.line.name;
+            placeholder: root.placeholder;
+            saved: root.line.text;
+            commit(text) => { root.entered(text); }
+        }
+        if root.line.problem != "": ErrorNote { text: root.line.problem; }
+    }
+    VerticalLayout {
+        width: 16px;
+        alignment: start;
+        Rectangle {
+            height: Theme.control-h;
+            if root.line.text != "": Icon {
+                y: (parent.height - self.height) / 2;
+                glyph: root.line.problem == "" ? Glyph.check-circle : Glyph.alert-circle;
+                size: 16px;
+                tint: root.line.problem != "" ? Theme.danger : root.line.active ? Theme.ok : Theme.faint;
+            }
+        }
+    }
+}
+
+component WindowsSection inherits VerticalLayout {
+    spacing: Theme.sp-2xl;
+    Fieldset {
+        legend: Features.strings.layouts;
+        CheckNote {
+            text: Features.strings.remember;
+            note: Features.strings.remember-note;
+            checked: Features.remember;
+            toggled(on) => { Features.toggle(0, on); }
+        }
+        CheckNote {
+            text: Features.strings.restore;
+            note: Features.strings.restore-note;
+            checked: Features.restore;
+            toggled(on) => { Features.toggle(1, on); }
+        }
+        CheckNote {
+            text: Features.strings.launch-saved;
+            note: Features.strings.launch-saved-note;
+            checked: Features.launch-saved;
+            toggled(on) => { Features.toggle(2, on); }
+        }
+        CheckNote {
+            text: Features.strings.order-windows;
+            note: Features.strings.order-windows-note;
+            checked: Features.order-windows;
+            toggled(on) => { Features.toggle(13, on); }
+        }
+    }
+    Fieldset {
+        legend: Features.strings.arrange;
+        Labelled {
+            caption: Features.strings.monitor;
+            Select {
+                label: Features.strings.monitor;
+                items: Features.monitors;
+                current: Features.monitor;
+                picked(index) => { Features.monitor = index; }
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.sp-s;
+            alignment: start;
+            Control { text: Features.strings.grid; clicked => { Features.arrange(0); } }
+            Control { text: Features.strings.main-large; clicked => { Features.arrange(1); } }
+        }
+        Note { text: Features.strings.arrange-note; }
+    }
+    Fieldset {
+        legend: Features.strings.remembered;
+        if Features.layouts.length == 0: Note { text: Features.strings.no-layouts; }
+        if Features.layouts.length > 0: Card {
+            for line[index] in Features.layouts: VerticalLayout {
+                if index > 0: Rule { }
+                CardRow {
+                    TwoLines { name: line.name; detail: line.detail; mono-detail: true; }
+                    SmallButton {
+                        cross-axis-self-alignment: center;
+                        scale: 1;
+                        text: Features.strings.forget;
+                        clicked => { Features.forget(index); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component HotkeysSection inherits VerticalLayout {
+    spacing: Theme.sp-2xl;
+    Fieldset {
+        legend: Features.strings.switch-windows;
+        for line[index] in Features.cycle-hotkeys: HotkeyRow {
+            line: line;
+            placeholder: Features.strings.hotkey-placeholder;
+            entered(text) => { Features.hotkey-entered(index, text); }
+        }
+        Note { text: Features.strings.hotkey-note; }
+    }
+    Fieldset {
+        legend: Features.strings.per-account;
+        if Features.account-hotkeys.length == 0: Note { text: Features.strings.no-accounts; }
+        for line[index] in Features.account-hotkeys: HotkeyRow {
+            line: line;
+            placeholder: Features.strings.hotkey-placeholder;
+            entered(text) => { Features.hotkey-entered(index + 2, text); }
+        }
+    }
+}
+
+/// The relaunches waiting: one row each, with its buttons. `scale` is Home's layout scale in
+/// the banner, 1 in the sheet.
+component RelaunchList inherits VerticalLayout {
+    in property <float> scale: 1;
+    spacing: Theme.sp-s * root.scale;
+    for line[index] in Features.relaunches: HorizontalLayout {
+        spacing: Theme.sp-m * root.scale;
+        Dot { cross-axis-self-alignment: center; tint: line.scheduled ? Theme.info : Theme.warn; }
+        Text {
+            horizontal-stretch: 1;
+            text: line.text;
+            font-size: Theme.type-small * root.scale;
+            color: Theme.ink;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        if line.scheduled: SmallButton { cross-axis-self-alignment: center; scale: root.scale; text: Features.strings.cancel; clicked => { Features.relaunch-cancel(index); } }
+        if !line.scheduled: SmallButton { cross-axis-self-alignment: center; scale: root.scale; soft: true; glyph: Glyph.play; text: Features.strings.relaunch; clicked => { Features.relaunch-now(index); } }
+        if !line.scheduled: SmallButton { cross-axis-self-alignment: center; scale: root.scale; text: Features.strings.dismiss; clicked => { Features.relaunch-dismiss(index); } }
+    }
+}
+
+component RecoverySection inherits VerticalLayout {
+    spacing: Theme.sp-2xl;
+    Fieldset {
+        legend: Features.strings.recovery;
+        CheckNote {
+            text: Features.strings.offer;
+            note: Features.strings.offer-note;
+            checked: Features.offer;
+            toggled(on) => { Features.toggle(3, on); }
+        }
+        CheckNote {
+            text: Features.strings.auto-relaunch;
+            note: Features.auto-note;
+            checked: Features.auto-relaunch;
+            toggled(on) => { Features.toggle(4, on); }
+        }
+    }
+    Fieldset {
+        legend: Features.strings.pending;
+        if Features.relaunches.length == 0: Note { text: Features.strings.no-pending; }
+        if Features.relaunches.length > 0: RelaunchList { }
+    }
+}
+
+component BackupsSection inherits VerticalLayout {
+    spacing: Theme.sp-2xl;
+    Fieldset {
+        legend: Features.strings.backups;
+        HorizontalLayout {
+            alignment: start;
+            Control {
+                tone: Tone.primary;
+                text: Features.strings.back-up-now;
+                glyph: Glyph.download;
+                busy: Features.backing-up;
+                enabled: !Features.busy;
+                clicked => { Features.back-up-now(); }
+            }
+        }
+        CheckNote {
+            text: Features.strings.before-update;
+            checked: Features.before-update;
+            toggled(on) => { Features.toggle(5, on); }
+        }
+        Labelled {
+            caption: Features.strings.keep;
+            Select {
+                label: Features.strings.keep;
+                items: Features.keep-items;
+                current: Features.keep;
+                picked(index) => { Features.keep-picked(index); }
+            }
+        }
+    }
+    Fieldset {
+        legend: Features.strings.saved-backups;
+        // Nothing while the list loads, so a list that exists never reads as empty.
+        if Features.backups-loading: HorizontalLayout {
+            alignment: start;
+            Spinner { }
+        }
+        if !Features.backups-loading && Features.backups.length == 0: Note { text: Features.strings.no-backups; }
+        if Features.backups.length > 0: Card {
+            for line[index] in Features.backups: VerticalLayout {
+                if index > 0: Rule { }
+                CardRow {
+                    TwoLines { name: line.date; detail: line.detail; mono-name: true; }
+                    SmallButton {
+                        cross-axis-self-alignment: center;
+                        scale: 1;
+                        text: Features.strings.restore-action;
+                        busy: line.restoring;
+                        enabled: !Features.busy && !line.confirming;
+                        // The confirmation below holds the one Restore while it shows.
+                        visible: !line.confirming;
+                        clicked => { Features.restore-ask(index); }
+                    }
+                }
+                if line.confirming: VerticalLayout {
+                    // The row above already ends in card-row-y.
+                    padding-top: 0px;
+                    padding-bottom: Theme.card-row-y;
+                    spacing: Theme.sp-s;
+                    Note { text: Features.strings.restore-question; color: Theme.ink2; }
+                    HorizontalLayout {
+                        spacing: Theme.sp-s;
+                        alignment: end;
+                        SmallButton { scale: 1; text: Features.strings.cancel; enabled: !Features.busy; clicked => { Features.restore-cancel(); } }
+                        SmallButton { scale: 1; danger: true; text: Features.strings.restore-action; enabled: !Features.busy; clicked => { Features.restore-confirm(); } }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component ClientsSection inherits VerticalLayout {
+    spacing: Theme.sp-2xl;
+    Fieldset {
+        legend: Features.strings.background;
+        CheckNote {
+            text: Features.strings.background-priority;
+            note: Features.strings.background-priority-note;
+            checked: Features.background-priority;
+            toggled(on) => { Features.toggle(9, on); }
+        }
+        CheckNote {
+            text: Features.strings.mute-background;
+            note: Features.strings.mute-background-note;
+            checked: Features.mute-background;
+            toggled(on) => { Features.toggle(10, on); }
+        }
+    }
+    Fieldset {
+        legend: Features.strings.per-account;
+        if Features.clients.length == 0: Note { text: Features.strings.no-accounts; }
+        for line[index] in Features.clients: Card {
+            VerticalLayout {
+                padding-top: Theme.card-row-y;
+                padding-bottom: Theme.card-row-y;
+                spacing: Theme.sp-m;
+                HorizontalLayout {
+                    spacing: Theme.sp-s;
+                    Text { text: line.name; font-size: Theme.type-body; font-weight: 600; color: Theme.ink; vertical-alignment: center; overflow: elide; }
+                    if line.running: Dot { cross-axis-self-alignment: center; tint: Theme.info; }
+                    if line.running: Text { text: Features.strings.running; font-size: Theme.type-caption; color: Theme.sub; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                HorizontalLayout {
+                    spacing: Theme.sp-m;
+                    Labelled {
+                        horizontal-stretch: 1;
+                        caption: Features.strings.priority;
+                        Select {
+                            label: Features.strings.priority;
+                            items: Features.priorities;
+                            current: line.priority;
+                            picked(choice) => { Features.priority-picked(index, choice); }
+                        }
+                    }
+                    Labelled {
+                        horizontal-stretch: 1;
+                        caption: Features.strings.processors;
+                        SavedField {
+                            label: Features.strings.processors;
+                            placeholder: Features.strings.processors-placeholder;
+                            saved: line.processors;
+                            commit(text) => { Features.processors-entered(index, text); }
+                        }
+                    }
+                }
+                if line.processors-error != "": ErrorNote { text: line.processors-error; }
+                Check {
+                    text: Features.strings.mute-client;
+                    checked: line.mute;
+                    toggled(on) => { Features.mute-client(index, on); }
+                }
+                Rule { }
+                HorizontalLayout {
+                    spacing: Theme.sp-m;
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 2px;
+                        Text { text: line.profile; font-size: Theme.type-small; color: line.profile-missing ? Theme.danger : Theme.ink2; wrap: word-wrap; }
+                        if line.gamepad != "": Note { text: line.gamepad; }
+                    }
+                    SmallButton {
+                        cross-axis-self-alignment: center;
+                        scale: 1;
+                        glyph: Glyph.edit;
+                        text: Features.strings.edit-account;
+                        clicked => { Features.edit-account(index); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component ActivitySection inherits VerticalLayout {
+    spacing: Theme.sp-2xl;
+    Fieldset {
+        legend: Features.strings.notifications;
+        CheckNote {
+            text: Features.strings.notify;
+            checked: Features.notify;
+            toggled(on) => { Features.toggle(6, on); }
+        }
+        VerticalLayout {
+            padding-left: 26px;
+            spacing: 10px;
+            Check { text: Features.strings.notify-mail; checked: Features.notify-mail; enabled: Features.notify; toggled(on) => { Features.toggle(7, on); } }
+            Check { text: Features.strings.notify-friends; checked: Features.notify-friends; enabled: Features.notify; toggled(on) => { Features.toggle(8, on); } }
+        }
+    }
+    Fieldset {
+        legend: Features.strings.discord;
+        CheckNote {
+            text: Features.strings.discord-switch;
+            checked: Features.discord;
+            toggled(on) => { Features.toggle(12, on); }
+        }
+        if Features.discord-status != "": HorizontalLayout {
+            padding-left: 26px;
+            spacing: Theme.sp-s;
+            Dot {
+                cross-axis-self-alignment: center;
+                tint: Features.discord-state == 1 ? Theme.ok : Features.discord-state == 3 ? Theme.danger : Features.discord-state == 2 ? Theme.warn : Theme.faint;
+            }
+            Note { horizontal-stretch: 1; text: Features.discord-status; vertical-alignment: center; }
+        }
+    }
+    Fieldset {
+        legend: Features.strings.playtime;
+        CheckNote {
+            text: Features.strings.record;
+            checked: Features.record;
+            toggled(on) => { Features.toggle(11, on); }
+        }
+        if Features.playtime.length == 0: Note { text: Features.strings.no-playtime; }
+        if Features.playtime.length > 0: Card {
+            for line[index] in Features.playtime: VerticalLayout {
+                if index > 0: Rule { }
+                CardRow {
+                    TwoLines { name: line.name; detail: line.detail; }
+                    Text { text: line.total; font-family: Theme.mono; font-size: Theme.type-small; color: Theme.ink2; vertical-alignment: center; }
+                }
+            }
+        }
+    }
+}
+
+/// The features sheet: wider than the account sheet (its lists carry several controls a row),
+/// with a tab per section between its header and its body.
+export component FeaturesSheet inherits SideSheet {
+    panel-width: Theme.sheet-wide-w;
+    caption: Features.strings.caption;
+    title: Features.strings.title;
+    close-label: Features.strings.close;
+    header-pad-bottom: Theme.sp-l;
+    close => { Features.open-sheet(false); }
+    HorizontalLayout {
+        padding-left: Theme.sheet-pad-x;
+        padding-right: Theme.sheet-pad-x;
+        padding-bottom: Theme.sp-l;
+        Segmented {
+            items: Features.sections;
+            current: Features.section;
+            picked(index) => { Features.section-picked(index); }
+        }
+    }
+    SheetBody {
+        if Features.section == 0: WindowsSection { }
+        if Features.section == 1: HotkeysSection { }
+        if Features.section == 2: RecoverySection { }
+        if Features.section == 3: BackupsSection { }
+        if Features.section == 4: ClientsSection { }
+        if Features.section == 5: ActivitySection { }
+    }
+    SheetFooter {
+        gap: Theme.sp-m;
+        if Features.notice != "": Icon {
+            cross-axis-self-alignment: center;
+            glyph: Features.notice-error ? Glyph.alert-circle : Glyph.check-circle;
+            size: 16px;
+            tint: Features.notice-error ? Theme.danger : Theme.ok;
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: Features.notice;
+            font-size: Theme.type-small;
+            color: Features.notice-error ? Theme.danger : Theme.ink2;
+            vertical-alignment: center;
+            wrap: word-wrap;
+        }
+        Control { text: Features.strings.close; clicked => { Features.open-sheet(false); } }
+    }
+}
+
+/// Over the play bar while a relaunch is scheduled or offered; it scales with Home.
+export component RelaunchBanner inherits VerticalLayout {
+    Rule { tint: Theme.chrome-line; }
+    Rectangle {
+        background: Theme.tint;
+        HorizontalLayout {
+            padding-left: Theme.page-x * Theme.scale;
+            padding-right: Theme.page-x * Theme.scale;
+            padding-top: 10px * Theme.scale;
+            padding-bottom: 10px * Theme.scale;
+            RelaunchList { scale: Theme.scale; }
+        }
+    }
+}

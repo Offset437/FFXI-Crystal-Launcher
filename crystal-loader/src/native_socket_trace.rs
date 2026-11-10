@@ -2,8 +2,7 @@
 //! record counts/timing, never hostnames, addresses, credentials or buffers.
 //! IAT wrappers and originals are process-lived: stopping recording does not
 //! race native workers by restoring imports or invalidating their call targets.
-//! The separate native-login-nodelay A/B feature can set TCP_NODELAY before
-//! startup PML connects only; ordinary diagnostics never write socket options.
+//! Diagnostics never write socket options.
 
 use std::{
     ffi::c_void,
@@ -15,19 +14,16 @@ use windows_sys::Win32::{
     Networking::WinSock::{FD_SET, TIMEVAL, HOSTENT, SOCKADDR, SOCKET, INVALID_SOCKET, SOCKET_ERROR, SOL_SOCKET, SO_ERROR, WSAEWOULDBLOCK, WSAGetLastError, WSASetLastError,
         getsockopt, WSAIoctl, IPPROTO_TCP, SIO_TCP_INFO, TCP_INFO_v0, TCP_NODELAY, TCPSTATE_ESTABLISHED},
     System::{
-        Diagnostics::Debug::ReadProcessMemory,
         LibraryLoader::{GetModuleHandleW, GetProcAddress},
         Memory::{VirtualProtect, PAGE_READWRITE},
-        Threading::{GetCurrentProcess, GetCurrentThreadId},
+        Threading::GetCurrentThreadId,
     },
 };
 
-// Exact IAT locations in the supported polcore build, verified statically.
-const IMPORTS: [(&str, usize); 8] = [
-    ("socket", 0x65324), ("connect", 0x652f4), ("gethostbyname", 0x652f8),
-    ("send", 0x652dc), ("recv", 0x652e0), ("getsockopt", 0x652e4), ("closesocket", 0x65304),
-    ("select", 0x65308),
-];
+// The Winsock imports traced, in wrapper order. Each is found in polcore's
+// import table by the address Windows bound it to, so any build's layout works,
+// and an entry another module already redirected is never chained through.
+const IMPORTS: [&str; 8] = ["socket", "connect", "gethostbyname", "send", "recv", "getsockopt", "closesocket", "select"];
 static ORIGINAL: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
 static STATE: OnceLock<State> = OnceLock::new();
 const QUEUE: usize = 512;
@@ -78,18 +74,13 @@ struct ReadinessRecord { direction: Direction, reason: Summary, stats: Readiness
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TcpReason { Connected, Send, Recv, Pending }
-#[derive(Clone, Copy, Default)]
+// Fields of these query records are read only by Debug (the log line).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Default, Debug)]
 struct TcpInfo {
     state: i32, mss: u32, connection_ms: u64, rtt_us: u32, min_rtt_us: u32,
     bytes_out: u64, bytes_in: u64, in_flight: u32, cwnd: u32, snd_wnd: u32, rcv_wnd: u32,
     retrans: u32, fast_retrans: u32, timeouts: u32, syn_retrans: u8,
-}
-impl std::fmt::Debug for TcpInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TcpInfo {{ state: {}, mss: {}, connection_ms: {}, rtt_us: {}, min_rtt_us: {}, bytes_out: {}, bytes_in: {}, in_flight: {}, cwnd: {}, snd_wnd: {}, rcv_wnd: {}, retrans: {}, fast_retrans: {}, timeouts: {}, syn_retrans: {} }}",
-            self.state, self.mss, self.connection_ms, self.rtt_us, self.min_rtt_us, self.bytes_out, self.bytes_in, self.in_flight,
-            self.cwnd, self.snd_wnd, self.rcv_wnd, self.retrans, self.fast_retrans, self.timeouts, self.syn_retrans)
-    }
 }
 impl From<TCP_INFO_v0> for TcpInfo {
     fn from(i: TCP_INFO_v0) -> Self {
@@ -98,31 +89,17 @@ impl From<TCP_INFO_v0> for TcpInfo {
             retrans: i.BytesRetrans, fast_retrans: i.FastRetrans, timeouts: i.TimeoutEpisodes, syn_retrans: i.SynRetrans }
     }
 }
-#[derive(Clone, Copy)]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
 struct QueryStatus { result: i32, error: i32, bytes: u32, duration_us: u64 }
-impl std::fmt::Debug for QueryStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "QueryStatus {{ result: {}, error: {}, bytes: {}, duration_us: {} }}", self.result, self.error, self.bytes, self.duration_us)
-    }
-}
-#[derive(Clone, Copy)]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
 struct NoDelayQuery { status: QueryStatus, value: Option<bool> }
-impl std::fmt::Debug for NoDelayQuery {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NoDelayQuery").field("status", &self.status).field("value", &self.value).finish()
-    }
-}
-#[derive(Clone, Copy)]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
 struct InfoQuery { status: QueryStatus, value: Option<TcpInfo> }
-impl std::fmt::Debug for InfoQuery {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InfoQuery").field("status", &self.status).field("value", &self.value).finish()
-    }
-}
 #[derive(Clone, Copy, Debug)]
 struct TcpQueries { nodelay: Option<NoDelayQuery>, info: Option<InfoQuery> }
-#[derive(Clone, Copy, Debug)]
-struct NoDelayTrial { previous: NoDelayQuery, applied: Option<QueryStatus> }
 type QueryTcp = fn(SOCKET, bool, bool) -> TcpQueries;
 
 // Providers can report a one-byte Boolean despite the caller supplying a
@@ -206,13 +183,10 @@ struct Record {
     port: Option<u16>, socket_error: Option<i32>,
     readiness: Option<ReadinessRecord>,
     tcp: Option<TcpRecord>,
-    trial: Option<NoDelayTrial>,
 }
 #[derive(Clone, Copy)]
 struct Handle {
     socket: SOCKET, generation: u64, readiness: [Readiness; 2], tcp: TcpTracking,
-    #[cfg(feature = "native-login-nodelay")]
-    nodelay_eligible: bool,
 }
 struct Handles { entries: [Option<Handle>; 64], next: u64 }
 impl Handles {
@@ -224,8 +198,6 @@ impl Handles {
         if found.is_none() || op.is_socket() {
             self.entries[index] = Some(Handle { socket, generation: self.next, readiness: [Readiness::default(); 2],
                 tcp: TcpTracking { created: op.is_socket(), ..TcpTracking::default() },
-                #[cfg(feature = "native-login-nodelay")]
-                nodelay_eligible: matches!(op, Op::Socket(2, 1, 0)),
             });
             self.next += 1;
         }
@@ -236,22 +208,16 @@ impl Handles {
 }
 struct State {
     enabled: AtomicBool, done: AtomicBool, epoch: Instant,
-    #[cfg(feature = "native-login-nodelay")]
-    nodelay_startup: AtomicBool,
     sender: SyncSender<Record>, handles: Mutex<Handles>, lost: AtomicU64,
     coverage: AtomicU64, native_active: AtomicUsize, native_epoch: AtomicU64, query_tcp: QueryTcp,
 }
 impl State {
     fn new(sender: SyncSender<Record>) -> Self {
         Self { enabled: AtomicBool::new(false), done: AtomicBool::new(false), epoch: Instant::now(), sender,
-            #[cfg(feature = "native-login-nodelay")]
-            nodelay_startup: AtomicBool::new(false),
             handles: Mutex::new(Handles::new()), lost: AtomicU64::new(0), coverage: AtomicU64::new(0),
             native_active: AtomicUsize::new(0), native_epoch: AtomicU64::new(0), query_tcp }
     }
     fn stop(&self) {
-        #[cfg(feature = "native-login-nodelay")]
-        self.nodelay_startup.store(false, Ordering::Release);
         if self.enabled.swap(false, Ordering::AcqRel) {
             if let Ok(handles) = self.handles.try_lock() {
                 for handle in handles.entries.iter().flatten() { self.summarize(*handle, Summary::Stop); }
@@ -262,31 +228,12 @@ impl State {
     fn enqueue(&self, record: Record) {
         if self.sender.try_send(record).is_err() { self.lost.fetch_add(1, Ordering::Relaxed); }
     }
-    #[cfg(feature = "native-login-nodelay")]
-    fn reserve_startup_pml(&self, socket: SOCKET) -> Option<u64> {
-        if !self.enabled.load(Ordering::Acquire) || !self.nodelay_startup.load(Ordering::Acquire) { return None; }
-        let Ok(mut handles) = self.handles.try_lock() else { return None; };
-        let handle = handles.entries.iter_mut().flatten().find(|h| h.socket == socket)?;
-        // Signature and generation were recorded in the SAME creation lock.
-        // Missing any lifecycle event makes a stale numeric handle ineligible.
-        let eligible = handle.nodelay_eligible && handle.tcp.created
-            && handle.tcp.creation_coverage == self.coverage.load(Ordering::SeqCst);
-        handle.nodelay_eligible = false; // only the generation's first connect
-        eligible.then_some(handle.generation)
-    }
-    #[cfg(feature = "native-login-nodelay")]
-    fn report_trial(&self, generation: u64, trial: NoDelayTrial) {
-        // Socket callbacks must never wait for the global file sink or flush.
-        self.enqueue(Record { op: Op::Tcp, at_us: self.epoch.elapsed().as_micros() as u64, duration_us: 0,
-            thread: unsafe { GetCurrentThreadId() }, generation, requested: 0, result: 0, error: 0,
-            port: Some(51220), socket_error: None, readiness: None, tcp: None, trial: Some(trial) });
-    }
     fn readiness_record(&self, handle: Handle, index: usize, reason: Summary, at: u64, thread: u32, error: i32) {
         let stats = handle.readiness[index];
         if stats.polls == 0 { return; }
         self.enqueue(Record { op: Op::Select, at_us: at, duration_us: 0, thread,
             generation: handle.generation, requested: 0, result: 0, error, port: None, socket_error: None,
-            readiness: Some(ReadinessRecord { direction: if index == 0 { Direction::Read } else { Direction::Write }, reason, stats }), tcp: None, trial: None });
+            readiness: Some(ReadinessRecord { direction: if index == 0 { Direction::Read } else { Direction::Write }, reason, stats }), tcp: None });
     }
     fn summarize(&self, handle: Handle, reason: Summary) {
         for index in 0..2 { self.readiness_record(handle, index, reason, self.epoch.elapsed().as_micros() as u64, 0, 0); }
@@ -311,8 +258,6 @@ impl State {
         self.enqueue(record);
         let handle = handles.entries.iter_mut().flatten().find(|h| h.socket == socket)?;
         if record.op.is_socket() { handle.tcp.creation_coverage = self.coverage.load(Ordering::SeqCst); }
-        #[cfg(feature = "native-login-nodelay")]
-        if record.op == Op::Connect { handle.nodelay_eligible = false; }
         let reason = match record.op {
             Op::Connect if record.result == 0 => { handle.tcp.connected = true; TcpReason::Connected }
             Op::Error if record.result == 0 && record.socket_error == Some(0) => { handle.tcp.connected = true; TcpReason::Connected }
@@ -400,83 +345,50 @@ impl State {
         }
         let tcp = t.report(request.reason, queries, coherent, coverage);
         self.enqueue(Record { op: Op::Tcp, at_us: at, duration_us, thread, generation: request.generation,
-            requested: 0, result: 0, error: 0, port: None, socket_error: None, readiness: None, tcp: Some(tcp), trial: None });
+            requested: 0, result: 0, error: 0, port: None, socket_error: None, readiness: None, tcp: Some(tcp) });
     }
 }
 
 pub struct Recording;
-#[cfg(feature = "native-login-nodelay")]
-const PML_CODE: &[(usize, &[u8])] = &[
-    (0x103d4, &[0x53, 0x6a, 0x01, 0x6a, 0x02, 0xe8, 0x88, 0x39, 0x05, 0x00]),
-    (0x1048e, &[0xe8, 0x15, 0x39, 0x05, 0x00, 0x85, 0xc0, 0x7d, 0x1c]),
-    (0x10563, &[0xe8, 0x3a, 0x38, 0x05, 0x00]),
-    (0x10ab9, &[0xe8, 0xcc, 0x32, 0x05, 0x00]),
-    (0x1f1b5, &[0x66, 0xc7, 0x46, 0x26, 0x14, 0xc8, 0x88, 0x46, 0x09, 0x8d, 0x46, 0x24,
-        0x50, 0x53, 0xe8, 0xd8, 0x11, 0xff, 0xff, 0x83, 0xc4, 0x08, 0x3b, 0xc3, 0x89, 0x46, 0x04]),
-    (0x1fc01, &[0x51, 0xe8, 0x09, 0x0f, 0xff, 0xff, 0x83, 0xc4, 0x04, 0x89, 0x5e, 0x04]),
-];
-#[cfg(feature = "native-login-nodelay")]
-pub(crate) fn supported_pml_layout(base: usize, size: usize) -> bool {
-    if size != 0x451000 { return false; }
-    // These ASLR-invariant snippets establish fresh/bound TCP creation, the
-    // fixed service destination, and natural close/FD clearing. Validate the
-    // mapped (unpacked) code, not just a same-timestamp file on disk.
-    if !PML_CODE.iter().all(|(rva, expected)| base.checked_add(*rva)
-        .and_then(|address| read::<32>(address as _))
-        .is_some_and(|actual| actual[..expected.len()] == **expected)) { return false; }
-    [(0x63d66, 0x65324), (0x63da2, 0x652f4), (0x63d8a, 0x65304), (0x63da8, 0x652f0)].into_iter().all(|(rva, iat)| {
-        let Some(address) = base.checked_add(rva) else { return false; };
-        let Some(target) = base.checked_add(iat).and_then(|v| u32::try_from(v).ok()) else { return false; };
-        read::<6>(address as _).is_some_and(|actual| actual[..2] == [0xff, 0x25]
-            && u32::from_ne_bytes(actual[2..6].try_into().unwrap()) == target)
-    })
-}
 impl Recording {
     /// The caller has validated this mapped polcore build and retains it until
     /// native teardown. No hook is installed unless every expected import fits.
     pub unsafe fn install(base: usize, size: usize) -> Result<Self, String> {
         if STATE.get().is_some() { return Err("already initialized".into()); }
         if std::mem::size_of::<usize>() != 4 { return Err("requires x86".into()); }
-        #[cfg(feature = "native-login-nodelay")]
-        if !supported_pml_layout(base, size) { return Err("startup TCP trial requires the verified native PML code layout".into()); }
-        let slots = crate::ffxi_settings::import_slots(base, "WS2_32.dll");
+        let slots = crate::iat::import_slots(base, "WS2_32.dll");
         let module_name: Vec<u16> = "WS2_32.dll\0".encode_utf16().collect();
         let module = GetModuleHandleW(module_name.as_ptr());
         if module.is_null() { return Err("Winsock is not loaded".into()); }
-        #[cfg(feature = "native-login-nodelay")]
-        {
-            for (rva, name) in [(0x652ec, b"setsockopt\0".as_slice()), (0x652f0, b"bind\0".as_slice())] {
-                let address = base.checked_add(rva).ok_or("startup TCP import outside core image")?;
-                let native = read::<4>(address as _).map(u32::from_ne_bytes).map(|p| p as usize);
-                let system = GetProcAddress(module, name.as_ptr()).map_or(0, |f| f as usize);
-                if system == 0 || native != Some(system) { return Err("unsupported startup bind/setsockopt import target".into()); }
-            }
-        }
         let mut entries = [std::ptr::null_mut(); 8];
         let mut originals = [0; 8];
-        for (index, (name, rva)) in IMPORTS.iter().enumerate() {
-            let address = base.checked_add(*rva).filter(|_| rva.checked_add(4).is_some_and(|end| end <= size))
-                .ok_or("import outside core image")?;
-            let slot = slots.iter().find(|s| s.slot as usize == address && s.name.as_deref().is_none_or(|n| n == *name))
-                .ok_or("unsupported socket import layout")?;
+        for (index, name) in IMPORTS.iter().enumerate() {
             let bytes: Vec<u8> = name.bytes().chain(Some(0)).collect();
             let system = GetProcAddress(module, bytes.as_ptr()).map_or(0, |f| f as usize);
-            let current = slot.slot.read();
-            // Avoid chaining through an unknown injector's networking hooks.
-            if current == 0 || current != system { return Err(format!("unsupported {name} import target")); }
+            if system == 0 { return Err(format!("Winsock has no {name}")); }
+            let found = |s: &&crate::iat::ImportSlot| {
+                let at = s.slot as usize;
+                at >= base && at.checked_add(4).is_some_and(|end| end <= base.saturating_add(size)) && s.slot.read() == system
+            };
+            // Exactly one entry bound to the system function; none means another
+            // module redirected it (never chain through an unknown hook).
+            let mut matching = slots.iter().filter(found);
+            let (Some(slot), None) = (matching.next(), matching.next()) else {
+                return Err(format!("unsupported {name} import target"));
+            };
             entries[index] = slot.slot;
-            originals[index] = current;
+            originals[index] = system;
         }
         let (sender, receiver) = mpsc::sync_channel(QUEUE);
         STATE.set(State::new(sender)).map_err(|_| "already initialized")?;
         let state = STATE.get().unwrap();
         if std::thread::Builder::new().name("native-socket-log".into()).spawn(move || {
             loop {
+                if !state.done.load(Ordering::Acquire) && state.epoch.elapsed() >= Duration::from_secs(60) {
+                    state.stop();
+                }
                 match receiver.recv_timeout(Duration::from_millis(100)) {
-                    Ok(r) => if let Some(trial) = r.trial {
-                        crate::log!("native POL TCP buffering trial: +{}us socket={} port=51220 previous={:?} query={:?} set={:?}",
-                            r.at_us, r.generation, trial.previous.value, trial.previous.status, trial.applied);
-                    } else if let Some(select) = r.readiness {
+                    Ok(r) => if let Some(select) = r.readiness {
                         let s = select.stats;
                         crate::log!("native POL readiness: {:?} {:?} +{}us socket={} polls={} pending={} ready={} errors={} transitions={} first_ready_us={:?} last_poll_us={:?} pending_since_us={:?} max_gap_us={} max_call_us={}",
                             select.direction, select.reason, r.at_us, r.generation, s.polls, s.pending, s.ready, s.errors, s.transitions,
@@ -494,10 +406,10 @@ impl Recording {
             }
             crate::log!("native POL socket trace stopped; metadata records lost={}", state.lost.load(Ordering::Relaxed));
         }).is_err() { state.stop(); return Err("cannot start metadata writer".into()); }
-        // All eight entries share this small IAT range. Publish every original
-        // before replacing any slot; workers may enter a wrapper immediately.
-        let start = base + 0x652dc;
-        let length = 0x65328 - 0x652dc;
+        // The eight entries lie in polcore's import address table. Publish every
+        // original before replacing any slot; workers may enter a wrapper immediately.
+        let start = entries.iter().map(|e| *e as usize).min().unwrap();
+        let length = entries.iter().map(|e| *e as usize).max().unwrap() + 4 - start;
         let mut protection = 0;
         if VirtualProtect(start as _, length, PAGE_READWRITE, &mut protection) == 0 {
             state.stop(); return Err("cannot write socket imports".into());
@@ -510,23 +422,10 @@ impl Recording {
         if VirtualProtect(start as _, length, protection, &mut ignored) == 0 {
             state.stop(); return Err("cannot restore socket import page protection; forwarding remains valid".into());
         }
-        #[cfg(feature = "native-login-nodelay")]
-        {
-            state.nodelay_startup.store(true, Ordering::Release);
-            crate::log!("native POL TCP buffering trial enabled for startup PML connects on port 51220 only");
-        }
         state.enabled.store(true, Ordering::Release);
-        crate::log!("native POL socket metadata recording enabled; TCP_INFO v0 pending interval={}us; stack counters are not wire timestamps; payloads omitted; startup TCP buffering trial={}",
-            TCP_POLL_US, cfg!(feature = "native-login-nodelay"));
+        crate::log!("native POL socket metadata recording enabled; TCP_INFO v0 pending interval={}us; stack counters are not wire timestamps; payloads omitted",
+            TCP_POLL_US);
         Ok(Self)
-    }
-    /// End the trial immediately after the complete sign-in returns. Trace
-    /// recording may continue during idle, but no new option changes occur.
-    pub fn finish_startup(&self) {
-        #[cfg(feature = "native-login-nodelay")]
-        if STATE.get().is_some_and(|s| s.nodelay_startup.swap(false, Ordering::AcqRel)) {
-            crate::log!("native POL TCP buffering trial ended; startup requests completed, later connections retain native socket options");
-        }
     }
     pub fn stop(&self) { if let Some(state) = STATE.get() { state.stop(); } }
 }
@@ -535,9 +434,7 @@ impl Drop for Recording { fn drop(&mut self) { self.stop(); } }
 /// Read only fixed, non-payload scalars. Invalid/native-racing pointers simply
 /// omit the optional field; never dereference application memory in Rust.
 fn read<const N: usize>(pointer: *const c_void) -> Option<[u8; N]> {
-    let mut bytes = [0; N];
-    let mut copied = 0;
-    unsafe { (ReadProcessMemory(GetCurrentProcess(), pointer, bytes.as_mut_ptr().cast(), N, &mut copied) != 0 && copied == N).then_some(bytes) }
+    crate::mem::read::<[u8; N]>(pointer as usize)
 }
 fn port(address: *const SOCKADDR, length: i32) -> Option<u16> {
     if length < 4 { return None; }
@@ -553,9 +450,7 @@ fn read_fd_set(pointer: *const FD_SET) -> Option<Sockets> {
     if set.count > set.values.len() { return None; }
     if set.count != 0 {
         let address = (pointer as usize).checked_add(std::mem::offset_of!(FD_SET, fd_array))?;
-        let size = set.count * std::mem::size_of::<SOCKET>();
-        let mut copied = 0;
-        if unsafe { ReadProcessMemory(GetCurrentProcess(), address as _, set.values.as_mut_ptr().cast(), size, &mut copied) } == 0 || copied != size {
+        if !crate::mem::read_into(address, &mut set.values[..set.count]) {
             return None;
         }
     }
@@ -600,7 +495,7 @@ fn forward_with<R: Copy>(state: &State, op: Op, socket: SOCKET, requested: i32, 
         let socket = if op.is_socket() { if result < 0 { INVALID_SOCKET } else { result as SOCKET } } else { socket };
         state.record(socket, Record { op, at_us: start.duration_since(state.epoch).as_micros() as u64,
             duration_us: end.duration_since(start).as_micros() as u64, thread, generation: 0, requested, result,
-            error: if result < 0 { after.winsock } else { 0 }, port, socket_error, readiness: None, tcp: None, trial: None })
+            error: if result < 0 { after.winsock } else { 0 }, port, socket_error, readiness: None, tcp: None })
     } else { None };
     drop(native);
     if let Some(request) = request { state.sample_tcp(request, thread, state.epoch.elapsed().as_micros() as u64); }
@@ -613,63 +508,11 @@ unsafe extern "system" fn socket(af: i32, kind: i32, protocol: i32) -> SOCKET {
         |r| if r == INVALID_SOCKET { -1 } else { r as i64 }, |_| (None, None))
 }
 unsafe extern "system" fn connect(s: SOCKET, address: *const SOCKADDR, length: i32) -> i32 {
-    let call = || forward(Op::Connect, s, 0,
+    forward(Op::Connect, s, 0,
         || original::<unsafe extern "system" fn(SOCKET, *const SOCKADDR, i32) -> i32>(1)(s, address, length),
-        i64::from, |_| (port(address, length), None));
-    #[cfg(feature = "native-login-nodelay")]
-    if let Some(state) = STATE.get().filter(|s| s.enabled.load(Ordering::Acquire)) {
-        let before = Errors::capture();
-        let generation = state.reserve_startup_pml(s);
-        before.restore();
-        if let Some(generation) = generation {
-            return startup_connect_with(s, address, length, &state.nodelay_startup, query_nodelay, enable_nodelay,
-                |trial| state.report_trial(generation, trial), call);
-        }
-    }
-    call()
+        i64::from, |_| (port(address, length), None))
 }
 
-#[cfg(feature = "native-login-nodelay")]
-fn enable_nodelay(socket: SOCKET) -> QueryStatus {
-    // Winsock requires sizeof(int) for setting a Boolean even when its get
-    // reports one byte. No global TCP policy or installed files are changed.
-    let value = 1i32;
-    let start = Instant::now();
-    let result = unsafe { windows_sys::Win32::Networking::WinSock::setsockopt(socket,
-        IPPROTO_TCP, TCP_NODELAY, (&value as *const i32).cast(), std::mem::size_of::<i32>() as i32) };
-    QueryStatus { result, error: if result == SOCKET_ERROR { unsafe { WSAGetLastError() } } else { 0 },
-        bytes: std::mem::size_of::<i32>() as u32, duration_us: start.elapsed().as_micros() as u64 }
-}
-
-#[cfg(feature = "native-login-nodelay")]
-fn startup_connect_with(socket: SOCKET, address: *const SOCKADDR, length: i32, startup: &AtomicBool,
-    query: impl FnOnce(SOCKET) -> NoDelayQuery, set: impl FnOnce(SOCKET) -> QueryStatus,
-    report: impl FnOnce(NoDelayTrial), call: impl FnOnce() -> i32) -> i32 {
-    let before = Errors::capture();
-    // The supported core's port-51220 PML requests each own a transient
-    // socket and close it on completion. The persistent 5124x member session
-    // is excluded. Do not retain handles or restore options on reused ones.
-    let pml_address = || length >= std::mem::size_of::<windows_sys::Win32::Networking::WinSock::SOCKADDR_IN>() as i32
-        && read::<4>(address.cast()).is_some_and(|b| u16::from_ne_bytes([b[0], b[1]]) == 2
-            && u16::from_be_bytes([b[2], b[3]]) == 51220);
-    let attempt = if startup.load(Ordering::Acquire) && pml_address() {
-        let previous = query(socket);
-        let applied = if previous.value == Some(false) && startup.load(Ordering::Acquire) {
-            Some(set(socket))
-        } else { None };
-        Some((previous, applied))
-    } else { None };
-    // Query/set errors must never replace the native caller's incoming error
-    // state, nor turn a successful native connect into our own failure.
-    before.restore();
-    let result = call();
-    let after = Errors::capture();
-    if let Some((previous, applied)) = attempt {
-        report(NoDelayTrial { previous, applied });
-    }
-    after.restore();
-    result
-}
 unsafe extern "system" fn dns(name: *const u8) -> *mut HOSTENT {
     forward(Op::Dns, INVALID_SOCKET, 0, || original::<unsafe extern "system" fn(*const u8) -> *mut HOSTENT>(2)(name),
         |r| if r.is_null() { -1 } else { 1 }, |_| (None, None))
@@ -799,175 +642,6 @@ mod tests {
             assert_eq!(socket_bool(0, width, 1), None);
         }
         for width in [1, 4] { assert_eq!(socket_bool(SOCKET_ERROR, width, 1), None); }
-    }
-
-    #[cfg(feature = "native-login-nodelay")]
-    fn nodelay_answer(value: Option<bool>) -> NoDelayQuery {
-        NoDelayQuery { value, status: QueryStatus { result: if value.is_some() { 0 } else { SOCKET_ERROR },
-            error: if value.is_some() { 0 } else { 10042 }, bytes: if value.is_some() { 1 } else { 0 }, duration_us: 1 } }
-    }
-    #[cfg(feature = "native-login-nodelay")]
-    fn pml_address() -> [u8; 16] {
-        let mut address = [0; 16];
-        address[..4].copy_from_slice(&[2, 0, 0xc8, 0x14]);
-        address
-    }
-
-    #[cfg(feature = "native-login-nodelay")]
-    #[test]
-    fn buffering_trial_keeps_native_connect_result_and_errors_even_if_setting_fails() {
-        let address = pml_address();
-        for set_result in [0, SOCKET_ERROR] {
-            let startup = AtomicBool::new(true);
-            unsafe { mark(); }
-            let result = startup_connect_with(19, address.as_ptr().cast(), 16, &startup,
-                |socket| { assert_eq!(socket, 19); unsafe { WSASetLastError(40001); } nodelay_answer(Some(false)) },
-                |socket| { assert_eq!(socket, 19); unsafe { WSASetLastError(40002); }
-                    QueryStatus { result: set_result, error: if set_result == 0 { 0 } else { 40002 }, bytes: 4, duration_us: 1 } },
-                |_| { unsafe { WSASetLastError(40003); } }, || { errors_unchanged(); unsafe { WSASetLastError(WSAEWOULDBLOCK); } SOCKET_ERROR });
-            assert_eq!(result, SOCKET_ERROR);
-            let after = Errors::capture();
-            assert_eq!((after.win32, after.winsock), (WSAEWOULDBLOCK as u32, WSAEWOULDBLOCK));
-        }
-    }
-
-    #[cfg(feature = "native-login-nodelay")]
-    #[test]
-    fn buffering_trial_skips_native_enabled_and_unknown_options() {
-        let address = pml_address();
-        for value in [Some(true), None] {
-            unsafe { mark(); }
-            assert_eq!(startup_connect_with(19, address.as_ptr().cast(), 16, &AtomicBool::new(true),
-                |_| { unsafe { WSASetLastError(40001); } nodelay_answer(value) },
-                |_| panic!("unknown or already enabled options must not be set"),
-                |_| {}, || { errors_unchanged(); 0 }), 0);
-            errors_unchanged();
-        }
-    }
-
-    #[cfg(feature = "native-login-nodelay")]
-    #[test]
-    fn buffering_trial_excludes_session_ports_ipv6_invalid_addresses_and_idle() {
-        let valid = pml_address();
-        let mut session = valid;
-        session[2..4].copy_from_slice(&51245u16.to_be_bytes());
-        let mut ipv6 = valid;
-        ipv6[..2].copy_from_slice(&23u16.to_ne_bytes());
-        for (address, length, active) in [(session.as_ptr(), 16, true), (ipv6.as_ptr(), 28, true),
-            (valid.as_ptr(), 4, true), (1usize as *const u8, 16, true),
-            (std::ptr::null(), 16, true), (valid.as_ptr(), 16, false)] {
-            unsafe { mark(); }
-            assert_eq!(startup_connect_with(19, address.cast(), length, &AtomicBool::new(active),
-                |_| panic!("out of scope connects must not be queried"),
-                |_| panic!("out of scope connects must not be changed"),
-                |_| {}, || { errors_unchanged(); 0 }), 0);
-            errors_unchanged();
-        }
-    }
-
-    #[cfg(feature = "native-login-nodelay")]
-    #[test]
-    fn buffering_trial_rechecks_shutdown_after_option_query() {
-        let address = pml_address();
-        let startup = AtomicBool::new(true);
-        unsafe { mark(); }
-        assert_eq!(startup_connect_with(19, address.as_ptr().cast(), 16, &startup,
-            |_| { startup.store(false, Ordering::Release); nodelay_answer(Some(false)) },
-            |_| panic!("no option changes after shutdown"),
-            |_| {}, || { errors_unchanged(); 0 }), 0);
-        errors_unchanged();
-    }
-
-    #[cfg(feature = "native-login-nodelay")]
-    #[test]
-    fn buffering_trial_real_private_tcp_socket_accepts_bool_and_reports_enabled() {
-        use windows_sys::Win32::Networking::WinSock::{WSAStartup, WSACleanup, WSADATA, AF_INET, SOCK_STREAM};
-        struct Winsock;
-        impl Drop for Winsock { fn drop(&mut self) { unsafe { WSACleanup(); } } }
-        struct Socket(SOCKET);
-        impl Drop for Socket { fn drop(&mut self) { unsafe { windows_sys::Win32::Networking::WinSock::closesocket(self.0); } } }
-        let mut data = WSADATA::default();
-        assert_eq!(unsafe { WSAStartup(0x0202, &mut data) }, 0);
-        let _winsock = Winsock;
-        let socket = Socket(unsafe { windows_sys::Win32::Networking::WinSock::socket(AF_INET as i32, SOCK_STREAM, IPPROTO_TCP) });
-        assert_ne!(socket.0, INVALID_SOCKET);
-        assert!(query_nodelay(socket.0).value.is_some(), "supported provider Boolean must decode");
-        assert_eq!(enable_nodelay(socket.0).result, 0);
-        assert_eq!(query_nodelay(socket.0).value, Some(true));
-        // This private socket never connects or sends; no live account is used.
-    }
-
-    #[cfg(feature = "native-login-nodelay")]
-    #[test]
-    fn buffering_trial_requires_verified_mapped_code_and_relocated_thunks() {
-        let mut image = vec![0u8; 0x451000];
-        let base = image.as_ptr() as usize;
-        for &(rva, bytes) in PML_CODE { image[rva..rva + bytes.len()].copy_from_slice(bytes); }
-        for (rva, iat) in [(0x63d66, 0x65324), (0x63da2, 0x652f4), (0x63d8a, 0x65304), (0x63da8, 0x652f0)] {
-            image[rva..rva + 2].copy_from_slice(&[0xff, 0x25]);
-            image[rva + 2..rva + 6].copy_from_slice(&((base + iat) as u32).to_ne_bytes());
-        }
-        assert!(supported_pml_layout(base, image.len()));
-        assert!(!supported_pml_layout(base, image.len() - 1));
-        assert!(!supported_pml_layout(1, image.len()));
-        for rva in [0x103d4, 0x1048e, 0x10563, 0x10ab9, 0x1f1b5, 0x1fc01, 0x63da4, 0x63daa] {
-            image[rva] ^= 1;
-            assert!(!supported_pml_layout(base, image.len()), "changed PML code or thunk must disable trial");
-            image[rva] ^= 1;
-        }
-    }
-
-    #[cfg(feature = "native-login-nodelay")]
-    #[test]
-    fn buffering_trial_reserves_only_known_fresh_generations_with_complete_lifecycle() {
-        let (state, _rx) = readiness_state();
-        state.nodelay_startup.store(true, Ordering::Release);
-        for op in [Op::Socket(2, 1, 6), Op::Socket(2, 2, 0), Op::Socket(23, 1, 0)] {
-            observed(&state, op, 61, 0, 61, None);
-            assert!(state.reserve_startup_pml(61).is_none());
-        }
-        observed(&state, Op::Socket(2, 1, 0), 61, 0, 61, None);
-        let first = state.reserve_startup_pml(61).unwrap();
-        assert!(state.reserve_startup_pml(61).is_none());
-        observed(&state, Op::Close, 61, 0, 0, None);
-        assert!(state.reserve_startup_pml(61).is_none());
-        observed(&state, Op::Socket(2, 1, 0), 61, 0, 61, None);
-        assert!(state.reserve_startup_pml(61).unwrap() > first);
-        observed(&state, Op::Socket(2, 1, 0), 61, 0, 61, None);
-        state.coverage.fetch_add(1, Ordering::SeqCst); // missed lifecycle call
-        assert!(state.reserve_startup_pml(61).is_none());
-        assert!(state.reserve_startup_pml(62).is_none()); // never observed
-    }
-
-    #[cfg(feature = "native-login-nodelay")]
-    #[test]
-    fn buffering_trial_contended_first_connect_and_stopped_recording_stay_ineligible() {
-        let (state, _rx) = readiness_state();
-        state.nodelay_startup.store(true, Ordering::Release);
-        observed(&state, Op::Socket(2, 1, 0), 71, 0, 71, None);
-        let lock = state.handles.lock().unwrap();
-        assert!(state.reserve_startup_pml(71).is_none());
-        drop(lock);
-        // A native first connect still runs after the contended reservation.
-        observed(&state, Op::Connect, 71, 0, SOCKET_ERROR, None);
-        assert!(state.reserve_startup_pml(71).is_none(), "a retry cannot be promoted to first connect");
-        observed(&state, Op::Socket(2, 1, 0), 71, 0, 71, None);
-        state.stop();
-        assert!(!state.nodelay_startup.load(Ordering::Acquire));
-        assert!(state.reserve_startup_pml(71).is_none());
-    }
-
-    #[cfg(feature = "native-login-nodelay")]
-    #[test]
-    fn buffering_trial_metadata_is_bounded_and_never_uses_the_file_sink_in_callback() {
-        let (tx, rx) = mpsc::sync_channel(1);
-        let state = State::new(tx);
-        let trial = NoDelayTrial { previous: nodelay_answer(Some(false)), applied: None };
-        state.report_trial(1, trial);
-        state.report_trial(1, trial); // full writer queue: discard, never wait
-        assert_eq!(state.lost.load(Ordering::Relaxed), 1);
-        assert_eq!(rx.try_recv().unwrap().trial.unwrap().previous.value, Some(false));
-        assert!(rx.try_recv().is_err());
     }
 
     #[test]

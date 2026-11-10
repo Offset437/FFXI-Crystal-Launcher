@@ -1,0 +1,136 @@
+// The Settings page: the page header with Privacy mode and the
+// language, the tab strip, and the selected tab's cards in the page scroller.
+import { Theme } from "theme.slint";
+import { SettingsView } from "settings_state.slint";
+import { Pressable, Select, Toggle, Rule, ScrollThumb, TipBody } from "widgets.slint";
+import { SystemTab } from "settings_system.slint";
+import { GraphicsTab, GameOptions } from "settings_graphics.slint";
+import { ControllerTab } from "settings_controller.slint";
+
+export { SettingsView }
+
+/// A Settings tab, like the title bar's: ink and semibold over a 2 px underline when active.
+component SettingsTab inherits Pressable {
+    in property <string> text;
+    in property <bool> active;
+    label: root.text;
+    accessible-role: tab;
+    accessible-checked: root.active;
+    min-width: caption.preferred-width;
+    preferred-width: self.min-width;
+    min-height: caption.preferred-height + 16px * Theme.scale + 2px;
+    horizontal-stretch: 0;
+    caption := Text {
+        y: 8px * Theme.scale;
+        height: self.preferred-height;
+        text: root.text;
+        font-size: Theme.type-body * Theme.scale;
+        font-weight: root.active ? 600 : 500;
+        color: root.active || root.hot ? Theme.ink : Theme.sub;
+    }
+    if root.active: Rectangle {
+        y: parent.height - 2px;
+        height: 2px;
+        background: Theme.play;
+    }
+}
+
+export component SettingsPage inherits Rectangle {
+    private property <float> s: Theme.scale;
+    VerticalLayout {
+        padding-top: 24px * root.s;
+        padding-left: 40px * root.s;
+        padding-right: 40px * root.s - 12px;
+        spacing: 16px * root.s;
+        // Header and tabs end at the page margin; the body's scroller runs in the lane beyond it.
+        VerticalLayout {
+            vertical-stretch: 0;
+            padding-right: 12px;
+            spacing: 20px * root.s;
+            HorizontalLayout {
+                spacing: 16px * root.s;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 4px * root.s;
+                    alignment: start;
+                    Text { text: SettingsView.strings.title; font-size: Theme.type-title * root.s; font-weight: 600; color: Theme.ink; }
+                    Text { text: SettingsView.strings.description; font-size: Theme.type-body * root.s; color: Theme.sub; wrap: word-wrap; }
+                }
+                // Privacy mode and the language apply to every page, not to one tab.
+                VerticalLayout {
+                    horizontal-stretch: 0;
+                    alignment: start;
+                    HorizontalLayout {
+                        spacing: 20px * root.s;
+                        privacy := Toggle {
+                            cross-axis-self-alignment: center;
+                            horizontal-stretch: 0;
+                            font-size: Theme.type-small * root.s;
+                            ink: Theme.sub;
+                            text: SettingsView.strings.privacy;
+                            on: SettingsView.system.privacy;
+                            toggled(on) => { SettingsView.set-privacy(on); }
+                            Tooltip { TipBody { text: SettingsView.strings.privacy-tip; } }
+                        }
+                        HorizontalLayout {
+                            horizontal-stretch: 0;
+                            spacing: 12px * root.s;
+                            Text { text: SettingsView.strings.language; font-size: Theme.type-small * root.s; color: Theme.sub; vertical-alignment: center; }
+                            Select {
+                                cross-axis-self-alignment: center;
+                                width: 150px * root.s;
+                                scale: root.s;
+                                label: SettingsView.strings.language;
+                                items: SettingsView.languages;
+                                current: SettingsView.system.language;
+                                picked(index) => { SettingsView.set-language(index); }
+                            }
+                        }
+                    }
+                }
+            }
+            VerticalLayout {
+                HorizontalLayout {
+                    spacing: 24px * root.s;
+                    alignment: start;
+                    for tab[i] in SettingsView.tabs: SettingsTab {
+                        text: tab;
+                        active: i == SettingsView.tab;
+                        clicked => { SettingsView.pick-tab(i); }
+                    }
+                }
+                Rule { }
+            }
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            page := Flickable {
+                // Its width comes from the page alone: its content (whose columns are sized from
+                // that width) must not feed back into it.
+                min-width: 0px;
+                preferred-width: 0px;
+                max-width: 100000px;
+                content-width: self.width;
+                content-height: body.preferred-height;
+                body := VerticalLayout {
+                    width: page.width;
+                    height: self.preferred-height;
+                    padding-right: 12px;
+                    padding-bottom: 24px * root.s;
+                    alignment: start;
+                    if SettingsView.tab == 0: GraphicsTab { width-hint: page.width - 12px; }
+                    if SettingsView.tab == 1: GameOptions { width-hint: page.width - 12px; }
+                    if SettingsView.tab == 2: ControllerTab { }
+                    if SettingsView.tab == 3: SystemTab { }
+                }
+            }
+            ScrollThumb {
+                x: parent.width - 8px;
+                height: parent.height;
+                content-y: page.content-y;
+                content-height: page.content-height;
+                visible-height: page.height;
+            }
+        }
+    }
+}

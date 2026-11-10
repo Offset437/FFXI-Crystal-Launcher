@@ -1,6 +1,6 @@
 //! A short, process-owned barrier immediately before GameStart. No POL calls.
-use std::time::{Duration, Instant};
-use windows_sys::Win32::{Foundation::{CloseHandle, HANDLE, FILETIME}, System::Threading::{CreateEventW, OpenEventW, SetEvent, OpenProcess, GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, EVENT_MODIFY_STATE}};
+use std::time::Duration;
+use windows_sys::Win32::{Foundation::{CloseHandle, HANDLE, FILETIME, WAIT_OBJECT_0, WAIT_TIMEOUT}, System::Threading::{CreateEventW, OpenEventW, SetEvent, OpenProcess, GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, WaitForMultipleObjects, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, EVENT_MODIFY_STATE}};
 
 const SYNCHRONIZE: u32 = 0x0010_0000;
 pub const LIMIT: Duration = Duration::from_secs(30);
@@ -32,7 +32,11 @@ fn token_parts(token: &str) -> Result<(&str, u32, u64, u8), String> {
         u64::from_str_radix(parts[2], 16).map_err(|_| "Invalid gate owner.")?,
         u8::from_str_radix(parts[3], 16).map_err(|_| "Invalid gate member.")?))
 }
+// The launcher uses Coordinator (and only opens a Participant to check a
+// token); the loader uses Participant. Each crate compiles the whole file.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct Coordinator { release: Handle, cancel: Handle, ready: Vec<Handle>, started: Vec<Handle> }
+#[cfg_attr(not(test), allow(dead_code))]
 impl Coordinator {
     pub fn new(id: &str, count: usize) -> Result<(Self, Vec<String>), String> {
         if count == 0 || count > 32 || id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) { return Err("Invalid game-start batch.".into()); }
@@ -54,6 +58,7 @@ impl Coordinator {
 }
 impl Drop for Coordinator { fn drop(&mut self) { let _ = self.cancel.signal(); } }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct Participant { release: Handle, cancel: Handle, ready: Handle, started: Handle, owner: Handle }
 impl Participant {
     pub fn open(token: &str) -> Result<Self, String> {
@@ -70,17 +75,21 @@ impl Participant {
     fn check(&self) -> Result<(), String> {
         if self.cancel.signaled() || self.owner.signaled() { Err("The game-start batch was canceled.".into()) } else { Ok(()) }
     }
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn wait(&self) -> Result<(), String> { self.wait_for(LIMIT) }
+    #[cfg_attr(not(test), allow(dead_code))]
     fn wait_for(&self, timeout: Duration) -> Result<(), String> {
         self.check()?;
         self.ready.signal()?;
-        let until = Instant::now() + timeout;
-        loop {
-            self.check()?;
-            if self.release.signaled() { self.started.signal()?; return Ok(()); }
-            if Instant::now() >= until { let _ = self.cancel.signal(); return Err("Timed out waiting for the other games.".into()); }
-            // The shared kernel event wakes every member without a supervisor poll.
-            unsafe { WaitForSingleObject(self.release.0, 10); }
+        // One kernel wait on whichever fires first. Cancel and owner death come
+        // before release, so (lowest index wins) they keep their priority.
+        let handles = [self.cancel.0, self.owner.0, self.release.0];
+        let ms = timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+        match unsafe { WaitForMultipleObjects(3, handles.as_ptr(), 0, ms) } {
+            r if r == WAIT_OBJECT_0 || r == WAIT_OBJECT_0 + 1 => Err("The game-start batch was canceled.".into()),
+            r if r == WAIT_OBJECT_0 + 2 => { self.started.signal()?; Ok(()) }
+            WAIT_TIMEOUT => { let _ = self.cancel.signal(); Err("Timed out waiting for the other games.".into()) }
+            _ => Err("Could not wait on the game-start gate.".into()),
         }
     }
 }
@@ -101,8 +110,8 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         assert!(!gate.ready()); assert!(gate.release().is_err()); assert!(!a.is_finished());
         let b = std::thread::spawn(move || second.wait());
-        let until = Instant::now() + Duration::from_secs(2);
-        while !gate.ready() { assert!(Instant::now() < until); std::thread::yield_now(); }
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while !gate.ready() { assert!(std::time::Instant::now() < until); std::thread::yield_now(); }
         gate.release().unwrap();
         a.join().unwrap().unwrap(); b.join().unwrap().unwrap(); assert!(gate.started());
     }

@@ -18,45 +18,9 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-// Verified against polcore 73b1864b (preferred base 10000000).
-pub const ENTRY_RVAS: &[(usize, usize)] = &[
-    (173, 0x1cc40),
-    (186, 0x24dd0),
-    (188, 0x24d90),
-    (190, 0x1cbb0),
-    (270, 0x1a760),
-    (272, 0x1a8e0),
-    (284, 0x1acb0),
-    (285, 0x1ac80),
-    (286, 0x1ad10),
-    (287, 0x1ace0),
-    (291, 0x1b6d0),
-    (316, 0x1a050),
-    (322, 0x1c0e0),
-    (323, 0x1c0f0),
-    (324, 0x1bee0),
-    (325, 0x1bf00),
-    (326, 0x1c050),
-    (327, 0x1c120),
-    (328, 0x1c150),
-    (329, 0x1bf60),
-    (330, 0x1bf90),
-    (331, 0x1b610),
-    (333, 0x1c180),
-    (342, 0x1fef0),
-    (385, 0x28040),
-    (394, 0x28290),
-    (926, 0x2ec70),
-    (927, 0x2edc0),
-    (928, 0x2ee60),
-    (1034, 0x255e0),
-    (1035, 0x25640),
-    (1304, 0x1c500),
-    (1305, 0x1c530),
-];
 pub static REQUEST: Mutex<Option<NativeSocialRequest>> = Mutex::new(None);
 pub(crate) static CATALOG_ACCESS: Mutex<()> = Mutex::new(());
-pub const HEADER_LEN: usize = 0x48;
+pub const HEADER_LEN: usize = crate::wire::SOCIAL_HEADER_LEN;
 /// One listed message: the 0x48 header, then +0x4c the body pointer 326
 /// fills (core 10027ac4 stride; app 100515eb allocates max*0x50).
 pub const RECORD_LEN: usize = 0x50;
@@ -68,7 +32,7 @@ const MAX_BODY: usize = 0x102000;
 /// Body follows the header at +0xa8 in every send buffer (app 100513b0).
 const BODY_AT: usize = 0xa8;
 /// The Viewer's 3600-frame mail limits at their stock cold wall time (112.5 s; 07d §6 S1 D).
-const MAIL_FRAMES: u32 = native_jobs::MAIL_FRAMES;
+fn mail_frames() -> u32 { native_jobs::mail_frames() }
 const MAIL_ATTEMPTS: u32 = 3;
 const LIST_PENDING: Duration = Duration::from_secs(60);
 const LIST_RETRY: Duration = Duration::from_secs(30);
@@ -173,7 +137,7 @@ impl MailNotifications {
     pub fn start(api: &Api) -> Self {
         mail().changed.store(false, Ordering::Release);
         set_listening(true);
-        unsafe { api.f::<unsafe extern "C" fn(usize)>(331)(mail_arrived as *const () as usize) };
+        unsafe { api.f::<unsafe extern "C" fn(usize)>(331, 1)(mail_arrived as *const () as usize) };
         Self { api: api.clone() }
     }
     pub fn take_changed(&self) -> bool {
@@ -184,16 +148,14 @@ impl MailNotifications {
 impl Drop for MailNotifications {
     fn drop(&mut self) {
         set_listening(false);
-        unsafe { self.api.f::<unsafe extern "C" fn(usize)>(331)(0) };
+        unsafe { self.api.f::<unsafe extern "C" fn(usize)>(331, 1)(0) };
     }
 }
 
-/// Keep one Service for the whole signed-in session: the first `social_entry`
-/// is the sign-in entry, every later one a return from a game.
+/// Keep one Service for the whole signed-in session.
 #[derive(Default)]
 pub struct Service {
     headers: Vec<StoredHeader>,
-    entered: bool,
     /// app [104e512c]: consecutive list failures since the last accepted start.
     list_errors: u32,
     /// app list state 6: re-list when this passes (10056b6a, 30 s).
@@ -228,14 +190,14 @@ impl Service {
     #[cfg(test)]
     fn remember(&mut self, bytes: &[u8]) {
         self.headers = bytes
-            .chunks_exact(HEADER_LEN)
+            .as_chunks::<HEADER_LEN>().0.iter()
             .filter(|h| h.iter().any(|b| *b != 0))
-            .map(|h| StoredHeader { header: h.try_into().unwrap(), folder: 0, read: false })
+            .map(|h| StoredHeader { header: *h, folder: 0, read: false })
             .collect();
     }
 }
 
-fn result(request: &NativeSocialRequest, code: i32, payload: Option<&[u8]>) {
+pub(crate) fn result(request: &NativeSocialRequest, code: i32, payload: Option<&[u8]>) {
     let extra = payload.map_or(String::new(), |bytes| {
         format!(",\"payload\":\"{}\"", b64::encode(bytes))
     });
@@ -263,12 +225,7 @@ fn friend(api: &Api, alternate: bool, slot: u16, expected: u64) -> Result<[u8; 0
         return Err(-7175);
     }
     let mut record = [0; 0xb0];
-    let code = unsafe {
-        api.f::<unsafe extern "C" fn(usize, usize) -> i32>(if alternate { 169 } else { 167 })(
-            slot as usize,
-            record.as_mut_ptr() as usize,
-        )
-    };
+    let code = api.call(if alternate { 169 } else { 167 }, &[slot as usize, record.as_mut_ptr() as usize]);
     if code < 0 {
         return Err(code);
     }
@@ -288,9 +245,7 @@ fn in_friend_list(api: &Api, uid: u64, handle: u8) -> bool {
     let _catalog = CATALOG_ACCESS.lock().unwrap_or_else(|e| e.into_inner());
     (0..200).any(|slot| {
         let mut record = [0u8; 0xb0];
-        let code = unsafe {
-            api.f::<unsafe extern "C" fn(usize, usize) -> i32>(167)(slot, record.as_mut_ptr() as usize)
-        };
+        let code = api.call(167, &[slot, record.as_mut_ptr() as usize]);
         code >= 0 && record[0x98] & 1 != 0 && u64_at(&record, 0) == uid && record_handle(&record) == handle
     })
 }
@@ -305,14 +260,12 @@ fn in_group(api: &Api, uid: u64, handle: u8) -> bool {
         return false;
     }
     let mut buffer = vec![0u8; 4 * GROUP];
-    let copied = unsafe {
-        api.f::<unsafe extern "C" fn(usize, i32) -> i32>(394)(buffer.as_mut_ptr() as usize, 1)
-    };
+    let copied = api.call(394, &[buffer.as_mut_ptr() as usize, 1]);
     buffer
-        .chunks_exact(GROUP)
+        .as_chunks::<GROUP>().0.iter()
         .take(copied.clamp(0, groups).min(4) as usize)
-        .filter(|group| !matches!((u32_at(group, 0xc) >> 1) & 7, 1 | 2))
-        .flat_map(|group| group[0x28..].chunks_exact(0xc0))
+        .filter(|group| !matches!((u32_at(&group[..], 0xc) >> 1) & 7, 1 | 2))
+        .flat_map(|group| group[0x28..].as_chunks::<0xc0>().0)
         .any(|m| m[8] & 1 != 0 && u64_at(m, 0) == uid && ((u64_at(m, 0x20) >> 45) & 0x3f) as u8 == handle)
 }
 
@@ -332,13 +285,7 @@ fn discarded_unread(api: &Api, header: &[u8]) -> bool {
         return false;
     }
     let mut id = [0u8; 32];
-    unsafe {
-        api.f::<unsafe extern "C" fn(u32, u32, usize)>(316)(
-            u32_at(header, 0),
-            u32_at(header, 4),
-            id.as_mut_ptr() as usize,
-        )
-    };
+    api.call(316, &[u32_at(header, 0) as usize, u32_at(header, 4) as usize, id.as_mut_ptr() as usize]); // void
     if !member_id(&id[..8]) {
         return false;
     }
@@ -346,7 +293,7 @@ fn discarded_unread(api: &Api, header: &[u8]) -> bool {
     !in_friend_list(api, uid, handle) && !in_group(api, uid, handle)
 }
 
-fn cp932(text: &str, limit: usize) -> Result<Zeroizing<Vec<u8>>, i32> {
+pub(crate) fn cp932(text: &str, limit: usize) -> Result<Zeroizing<Vec<u8>>, i32> {
     use windows_sys::Win32::Globalization::{WideCharToMultiByte, WC_NO_BEST_FIT_CHARS};
     if text
         .chars()
@@ -465,9 +412,7 @@ fn handle_name(api: &Api, handle: i32) -> Option<[u8; 16]> {
         return None;
     }
     let mut record = [0u8; 0x28];
-    let code = unsafe {
-        api.f::<unsafe extern "C" fn(usize, usize) -> i32>(173)(handle as usize, record.as_mut_ptr() as usize)
-    };
+    let code = api.call(173, &[handle as usize, record.as_mut_ptr() as usize]);
     if code < 0 || record[0] & 1 == 0 {
         return None;
     }
@@ -502,11 +447,11 @@ fn pack_message(api: &Api, m: &Message, subject: &[u8], text: &[u8]) -> Result<(
     let mut buffer = Zeroizing::new(vec![0u64; (BODY_AT + length).div_ceil(8)]);
     let header = buffer.as_mut_ptr() as usize;
     unsafe {
-        let built = api.f::<unsafe extern "C" fn(usize, u32, u32, u32, u32, u32, usize, usize, u32, u32, u32, u32, u32) -> i32>(270)(
+        let built = api.f::<unsafe extern "C" fn(usize, u32, u32, u32, u32, u32, usize, usize, u32, u32, u32, u32, u32) -> i32>(270, 13)(
             header, 0, m.own as u32, (m.own >> 32) as u32, m.to as u32, (m.to >> 32) as u32,
             m.name.as_ptr() as usize, short.as_ptr() as usize,
             u32::from(m.sender_handle), u32::from(m.recipient_handle), 1000, 0, length as u32);
-        let packed = api.f::<unsafe extern "C" fn(usize, usize, u32, usize, usize) -> i32>(272)(
+        let packed = api.f::<unsafe extern "C" fn(usize, usize, u32, usize, usize) -> i32>(272, 5)(
             subject.as_ptr() as usize, text.as_ptr() as usize, 0, 0, header + BODY_AT);
         if built != length as i32 || packed != length as i32 {
             return Err(-5120);
@@ -541,12 +486,18 @@ fn send_job(api: &Api, buffer: &mut [u64], frame: &mut dyn FnMut() -> bool) -> i
                 }
                 if polled < 0 {
                     (error, state) = (polled, 4);
-                } else if frames > MAIL_FRAMES {
+                } else if frames > mail_frames() {
                     cancel(api, ticket);
                     (error, state) = (native_jobs::TIMED_OUT, 4);
                 }
             }
-            4 => match { request.result = error; error } {
+            // Once Play is requested no new attempt starts (07a
+            // presign-no-cancel-freeze 1), a full-table reissue included.
+            4 | 5 if crate::native_auth::play_requested() => {
+                request.result = error;
+                return error;
+            }
+            4 => { request.result = error; match error {
                 -256 => state = 2,
                 // 1005373b, 10052131 and 10052272 end the job: the message
                 // is returned or marked undeliverable, never retried.
@@ -559,10 +510,10 @@ fn send_job(api: &Api, buffer: &mut [u64], frame: &mut dyn FnMut() -> bool) -> i
                         return error;
                     }
                 }
-            },
+            } }
             _ => {
                 frames += 1;
-                if frames > MAIL_FRAMES {
+                if frames > mail_frames() {
                     state = 2;
                 }
             }
@@ -578,7 +529,7 @@ fn send_job(api: &Api, buffer: &mut [u64], frame: &mut dyn FnMut() -> bool) -> i
 }
 
 fn cancel(api: &Api, ticket: i32) {
-    unsafe { api.f::<unsafe extern "C" fn(usize)>(328)(ticket as usize) };
+    api.call(328, &[ticket as usize]); // void
 }
 
 fn send_mail(
@@ -601,7 +552,7 @@ fn send_mail(
     // app 10055982..100559c3: the current handle (190) and its own name.
     let handle = api.zero(190);
     let name = handle_name(api, handle).ok_or(-7186)?;
-    let own = unsafe { api.f::<unsafe extern "C" fn() -> u64>(342)() };
+    let own = unsafe { api.f::<unsafe extern "C" fn() -> u64>(342, 0)() };
     let m = Message { own, to: uid, name, sender_handle: handle as u8, recipient_handle: record_handle(&target) };
     let (mut buffer, length, truncated) = pack_message(api, &m, &subject, &text)?;
     drop(catalog);
@@ -718,8 +669,8 @@ fn write_file(path: &[u8], bytes: &[u8]) -> Result<(), i32> {
 }
 fn aligned_header(bytes: &[u8; HEADER_LEN]) -> [u64; HEADER_LEN / 8] {
     let mut header = [0u64; HEADER_LEN / 8];
-    for (out, word) in header.iter_mut().zip(bytes.chunks_exact(8)) {
-        *out = u64::from_le_bytes(word.try_into().unwrap());
+    for (out, word) in header.iter_mut().zip(bytes.as_chunks::<8>().0) {
+        *out = u64::from_le_bytes(*word);
     }
     header
 }
@@ -776,18 +727,8 @@ fn read_mail(api: &Api, stored: &mut StoredHeader) -> Result<Option<Zeroizing<Ve
 
 fn local_headers(api: &Api, folder: u8) -> Result<Vec<StoredHeader>, i32> {
     let mut directory = [0u8; 512];
-    unsafe {
-        api.f::<unsafe extern "C" fn(i32, usize, i32, i32) -> i32>(126)(
-            match folder {
-                0 => 7,
-                1 => 8,
-                _ => 6,
-            },
-            directory.as_mut_ptr() as usize,
-            512,
-            0,
-        )
-    };
+    let kind = match folder { 0 => 7, 1 => 8, _ => 6 };
+    api.call(126, &[kind, directory.as_mut_ptr() as usize, 512, 0]);
     let end = directory
         .iter()
         .position(|b| *b == 0)
@@ -808,13 +749,7 @@ fn local_headers(api: &Api, folder: u8) -> Result<Vec<StoredHeader>, i32> {
         let mut header = [0u64; 12];
         // The installed 291 wrapper takes output first, source filename second.
         // Older reverse-engineering notes had these parameters reversed.
-        if unsafe {
-            api.f::<unsafe extern "C" fn(usize, usize) -> i32>(291)(
-                header.as_mut_ptr() as usize,
-                name.as_ptr() as usize,
-            )
-        } != 0
-        {
+        if api.call(291, &[header.as_mut_ptr() as usize, name.as_ptr() as usize]) != 0 {
             continue;
         }
         let bytes = &bytes_of(&header)[..HEADER_LEN];
@@ -938,7 +873,7 @@ impl Download {
                     }
                 } else if polled < 0 {
                     (self.error, self.state) = (polled, failed);
-                } else if self.frames > MAIL_FRAMES {
+                } else if self.frames > mail_frames() {
                     cancel(api, self.ticket);
                     (self.error, self.state) = (native_jobs::TIMED_OUT, failed);
                 }
@@ -948,7 +883,7 @@ impl Download {
             3 | 8 if crate::native_auth::play_requested() => self.outcome = Some(Fetched::Failed(self.error)),
             3 | 8 => {
                 self.frames += 1;
-                if self.frames >= MAIL_FRAMES {
+                if self.frames >= mail_frames() {
                     self.state = if self.state == 3 { 0 } else { 5 };
                 }
             }
@@ -1003,9 +938,8 @@ impl Service {
         // it is set once at Viewer start and never cleared, and the live stock
         // capture lists after sign-in and after the game alike (pol-spec 05 §3).
         // 1019fef3..1019ff14 still clears an arrival no receiver took.
-        self.entered = true;
         if api.zero(1304) != 0 {
-            unsafe { api.f::<unsafe extern "C" fn(i32)>(1305)(0) };
+            api.call(1305, &[0]); // void
         }
         // A check request leaves the 30 s retry wait at once (10056b83).
         self.list_retry = None;
@@ -1034,7 +968,7 @@ impl PushDelivery {
             log!("native POL dropped {dropped} pushed message(s) the receiver could not copy");
         }
         let mut pushed = std::mem::take(&mut *mail().pushed.lock().unwrap_or_else(|e| e.into_inner()));
-        pushed.extend(self.unsaved.drain(..));
+        pushed.append(&mut self.unsaved);
         for message in pushed {
             // app 10056b24: queue the receipt, then save the message.
             if receipts && !message.answered {
@@ -1059,6 +993,15 @@ impl PushDelivery {
             self.receipts.retain_mut(|buffer| api.one(333, buffer.as_mut_ptr() as usize) < 0);
         }
     }
+
+    /// The Viewer instance ends at the game handoff and its receipt queue with
+    /// it: a receipt still unaccepted then is never sent after the game.
+    /// Returns how many were dropped.
+    pub fn abandon_receipts(&mut self) -> usize {
+        let dropped = self.receipts.len();
+        self.receipts.clear();
+        dropped
+    }
 }
 
 impl Service {
@@ -1077,7 +1020,7 @@ impl Service {
         }
         // app 1005641d: every new record (header +0x3e bit 15) not already queued.
         let mut jobs: Vec<Box<Download>> = Vec::new();
-        for record in listed.chunks_exact(RECORD_LEN).filter(|r| u16_at(r, 0x3e) & 0x8000 != 0) {
+        for record in listed.as_chunks::<RECORD_LEN>().0.iter().filter(|r| u16_at(&r[..], 0x3e) & 0x8000 != 0) {
             if jobs.iter().any(|job| same_message(job.header(), record)) {
                 continue;
             }
@@ -1118,16 +1061,15 @@ impl Service {
         // 07d §4.7: one start/end pair over the reissues; its end line on return.
         let mut request: Option<native_jobs::RequestLog> = None;
         'issue: loop {
-            // 1001cf90: the Viewer issues nothing without a connected member.
-            if api.zero(838) != 3 {
+            // 1001cf90: the Viewer issues nothing without a connected member,
+            // and a closing or cancelled owner starts no list only to cancel it.
+            if api.zero(838) != 3 || crate::native_auth::owner_stopping(api) {
                 return None;
             }
             let mut buffer = Zeroizing::new(vec![0u64; LIST_MAX * RECORD_LEN / 8]);
             let request = request.get_or_insert_with(|| native_jobs::RequestLog::start("mail-list"));
             request.attempts += 1;
-            let ticket = unsafe {
-                api.f::<unsafe extern "C" fn(usize, u32) -> i32>(329)(buffer.as_mut_ptr() as usize, LIST_MAX as u32)
-            };
+            let ticket = api.call(329, &[buffer.as_mut_ptr() as usize, LIST_MAX]);
             request.result = ticket;
             if ticket < 0 {
                 if transient_list_error(ticket) {
@@ -1190,20 +1132,16 @@ impl Service {
             return;
         }
         result(&request, 0, None);
-        let (folder, page) = match &request {
-            NativeSocialRequest::Inbox { folder, page, .. } => (*folder, *page),
-            NativeSocialRequest::Check { .. } => {
-                // The Viewer's check (1005166e): leave any retry wait and run
-                // the list job now; new mail is downloaded, saved and
-                // acknowledged before the Inbox is shown.
-                self.list_retry = None;
-                self.mail_cycle(api, frame);
-                (0, 0)
-            }
-            _ => (0, 0),
-        };
         match &request {
             NativeSocialRequest::Inbox { .. } | NativeSocialRequest::Check { .. } => {
+                let (folder, page) = if let NativeSocialRequest::Inbox { folder, page, .. } = &request { (*folder, *page) } else {
+                    // The Viewer's check (1005166e): leave any retry wait and run
+                    // the list job now; new mail is downloaded, saved and
+                    // acknowledged before the Inbox is shown.
+                    self.list_retry = None;
+                    self.mail_cycle(api, frame);
+                    (0, 0)
+                };
                 // Otherwise local only: new mail is downloaded automatically at
                 // the social entry, on arrival and on a check, as by the Viewer.
                 let mut records = match local_headers(api, folder) {
@@ -1223,7 +1161,7 @@ impl Service {
                 payload[4..8].copy_from_slice(&page.to_le_bytes());
                 payload[8..12].copy_from_slice(&unread.to_le_bytes());
                 for (out, record) in payload[12..]
-                    .chunks_exact_mut(HEADER_LEN)
+                    .as_chunks_mut::<HEADER_LEN>().0.iter_mut()
                     .zip(records.iter().skip(offset).take(HEADER_COUNT))
                 {
                     out.copy_from_slice(&record.header);
@@ -1314,8 +1252,8 @@ pub unsafe fn smoke_builders(table: &[usize]) {
     wire.extend_from_slice(filename);
     wire.extend_from_slice(&bytes[BODY_AT..BODY_AT + length]);
     let notifications = MailNotifications::start(&api);
-    api.f::<unsafe extern "C" fn(i32)>(1032)(1);
-    api.f::<unsafe extern "C" fn(usize)>(334)(wire.as_ptr() as usize);
+    api.f::<unsafe extern "C" fn(i32)>(1032, 1)(1);
+    api.f::<unsafe extern "C" fn(usize)>(334, 1)(wire.as_ptr() as usize);
     assert!(notifications.take_changed(), "native Viewer message callback was not dispatched");
     {
         let pushed = mail().pushed.lock().unwrap();
@@ -1325,7 +1263,7 @@ pub unsafe fn smoke_builders(table: &[usize]) {
     }
     drop(notifications);
     discard_pushed();
-    api.f::<unsafe extern "C" fn(i32)>(1032)(0);
+    api.f::<unsafe extern "C" fn(i32)>(1032, 1)(0);
     assert_ne!(api.zero(838), 3);
 }
 
@@ -1825,6 +1763,55 @@ mod tests {
         assert_eq!(u16_at(&header, 0x3e), 0xc000, "bits 12-13 cleared, immediate delivery");
         assert_eq!(&header[BODY_AT..BODY_AT + 26], b"A long subject line\x07Hello\0");
         assert!(dir.join("sent-0.bin").exists() && !dir.join("out-0.bin").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn after_play_a_failed_mail_send_starts_no_second_324() {
+        use std::sync::atomic::{AtomicI32, AtomicU32};
+        static STARTS: AtomicU32 = AtomicU32::new(0);
+        static RESULT: AtomicI32 = AtomicI32::new(0);
+        unsafe extern "C" fn start(_: usize) -> i32 { STARTS.fetch_add(1, Ordering::SeqCst); RESULT.load(Ordering::SeqCst) }
+        unsafe extern "C" fn retryable(_: usize) -> i32 { 1 }
+        let mut table = vec![0usize; 1560];
+        table[324] = start as *const () as usize;
+        table[1107] = retryable as *const () as usize;
+        let api = Api::test_table(&table);
+        let _play = crate::native_auth::TestPlay::requested();
+        // A retryable failure and a full request table both stand once Play is requested.
+        for code in [-2, -256] {
+            STARTS.store(0, Ordering::SeqCst);
+            RESULT.store(code, Ordering::SeqCst);
+            let mut buffer = [0u64; 8];
+            assert_eq!(send_job(&api, &mut buffer, &mut || true), code);
+            assert_eq!(STARTS.load(Ordering::SeqCst), 1, "result {code}: one 324 only");
+        }
+    }
+
+    #[test]
+    fn receipts_still_unaccepted_at_the_game_handoff_are_never_sent_later() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (api, dir) = fake(Core { receipt_results: vec![-256], ..Default::default() });
+        let body = b"Hi\x07There\0".to_vec();
+        let mut record = [0u64; RECORD_LEN / 8];
+        {
+            let bytes = bytes_of_mut(&mut record);
+            bytes[0x10..0x15].copy_from_slice(b"Alice");
+            bytes[0x30] = 7;
+            bytes[0x38] = 9;
+            bytes[0x3e..0x40].copy_from_slice(&0x8000u16.to_le_bytes());
+            bytes[0x40..0x42].copy_from_slice(&1000u16.to_le_bytes());
+            bytes[0x4c..0x50].copy_from_slice(&(body.as_ptr() as u32).to_le_bytes());
+        }
+        set_listening(true);
+        unsafe { mail_arrived(record.as_ptr() as usize) };
+        let mut delivery = PushDelivery::default();
+        delivery.flush_pushed(&api, true); // 333 refused (-256): kept
+        assert_eq!(with(|c| c.receipts.len()), 1);
+        assert_eq!(delivery.abandon_receipts(), 1);
+        delivery.flush_pushed(&api, true); // the restarted Viewer after the game
+        assert_eq!(with(|c| c.receipts.len()), 1, "no 333 for a pre-game receipt");
+        set_listening(false);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

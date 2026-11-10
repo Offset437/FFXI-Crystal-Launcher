@@ -1,7 +1,7 @@
-//! Which injector starts may run at the same time.
-//!
-//! Sign-ins never wait here: each account signs in on its own thread first. Only the tool
-//! start is gated, and only as far as the tools need:
+//! Which injector starts may run at the same time: the in-process gate tests give
+//! `start_host` (`TurnGate`). Each session worker starts one tool, so production uses the
+//! machine-wide Windower lock instead (`session_worker::windower_turn_at`). Only the tool start
+//! is gated, and only as far as the tools need:
 //!
 //! - **Windower 4**: its injection handshake writes settings into the fixed-name file mapping
 //!   `WindowerMMFSettingsHandler`, creates the fixed-name auto-reset event
@@ -120,16 +120,5 @@ mod tests {
         let second = second.join().unwrap();
         assert!(entered.load(Ordering::SeqCst));
         drop(second);
-    }
-
-    #[test]
-    fn a_failed_start_frees_the_turn() {
-        let turns = turns();
-        let first = turns.enter(Tool::Windower, &mut |_| {});
-        let (entered, second) = enter_later(turns, Tool::Windower);
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(!entered.load(Ordering::SeqCst));
-        drop(first);
-        drop(second.join().unwrap());
     }
 }

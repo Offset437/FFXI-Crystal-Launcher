@@ -3,13 +3,9 @@
 //! never gain a proxy DLL. Presets, effects and the editable config stay in one
 //! persistent folder across host and launcher updates.
 
-use crate::i18n::{t, tf};
-use crate::icons::Icon;
-use crate::ui::{colors, scale, BODY, SEMI};
+use crate::i18n::t;
 use crate::{App, Message};
-use iced::widget::{column, row, text};
-use iced::{Alignment, Element, Length, Task};
-use sha2::{Digest, Sha256};
+use crate::effect::Effect;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -65,27 +61,26 @@ fn root() -> PathBuf {
     crate::dgvoodoo::data_root()
 }
 
-fn digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+use crate::pol_less::tools::embedded::sha256_hex as digest;
+
+/// Neither a symlink nor another reparse point (a junction, a cloud placeholder).
+fn plain(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return false;
+    }
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 fn regular_file(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
     let metadata = fs::symlink_metadata(path).map_err(|_| t("Could not read the ReShade file."))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > cap {
+    if !metadata.is_file() || !plain(&metadata) || metadata.len() > cap {
         return Err(t("The ReShade file is not a supported regular file.").into());
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-        {
-            return Err(t("The ReShade file is not a supported regular file.").into());
-        }
     }
     let file = File::open(path).map_err(|_| t("Could not read the ReShade file."))?;
     let mut bytes = Vec::new();
@@ -102,18 +97,8 @@ fn directory(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|_| t("Could not create the ReShade folder."))?;
     let metadata =
         fs::symlink_metadata(path).map_err(|_| t("Could not read the ReShade folder."))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !metadata.is_dir() || !plain(&metadata) {
         return Err(t("The ReShade folder must be a regular local folder.").into());
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-        {
-            return Err(t("The ReShade folder must be a regular local folder.").into());
-        }
     }
     Ok(())
 }
@@ -156,13 +141,24 @@ fn installed(root: &Path) -> bool {
     runtime(root).is_ok()
 }
 
+/// Whether ReShade is installed, and the preset its config names; ReShade.ini is read once.
+fn status(root: &Path) -> (bool, String) {
+    let dir = folder(root);
+    let dll_ok = regular_file(&dir.join("dxgi.dll"), MAX_BINARY).is_ok_and(|b| digest(&b) == DLL_HASH && x86_image(&b));
+    let config = regular_file(&dir.join("ReShade.ini"), MAX_INI).ok();
+    match config.as_deref().map(ini_text) {
+        Some(Ok(text)) => (dll_ok, parse_preset(text)),
+        _ => (false, String::new()),
+    }
+}
+
+#[cfg(test)]
 fn current_preset(root: &Path) -> String {
-    let Ok(bytes) = regular_file(&folder(root).join("ReShade.ini"), MAX_INI) else {
-        return String::new();
-    };
-    let Ok(text) = ini_text(&bytes) else {
-        return String::new();
-    };
+    status(root).1
+}
+
+/// `PresetPath` under `[GENERAL]`.
+fn parse_preset(text: &str) -> String {
     let mut general = false;
     let mut preset = String::new();
     for line in text.lines() {
@@ -224,7 +220,8 @@ fn variant(root: &Path, host: &[u8], dll: &[u8]) -> Result<PathBuf, String> {
     let dir = cache(root)?;
     let hosts = dir.join("hosts");
     directory(&hosts)?;
-    let launch = hosts.join(format!("{}-{}", &digest(host)[..16], &digest(dll)[..16]));
+    // The runtime was verified against DLL_HASH, so its name part is known.
+    let launch = hosts.join(format!("{}-{}", &digest(host)[..16], &DLL_HASH[..16]));
     directory(&launch)?;
     let base = dir
         .to_str()
@@ -235,8 +232,22 @@ fn variant(root: &Path, host: &[u8], dll: &[u8]) -> Result<PathBuf, String> {
     place_once(&launch.join("dxgi.dll"), dll)?;
     let loader = launch.join("pol.exe");
     place_once(&loader, host)?;
+    // Marks the folder (not the host, which stays byte- and time-identical) as in
+    // use, so `prune_hosts` in another launch keeps it.
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_WRITE_ATTRIBUTES; FILE_FLAG_BACKUP_SEMANTICS opens a folder.
+        let _ = OpenOptions::new()
+            .access_mode(0x0100)
+            .custom_flags(0x0200_0000)
+            .open(&launch)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    }
     Ok(loader)
 }
+
+/// Launches running together prepare and prune host folders one at a time.
+static HOSTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) fn loader_for_launch(
     loader: &Path,
@@ -256,6 +267,7 @@ pub(crate) fn loader_for_launch(
     if !x86_image(&host) {
         return Err(t("ReShade needs Crystal's 32-bit game host.").into());
     }
+    let _hosts = HOSTS.lock().unwrap_or_else(|e| e.into_inner());
     let path = variant(&root, &host, &dll)?;
     let dir = path
         .parent()
@@ -263,7 +275,48 @@ pub(crate) fn loader_for_launch(
     // ReShade hooks the translated DirectX output, so a failed wrapper install
     // must not silently launch with an ineffective ReShade option.
     crate::dgvoodoo::place(&root, &crate::dgvoodoo::PINNED, dir)?;
+    prune_hosts(dir);
     Ok(path)
+}
+
+/// Whether a `hosts` entry name is one `variant` makes: 16 hex, a dash, 16 hex.
+fn host_folder_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() == 33 && b[16] == b'-' && b.iter().enumerate().all(|(i, c)| i == 16 || c.is_ascii_hexdigit())
+}
+
+/// Best effort: deletes host folders an older Crystal or loader made. A folder whose `pol.exe`
+/// cannot be deleted (Windows locks a running image) is left whole, and so is one used or
+/// written in the last hour (its `pol.exe` or the folder itself), which another launch, possibly
+/// in another Crystal process, may be preparing.
+fn prune_hosts(current: &Path) {
+    let Some(hosts) = current.parent() else { return };
+    let recent = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().map_or(true, |age| age < Duration::from_secs(3600)));
+    for entry in fs::read_dir(hosts).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path == current || !host_folder_name(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir() && plain(&m)) {
+            continue;
+        }
+        let host = path.join("pol.exe");
+        if recent(&host) || recent(&path) || (host.exists() && fs::remove_file(&host).is_err()) {
+            continue;
+        }
+        let _ = fs::remove_dir_all(&path);
+    }
+}
+
+/// Best effort: deletes setup targets older Crystal builds made (`Crystal-ReShade-Setup-<hash16>.exe`).
+fn prune_setup_targets(dir: &Path, keep: &Path) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if path != keep && name.starts_with("Crystal-ReShade-Setup-") && name.ends_with(".exe") {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 async fn setup_download(root: &Path) -> Result<PathBuf, String> {
@@ -328,7 +381,6 @@ fn run_setup(root: &Path, setup: &Path) -> Result<(), String> {
     // Keep write and delete sharing denied from verification through execution.
     let mut options = OpenOptions::new();
     options.read(true);
-    #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
@@ -356,6 +408,7 @@ fn run_setup(root: &Path, setup: &Path) -> Result<(), String> {
     let dir = cache(root)?;
     // This copy is an installer target for bitness detection. It is never run.
     let target = dir.join(format!("Crystal-ReShade-Setup-{}.exe", &hash[..16]));
+    prune_setup_targets(&dir, &target);
     place_once(&target, host)?;
     let mut child = setup_command(setup, &target)
         .spawn()
@@ -446,17 +499,12 @@ fn save_preset(root: &Path, source: &Path) -> Result<String, String> {
         .filter(|s| !s.chars().any(char::is_control))
         .ok_or(t("The ReShade preset path is not supported."))?;
     place_once(&destination, &bytes)?;
-    let temp = dir.join(format!("ReShade.{}.tmp", crate::backend::unique_id()?));
-    let result = fs::write(&temp, set_preset(config_text, path))
-        .and_then(|()| fs::rename(&temp, &config_path));
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-        return Err(t("Could not save the ReShade preset selection.").into());
-    }
+    crate::fsutil::write_atomic(&config_path, set_preset(config_text, path).as_bytes())
+        .map_err(|_| t("Could not save the ReShade preset selection."))?;
     Ok(path.into())
 }
 
-fn editable(app: &App) -> bool {
+pub(crate) fn editable(app: &App) -> bool {
     app.preview
         || app.vault_ready
             && !app
@@ -467,22 +515,22 @@ fn editable(app: &App) -> bool {
             && !app.reshade.busy
 }
 
-pub(crate) fn update(app: &mut App, msg: Msg) -> Task<Message> {
+pub(crate) fn update(app: &mut App, msg: Msg) -> Effect<Message> {
     if matches!(msg, Msg::Toggle(_) | Msg::Setup | Msg::ChoosePreset)
         && !app.preview
         && (!editable(app) || app.has_sessions())
     {
         app.status =
             t("Close games and sign out PlayOnline sessions before changing ReShade.").into();
-        return Task::none();
+        return Effect::none();
     }
     match msg {
         Msg::Refresh if !app.preview && !app.reshade.busy => {
             app.reshade.generation = app.reshade.generation.wrapping_add(1);
             let generation = app.reshade.generation;
-            return Task::perform(
+            return Effect::perform(
                 async {
-                    tokio::task::spawn_blocking(|| (installed(&root()), current_preset(&root())))
+                    tokio::task::spawn_blocking(|| status(&root()))
                         .await
                         .unwrap_or_default()
                 },
@@ -513,14 +561,14 @@ pub(crate) fn update(app: &mut App, msg: Msg) -> Task<Message> {
             app.reshade.busy = true;
             app.reshade.error = None;
             app.reshade.status = t("Downloading official ReShade setup…").into();
-            return Task::perform(async { setup_download(&root()).await }, |result| {
+            return Effect::perform(async { setup_download(&root()).await }, |result| {
                 message(Msg::Downloaded(result))
             });
         }
         Msg::Downloaded(Ok(setup)) if app.reshade.busy => {
             app.reshade.status =
                 t("Choose effects in ReShade setup, click Finish, then close its window.").into();
-            return Task::perform(
+            return Effect::perform(
                 async move {
                     tokio::task::spawn_blocking(move || run_setup(&root(), &setup))
                         .await
@@ -544,7 +592,7 @@ pub(crate) fn update(app: &mut App, msg: Msg) -> Task<Message> {
             app.reshade.generation = app.reshade.generation.wrapping_add(1);
             app.reshade.busy = true;
             app.reshade.error = None;
-            return Task::perform(
+            return Effect::perform(
                 async {
                     rfd::AsyncFileDialog::new()
                         .add_filter("ReShade preset", &["ini"])
@@ -556,7 +604,7 @@ pub(crate) fn update(app: &mut App, msg: Msg) -> Task<Message> {
             );
         }
         Msg::Picked(Some(path)) if app.reshade.busy => {
-            return Task::perform(
+            return Effect::perform(
                 async move {
                     tokio::task::spawn_blocking(move || save_preset(&root(), &path))
                         .await
@@ -596,85 +644,8 @@ pub(crate) fn update(app: &mut App, msg: Msg) -> Task<Message> {
         }
         _ => (),
     }
-    Task::none()
+    Effect::none()
 }
-
-pub(crate) fn view(app: &App) -> Element<'_, Message> {
-    let c = colors(app.settings.light_theme);
-    let s = scale(app);
-    let state = &app.reshade;
-    let can_edit = editable(app);
-    let switch = crate::controller_nav::toggler(app.settings.reshade.enabled).size(21.0 * s);
-    let switch: Element<'_, Message> = if can_edit {
-        switch.on_toggle(|on| message(Msg::Toggle(on))).into()
-    } else {
-        switch.into()
-    };
-    let head = row![column![
-        text("ReShade").font(SEMI).size(16.0 * s).color(c.ink),
-        text(t("Optional color correction, sharpening and shader presets. Requires dgVoodoo; available for Vanilla, Windower and Ashita."))
-            .font(BODY).size(12.5 * s).color(c.sub),
-    ].spacing(5.0 * s).width(Length::Fill), switch].spacing(20.0 * s).align_y(Alignment::Center);
-    let small = |which: Icon, label: &'static str, msg: Msg, enabled: bool| {
-        crate::prereqs::action(c, which, label, false, enabled.then_some(message(msg)))
-    };
-    let mut body = column![
-        head,
-        row![
-            small(
-                Icon::Download,
-                t("Set up ReShade"),
-                Msg::Setup,
-                can_edit && app.settings.dgvoodoo
-            ),
-            small(
-                Icon::Settings,
-                t("Choose preset…"),
-                Msg::ChoosePreset,
-                can_edit && state.installed
-            ),
-            small(
-                Icon::Folder,
-                t("Open ReShade folder"),
-                Msg::OpenFolder,
-                !state.busy
-            ),
-            small(Icon::ExternalLink, t("ReShade website"), Msg::Website, true)
-        ]
-        .spacing(8.0 * s),
-    ]
-    .spacing(12.0 * s);
-    let detail = if state.busy {
-        state.status.clone()
-    } else if !can_edit {
-        t("Close games and sign out PlayOnline sessions before changing ReShade.").into()
-    } else if !app.settings.dgvoodoo {
-        t("Enable dgVoodoo before using ReShade.").into()
-    } else if !state.status.is_empty() {
-        state.status.clone()
-    } else if state.installed {
-        tf("Installed v{version}", &[("version", &VERSION)])
-    } else {
-        t("Not installed").into()
-    };
-    body = body.push(text(detail).font(BODY).size(12.0 * s).color(c.sub));
-    if !state.preset.is_empty() {
-        let name = Path::new(&state.preset)
-            .file_name()
-            .and_then(|p| p.to_str())
-            .unwrap_or(&state.preset);
-        let name = name
-            .split_once('-')
-            .filter(|(hash, _)| hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
-            .map_or(name, |(_, name)| name);
-        body = body.push(text(name.to_owned()).font(BODY).size(12.0 * s).color(c.sub));
-    }
-    if let Some(error) = &state.error {
-        body = body.push(crate::ui::private_text(app, error, 12.0 * s, BODY, c.ink));
-    }
-    crate::prereqs::card(c, body, s)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,9 +682,9 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         let mut account = crate::blank_account();
         for route in [
-            crate::ui::LaunchWith::Vanilla,
-            crate::ui::LaunchWith::Windower,
-            crate::ui::LaunchWith::Ashita,
+            crate::backend::LaunchWith::Vanilla,
+            crate::backend::LaunchWith::Windower,
+            crate::backend::LaunchWith::Ashita,
         ] {
             account.launch_with = Some(route);
             let plan = settings.launch_plan(&account).unwrap();
@@ -826,6 +797,48 @@ mod tests {
         fs::write(&second, b"unexpected host").unwrap();
         assert!(variant(&root, &new, &dll).is_err());
         assert_eq!(fs::read(&second).unwrap(), b"unexpected host");
+    }
+
+    #[test]
+    fn older_host_folders_are_pruned_and_live_or_foreign_ones_kept() {
+        let root = temp("prune");
+        let dll = image(0x14c, 2);
+        let current = variant(&root, &image(0x14c, 1), &dll).unwrap();
+        let hosts = current.parent().unwrap().parent().unwrap().to_path_buf();
+        let make = |name: &str, age: u64| {
+            let dir = hosts.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            let when = std::time::SystemTime::now() - Duration::from_secs(age);
+            let file = File::create(dir.join("pol.exe")).unwrap();
+            file.set_modified(when).unwrap();
+            age_dir(&dir, when);
+            dir
+        };
+        fn age_dir(dir: &Path, when: std::time::SystemTime) {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_WRITE_ATTRIBUTES; FILE_FLAG_BACKUP_SEMANTICS opens a folder.
+            OpenOptions::new().access_mode(0x0100).custom_flags(0x0200_0000).open(dir).unwrap().set_modified(when).unwrap();
+        }
+        // A folder another launch is still preparing: no pol.exe yet, but new.
+        let preparing = hosts.join("00000000000000aa-0123456789abcdef");
+        fs::create_dir_all(&preparing).unwrap();
+        fs::write(preparing.join("ReShade.ini"), b"x").unwrap();
+        // An old folder whose pol.exe went missing.
+        let stale = hosts.join("00000000000000bb-0123456789abcdef");
+        fs::create_dir_all(&stale).unwrap();
+        age_dir(&stale, std::time::SystemTime::now() - Duration::from_secs(7200));
+        let old = make("0123456789abcdef-0123456789abcdef", 7200);
+        let recent = make("fedcba9876543210-0123456789abcdef", 10);
+        let foreign = make("my-notes", 7200);
+        prune_hosts(current.parent().unwrap());
+        assert!(!old.exists());
+        assert!(!stale.exists());
+        assert!(preparing.join("ReShade.ini").exists());
+        assert!(recent.join("pol.exe").exists());
+        assert!(foreign.join("pol.exe").exists());
+        assert!(current.exists());
+        assert!(host_folder_name("0123456789abcdef-0123456789abcdef"));
+        assert!(!host_folder_name("0123456789abcdef_0123456789abcdef"));
     }
 
     #[test]

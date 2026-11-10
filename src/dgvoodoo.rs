@@ -17,12 +17,8 @@
 //!   files that match what Crystal placed are removed.
 
 use crate::i18n::{t, tf};
-use crate::icons::{icon, Icon};
-use crate::ui::{colors, primary, quiet, scale, Colors, BODY, SEMI};
 use crate::{App, Message};
-use iced::widget::{column, container, progress_bar, row, text, toggler, Space};
-use iced::{Alignment, Border, Color, Element, Length, Subscription, Task};
-use sha2::{Digest, Sha256};
+use crate::effect::Effect;
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -72,12 +68,11 @@ pub(crate) static PINNED: Release = Release {
     conf: Pinned { entry: "dgVoodoo.conf", name: CONF, sha256: "45cc0eb8e6ed4f067aca1b2e4ac1268dfbd164bbbd06d264c53e8a60642c4dbf" },
 };
 
-/// Settings-side installs and launch-time installs never write the cache at the same time.
+/// Settings-side installs and launch-time installs never write the cache at the same time, and
+/// launches running together never place into (or clear) a loader folder at the same time.
 static WRITING: Mutex<()> = Mutex::new(());
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
-}
+use crate::pol_less::tools::embedded::sha256_hex;
 
 fn file_hash(path: &Path) -> Option<String> {
     fs::read(path).ok().map(|b| sha256_hex(&b))
@@ -105,17 +100,10 @@ pub(crate) fn installed(root: &Path, release: &Release) -> bool {
         && dir.join(CONF).is_file()
 }
 
-/// Writes through a temp file and a rename, so a reader never sees half a file.
+/// Creates the parent folder, then replaces `path` whole, so a reader never sees half a file.
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path.parent().ok_or_else(|| io::Error::other("no parent folder"))?;
-    fs::create_dir_all(dir)?;
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let temp = dir.join(format!("{name}.{}.tmp", std::process::id()));
-    let result = fs::write(&temp, bytes).and_then(|()| fs::rename(&temp, path));
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
+    fs::create_dir_all(path.parent().ok_or_else(|| io::Error::other("no parent folder"))?)?;
+    Ok(crate::fsutil::write_atomic(path, bytes)?)
 }
 
 /// The wanted entries' bytes, by their on-disk name. Entry names compare without case and with
@@ -163,21 +151,13 @@ pub(crate) fn watermark_off(conf: &str) -> String {
     out
 }
 
-/// Where the conf Crystal starts from comes from: one the user already has in Crystal's folder
-/// (this version's, else an older version's), then PlayOnline's, then the release default.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ConfSource {
-    Kept,
-    Crystal(PathBuf),
-    PlayOnline(PathBuf),
-    Default,
-}
-
 /// Puts a `dgVoodoo.conf` in `dir` unless one is there already (never overwrites the user's).
-pub(crate) fn seed_conf(dir: &Path, pol_conf: Option<&Path>, release_conf: &[u8]) -> io::Result<ConfSource> {
+/// It starts from one the user already has in Crystal's folder (an older version's), then
+/// PlayOnline's, then the release default.
+pub(crate) fn seed_conf(dir: &Path, pol_conf: Option<&Path>, release_conf: &[u8]) -> io::Result<()> {
     let target = dir.join(CONF);
     if target.is_file() {
-        return Ok(ConfSource::Kept);
+        return Ok(());
     }
     let readable = |p: &Path| fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() <= 1024 * 1024);
     // An older version's conf in Crystal's own dgvoodoo folder, newest first.
@@ -192,25 +172,24 @@ pub(crate) fn seed_conf(dir: &Path, pol_conf: Option<&Path>, release_conf: &[u8]
         .filter_map(|p| Some((fs::metadata(&p).ok()?.modified().ok()?, p)))
         .collect();
     older.sort();
-    let (bytes, source) = if let Some((_, path)) = older.pop() {
-        (fs::read(&path)?, ConfSource::Crystal(path))
+    let bytes = if let Some((_, path)) = older.pop() {
+        fs::read(&path)?
     } else if let Some(path) = pol_conf.filter(|p| readable(p)) {
-        (fs::read(path)?, ConfSource::PlayOnline(path.to_owned()))
+        fs::read(path)?
     } else {
-        (watermark_off(&String::from_utf8_lossy(release_conf)).into_bytes(), ConfSource::Default)
+        watermark_off(&String::from_utf8_lossy(release_conf)).into_bytes()
     };
-    write_atomic(&target, &bytes)?;
-    Ok(source)
+    write_atomic(&target, &bytes)
 }
 
 /// PlayOnline's own `dgVoodoo.conf`, from the Viewer's install folder in the registry.
 pub(crate) fn playonline_conf() -> Option<PathBuf> {
-    crate::patch::registry_install_folder("1000").map(|dir| dir.join(CONF)).filter(|p| p.is_file())
+    crate::patch::install_folder(crate::updater::Product::Viewer).map(|dir| dir.join(CONF)).filter(|p| p.is_file())
 }
 
 /// Checks the zip against the pinned hash, then writes only the needed files to the cache and
 /// seeds the conf. Nothing is written for a zip that doesn't match.
-pub(crate) fn install_from_zip(root: &Path, zip: &[u8], release: &Release, pol_conf: Option<&Path>) -> Result<ConfSource, String> {
+pub(crate) fn install_from_zip(root: &Path, zip: &[u8], release: &Release, pol_conf: Option<&Path>) -> Result<(), String> {
     if sha256_hex(zip) != release.zip_sha256 {
         return Err(t("The dgVoodoo download doesn't match its pinned SHA-256, so nothing was installed.").into());
     }
@@ -250,37 +229,51 @@ fn read_manifest(dir: &Path) -> Vec<(String, String)> {
 
 fn write_manifest(dir: &Path, entries: &[(String, String)]) -> io::Result<()> {
     let body: String = entries.iter().map(|(n, h)| format!("{h} {n}\n")).collect();
-    write_atomic(&dir.join(MANIFEST), body.as_bytes())
+    let path = dir.join(MANIFEST);
+    if fs::read(&path).is_ok_and(|current| current == body.as_bytes()) {
+        return Ok(());
+    }
+    write_atomic(&path, body.as_bytes())
 }
 
-/// What a sync did next to the loader.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Placed {
-    pub copied: Vec<String>,
-    /// Files that were there, weren't Crystal's, and were renamed aside.
-    pub set_aside: Vec<String>,
+/// Why `place` did not set dgVoodoo up.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PlaceError {
+    /// The cache lacks a pinned DLL (or it differs), or the conf.
+    NotInstalled,
+    Io(String),
+}
+
+impl From<PlaceError> for String {
+    fn from(error: PlaceError) -> Self {
+        match error {
+            PlaceError::NotInstalled => t("dgVoodoo is not installed yet.").into(),
+            PlaceError::Io(error) => error,
+        }
+    }
 }
 
 /// Makes the loader's folder hold the cached DLLs and conf. Copies a file only when it is missing
 /// or differs; a differing file Crystal didn't place is renamed to `<name>.crystal-backup[-n]`.
-pub(crate) fn place(root: &Path, release: &Release, loader_dir: &Path) -> Result<Placed, String> {
+/// Each cache file is read once: the bytes whose hash was checked are the bytes written.
+pub(crate) fn place(root: &Path, release: &Release, loader_dir: &Path) -> Result<(), PlaceError> {
     let cache = cache_dir(root, release);
-    let mut sources: Vec<(String, PathBuf, String)> = Vec::new();
+    let mut sources: Vec<(String, Vec<u8>, String)> = Vec::new();
     for pin in release.dlls {
-        let path = cache.join(pin.name);
-        if !has_hash(&path, pin.sha256) {
-            return Err(t("dgVoodoo is not installed yet.").into());
+        let bytes = fs::read(cache.join(pin.name)).map_err(|_| PlaceError::NotInstalled)?;
+        if sha256_hex(&bytes) != pin.sha256 {
+            return Err(PlaceError::NotInstalled);
         }
-        sources.push((pin.name.to_owned(), path, pin.sha256.to_owned()));
+        sources.push((pin.name.to_owned(), bytes, pin.sha256.to_owned()));
     }
-    let conf = cache.join(CONF);
-    let conf_hash = file_hash(&conf).ok_or_else(|| t("dgVoodoo is not installed yet.").to_owned())?;
+    let conf = fs::read(cache.join(CONF)).map_err(|_| PlaceError::NotInstalled)?;
+    let conf_hash = sha256_hex(&conf);
     sources.push((CONF.to_owned(), conf, conf_hash));
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let ours = read_manifest(loader_dir);
-    let mut placed = Placed::default();
     let mut manifest = Vec::new();
-    let fail = |e: io::Error| tf("Could not set up dgVoodoo in {folder}: {error}", &[("folder", &loader_dir.display()), ("error", &e)]);
-    for (name, source, hash) in sources {
+    let fail = |e: io::Error| PlaceError::Io(tf("Could not set up dgVoodoo in {folder}: {error}", &[("folder", &loader_dir.display()), ("error", &e)]));
+    for (name, bytes, hash) in sources {
         let target = loader_dir.join(&name);
         match file_hash(&target) {
             Some(current) if current == hash => {}
@@ -293,26 +286,20 @@ pub(crate) fn place(root: &Path, release: &Release, loader_dir: &Path) -> Result
                         .find(|p| !p.exists())
                         .expect("an unused name");
                     fs::rename(&target, &aside).map_err(fail)?;
-                    placed.set_aside.push(name.clone());
-                }
-                let bytes = fs::read(&source).map_err(fail)?;
-                if sha256_hex(&bytes) != hash {
-                    return Err(t("dgVoodoo is not installed yet.").into());
                 }
                 write_atomic(&target, &bytes).map_err(fail)?;
-                placed.copied.push(name.clone());
             }
         }
         manifest.push((name, hash));
     }
-    write_manifest(loader_dir, &manifest).map_err(fail)?;
-    Ok(placed)
+    write_manifest(loader_dir, &manifest).map_err(fail)
 }
-
 /// Removes, from a loader's folder, only files that match the pinned DLLs or what Crystal's
-/// manifest says it placed (the conf). Anything else stays. A failed removal keeps the
-/// manifest so a later attempt can still recognize the conf and older release's DLLs.
+/// manifest says it placed (the conf). Anything else stays. The DLLs go first: while one cannot
+/// be removed (a running game has it loaded) the conf and the manifest stay, so that game keeps
+/// its settings and a later attempt can still recognize the conf and older release's DLLs.
 pub(crate) fn remove_from(release: &Release, loader_dir: &Path) -> Result<Vec<String>, String> {
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let ours = read_manifest(loader_dir);
     let mut removed = Vec::new();
     let mut errors = Vec::new();
@@ -322,6 +309,9 @@ pub(crate) fn remove_from(release: &Release, loader_dir: &Path) -> Result<Vec<St
     let mut names: Vec<String> = release.dlls.iter().map(|p| p.name.to_owned()).collect();
     names.push(CONF.to_owned());
     for name in names {
+        if name == CONF && !errors.is_empty() {
+            break;
+        }
         let target = loader_dir.join(&name);
         let current = match fs::read(&target) {
             Ok(bytes) => sha256_hex(&bytes),
@@ -374,11 +364,17 @@ pub(crate) fn loader_dirs(root: &Path, override_path: &str) -> Vec<PathBuf> {
     dirs
 }
 
-/// Removes the placed files everywhere a loader can run from.
-fn remove_everywhere(root: &Path, override_path: &str) -> Result<(), String> {
+/// Removes the placed files everywhere a loader can run from, ReShade's host folders included.
+fn remove_everywhere(release: &Release, root: &Path, override_path: &str) -> Result<(), String> {
     let mut errors = Vec::new();
-    for dir in loader_dirs(root, override_path) {
-        if let Err(error) = remove_from(&PINNED, &dir) {
+    let hosts = fs::read_dir(crate::reshade::folder(root).join("hosts"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path());
+    for dir in loader_dirs(root, override_path).into_iter().chain(hosts) {
+        if let Err(error) = remove_from(release, &dir) {
             errors.push(error);
         }
     }
@@ -387,7 +383,7 @@ fn remove_everywhere(root: &Path, override_path: &str) -> Result<(), String> {
 
 /// Deletes the cached DLLs and settings app. The user's `dgVoodoo.conf` stays for next time.
 fn uninstall(root: &Path, override_path: &str) -> Result<(), String> {
-    remove_everywhere(root, override_path)?;
+    remove_everywhere(&PINNED, root, override_path)?;
     let dir = cache_dir(root, &PINNED);
     let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     for pin in PINNED.dlls.iter().chain([&PINNED.cpl]) {
@@ -410,13 +406,10 @@ pub(crate) fn sync_for_launch(loader: &Path, enabled: bool) -> Option<String> {
     if !enabled {
         return remove_from(&PINNED, dir).err();
     }
-    let root = data_root();
-    if !installed(&root, &PINNED) {
-        return Some(t("dgVoodoo is not installed yet, so this launch uses the game's own DirectX 8.").into());
-    }
-    match place(&root, &PINNED, dir) {
-        Ok(_) => Some(tf("dgVoodoo {version} is set up for this launch.", &[("version", &VERSION)])),
-        Err(error) => Some(tf("{error} The game starts without dgVoodoo.", &[("error", &error)])),
+    match place(&data_root(), &PINNED, dir) {
+        Ok(()) => Some(tf("dgVoodoo {version} is set up for this launch.", &[("version", &VERSION)])),
+        Err(PlaceError::NotInstalled) => Some(t("dgVoodoo is not installed yet, so this launch uses the game's own DirectX 8.").into()),
+        Err(PlaceError::Io(error)) => Some(tf("{error} The game starts without dgVoodoo.", &[("error", &error)])),
     }
 }
 
@@ -435,7 +428,11 @@ async fn download(release: &Release, mut progress: impl FnMut(u64, Option<u64>))
         .user_agent("CrystalLauncher/0.1")
         .build()
         .map_err(|_| unreachable())?;
-    let mut response = client.get(URL).send().await.map_err(|_| unreachable())?;
+    // The stall guard below covers the body; this one covers the headers (and redirects).
+    let mut response = tokio::time::timeout(Duration::from_secs(30), client.get(URL).send())
+        .await
+        .map_err(|_| unreachable())?
+        .map_err(|_| unreachable())?;
     if !response.status().is_success() {
         return Err(tf("GitHub answered {status} for the dgVoodoo download.", &[("status", &response.status())]));
     }
@@ -469,10 +466,18 @@ async fn download(release: &Release, mut progress: impl FnMut(u64, Option<u64>))
     Ok(bytes)
 }
 
+/// One install at a time: launches and the Settings page started together wait for one download.
+static INSTALLING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Download, verify and install, off the UI thread.
 async fn download_and_install(root: PathBuf, progress: impl FnMut(u64, Option<u64>)) -> Result<(), String> {
+    let _installing = INSTALLING.lock().await;
+    let check = root.clone();
+    if tokio::task::spawn_blocking(move || installed(&check, &PINNED)).await.unwrap_or(false) {
+        return Ok(());
+    }
     let zip = download(&PINNED, progress).await?;
-    tokio::task::spawn_blocking(move || install_from_zip(&root, &zip, &PINNED, playonline_conf().as_deref()).map(|_| ()))
+    tokio::task::spawn_blocking(move || install_from_zip(&root, &zip, &PINNED, playonline_conf().as_deref()))
         .await
         .unwrap_or_else(|_| Err(t("The dgVoodoo install stopped unexpectedly.").into()))
 }
@@ -490,7 +495,7 @@ pub(crate) fn ensure_installed_blocking(mut status: impl FnMut(String)) -> Resul
         .map_err(|_| t("The dgVoodoo install stopped unexpectedly.").to_owned())?;
     status(t("Downloading dgVoodoo…").into());
     let mut shown = u64::MAX;
-    runtime.block_on(download_and_install(root, move |done, total| {
+    let install = download_and_install(root, move |done, total| {
         if let Some(total) = total.filter(|t| *t > 0) {
             let percent = done.saturating_mul(100) / total;
             if percent != shown {
@@ -498,7 +503,10 @@ pub(crate) fn ensure_installed_blocking(mut status: impl FnMut(String)) -> Resul
                 status(tf("Downloading dgVoodoo… {percent}%", &[("percent", &percent)]));
             }
         }
-    }))
+    });
+    // The connect, header and per-chunk stall timeouts in `download` bound a hung
+    // connection; a slow one that still makes progress is allowed to finish.
+    runtime.block_on(install)
 }
 
 // ---- Settings → Graphics ----
@@ -522,7 +530,7 @@ impl State {
     /// Reads the cache; with the option on and nothing installed yet, the install starts now.
     pub(crate) fn new(enabled: bool) -> Self {
         let mut state = Self { installed: false, job: Job::Idle, next_id: 1, preview: false };
-        if std::env::args().any(|a| a.starts_with("--preview")) {
+        if crate::preview::flags().is_some() {
             state.preview = true;
             match std::env::var("XI_PREVIEW_DGVOODOO").unwrap_or_default().as_str() {
                 "installed" => state.installed = true,
@@ -566,15 +574,21 @@ fn dg(msg: Msg) -> Message {
     Message::Dgvoodoo(msg)
 }
 
-pub(crate) fn update(app: &mut App, msg: Msg) -> Task<Message> {
+pub(crate) fn update(app: &mut App, msg: Msg) -> Effect<Message> {
     if app.reshade.busy && matches!(msg, Msg::Toggle(_) | Msg::Remove) {
         app.status = t("Finish ReShade setup before changing dgVoodoo.").into();
-        return Task::none();
+        return Effect::none();
+    }
+    // A running game has D3D8.dll loaded: removing only what is not locked would leave later
+    // "off" launches on dgVoodoo without its settings.
+    if matches!(msg, Msg::Toggle(false) | Msg::Remove) && !app.preview && app.has_sessions() {
+        app.status = t("Close games and sign out PlayOnline sessions before changing dgVoodoo.").into();
+        return Effect::none();
     }
     if matches!(msg, Msg::Toggle(false) | Msg::Remove) && app.settings.reshade.enabled {
         if !app.preview && app.has_sessions() {
             app.status = t("Close games and sign out PlayOnline sessions before changing ReShade.").into();
-            return Task::none();
+            return Effect::none();
         }
         app.settings.reshade.enabled = false;
     }
@@ -591,21 +605,23 @@ pub(crate) fn update(app: &mut App, msg: Msg) -> Task<Message> {
             app.settings.dgvoodoo = on;
             save(app);
             if preview {
-                return Task::none();
+                return Effect::none();
             }
             if on {
+                // A removal error from turning it off no longer applies.
+                app.dgvoodoo.job = Job::Idle;
                 app.dgvoodoo.installed = installed(&data_root(), &PINNED);
                 if !app.dgvoodoo.installed {
                     app.dgvoodoo.start();
                 }
             } else {
-                // Stops a download in progress (its subscription ends) and takes Crystal's
+                // Stops a download in progress (its job stops) and takes Crystal's
                 // files away from the loader folders; the cache stays for turning it back on.
                 app.dgvoodoo.job = Job::Idle;
                 let loader = app.settings.loader_path.clone();
-                return Task::perform(
+                return Effect::perform(
                     async move {
-                        tokio::task::spawn_blocking(move || remove_everywhere(&data_root(), &loader))
+                        tokio::task::spawn_blocking(move || remove_everywhere(&PINNED, &data_root(), &loader))
                             .await
                             .unwrap_or_else(|_| Err(t("The dgVoodoo install stopped unexpectedly.").into()))
                     },
@@ -631,7 +647,7 @@ pub(crate) fn update(app: &mut App, msg: Msg) -> Task<Message> {
         }
         Msg::OpenSettings => {
             if preview {
-                return Task::none();
+                return Effect::none();
             }
             let dir = cache_dir(&data_root(), &PINNED);
             let cpl = dir.join(PINNED.cpl.name);
@@ -651,10 +667,10 @@ pub(crate) fn update(app: &mut App, msg: Msg) -> Task<Message> {
             app.dgvoodoo.job = Job::Idle;
             if preview {
                 app.dgvoodoo.installed = false;
-                return Task::none();
+                return Effect::none();
             }
             let loader = app.settings.loader_path.clone();
-            return Task::perform(
+            return Effect::perform(
                 async move {
                     tokio::task::spawn_blocking(move || uninstall(&data_root(), &loader))
                         .await
@@ -674,205 +690,41 @@ pub(crate) fn update(app: &mut App, msg: Msg) -> Task<Message> {
             }
         }
     }
-    Task::none()
+    Effect::none()
 }
 
-pub(crate) fn subscription(state: &State) -> Subscription<Message> {
-    let Job::Running { id, .. } = state.job else { return Subscription::none() };
-    if state.preview {
-        return Subscription::none();
+/// The running download's id, while one should run.
+pub(crate) fn work(state: &State) -> Option<u64> {
+    match state.job {
+        Job::Running { id, .. } if !state.preview => Some(id),
+        _ => None,
     }
-    Subscription::run_with(id, |id| {
-        let id = *id;
-        iced::stream::channel(16, async move |mut out: iced::futures::channel::mpsc::Sender<Message>| {
-            use iced::futures::SinkExt;
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let work = download_and_install(data_root(), move |done, total| {
-                let _ = tx.send((done, total));
-            });
-            tokio::pin!(work);
-            let result = loop {
-                tokio::select! {
-                    result = &mut work => break result,
-                    Some((done, total)) = rx.recv() => { let _ = out.send(dg(Msg::Progress(id, done, total))).await; }
-                }
-            };
-            let _ = out.send(dg(Msg::Finished(id, result))).await;
-        })
+}
+
+/// Download `id`'s progress and outcome as messages, in order.
+pub(crate) fn run(id: u64) -> impl futures_util::Stream<Item = Message> + Send + 'static {
+    crate::runtime::channel(16, async move |mut out: futures_channel::mpsc::Sender<Message>| {
+        use futures_util::SinkExt;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let work = download_and_install(data_root(), move |done, total| {
+            let _ = tx.send((done, total));
+        });
+        tokio::pin!(work);
+        let result = loop {
+            tokio::select! {
+                result = &mut work => break result,
+                Some((done, total)) = rx.recv() => { let _ = out.send(dg(Msg::Progress(id, done, total))).await; }
+            }
+        };
+        let _ = out.send(dg(Msg::Finished(id, result))).await;
     })
 }
 
-fn rgb(value: u32) -> Color {
-    Color::from_rgb8((value >> 16) as u8, (value >> 8) as u8, value as u8)
-}
-/// The Graphics tab's success and error tones.
-fn tone(light: bool, ok: bool) -> Color {
-    match (ok, light) {
-        (true, false) => rgb(0x7CC4A6),
-        (true, true) => rgb(0x2F7A5F),
-        (false, false) => rgb(0xE88A8A),
-        (false, true) => rgb(0xB03E3E),
-    }
-}
-
-fn chip<'a>(label: String, color: Color, s: f32) -> Element<'a, Message> {
-    container(text(label).font(SEMI).size(11.5 * s).color(color))
-        .padding([2.0 * s, 9.0 * s])
-        .style(move |_| container::Style {
-            background: Some(Color { a: 0.13, ..color }.into()),
-            border: Border { color: Color { a: 0.32, ..color }, width: 1.0, radius: (10.0 * s).into() },
-            ..Default::default()
-        })
-        .into()
-}
+/// The card as plain data for the Slint front end.
+pub(crate) mod front;
 
 fn mb(value: u64) -> String {
     format!("{:.1} MB", value as f64 / 1_000_000.0)
-}
-
-/// The dgVoodoo card at the top of Settings → Graphics.
-pub(crate) fn view(app: &App) -> Element<'_, Message> {
-    let light = app.settings.light_theme;
-    let c = colors(light);
-    let s = scale(app);
-    let state = &app.dgvoodoo;
-    let on = app.settings.dgvoodoo;
-
-    let status = match &state.job {
-        Job::Running { done, total: Some(total), .. } if *total > 0 => {
-            chip(tf("Downloading {percent}%", &[("percent", &(done.saturating_mul(100) / total))]), c.accent, s)
-        }
-        Job::Running { .. } => chip(t("Downloading…").into(), c.accent, s),
-        _ if state.installed => chip(tf("Installed v{version}", &[("version", &VERSION)]), tone(light, true), s),
-        _ => chip(t("Not installed").into(), c.sub, s),
-    };
-    let switch = crate::controller_nav::toggler(on)
-        .on_toggle(|v| dg(Msg::Toggle(v)))
-        .size(21.0 * s)
-        .style(move |_, status| {
-            let c = colors(light);
-            let (toggled, hovered) = match status {
-                toggler::Status::Active { is_toggled } => (is_toggled, false),
-                toggler::Status::Hovered { is_toggled } => (is_toggled, true),
-                toggler::Status::Disabled { is_toggled } => (is_toggled, false),
-            };
-            toggler::Style {
-                background: if toggled { c.play.into() } else { c.field.into() },
-                background_border_width: 1.0,
-                background_border_color: if toggled { c.play } else if hovered { c.sub } else { c.line },
-                foreground: if toggled { c.play_text.into() } else { c.sub.into() },
-                foreground_border_width: 0.0,
-                foreground_border_color: Color::TRANSPARENT,
-                text_color: None,
-                border_radius: None,
-                padding_ratio: 0.2,
-            }
-        });
-    let head = row![
-        column![
-            row![text(t("Use dgVoodoo (DirectX 8 → 11 wrapper)")).font(SEMI).size(16.0 * s).color(c.ink), status]
-                .spacing(10.0 * s)
-                .align_y(Alignment::Center),
-            text(t("Draws the game through Direct3D 11, which can fix black screens, stutter and alt-tab problems on newer graphics cards. Crystal downloads it from the official GitHub release, checks it, and sets it up at each launch."))
-                .font(BODY)
-                .size(12.5 * s)
-                .color(c.sub),
-        ]
-        .spacing(5.0 * s)
-        .width(Length::Fill),
-        switch,
-    ]
-    .spacing(20.0 * s)
-    .align_y(Alignment::Center);
-
-    let mut body = column![head].spacing(14.0 * s);
-    match &state.job {
-        Job::Running { done, total, .. } => {
-            let fraction = total.filter(|t| *t > 0).map(|t| (*done as f64 / t as f64).clamp(0.0, 1.0) as f32);
-            let detail = match total {
-                Some(total) => tf("{done} of {total}", &[("done", &mb(*done)), ("total", &mb(*total))]),
-                None => tf("{done} received", &[("done", &mb(*done))]),
-            };
-            body = body.push(
-                column![
-                    row![
-                        text(tf("Downloading dgVoodoo {version}", &[("version", &VERSION)])).font(BODY).size(13.0 * s).color(c.ink).width(Length::Fill),
-                        text(detail).font(BODY).size(12.0 * s).color(c.sub)
-                    ]
-                    .align_y(Alignment::Center),
-                    progress_bar(0.0..=1.0, fraction.unwrap_or(0.0)).girth(6.0 * s).style(move |_| progress_bar::Style {
-                        background: c.select.into(),
-                        bar: c.accent.into(),
-                        border: Border { radius: 3.0.into(), ..Default::default() },
-                    }),
-                ]
-                .spacing(8.0 * s),
-            );
-        }
-        Job::Failed(error) => {
-            let color = tone(light, false);
-            body = body.push(
-                row![
-                    icon(Icon::AlertCircle, 15.0 * s, color),
-                    container(crate::ui::private_text(app, error, 12.5 * s, BODY, c.ink)).width(Length::Fill),
-                ]
-                .spacing(8.0 * s)
-                .align_y(Alignment::Center),
-            );
-        }
-        Job::Idle => {}
-    }
-    let busy = matches!(state.job, Job::Running { .. });
-    let failed_and_on = on && matches!(state.job, Job::Failed(_)) && !state.installed;
-    if state.installed || failed_and_on {
-        let small = |which: Icon, label: &'static str, msg: Option<Msg>, tint: Color| {
-            crate::controller_nav::button(row![icon(which, 14.0 * s, tint), text(label).font(BODY).size(13.0 * s)].spacing(7.0 * s).align_y(Alignment::Center))
-                .padding([7.0 * s, 12.0 * s])
-                .style(quiet)
-                .on_press_maybe(msg.map(dg))
-        };
-        let mut actions = row![].spacing(6.0 * s).align_y(Alignment::Center);
-        if state.installed {
-            actions = actions
-                .push(small(Icon::Settings, t("Open dgVoodoo settings"), Some(Msg::OpenSettings), c.accent))
-                .push(small(Icon::Trash, t("Remove"), (!busy).then_some(Msg::Remove), c.sub));
-        } else {
-            actions = actions.push(
-                crate::controller_nav::button(text(t("Try again")).font(SEMI).size(13.0 * s))
-                    .padding([7.0 * s, 16.0 * s])
-                    .style(primary)
-                    .on_press(dg(Msg::Toggle(true))),
-            );
-        }
-        let note = text(tf("dgVoodoo {version} · settings are kept in Crystal's folder", &[("version", &VERSION)]))
-            .font(BODY)
-            .size(11.5 * s)
-            .color(c.sub);
-        body = body.push(divider(c)).push(row![actions, Space::new().width(Length::Fill), note].align_y(Alignment::Center));
-    }
-
-    container(
-        container(body)
-            .padding([18.0 * s, 22.0 * s])
-            .width(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(c.panel.into()),
-                text_color: Some(c.ink),
-                border: Border { color: c.line, width: 1.0, radius: (9.0 * s).into() },
-                ..Default::default()
-            }),
-    )
-    .padding(iced::Padding::ZERO.top(4.0 * s).right(16.0 * s))
-    .width(Length::Fill)
-    .into()
-}
-
-fn divider<'a>(c: Colors) -> Element<'a, Message> {
-    container(Space::new())
-        .width(Length::Fill)
-        .height(1)
-        .style(move |_| container::Style { background: Some(c.line.into()), ..Default::default() })
-        .into()
 }
 
 #[cfg(test)]
@@ -967,8 +819,7 @@ mod tests {
         assert!(pick_files(&bytes, &[missing]).is_err());
 
         let root = temp("install");
-        let source = install_from_zip(&root, &bytes, &release, None).unwrap();
-        assert_eq!(source, ConfSource::Default);
+        install_from_zip(&root, &bytes, &release, None).unwrap();
         let dir = cache_dir(&root, &release);
         let mut files: Vec<String> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         files.sort();
@@ -989,19 +840,20 @@ mod tests {
         fs::create_dir_all(pol.parent().unwrap()).unwrap();
         fs::write(&pol, "tuned in PlayOnline").unwrap();
         // Nothing else: the release default, watermark off.
-        assert_eq!(seed_conf(&dir, None, CONF_TEXT.as_bytes()).unwrap(), ConfSource::Default);
+        seed_conf(&dir, None, CONF_TEXT.as_bytes()).unwrap();
+        assert!(fs::read_to_string(dir.join(CONF)).unwrap().contains("dgVoodooWatermark                   = false\r\n"));
         fs::remove_file(dir.join(CONF)).unwrap();
         // PlayOnline's beats the default.
-        assert_eq!(seed_conf(&dir, Some(&pol), CONF_TEXT.as_bytes()).unwrap(), ConfSource::PlayOnline(pol.clone()));
+        seed_conf(&dir, Some(&pol), CONF_TEXT.as_bytes()).unwrap();
         assert_eq!(fs::read_to_string(dir.join(CONF)).unwrap(), "tuned in PlayOnline");
         // An existing Crystal conf is never overwritten.
         fs::write(dir.join(CONF), "edited in Crystal").unwrap();
-        assert_eq!(seed_conf(&dir, Some(&pol), CONF_TEXT.as_bytes()).unwrap(), ConfSource::Kept);
+        seed_conf(&dir, Some(&pol), CONF_TEXT.as_bytes()).unwrap();
         assert_eq!(fs::read_to_string(dir.join(CONF)).unwrap(), "edited in Crystal");
         // A new version starts from the older version's Crystal conf, over PlayOnline's.
         let newer = root.join("crystal").join("dgvoodoo").join("3.0");
         fs::create_dir_all(&newer).unwrap();
-        assert_eq!(seed_conf(&newer, Some(&pol), CONF_TEXT.as_bytes()).unwrap(), ConfSource::Crystal(dir.join(CONF)));
+        seed_conf(&newer, Some(&pol), CONF_TEXT.as_bytes()).unwrap();
         assert_eq!(fs::read_to_string(newer.join(CONF)).unwrap(), "edited in Crystal");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -1042,20 +894,32 @@ mod tests {
         fs::create_dir_all(&versioned).unwrap();
         fs::write(standard.join("pol.exe"), b"loader").unwrap();
         fs::write(versioned.join("pol.exe"), b"loader 2").unwrap();
+        let names = ["D3D8.dll", "D3DImm.dll", "DDraw.dll", CONF, MANIFEST];
+        let modified = |dir: &Path| -> Vec<std::time::SystemTime> {
+            names.iter().map(|n| fs::metadata(dir.join(n)).unwrap().modified().unwrap()).collect()
+        };
         for dir in [&standard, &versioned] {
-            let placed = place(&root, &release, dir).unwrap();
-            assert_eq!(placed.copied, ["D3D8.dll", "D3DImm.dll", "DDraw.dll", "dgVoodoo.conf"]);
-            assert!(placed.set_aside.is_empty());
+            place(&root, &release, dir).unwrap();
             for pin in release.dlls {
                 assert!(has_hash(&dir.join(pin.name), pin.sha256));
             }
-            // A second launch copies nothing.
-            assert_eq!(place(&root, &release, dir).unwrap(), Placed::default());
+            assert!(dir.join(CONF).is_file());
+            assert!(fs::read_dir(dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains("crystal-backup")));
+            // A second launch writes nothing (the manifest included).
+            let before = modified(dir);
+            std::thread::sleep(Duration::from_millis(20));
+            place(&root, &release, dir).unwrap();
+            assert_eq!(modified(dir), before);
         }
         assert_eq!(loader_dirs(&root, ""), vec![standard.clone(), versioned.clone()]);
-        // An edited conf in the cache reaches the loader at the next launch.
+        // An edited conf in the cache reaches the loader at the next launch; the DLLs stay.
+        let before = modified(&standard);
+        std::thread::sleep(Duration::from_millis(20));
         fs::write(cache_dir(&root, &release).join(CONF), "edited").unwrap();
-        assert_eq!(place(&root, &release, &standard).unwrap().copied, ["dgVoodoo.conf"]);
+        place(&root, &release, &standard).unwrap();
+        let after = modified(&standard);
+        assert_eq!(after[..3], before[..3]);
+        assert_ne!(after[3], before[3]);
         assert_eq!(fs::read_to_string(standard.join(CONF)).unwrap(), "edited");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -1066,9 +930,9 @@ mod tests {
         let dir = root.join("custom");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("D3D8.dll"), b"someone else's d3d8").unwrap();
-        let placed = place(&root, &release, &dir).unwrap();
-        assert_eq!(placed.set_aside, ["D3D8.dll"]);
+        place(&root, &release, &dir).unwrap();
         assert_eq!(fs::read(dir.join("D3D8.dll.crystal-backup")).unwrap(), b"someone else's d3d8");
+        assert!(has_hash(&dir.join("D3D8.dll"), release.dlls[0].sha256));
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1099,7 +963,6 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
-    #[cfg(windows)]
     #[test]
     fn locked_files_keep_the_ownership_needed_to_retry_removal() {
         use std::os::windows::fs::OpenOptionsExt;
@@ -1115,7 +978,9 @@ mod tests {
             let locked_conf = fs::OpenOptions::new().read(true).share_mode(sharing)
                 .open(dir.join(CONF)).unwrap();
             let error = remove_from(&release, &dir).unwrap_err();
-            assert!(error.contains("D3D8.dll") && error.contains(CONF), "{error}");
+            assert!(error.contains("D3D8.dll"), "{error}");
+            // While a DLL stays (a running game has it loaded), its conf stays with it.
+            assert!(dir.join(CONF).is_file());
             assert_eq!(fs::read(dir.join(MANIFEST)).unwrap(), manifest);
             drop(locked_dll);
             drop(locked_conf);
@@ -1160,14 +1025,14 @@ mod tests {
     fn the_real_release_installs_with_every_pin() {
         let Some(path) = std::env::var_os("DGVOODOO_ZIP") else { return };
         let root = temp("real");
-        let source = install_from_zip(&root, &fs::read(path).unwrap(), &PINNED, None).unwrap();
-        assert_eq!(source, ConfSource::Default);
+        install_from_zip(&root, &fs::read(path).unwrap(), &PINNED, None).unwrap();
         assert!(installed(&root, &PINNED));
         assert!(has_hash(&cache_dir(&root, &PINNED).join(PINNED.cpl.name), PINNED.cpl.sha256));
         let conf = fs::read_to_string(cache_dir(&root, &PINNED).join(CONF)).unwrap();
         assert!(conf.lines().any(|l| l.starts_with("dgVoodooWatermark") && l.trim_end().ends_with("= false")));
         let loader = root.join("crystal");
-        assert_eq!(place(&root, &PINNED, &loader).unwrap().copied.len(), 4);
+        place(&root, &PINNED, &loader).unwrap();
+        assert!(loader.join("D3D8.dll").is_file() && loader.join(CONF).is_file());
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1177,5 +1042,41 @@ mod tests {
         assert_eq!(PINNED.zip_sha256.len(), 64);
         assert!(trusted_host("github.com") && trusted_host("release-assets.githubusercontent.com"));
         assert!(!trusted_host("github.com.example.net"));
+    }
+
+    #[test]
+    fn a_missing_cache_reports_not_installed() {
+        let root = temp("not-installed");
+        let (_, release) = synthetic();
+        assert_eq!(place(&root, &release, &root.join("crystal")), Err(PlaceError::NotInstalled));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Launches running together place into one loader folder without
+    /// tripping over each other's temporary files.
+    #[test]
+    fn concurrent_places_into_one_folder_all_succeed() {
+        let (root, release) = installed_root("concurrent");
+        let dir = root.join("crystal");
+        fs::write(cache_dir(&root, &release).join(CONF), "edited").unwrap();
+        let results: Vec<Result<(), PlaceError>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..6).map(|_| scope.spawn(|| place(&root, &release, &dir))).collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert!(fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn removal_also_clears_reshade_host_folders() {
+        let (root, release) = installed_root("hosts");
+        let host = crate::reshade::folder(&root).join("hosts").join("0123456789abcdef-0123456789abcdef");
+        fs::create_dir_all(&host).unwrap();
+        place(&root, &release, &host).unwrap();
+        remove_everywhere(&release, &root, "").unwrap();
+        assert!(!host.join("D3D8.dll").exists());
+        assert!(!host.join(CONF).exists());
+        fs::remove_dir_all(&root).unwrap();
     }
 }

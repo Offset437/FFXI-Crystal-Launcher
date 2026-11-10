@@ -1,6 +1,6 @@
-//! Windower saves settings.xml after the game window appears, well after the
-//! loader hello. Hold its existing launch turn until that parent process exits
-//! so a second save or fresh profile read cannot overlap it.
+//! Windower saves settings.xml when its child first has a main window or exits.
+//! Coordinate before game component creation and before a windowless host exits.
+//! Give the verified parent a copy of the turn: its save outlives a failed host.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -10,23 +10,42 @@ use std::{
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
     path::{Path, PathBuf},
+    sync::{atomic::{AtomicBool, Ordering}, Mutex},
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::{FILETIME, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, FILETIME, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::{
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
             TH32CS_SNAPPROCESS,
         },
-        LibraryLoader::{GetModuleFileNameW, GetModuleHandleW},
         Threading::{
             GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess,
             QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
-            PROCESS_SYNCHRONIZE,
+            PROCESS_DUP_HANDLE, PROCESS_SYNCHRONIZE,
         },
     },
 };
+
+static COORDINATING: Mutex<()> = Mutex::new(());
+static RETAINED: AtomicBool = AtomicBool::new(false);
+
+/// Armed only after hello: before that, the worker owns the injection turn and
+/// stops Windower before releasing it. Later, sign-in failure and normal sign-out
+/// also make Windower save, even when GameStart was never reached.
+pub(crate) struct ExitGuard;
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        if let Err(error) = coordinate(&mut || {
+            crate::native_auth::pump_idle_messages();
+            true
+        }) {
+            log!("error: Windower profile save could not be protected at host exit: {error}");
+        }
+    }
+}
 
 fn created(process: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
     let mut start = FILETIME {
@@ -48,18 +67,11 @@ fn same_folder(first: &Path, second: &Path) -> bool {
 }
 
 fn windower_parent() -> Result<Option<OwnedHandle>, String> {
-    let name: Vec<u16> = "Hook.dll\0".encode_utf16().collect();
-    let hook = unsafe { GetModuleHandleW(name.as_ptr()) };
-    if hook.is_null() {
-        return Ok(None);
-    }
-    let mut hook_name = vec![0u16; 32768];
-    let length = unsafe { GetModuleFileNameW(hook, hook_name.as_mut_ptr(), hook_name.len() as u32) }
-        as usize;
-    if length == 0 || length == hook_name.len() {
+    let Some(hook) = crate::hook_layout::hook_base() else { return Ok(None) };
+    let hook = hook as windows_sys::Win32::Foundation::HMODULE;
+    let Some(hook_path) = crate::win::module_path(hook) else {
         return Err("Could not locate Windower before saving profiles.".into());
-    }
-    let hook_path = PathBuf::from(String::from_utf16_lossy(&hook_name[..length]));
+    };
     let Some(folder) = hook_path.parent() else {
         return Err("Could not locate Windower's folder.".into());
     };
@@ -85,7 +97,7 @@ fn windower_parent() -> Result<Option<OwnedHandle>, String> {
     };
     let handle = unsafe {
         OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_DUP_HANDLE,
             0,
             pid,
         )
@@ -113,11 +125,12 @@ fn windower_parent() -> Result<Option<OwnedHandle>, String> {
         return Err("Could not verify Windower's launcher process.".into());
     }
     let image = PathBuf::from(String::from_utf16_lossy(&image[..size as usize]));
-    if !image
+    let named_windower = image
         .file_name()
-        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("Windower.exe"))
-        || !image.parent().is_some_and(|path| same_folder(path, folder))
-    {
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("Windower.exe"));
+    let folder_matches = image.parent().is_some_and(|path| same_folder(path, folder));
+    if !named_windower || !folder_matches {
+        log!("note: Windower profile save coordination off: the game host's parent is not Windower.exe beside Hook.dll (named_windower={named_windower} folder_matches={folder_matches})");
         return Ok(None);
     }
     let (Some(parent_created), Some(host_created)) = (
@@ -133,7 +146,7 @@ fn windower_parent() -> Result<Option<OwnedHandle>, String> {
 }
 
 fn turn_path() -> Result<PathBuf, String> {
-    // Same path as session_worker::windower_turn, including isolated test roots.
+    // Same path as session_worker::windower_lock_path, including isolated test roots.
     let root = std::env::var_os("CRYSTAL_DATA_ROOT")
         .or_else(|| std::env::var_os("LOCALAPPDATA"))
         .ok_or("Could not locate the Windower launch lock directory.")?;
@@ -182,41 +195,63 @@ fn acquire(
         if !pump() {
             return Err("The session ended while waiting for Windower's profile save.".into());
         }
+        // File share locks have no waitable handle. Wait on the parent between
+        // attempts so its exit wakes us and failure cleanup cannot busy-spin.
+        unsafe { WaitForSingleObject(parent.as_raw_handle(), 20) };
     }
 }
 
 pub(crate) fn coordinate(pump: &mut dyn FnMut() -> bool) -> Result<(), String> {
+    let _coordination = COORDINATING.lock().unwrap_or_else(|e| e.into_inner());
+    if RETAINED.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let Some(parent) = windower_parent()? else {
         return Ok(());
     };
-    let Some(turn) = acquire(&turn_path()?, &parent, pump)? else {
+    if !coordinate_parent(&turn_path()?, &parent, pump)? {
         return Ok(());
-    };
-    retain_turn(parent, turn)
-        .map_err(|_| "Could not monitor Windower's final profile save.".to_owned())?;
+    }
+    RETAINED.store(true, Ordering::Release);
+    log!("stage: Windower profile-save turn retained by its launcher until exit");
     Ok(())
 }
 
-fn retain_turn(parent: OwnedHandle, turn: File) -> io::Result<std::thread::JoinHandle<()>> {
-    std::thread::Builder::new()
-        .name("windower-profile-save".into())
-        .spawn(move || {
-            let result = unsafe { WaitForSingleObject(parent.as_raw_handle(), u32::MAX) };
-            if result == WAIT_OBJECT_0 {
-                log!("stage: Windower profile save finished; launch turn released");
-            } else {
-                log!("error: Windower profile-save process wait failed");
-            }
-            drop(turn);
-        })
+fn coordinate_parent(path: &Path, parent: &OwnedHandle, pump: &mut dyn FnMut() -> bool) -> Result<bool, String> {
+    let Some(turn) = acquire(path, parent, pump)? else { return Ok(false); };
+    if let Err(error) = retain_turn(parent, turn) {
+        if unsafe { WaitForSingleObject(parent.as_raw_handle(), 0) } == WAIT_OBJECT_0 {
+            return Ok(false);
+        }
+        return Err(format!("Could not retain Windower's final profile-save turn: {error}"));
+    }
+    Ok(true)
+}
+
+fn retain_turn(parent: &OwnedHandle, turn: File) -> io::Result<()> {
+    let mut remote = std::ptr::null_mut();
+    // The target is our verified Windower parent, not a process found by name.
+    // This duplicates only a non-inheritable file handle, never code or memory.
+    // Its handle table owns the duplicate until Windower exits after Profile.Save;
+    // a host thread cannot retain the turn after this host's own process exit.
+    if unsafe {
+        DuplicateHandle(GetCurrentProcess(), turn.as_raw_handle(), parent.as_raw_handle(),
+            &mut remote, 0, 0, DUPLICATE_SAME_ACCESS)
+    } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // `remote` belongs to the parent's handle table. Closing it here would close
+    // an unrelated handle in this process. Parent process exit closes it exactly once.
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{
+        io::{Read, Write},
         os::windows::{io::IntoRawHandle, process::CommandExt},
-        process::{Command, Stdio},
+        process::{Child, Command, Stdio},
     };
 
     #[test]
@@ -242,11 +277,12 @@ mod tests {
             unsafe { WaitForSingleObject(child.as_raw_handle(), 0) },
             WAIT_TIMEOUT
         );
-        let save = retain_turn(child, first).unwrap();
+        retain_turn(&child, first).unwrap();
         assert_eq!(open_turn(&path).unwrap_err().raw_os_error(), Some(32));
         drop(input); // Windower stand-in finishes its final save and exits.
-        save.join().unwrap();
+        assert_eq!(unsafe { WaitForSingleObject(child.as_raw_handle(), 10_000) }, WAIT_OBJECT_0);
         assert!(open_turn(&path).is_ok());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -267,5 +303,122 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("session ended"));
         assert_eq!(calls, 1);
+    }
+
+    struct FixtureProcess(Child);
+    impl Drop for FixtureProcess {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    fn fixture_command(test: &str, root: &Path, role: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", test, "--ignored", "--nocapture"])
+            .env("CRYSTAL_SAVE_FIXTURE", root).env("CRYSTAL_SAVE_ROLE", role)
+            .stdin(Stdio::null()).stdout(Stdio::null())
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        command
+    }
+
+    fn until(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !ready() {
+            assert!(Instant::now() < deadline, "profile-save process fixture timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    #[ignore = "executed only by the profile-save process fixture"]
+    fn exiting_host_fixture() {
+        let root = PathBuf::from(std::env::var_os("CRYSTAL_SAVE_FIXTURE").unwrap());
+        let role = std::env::var("CRYSTAL_SAVE_ROLE").unwrap();
+        let pid = std::env::var("CRYSTAL_SAVE_PARENT").unwrap().parse::<u32>().unwrap();
+        let parent = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_DUP_HANDLE, 0, pid) };
+        assert!(!parent.is_null());
+        let parent = unsafe { OwnedHandle::from_raw_handle(parent) };
+        fs::write(root.join(&role).join("host-ready"), []).unwrap();
+        until(|| root.join("allow-host-exits").exists());
+        // The same acquire/retain operation used before a windowless host exits.
+        // No thread in this process will remain after this fixture returns.
+        assert!(coordinate_parent(&root.join("windower.lock"), &parent, &mut || true).unwrap());
+    }
+
+    #[test]
+    #[ignore = "executed only by the profile-save process fixture"]
+    fn saving_parent_fixture() {
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+        let root = PathBuf::from(std::env::var_os("CRYSTAL_SAVE_FIXTURE").unwrap());
+        let role = std::env::var("CRYSTAL_SAVE_ROLE").unwrap();
+        let settings = root.join("settings.xml");
+        let mut snapshot = Vec::new();
+        OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&settings).unwrap()
+            .read_to_end(&mut snapshot).unwrap();
+        let mut host = FixtureProcess(fixture_command(
+            "windower_start::tests::exiting_host_fixture", &root, &role)
+            .env("CRYSTAL_SAVE_PARENT", std::process::id().to_string()).spawn().unwrap());
+        assert!(host.0.wait().unwrap().success());
+        fs::write(root.join(&role).join("host-exited"), []).unwrap();
+        // .NET Framework's XDocument.Save opens Create/Write/FileShare.Read.
+        // Hold the truncating write open after host exit to expose its lifetime.
+        let mut save = OpenOptions::new().write(true).create(true).truncate(true)
+            .share_mode(FILE_SHARE_READ).open(&settings).unwrap();
+        let half = snapshot.len() / 2;
+        save.write_all(&snapshot[..half]).unwrap();
+        fs::write(root.join(&role).join("writer-open"), []).unwrap();
+        until(|| root.join(&role).join("finish-save").exists());
+        save.write_all(&snapshot[half..]).unwrap();
+        save.flush().unwrap();
+    }
+
+    #[test]
+    fn six_host_exits_keep_parent_xml_saves_exclusive_after_parallel_readiness() {
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+        let root = std::env::temp_dir().join(format!("crystal-parent-save-{}-{}", std::process::id(),
+            unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }));
+        fs::create_dir_all(&root).unwrap();
+        let xml = b"<settings><profile name=\"\"><width>1920</width><height>1080</height><uiscale>1.5</uiscale></profile><profile name=\"Second\"><width>1280</width></profile></settings>";
+        let settings = root.join("settings.xml");
+        fs::write(&settings, xml).unwrap();
+        let roles = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
+        let mut parents: Vec<_> = roles.iter().map(|role| {
+            fs::create_dir(root.join(role)).unwrap();
+            FixtureProcess(fixture_command("windower_start::tests::saving_parent_fixture", &root, role)
+                .spawn().unwrap())
+        }).collect();
+        // All six independent hosts finish their simulated sign-in before any
+        // takes the save turn: this guard never serializes account authentication.
+        until(|| roles.iter().all(|role| root.join(role).join("host-ready").exists()));
+        fs::write(root.join("allow-host-exits"), []).unwrap();
+        let mut finished = std::collections::BTreeSet::new();
+        for _ in roles {
+            let mut saving = None;
+            until(|| {
+                saving = roles.iter().copied().find(|role| !finished.contains(role)
+                    && root.join(role).join("writer-open").exists());
+                saving.is_some()
+            });
+            let role = saving.unwrap();
+            assert!(root.join(role).join("host-exited").exists());
+            assert_eq!(open_turn(&root.join("windower.lock")).unwrap_err().raw_os_error(), Some(32),
+                "the live parent must retain its exited host's turn");
+            assert_eq!(roles.iter().filter(|role| !finished.contains(*role)
+                && root.join(role).join("writer-open").exists()).count(), 1);
+            // A matching second .NET writer really would fail here; this is not
+            // merely a mutex test. Rust's share-write reader is allowed, however.
+            assert_eq!(OpenOptions::new().write(true).share_mode(FILE_SHARE_READ)
+                .open(&settings).unwrap_err().raw_os_error(), Some(32));
+            assert!(fs::read(&settings).is_ok());
+            fs::write(root.join(role).join("finish-save"), []).unwrap();
+            finished.insert(role);
+        }
+        for parent in &mut parents { assert!(parent.0.wait().unwrap().success()); }
+        assert_eq!(fs::read(&settings).unwrap(), xml);
+        drop(open_turn(&root.join("windower.lock")).unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
 }

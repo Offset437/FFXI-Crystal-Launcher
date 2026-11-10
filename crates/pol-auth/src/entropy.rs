@@ -13,16 +13,12 @@ pub struct SystemRandom;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntropyError {
-    UnsupportedPlatform,
     LengthOverflow,
     OsStatus(i32),
 }
 impl std::fmt::Display for EntropyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnsupportedPlatform => {
-                f.write_str("system entropy is implemented only for Windows")
-            }
             Self::LengthOverflow => f.write_str("entropy request exceeds BCrypt ULONG length"),
             Self::OsStatus(status) => write!(
                 f,
@@ -34,7 +30,6 @@ impl std::fmt::Display for EntropyError {
 }
 impl std::error::Error for EntropyError {}
 
-#[cfg(windows)]
 #[link(name = "bcrypt")]
 unsafe extern "system" {
     fn BCryptGenRandom(
@@ -46,34 +41,26 @@ unsafe extern "system" {
 }
 
 impl SystemRandom {
-    /// Empty requests succeed without touching an OS API, including on other
-    /// platforms. Any failed nonempty request wipes the complete output slice.
+    /// Empty requests succeed without touching an OS API. Any failed nonempty
+    /// request wipes the complete output slice.
     pub fn fill_bytes(&mut self, output: &mut [u8]) -> Result<(), EntropyError> {
         if output.is_empty() {
             return Ok(());
         }
-        #[cfg(windows)]
-        {
-            fill_using(output, |bytes, length| {
-                const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 2;
-                // SAFETY: bytes is writable for exactly length checked below.
-                // The system-preferred flag requires no provider handle; this
-                // synchronous call does not retain the slice pointer.
-                unsafe {
-                    BCryptGenRandom(
-                        std::ptr::null_mut(),
-                        bytes.as_mut_ptr(),
-                        length,
-                        BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-                    )
-                }
-            })
-        }
-        #[cfg(not(windows))]
-        {
-            output.zeroize();
-            Err(EntropyError::UnsupportedPlatform)
-        }
+        fill_using(output, |bytes, length| {
+            const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 2;
+            // SAFETY: bytes is writable for exactly length checked below.
+            // The system-preferred flag requires no provider handle; this
+            // synchronous call does not retain the slice pointer.
+            unsafe {
+                BCryptGenRandom(
+                    std::ptr::null_mut(),
+                    bytes.as_mut_ptr(),
+                    length,
+                    BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+                )
+            }
+        })
     }
 }
 impl RandomBytes for SystemRandom {
@@ -82,12 +69,10 @@ impl RandomBytes for SystemRandom {
     }
 }
 
-#[cfg(any(windows, test))]
 fn checked_length(length: usize) -> Result<u32, EntropyError> {
     u32::try_from(length).map_err(|_| EntropyError::LengthOverflow)
 }
 
-#[cfg(any(windows, test))]
 fn fill_using(
     output: &mut [u8],
     call: impl FnOnce(&mut [u8], u32) -> i32,
@@ -114,7 +99,6 @@ fn fill_using(
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
     #[test]
     fn windows_system_provider_accepts_a_64_byte_request() {
         let mut output = zeroize::Zeroizing::new([0; 64]);
@@ -159,21 +143,6 @@ mod tests {
         assert_eq!(
             checked_length(u32::MAX as usize + 1),
             Err(EntropyError::LengthOverflow)
-        );
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn unsupported_platform_fails_and_wipes_output() {
-        let mut output = [0x5a; 8];
-        assert_eq!(
-            SystemRandom.fill_bytes(&mut output),
-            Err(EntropyError::UnsupportedPlatform)
-        );
-        assert_eq!(output, [0; 8]);
-        assert_eq!(
-            RandomBytes::fill(&mut SystemRandom, &mut output),
-            Err(RsaError::RandomSource)
         );
     }
 }

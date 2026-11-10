@@ -44,16 +44,6 @@ impl LobbySession {
         }
     }
 
-    /// Session value V (polcore 100aaad0, slot 1003).
-    pub(crate) fn value(&self) -> &[u8; 16] {
-        &self.value
-    }
-
-    /// The 0x34 meaningful authCode bytes (polcore 104057b0, slot 936).
-    pub(crate) fn authcode(&self) -> &[u8; 52] {
-        &self.authcode
-    }
-
     pub fn write_handoff(&self, writer: &mut impl Write) -> io::Result<()> {
         writer.write_all(b"XIRT001\n")?;
         writer.write_all(&*self.value)?;

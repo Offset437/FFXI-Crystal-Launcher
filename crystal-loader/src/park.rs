@@ -85,7 +85,7 @@ mod tests {
 
     fn credentials() -> String {
         use crate::b64::encode;
-        format!("{{\"type\":\"credentials\",\"start_game\":false,\"keep_session\":false,\"invisible_login\":false,\"viewer_gaps\":false,\"auto_away_minutes\":20,\
+        format!("{{\"type\":\"credentials\",\"start_game\":false,\"keep_session\":false,\"viewer_gaps\":false,\"auto_away_minutes\":20,\
             \"native_auth\":{{\"pol_id\":\"{}\",\"pol_password\":\"{}\",\"se_id\":\"{}\",\"se_secret\":\"{}\",\"otp\":\"{}\",\"profile_key\":\"{}\"}}}}",
             encode(b"ABCD1234"), encode(b"fake password"), encode(b"fakeuser"), encode(&[0x51; 20]), encode(b"123456"), "a".repeat(40))
     }

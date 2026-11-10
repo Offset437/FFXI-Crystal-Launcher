@@ -16,11 +16,8 @@ pub(super) fn start(stage: &Stage) -> Result<(), String> {
         .arg(std::process::id().to_string())
         .arg(&target)
         .arg(&stage.directory);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     let mut child = command.spawn().map_err(|e| e.to_string())?;
     let ready = stage.directory.join("helper-ready");
     let started = Instant::now();
@@ -43,12 +40,9 @@ pub(super) fn start(stage: &Stage) -> Result<(), String> {
 
 fn ordinary_file(path: &Path) -> Result<(), String> {
     let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if meta.file_attributes() & 0x400 != 0 {
-            return Err(t("Launcher update paths cannot be links.").into());
-        }
+    use std::os::windows::fs::MetadataExt;
+    if meta.file_attributes() & 0x400 != 0 {
+        return Err(t("Launcher update paths cannot be links.").into());
     }
     if !meta.is_file() || meta.file_type().is_symlink() {
         return Err(t("Launcher update paths must be ordinary files.").into());
@@ -74,20 +68,14 @@ fn validate_target(target: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
 fn replace(source: &Path, destination: &Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
     if !destination.exists() {
         return fs::rename(source, destination).map_err(|e| e.to_string());
     }
     ordinary_file(destination)?;
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
+    let source = crate::win::wide_path(source);
+    let destination = crate::win::wide_path(destination);
     let ok = unsafe {
         ReplaceFileW(
             destination.as_ptr(),
@@ -104,9 +92,13 @@ fn replace(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(windows))]
-fn replace(source: &Path, destination: &Path) -> Result<(), String> {
-    fs::rename(source, destination).map_err(|e| e.to_string())
+/// The executable keeps its (possibly renamed) path; the notices sit beside it.
+fn destination(target: &Path, parent: &Path, index: usize, name: &str) -> PathBuf {
+    if index == 0 {
+        target.to_owned()
+    } else {
+        parent.join(name)
+    }
 }
 
 /// Copy everything first. Any replacement failure restores all affected files.
@@ -115,11 +107,7 @@ fn install_package(extracted: &Path, target: &Path) -> Result<PathBuf, String> {
     let parent = target.parent().unwrap();
     for (index, name) in FILES.iter().enumerate() {
         ordinary_file(&extracted.join(name))?;
-        let destination = if index == 0 {
-            target.to_owned()
-        } else {
-            parent.join(name)
-        };
+        let destination = destination(target, parent, index, name);
         if destination.try_exists().map_err(|e| e.to_string())? {
             ordinary_file(&destination)?;
         }
@@ -134,11 +122,7 @@ fn install_package(extracted: &Path, target: &Path) -> Result<PathBuf, String> {
     for (index, name) in FILES.iter().enumerate() {
         let source = extracted.join(name);
         ordinary_file(&source)?;
-        let destination = if index == 0 {
-            target.to_owned()
-        } else {
-            parent.join(name)
-        };
+        let destination = destination(target, parent, index, name);
         let existed = destination.try_exists().map_err(|e| e.to_string())?;
         if existed {
             ordinary_file(&destination)?;
@@ -161,8 +145,7 @@ fn install_package(extracted: &Path, target: &Path) -> Result<PathBuf, String> {
         .map_err(|e| e.to_string())?;
         changes.push((destination, temporary, existed, *name));
     }
-    let mut committed = 0;
-    for (destination, temporary, _, _) in &changes {
+    for (committed, (destination, temporary, _, _)) in changes.iter().enumerate() {
         if let Err(error) = replace(temporary, destination) {
             let mut restore_errors = Vec::new();
             for (destination, temporary, existed, name) in changes[..committed].iter().rev() {
@@ -180,26 +163,32 @@ fn install_package(extracted: &Path, target: &Path) -> Result<PathBuf, String> {
             for (_, temporary, _, _) in &changes {
                 let _ = fs::remove_file(temporary);
             }
+            if !restore_errors.is_empty() {
+                keep_backup(&backup);
+            }
             return Err(format!(
                 "{error}. Previous package: {}. {}",
                 backup.display(),
                 restore_errors.join("; ")
             ));
         }
-        committed += 1;
     }
     Ok(backup)
+}
+
+/// Marks a backup that holds the only copy of the previous package (its restore failed), so
+/// later starts never delete it.
+pub(super) const RESTORE_FAILED: &str = "restore-failed.txt";
+
+fn keep_backup(backup: &Path) {
+    let _ = fs::write(backup.join(RESTORE_FAILED), "");
 }
 
 fn restore_package(backup: &Path, target: &Path) -> Result<(), String> {
     let parent = target.parent().ok_or("Invalid backup destination.")?;
     for (index, name) in FILES.iter().enumerate() {
         let old = backup.join(name);
-        let destination = if index == 0 {
-            target.to_owned()
-        } else {
-            parent.join(name)
-        };
+        let destination = destination(target, parent, index, name);
         if old.try_exists().map_err(|e| e.to_string())? {
             ordinary_file(&old)?;
             let temporary = backup.join(format!("restore-{index}"));
@@ -213,35 +202,14 @@ fn restore_package(backup: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
-struct Parent(windows_sys::Win32::Foundation::HANDLE);
-#[cfg(windows)]
-impl Drop for Parent {
-    fn drop(&mut self) {
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.0);
-        }
-    }
-}
-#[cfg(windows)]
+struct Parent(std::os::windows::io::OwnedHandle);
 impl Parent {
     fn open(pid: u32, target: &Path) -> Result<Self, String> {
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
-        let handle =
-            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000, 0, pid) };
-        if handle.is_null() {
-            return Err(t("Could not verify the launcher instance being updated.").into());
-        }
-        let parent = Self(handle);
-        let mut path = vec![0u16; 32768];
-        let mut count = path.len() as u32;
-        if unsafe { QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut count) } == 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        use std::os::windows::ffi::OsStringExt;
-        let actual = PathBuf::from(std::ffi::OsString::from_wide(&path[..count as usize]));
+        use crate::win::process::{self, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE};
+        let parent = process::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE)
+            .map(Self)
+            .map_err(|_| t("Could not verify the launcher instance being updated.").to_owned())?;
+        let actual = process::image_path_of(&parent.0).map_err(|e| e.to_string())?;
         if fs::canonicalize(actual).map_err(|e| e.to_string())?
             != fs::canonicalize(target).map_err(|e| e.to_string())?
         {
@@ -252,8 +220,10 @@ impl Parent {
         Ok(parent)
     }
     fn wait(&self) -> Result<(), String> {
-        let status =
-            unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(self.0, 30_000) };
+        use std::os::windows::io::AsRawHandle;
+        let status = unsafe {
+            windows_sys::Win32::System::Threading::WaitForSingleObject(self.0.as_raw_handle() as _, 30_000)
+        };
         if status == 0 {
             Ok(())
         } else {
@@ -262,76 +232,38 @@ impl Parent {
     }
 }
 
-#[cfg(windows)]
 fn refresh_installed_version(target: &Path, version: &str, key_path: &str) -> Result<bool, String> {
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use crate::win::reg::{Key, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_WOW64_64KEY, RRF_RT_REG_SZ};
+    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::{
         Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND},
         Globalization::{CompareStringOrdinal, CSTR_EQUAL},
-        System::Registry::{
-            RegCloseKey, RegGetValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-            KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_WOW64_64KEY, REG_SZ, RRF_RT_REG_SZ,
-        },
     };
-    struct Key(HKEY);
-    impl Drop for Key {
-        fn drop(&mut self) {
-            unsafe { RegCloseKey(self.0) };
-        }
-    }
     let win_error = |status| std::io::Error::from_raw_os_error(status as i32).to_string();
-    let key_path: Vec<u16> = key_path.encode_utf16().chain(Some(0)).collect();
-    let mut handle = std::ptr::null_mut();
-    let status = unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            key_path.as_ptr(),
-            0,
-            KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY,
-            &mut handle,
-        )
+    let key = match Key::open(HKEY_CURRENT_USER, key_path, KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY) {
+        Ok(key) => key,
+        // Portable copies have no installer registration.
+        Err(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => return Ok(false),
+        Err(status) => {
+            return Err(format!("Could not open Installed Apps registration: {}", win_error(status)))
+        }
     };
-    if matches!(status, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
-        return Ok(false); // Portable copies have no installer registration.
-    }
-    if status != 0 {
-        return Err(format!(
-            "Could not open Installed Apps registration: {}",
-            win_error(status)
-        ));
-    }
-    let key = Key(handle);
-    let location_name: Vec<u16> = "InstallLocation".encode_utf16().chain(Some(0)).collect();
     let mut location = vec![0u16; 32768];
-    let mut bytes = (location.len() * 2) as u32;
-    let status = unsafe {
-        RegGetValueW(
-            key.0,
-            std::ptr::null(),
-            location_name.as_ptr(),
-            RRF_RT_REG_SZ,
-            std::ptr::null_mut(),
-            location.as_mut_ptr().cast(),
-            &mut bytes,
-        )
+    let bytes = match key.get_into("InstallLocation", RRF_RT_REG_SZ, &mut location) {
+        Ok(bytes) => bytes,
+        Err(ERROR_FILE_NOT_FOUND) => return Ok(false),
+        Err(status) => {
+            return Err(format!("Could not read Installed Apps InstallLocation: {}", win_error(status)))
+        }
     };
-    if status == ERROR_FILE_NOT_FOUND {
-        return Ok(false);
-    }
-    if status != 0 {
-        return Err(format!(
-            "Could not read Installed Apps InstallLocation: {}",
-            win_error(status)
-        ));
-    }
-    if bytes < 2 || bytes as usize > location.len() * 2 || bytes % 2 != 0 {
+    if bytes < 2 || bytes % 2 != 0 {
         return Err("Invalid Installed Apps InstallLocation.".into());
     }
-    let location = &location[..bytes as usize / 2 - 1];
+    let location = &location[..bytes / 2 - 1];
     if location.contains(&0) {
         return Err("Invalid Installed Apps InstallLocation.".into());
     }
-    let location = PathBuf::from(std::ffi::OsString::from_wide(location));
+    let location = PathBuf::from(crate::win::from_wide(location));
     if !location.is_absolute() {
         return Ok(false);
     }
@@ -364,28 +296,11 @@ fn refresh_installed_version(target: &Path, version: &str, key_path: &str) -> Re
     {
         return Ok(false); // A different installed copy owns this registration.
     }
-    let name: Vec<u16> = "DisplayVersion".encode_utf16().chain(Some(0)).collect();
-    let version: Vec<u16> = version.encode_utf16().chain(Some(0)).collect();
-    let status = unsafe {
-        RegSetValueExW(
-            key.0,
-            name.as_ptr(),
-            0,
-            REG_SZ,
-            version.as_ptr().cast(),
-            (version.len() * 2) as u32,
-        )
-    };
-    if status != 0 {
-        return Err(format!(
-            "Could not refresh Installed Apps DisplayVersion: {}",
-            win_error(status)
-        ));
-    }
+    key.set_string("DisplayVersion", version)
+        .map_err(|status| format!("Could not refresh Installed Apps DisplayVersion: {}", win_error(status)))?;
     Ok(true)
 }
 
-#[cfg(windows)]
 fn refresh_registration_after_restart(
     target: &Path,
     version: &str,
@@ -407,79 +322,72 @@ fn refresh_registration_after_restart(
 }
 
 pub(super) fn run(args: &[String]) -> Result<(), String> {
-    #[cfg(not(windows))]
-    {
-        let _ = args;
-        Err("Launcher self-updates are supported on Windows.".into())
+    if args.len() != 5 {
+        return Err("Invalid update helper arguments.".into());
     }
-    #[cfg(windows)]
-    {
-        if args.len() != 5 {
-            return Err("Invalid update helper arguments.".into());
+    let pid = args[2].parse::<u32>().map_err(|e| e.to_string())?;
+    let target = PathBuf::from(&args[3]);
+    let directory = PathBuf::from(&args[4]);
+    if !directory.is_absolute() {
+        return Err("An absolute staging directory is required.".into());
+    }
+    let mut parent_closed = false;
+    let result = (|| {
+        validate_target(&target)?;
+        let parent = Parent::open(pid, &target)?;
+        ordinary_file(&directory.join("launcher-update.json"))?;
+        let metadata = read_metadata(&directory.join("launcher-update.json"))?;
+        let release = verify(&metadata, &trusted_key()?)?;
+        if release.version <= current_version() {
+            return Err(
+                t("Launcher updates cannot install an older or identical version.").into(),
+            );
         }
-        let pid = args[2].parse::<u32>().map_err(|e| e.to_string())?;
-        let target = PathBuf::from(&args[3]);
-        let directory = PathBuf::from(&args[4]);
-        if !directory.is_absolute() {
-            return Err("An absolute staging directory is required.".into());
-        }
-        let mut parent_closed = false;
-        let result = (|| {
-            validate_target(&target)?;
-            let parent = Parent::open(pid, &target)?;
-            ordinary_file(&directory.join("launcher-update.json"))?;
-            let metadata = read_metadata(&directory.join("launcher-update.json"))?;
-            let release = verify(&metadata, &trusted_key()?)?;
-            let current = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
-            if semver::Version::parse(&release.payload.version).unwrap() <= current {
-                return Err(
-                    t("Launcher updates cannot install an older or identical version.").into(),
+        let archive = directory.join("release.zip");
+        ordinary_file(&archive)?;
+        verify_archive(&archive, &release)?;
+        let extracted = directory.join("apply-verified");
+        fs::create_dir(&extracted).map_err(|e| e.to_string())?;
+        unpack(&archive, &extracted)?;
+        fs::write(
+            directory.join("helper-ready"),
+            std::process::id().to_string(),
+        )
+        .map_err(|e| e.to_string())?;
+        parent.wait()?;
+        parent_closed = true;
+        let backup = install_package(&extracted, &target)?;
+        match Command::new(&target).spawn() {
+            Ok(_) => {
+                // No rollback is possible past this point; the backup is only clutter.
+                let _ = fs::remove_dir_all(&backup);
+                refresh_registration_after_restart(
+                    &target,
+                    &release.payload.version,
+                    &directory,
+                    r"Software\Microsoft\Windows\CurrentVersion\Uninstall\CrystalLauncher",
                 );
+                Ok(())
             }
-            let archive = directory.join("release.zip");
-            ordinary_file(&archive)?;
-            verify_archive(&archive, &release)?;
-            let extracted = directory.join("apply-verified");
-            fs::create_dir(&extracted).map_err(|e| e.to_string())?;
-            unpack(&archive, &extracted)?;
-            fs::write(
-                directory.join("helper-ready"),
-                std::process::id().to_string(),
-            )
-            .map_err(|e| e.to_string())?;
-            parent.wait()?;
-            parent_closed = true;
-            let backup = install_package(&extracted, &target)?;
-            match Command::new(&target).spawn() {
-                Ok(_) => {
-                    refresh_registration_after_restart(
-                        &target,
-                        &release.payload.version,
-                        &directory,
-                        r"Software\Microsoft\Windows\CurrentVersion\Uninstall\CrystalLauncher",
-                    );
-                    Ok(())
-                }
-                Err(error) => {
-                    // The new executable could not start: restore the complete old package.
-                    restore_package(&backup, &target)?;
-                    Err(format!("Could not restart the new launcher: {error}"))
-                }
+            Err(error) => {
+                // The new executable could not start: restore the complete old package.
+                restore_package(&backup, &target).inspect_err(|_| keep_backup(&backup))?;
+                Err(format!("Could not restart the new launcher: {error}"))
             }
-        })();
-        if let Err(error) = &result {
-            let _ = fs::write(directory.join("last-error.txt"), error);
-            if let Some(root) = directory.parent() {
-                let _ = fs::write(root.join("last-error.txt"), error);
-            }
-            if parent_closed {
-                let _ = Command::new(&target).spawn();
-            }
-        } else if let Some(root) = directory.parent() {
-            let _ = fs::remove_file(root.join("last-error.txt"));
         }
-        result
+    })();
+    if let Err(error) = &result {
+        let _ = fs::write(directory.join("last-error.txt"), error);
+        if let Some(root) = directory.parent() {
+            let _ = fs::write(root.join("last-error.txt"), error);
+        }
+        if parent_closed {
+            let _ = Command::new(&target).spawn();
+        }
+    } else if let Some(root) = directory.parent() {
+        let _ = fs::remove_file(root.join("last-error.txt"));
     }
+    result
 }
 
 #[cfg(test)]
@@ -557,7 +465,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(windows)]
     #[test]
     fn a_locked_notice_rolls_back_an_already_replaced_executable() {
         use std::os::windows::fs::OpenOptionsExt;
@@ -583,14 +490,13 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(windows)]
     mod registration {
         use super::*;
-        use windows_sys::Win32::System::Registry::*;
+        use crate::win::reg::{Key, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_WOW64_64KEY, RRF_RT_REG_SZ};
 
         struct Registration {
             path: String,
-            key: HKEY,
+            key: Option<Key>,
         }
         impl Registration {
             fn create(root: &Path) -> Self {
@@ -599,72 +505,27 @@ mod tests {
                     "Software\\CrystalLauncherUpdateTest-{}",
                     root.file_name().unwrap().to_string_lossy()
                 );
-                let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
-                let mut key = std::ptr::null_mut();
-                let mut disposition = 0;
-                assert_eq!(
-                    unsafe {
-                        RegCreateKeyExW(
-                            HKEY_CURRENT_USER,
-                            wide.as_ptr(),
-                            0,
-                            std::ptr::null(),
-                            0,
-                            KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY,
-                            std::ptr::null(),
-                            &mut key,
-                            &mut disposition,
-                        )
-                    },
-                    0
-                );
-                assert_eq!(disposition, REG_CREATED_NEW_KEY);
-                Self { path, key }
+                let (key, created) =
+                    Key::create(HKEY_CURRENT_USER, &path, KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY).unwrap();
+                assert!(created);
+                Self { path, key: Some(key) }
+            }
+            fn key(&self) -> &Key {
+                self.key.as_ref().unwrap()
             }
             fn set(&self, name: &str, value: &str) {
-                let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-                let value: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
-                assert_eq!(
-                    unsafe {
-                        RegSetValueExW(
-                            self.key,
-                            name.as_ptr(),
-                            0,
-                            REG_SZ,
-                            value.as_ptr().cast(),
-                            (value.len() * 2) as u32,
-                        )
-                    },
-                    0
-                );
+                self.key().set_string(name, value).unwrap();
             }
             fn version(&self) -> String {
-                let name: Vec<u16> = "DisplayVersion".encode_utf16().chain(Some(0)).collect();
-                let mut buffer = [0u16; 256];
-                let mut bytes = (buffer.len() * 2) as u32;
-                assert_eq!(
-                    unsafe {
-                        RegGetValueW(
-                            self.key,
-                            std::ptr::null(),
-                            name.as_ptr(),
-                            RRF_RT_REG_SZ,
-                            std::ptr::null_mut(),
-                            buffer.as_mut_ptr().cast(),
-                            &mut bytes,
-                        )
-                    },
-                    0
-                );
-                String::from_utf16(&buffer[..bytes as usize / 2 - 1]).unwrap()
+                String::from_utf16(&self.key().string("DisplayVersion", RRF_RT_REG_SZ, 256).unwrap()).unwrap()
             }
         }
         impl Drop for Registration {
             fn drop(&mut self) {
-                let path: Vec<u16> = self.path.encode_utf16().chain(Some(0)).collect();
+                drop(self.key.take());
+                let path = crate::win::wide(&self.path);
                 unsafe {
-                    RegCloseKey(self.key);
-                    RegDeleteKeyExW(HKEY_CURRENT_USER, path.as_ptr(), KEY_WOW64_64KEY, 0);
+                    windows_sys::Win32::System::Registry::RegDeleteKeyExW(HKEY_CURRENT_USER, path.as_ptr(), KEY_WOW64_64KEY, 0);
                 }
             }
         }
@@ -750,7 +611,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     #[test]
     fn parent_identity_is_checked_and_the_handle_waits_for_that_process() {
         use std::os::windows::process::CommandExt;
@@ -785,7 +645,6 @@ mod tests {
         std::thread::sleep(Duration::from_secs(30));
     }
 
-    #[cfg(windows)]
     #[test]
     fn a_surviving_session_process_does_not_prevent_the_update() {
         use std::os::windows::process::CommandExt;

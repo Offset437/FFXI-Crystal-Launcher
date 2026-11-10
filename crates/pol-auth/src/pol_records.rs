@@ -17,10 +17,8 @@
 //!   `0x100227d0`).
 //!
 //! The field transforms below reproduce those stores exactly. Field meanings
-//! beyond what FFXiMain reads (see the layout in [`LoaderSession`] docs) are not
+//! beyond what FFXiMain reads (see the layout in [`PolRecords::to_blob`]) are not
 //! inferred. Not live-verified: a recorded retail table has not been compared.
-//!
-//! [`LoaderSession`]: crate::loader::LoaderSession
 
 use crate::catalog::{SelectionMap, SelectionMapCatalog, ServiceCatalog};
 use zeroize::{Zeroize, Zeroizing};
@@ -179,7 +177,26 @@ impl PolRecords {
             .collect()
     }
 
-    /// The serialized `pol_records` blob; see `LoaderSession` for the layout.
+    /// The serialized `pol_records` blob, exactly `BLOB_LEN` (0x2420) bytes, all
+    /// integers little-endian:
+    ///
+    /// | Offset | Size | Content |
+    /// |---|---|---|
+    /// | 0x0000 | 8 | magic `"XIPOLR"`, version byte `0x01`, `0x00` |
+    /// | 0x0008 | 24 | presence store, six `i32`: handle (slot 190), primary (189), context (204), type (206), flag, content class (207) |
+    /// | 0x0020 | 64 x 0x28 | handle table; record `i` is what slot 173(`i`) copies out |
+    /// | 0x0A20 | 64 x 0x68 | character table; record `i` is what slot 177(`i`) copies out |
+    ///
+    /// Handle record (0x28): `q[0]` bit0 valid, bits 1..44 server flags, bits
+    /// 45..50 slot; `+0x08` name, 15 bytes + NUL; `d[0x18]` bits 0..1 status/kind,
+    /// bits 2..7 order; `d[0x1c]` server word; `+0x20` eight character-slot bytes
+    /// (bit0 used, bits 1..6 = character index).
+    ///
+    /// Character record (0x68): `b[0]` bit0 valid; `w[2]` type (1 = FFXI);
+    /// `d[4]` packed character id `(id & 0xffff) | world << 16 | (id >> 16 & 0xff) << 24`;
+    /// `d[8]` content id; `d[0xc]` 0 for FFXI; `q[0x10]` bits 0..7 server flags,
+    /// bit 15 linked to a handle, bits 16..21 handle index; `+0x18` name
+    /// (15 + NUL); `+0x28` text (63 + NUL). Unused records are all zero.
     pub fn to_blob(&self, presence: &PresenceState) -> Zeroizing<Vec<u8>> {
         let mut out = Zeroizing::new(Vec::with_capacity(BLOB_LEN));
         out.extend_from_slice(&MAGIC);

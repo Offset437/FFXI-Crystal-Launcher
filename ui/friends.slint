@@ -1,0 +1,1355 @@
+// The Friends page: the PlayOnline friends sidebar beside a
+// conversation, the Mailbox or the block list, or the sign-in card. src/slint_host/friends.rs
+// fills FriendsView from the core after every batch of messages (only what changed) and turns
+// its callbacks into core messages. Every string comes from Rust; names,
+// characters and mail arrive already masked while privacy mode is on.
+//
+// Unlike Home, only the page header scales.
+import { Theme } from "theme.slint";
+import { Glyph, Icon, Pressable, Control, Tone, Check, Field, Select, Rule, ScrollThumb, IconButton, Hint, Menu, RoundGlyph, Banner } from "widgets.slint";
+
+/// The words that change only with the language.
+export struct FriendsStrings {
+    title: string,
+    sign-out: string,
+    start-ffxi: string,
+    your-friends: string,
+    otp-placeholder: string,
+    choose-account: string,
+    status-options: string,
+    groups: string,
+    auto-away-note: string,
+    find: string,
+    mailbox: string,
+    mailbox-desc: string,
+    blocked: string,
+    blocked-desc: string,
+    welcome: string,
+    remove: string,
+    cancel: string,
+    in-game-title: string,
+    in-game-body: string,
+    cant-receive: string,
+    subject-placeholder: string,
+    draft-placeholder: string,
+    send: string,
+    newest: string,
+    sending: string,
+    you: string,
+    previous: string,
+    next: string,
+    unblock: string,
+    nobody: string,
+    new-mail: string,
+}
+
+/// One line of the sidebar's friend list: a section header (0), a friend (1) or a note (2).
+export struct FriendLine {
+    kind: int,
+    text: string,
+    folded: bool,
+    secondary: string,
+    initial: string,
+    tint: int,
+    /// 0 online, 1 away, 2 offline, 3 no status yet.
+    presence: int,
+    selected: bool,
+    unread: string,
+    bold: bool,
+    strong: bool,
+}
+
+/// One message of a group: its subject and text, a loading skeleton, or one on its way.
+export struct ChatItem {
+    subject: string,
+    text: string,
+    /// A message type Crystal can't show: its notice in italics.
+    italic: bool,
+    skeleton: bool,
+    /// Not yet confirmed sent: dimmed, with "Sending…" under it.
+    pending: bool,
+}
+
+/// A day or "new" divider (0), or a run of messages from one side (1).
+export struct ChatBlock {
+    kind: int,
+    label: string,
+    accent: bool,
+    mine: bool,
+    who: string,
+    time: string,
+    initial: string,
+    tint: int,
+    items: [ChatItem],
+}
+
+/// One stored message in the Mailbox.
+export struct MailLine {
+    unread: bool,
+    mine: bool,
+    initial: string,
+    tint: int,
+    correspondent: string,
+    subject: string,
+    enabled: bool,
+}
+
+/// One blocked handle.
+export struct BlockedLine {
+    name: string,
+    initial: string,
+    tint: int,
+    enabled: bool,
+}
+
+export global FriendsView {
+    in property <FriendsStrings> strings;
+
+    // ---- header ----
+    in property <string> description;
+    in property <bool> connected;
+    in property <bool> sign-out-enabled;
+    in property <bool> play-enabled;
+    in property <[string]> problems;
+    callback sign-out();
+    callback play();
+
+    /// A friend list was fetched: the two panes show; otherwise the sign-in card.
+    in property <bool> shown;
+    /// The sidebar is 296 px wide (256 below a 1200 px window).
+    in property <length> side-w: 296px;
+
+    // ---- the sign-in card ----
+    in property <string> sign-in-message;
+    in property <string> sign-in-error;
+    in property <bool> sign-in-controls;
+    in property <bool> sign-in-switcher;
+    in property <bool> otp-shown;
+    in-out property <string> otp;
+    in property <string> connect-label;
+    in property <bool> connect-enabled;
+    callback otp-edited(string);
+    callback connect();
+
+    // ---- your account (the switcher) and status ----
+    in property <string> account-label;
+    in property <bool> switchable;
+    in property <[string]> accounts;
+    in property <int> account-current: -1;
+    callback account-picked(int);
+    /// Your status is a drop-down (signed in with FFXI closed), else a line of text.
+    in property <bool> status-editable;
+    in property <string> status-text;
+    in property <[string]> statuses;
+    in property <int> status-current: -1;
+    in property <int> own-presence: 3;
+    in property <bool> options-open;
+    in property <bool> groups;
+    in property <bool> auto-away-shown;
+    in property <[string]> auto-away-items;
+    in property <int> auto-away-current: -1;
+    callback status-picked(int);
+    callback status-options();
+    callback groups-toggled(bool);
+    callback auto-away-picked(int);
+
+    // ---- the friend list ----
+    in-out property <string> query;
+    in property <bool> query-enabled: true;
+    in property <[FriendLine]> rows;
+    in property <string> mailbox-count;
+    in property <string> blocked-count;
+    callback query-edited(string);
+    callback row-clicked(int);
+    callback open-mailbox();
+    callback open-blocked();
+
+    /// 0 the welcome note, 1 a conversation, 2 the Mailbox, 3 the block list.
+    in property <int> pane;
+    in property <string> pane-error;
+    in property <string> pane-notice;
+    in property <string> check-label;
+    in property <bool> check-enabled;
+    in property <bool> in-game;
+    callback check();
+
+    // ---- remove / unblock confirmation ----
+    in property <bool> confirm-shown;
+    in property <string> confirm-question;
+    in property <string> confirm-action;
+    in property <bool> confirm-danger;
+    in property <bool> confirm-enabled;
+    callback confirm-cancel();
+    callback confirm();
+
+    // ---- the conversation ----
+    in property <string> friend-name;
+    in property <string> friend-secondary;
+    in property <string> friend-initial;
+    in property <int> friend-tint;
+    in property <int> friend-presence: 3;
+    in property <bool> remove-enabled;
+    callback remove();
+    /// 0 the messages, 1 an empty state.
+    in property <int> chat-state;
+    in property <string> chat-title;
+    in property <string> chat-body;
+    in property <bool> chat-newest;
+    in property <[ChatBlock]> chat;
+    /// Changes when another friend's conversation opens: the messages start at the newest.
+    in property <int> chat-key;
+    /// 0 the in-game notice, 1 the composer, 2 "can't receive messages".
+    in property <int> composer;
+    in property <bool> show-subject;
+    in-out property <string> subject;
+    in property <bool> subject-enabled;
+    in-out property <string> draft;
+    in property <bool> draft-enabled;
+    /// Privacy mode: a fixed mask stands in for the draft, and nothing can be typed.
+    in property <bool> draft-masked;
+    in property <string> mask;
+    in property <int> draft-lines: 1;
+    in property <bool> can-send;
+    in property <string> note;
+    /// 0 the keys hint (muted), 1 a byte count (sub), 2 a problem (danger).
+    in property <int> note-tone;
+    in property <string> subject-toggle;
+    in property <bool> subject-toggle-enabled;
+    callback subject-edited(string);
+    callback draft-edited(string);
+    callback add-subject();
+    callback send();
+
+    // ---- the Mailbox ----
+    in property <[string]> folders;
+    in property <int> folder;
+    in property <bool> folders-enabled;
+    in property <string> mail-count;
+    in property <bool> paging;
+    in property <bool> previous-enabled;
+    in property <bool> next-enabled;
+    in property <bool> mail-changed;
+    in property <bool> opened;
+    in property <string> opened-from;
+    in property <string> opened-subject;
+    in property <string> opened-text;
+    in property <[MailLine]> mail;
+    callback folder-picked(int);
+    callback previous();
+    callback next();
+    callback read(int);
+
+    // ---- the block list ----
+    in property <[BlockedLine]> blocked;
+    callback unblock(int);
+}
+
+/// A round avatar: the name's initial on a quiet tint picked by name (your own: the Play colour
+/// with the person glyph; privacy mode: the glyph on a neutral fill), and a presence dot whose
+/// shape, not only colour, says the state: filled online, a half moon away, an outline otherwise.
+/// The tints and the away colour are the page's own (not theme tokens).
+component Avatar inherits Rectangle {
+    in property <length> size: 34px;
+    in property <bool> mine;
+    in property <string> initial;
+    /// AVATAR_TINTS index, or -1 for the neutral fill.
+    in property <int> tint: -1;
+    /// -1 none, 0 online, 1 away, 2 offline, 3 no status yet.
+    in property <int> presence: -1;
+    /// What the dot is cut out of: the surface behind the avatar.
+    in property <color> ring: Theme.bg;
+    width: root.size;
+    height: root.size;
+    accessible-role: none;
+    private property <color> hue: root.tint == 0 ? #5B7FA6 : root.tint == 1 ? #4E8C8A : root.tint == 2 ? #6E8F6A
+        : root.tint == 3 ? #A08A5C : root.tint == 4 ? #8A6F96 : #6B7A8F;
+    private property <color> fill: root.mine ? Theme.play : root.tint < 0 ? Theme.select : root.hue.mix(Theme.select, Theme.light ? 0.35 : 0.55);
+    private property <color> ink: root.mine ? Theme.play-text : root.tint < 0 ? Theme.sub : Theme.ink;
+    private property <bool> glyph: root.mine || root.tint < 0 || root.initial == "";
+    private property <length> dot: max(root.size * 0.32, 10px);
+    private property <color> away: Theme.light ? #B7862F : #D9B060;
+    Rectangle {
+        border-radius: root.size / 2;
+        background: root.fill;
+        if root.glyph: Icon { glyph: Glyph.user; size: root.size * 0.48; tint: root.ink; }
+        if !root.glyph: Text {
+            text: root.initial;
+            font-size: root.size * 0.42;
+            font-weight: 600;
+            color: root.ink;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    if root.presence == 0 || root.presence == 1: Rectangle {
+        x: root.size - root.dot;
+        y: root.size - root.dot;
+        width: root.dot;
+        height: root.dot;
+        border-radius: root.dot / 2;
+        border-width: 2px;
+        border-color: root.ring;
+        background: root.presence == 0 ? Theme.ok : root.away;
+        if root.presence == 1: Rectangle {
+            x: root.dot * 0.14;
+            y: root.dot * 0.14;
+            width: root.dot * 0.36;
+            height: root.dot * 0.36;
+            border-radius: root.dot * 0.18;
+            background: root.ring;
+        }
+    }
+    if root.presence == 2 || root.presence == 3: Rectangle {
+        x: root.size - root.dot - 1.5px;
+        y: root.size - root.dot - 1.5px;
+        width: root.dot + 3px;
+        height: root.dot + 3px;
+        border-radius: root.dot / 2 + 1.5px;
+        background: root.ring;
+        Rectangle {
+            width: root.dot;
+            height: root.dot;
+            border-radius: root.dot / 2;
+            background: root.ring;
+            border-width: root.presence == 2 ? 2px : 1.5px;
+            border-color: Theme.sub.with-alpha(root.presence == 2 ? 0.9 : 0.5);
+        }
+    }
+}
+
+/// An unread count: a small accent pill.
+component Badge inherits Rectangle {
+    in property <string> text;
+    horizontal-stretch: 0;
+    height: caption.preferred-height + 2px;
+    min-width: caption.preferred-width + 14px;
+    preferred-width: self.min-width;
+    border-radius: 9px;
+    background: Theme.select;
+    caption := Text {
+        text: root.text;
+        font-size: Theme.type-micro;
+        font-weight: 600;
+        color: Theme.select-ink;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+/// A one-line message in a tinted tile: a problem (danger) or a notice (accent).
+component Notice inherits VerticalLayout {
+    vertical-stretch: 0;
+    in property <string> text;
+    in property <bool> problem: true;
+    in property <Glyph> glyph: Glyph.alert-circle;
+    Banner {
+        tone: root.problem ? Theme.danger : Theme.accent;
+        glyph: root.glyph;
+        Text {
+            horizontal-stretch: 1;
+            text: root.text;
+            font-size: Theme.type-small;
+            color: root.problem ? Theme.danger : Theme.ink;
+            vertical-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+}
+
+/// A notice under a pane's header (BANNER_PAD: 12 px above, 16 at the sides).
+component PaneBanner inherits Notice {
+    padding-top: Theme.sp-m;
+    padding-left: Theme.sp-l;
+    padding-right: Theme.sp-l;
+}
+
+/// Signed in to FFXI: messages and friend changes wait until it closes.
+component InGameNotice inherits VerticalLayout {
+    vertical-stretch: 0;
+    // As tall as the sidebar's Mailbox/Blocked footer (and the composer), so the dividers meet.
+    min-height: 2 * Theme.sp-s + 2 * Theme.row-h + 2px;
+    alignment: center;
+    padding-top: 14px;
+    padding-bottom: 14px;
+    padding-left: Theme.sp-l;
+    padding-right: Theme.sp-l;
+    Rectangle {
+        border-radius: Theme.radius-inner;
+        background: Theme.select.with-alpha(Theme.light ? 0.7 : 0.55);
+        HorizontalLayout {
+            padding-left: 14px;
+            padding-right: 14px;
+            padding-top: Theme.sp-m;
+            padding-bottom: Theme.sp-m;
+            spacing: Theme.sp-m;
+            RoundGlyph { cross-axis-self-alignment: center; size: 36px; glyph: Glyph.gamepad; }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                spacing: 2px;
+                Text { text: FriendsView.strings.in-game-title; font-size: Theme.type-body; font-weight: 600; color: Theme.ink; }
+                Text { text: FriendsView.strings.in-game-body; font-size: Theme.type-caption; color: Theme.sub; wrap: word-wrap; }
+            }
+        }
+    }
+}
+
+/// The centred empty state of a pane.
+component Empty inherits VerticalLayout {
+    in property <Glyph> glyph;
+    in property <string> title;
+    in property <string> body;
+    alignment: center;
+    padding: Theme.sp-3;
+    spacing: 6px;
+    HorizontalLayout { alignment: center; RoundGlyph { size: 56px; glyph: root.glyph; } }
+    Rectangle { height: Theme.sp-xs; }
+    Text { text: root.title; font-size: Theme.type-heading; font-weight: 600; color: Theme.ink; horizontal-alignment: center; wrap: word-wrap; }
+    if root.body != "": HorizontalLayout {
+        alignment: center;
+        Text { max-width: 360px; text: root.body; font-size: Theme.type-small; color: Theme.sub; horizontal-alignment: center; wrap: word-wrap; }
+    }
+}
+
+/// The Remove / Unblock question with its two answers.
+component ConfirmBar inherits Rectangle {
+    border-radius: Theme.radius-inner;
+    background: Theme.select.with-alpha(Theme.light ? 0.7 : 0.55);
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: Theme.sp-s;
+        Text { horizontal-stretch: 1; text: FriendsView.confirm-question; font-size: Theme.type-small; color: Theme.ink; vertical-alignment: center; wrap: word-wrap; }
+        Control { cross-axis-self-alignment: center; text: FriendsView.strings.cancel; tone: Tone.secondary; clicked => { FriendsView.confirm-cancel(); } }
+        Control {
+            cross-axis-self-alignment: center;
+            text: FriendsView.confirm-action;
+            tone: FriendsView.confirm-danger ? Tone.danger : Tone.primary;
+            enabled: FriendsView.confirm-enabled;
+            clicked => { FriendsView.confirm(); }
+        }
+    }
+}
+
+/// A pane's header row: identity on the left, actions on the right, 64 px tall.
+component PaneHeader inherits Rectangle {
+    height: 64px;
+    HorizontalLayout {
+        padding-left: Theme.sp-l;
+        padding-right: Theme.sp-l;
+        spacing: Theme.sp-xs;
+        @children
+    }
+}
+
+/// A bare icon button in a pane header, named by its hint.
+component PaneButton inherits IconButton {
+    glyph-size: 17px;
+}
+
+/// The signed-in account: avatar with your presence, the name, and under it your status (a
+/// drop-down or a line). With several retail accounts the face is also the account switcher.
+component AccountFace inherits Rectangle {
+    in property <bool> sidebar;
+    in property <string> status-line;
+    height: 54px;
+    // The switcher: the whole face, short of the controls of its own (the status drop-down
+    // under the name, the options button), so the D-pad reaches each of them apart.
+    face := Pressable {
+        x: 0;
+        y: 0;
+        width: root.sidebar ? root.width - 48px : root.width;
+        height: root.sidebar && FriendsView.status-editable ? 31px : root.height;
+        label: FriendsView.account-label;
+        enabled: FriendsView.switchable;
+        accessible-role: combobox;
+        border-radius: Theme.radius-inner;
+        background: self.hot ? Theme.select.with-alpha(0.45) : transparent;
+        clicked => { accounts.show(); }
+    }
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        spacing: 10px;
+        Avatar {
+            cross-axis-self-alignment: center;
+            size: 38px;
+            mine: true;
+            presence: root.sidebar ? FriendsView.own-presence : -1;
+            ring: Theme.bg;
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 0px;
+            HorizontalLayout {
+                alignment: start;
+                spacing: 6px;
+                Text { text: FriendsView.account-label; font-size: Theme.type-body; font-weight: 600; color: Theme.ink; vertical-alignment: center; overflow: elide; }
+                if FriendsView.switchable: Icon { cross-axis-self-alignment: center; glyph: Glyph.chevron-down; size: 12px; tint: Theme.sub; }
+            }
+            // As tall as the status drop-down, so the name stays put between states.
+            if !root.sidebar || !FriendsView.status-editable: Text {
+                height: self.preferred-height + 2px;
+                text: root.sidebar ? FriendsView.status-text : root.status-line;
+                font-size: Theme.type-caption;
+                color: Theme.sub;
+                vertical-alignment: center;
+            }
+            if root.sidebar && FriendsView.status-editable: HorizontalLayout {
+                alignment: start;
+                status := Pressable {
+                    label: FriendsView.status-text;
+                    accessible-role: combobox;
+                    height: status-row.preferred-height + 2px;
+                    min-width: status-row.preferred-width + 18px;
+                    horizontal-stretch: 0;
+                    border-radius: 5px;
+                    background: self.hot ? Theme.select.with-alpha(0.7) : transparent;
+                    clicked => {
+                        // The menu opens just under this drop-down, wherever the layout put it.
+                        root.status-at = { x: self.absolute-position.x - root.absolute-position.x, y: self.absolute-position.y - root.absolute-position.y + self.height + 2px };
+                        statuses.show();
+                    }
+                    status-row := HorizontalLayout {
+                        x: 0;
+                        y: 1px;
+                        width: self.preferred-width;
+                        spacing: Theme.sp-xs;
+                        Text { text: FriendsView.status-text; font-size: Theme.type-caption; color: Theme.sub; vertical-alignment: center; }
+                        Icon { cross-axis-self-alignment: center; glyph: Glyph.chevron-down; size: 11px; tint: Theme.sub; }
+                    }
+                }
+            }
+        }
+        if root.sidebar: IconButton {
+            cross-axis-self-alignment: center;
+            glyph: FriendsView.options-open ? Glyph.chevron-down : Glyph.settings;
+            hint: FriendsView.strings.status-options;
+            clicked => { FriendsView.status-options(); }
+        }
+    }
+    // A popup can't sit inside the conditional status row: it is placed from where that row is.
+    private property <Point> status-at;
+    statuses := Menu {
+        x: root.status-at.x;
+        y: root.status-at.y;
+        width: 160px;
+        font-size: Theme.type-caption;
+        items: FriendsView.statuses;
+        current: FriendsView.status-current;
+        picked(index) => { FriendsView.status-picked(index); }
+    }
+    accounts := Menu {
+        x: 0;
+        y: root.height;
+        width: root.width;
+        font-size: Theme.type-body;
+        items: FriendsView.accounts;
+        current: FriendsView.account-current;
+        picked(index) => { FriendsView.account-picked(index); }
+    }
+}
+
+/// Not signed in (or nothing fetched yet): what to do, and the sign-in controls.
+component SignInCard inherits Rectangle {
+    private property <length> column: 360px;
+    background: Theme.card;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.hairline;
+    VerticalLayout {
+        alignment: center;
+        padding: Theme.sp-3;
+        spacing: Theme.sp-s;
+        HorizontalLayout { alignment: center; RoundGlyph { size: 64px; glyph: Glyph.users; } }
+        Rectangle { height: Theme.sp-xs; }
+        // 18 px (between the type scale's heading and title).
+        Text { text: FriendsView.strings.your-friends; font-size: 18px; font-weight: 600; color: Theme.ink; horizontal-alignment: center; }
+        HorizontalLayout {
+            alignment: center;
+            Text { max-width: 440px; text: FriendsView.sign-in-message; font-size: Theme.type-small; color: Theme.sub; horizontal-alignment: center; wrap: word-wrap; }
+        }
+        // The error, the account chooser and the sign-in row share one centred column.
+        if FriendsView.sign-in-error != "": HorizontalLayout {
+            alignment: center;
+            Notice { width: root.column; text: FriendsView.sign-in-error; }
+        }
+        if FriendsView.sign-in-controls: Rectangle { height: Theme.sp-s; }
+        if FriendsView.sign-in-controls && FriendsView.sign-in-switcher: HorizontalLayout {
+            alignment: center;
+            AccountFace { width: root.column; sidebar: false; status-line: FriendsView.strings.choose-account; }
+        }
+        if FriendsView.sign-in-controls: HorizontalLayout {
+            alignment: center;
+            HorizontalLayout {
+                width: root.column;
+                spacing: Theme.sp-s;
+                alignment: FriendsView.otp-shown ? LayoutAlignment.stretch : LayoutAlignment.center;
+                // No Enter-to-sign-in.
+                if FriendsView.otp-shown: Field {
+                    horizontal-stretch: 1;
+                    password: true;
+                    placeholder: FriendsView.strings.otp-placeholder;
+                    text <=> FriendsView.otp;
+                    edited(value) => { FriendsView.otp-edited(value); }
+                }
+                Control {
+                    text: FriendsView.connect-label;
+                    tone: Tone.primary;
+                    enabled: FriendsView.connect-enabled;
+                    clicked => { FriendsView.connect(); }
+                }
+            }
+        }
+    }
+}
+
+/// A sidebar entry's look: tinted when selected, a softer tint on hover.
+component Item inherits Pressable {
+    in property <bool> selected;
+    border-radius: Theme.radius-inner;
+    background: root.selected ? Theme.select.with-alpha(Theme.light ? 0.95 : 0.85) : self.hot || self.down ? Theme.select.with-alpha(0.45) : transparent;
+}
+
+/// Mailbox and Blocked under the friend list.
+component NavRow inherits Item {
+    in property <Glyph> glyph;
+    in property <string> text;
+    in property <string> count;
+    /// The count as an accent pill (unread mail) rather than plain text.
+    in property <bool> badge;
+    label: root.text;
+    height: Theme.row-h;
+    HorizontalLayout {
+        padding-left: Theme.sp-s;
+        padding-right: Theme.sp-s;
+        spacing: 10px;
+        Rectangle {
+            width: 34px;
+            Icon { glyph: root.glyph; size: 17px; tint: root.selected ? Theme.accent : Theme.sub; }
+        }
+        Text { horizontal-stretch: 1; text: root.text; font-size: Theme.type-body; font-weight: root.selected ? 600 : 400; color: Theme.ink; vertical-alignment: center; }
+        if root.count != "" && root.badge: Badge { cross-axis-self-alignment: center; text: root.count; }
+        if root.count != "" && !root.badge: Text { text: root.count; font-size: Theme.type-caption; color: Theme.sub; vertical-alignment: center; }
+    }
+}
+
+component Sidebar inherits Rectangle {
+    background: Theme.bg;
+    // Inside TwoPane's 1 px border: one pixel tighter, so the fill stays within the card's curve.
+    border-top-left-radius: Theme.radius - 1px;
+    border-bottom-left-radius: Theme.radius - 1px;
+    VerticalLayout {
+        VerticalLayout {
+            // Only the friend list takes the spare height.
+            vertical-stretch: 0;
+            padding: Theme.sp-m;
+            spacing: Theme.sp-s;
+            AccountFace { sidebar: true; }
+            // On the search field's edges.
+            if FriendsView.options-open: VerticalLayout {
+                padding-top: Theme.sp-xs;
+                padding-bottom: Theme.sp-xs;
+                spacing: Theme.sp-s;
+                Check {
+                    box: 15px;
+                    text: FriendsView.strings.groups;
+                    checked: FriendsView.groups;
+                    toggled(on) => { FriendsView.groups-toggled(on); }
+                }
+                if FriendsView.auto-away-shown: Select {
+                    height: 32px;
+                    fill: Theme.well;
+                    font-size: Theme.type-small;
+                    // Named by its value.
+                    label: FriendsView.auto-away-current >= 0 && FriendsView.auto-away-current < FriendsView.auto-away-items.length
+                        ? FriendsView.auto-away-items[FriendsView.auto-away-current] : "";
+                    items: FriendsView.auto-away-items;
+                    current: FriendsView.auto-away-current;
+                    picked(index) => { FriendsView.auto-away-picked(index); }
+                }
+                if FriendsView.auto-away-shown: Text { text: FriendsView.strings.auto-away-note; font-size: Theme.type-micro; color: Theme.sub; wrap: word-wrap; }
+            }
+        }
+        HorizontalLayout {
+            padding-left: Theme.sp-m;
+            padding-right: Theme.sp-m;
+            Field {
+                font-size: Theme.type-small;
+                pad-x: Theme.sp-m;
+                placeholder: FriendsView.strings.find;
+                enabled: FriendsView.query-enabled;
+                text <=> FriendsView.query;
+                edited(value) => { FriendsView.query-edited(value); }
+            }
+        }
+        Rectangle { height: 6px; }
+        Rectangle {
+            vertical-stretch: 1;
+            list := Flickable {
+                x: 0;
+                width: parent.width;
+                content-width: self.width;
+                content-height: rows.preferred-height;
+                rows := VerticalLayout {
+                    width: list.width;
+                    padding-left: Theme.sp-s;
+                    padding-right: Theme.sp-s;
+                    spacing: 2px;
+                    alignment: start;
+                    // Each line builds only its own kind.
+                    for row[index] in FriendsView.rows: VerticalLayout {
+                        if row.kind == 0: Pressable {
+                            height: 32px;
+                            label: row.text;
+                            accessible-role: button;
+                            accessible-expandable: true;
+                            accessible-expanded: !row.folded;
+                            clicked => { FriendsView.row-clicked(index); }
+                            HorizontalLayout {
+                                padding-left: Theme.sp-s;
+                                padding-right: Theme.sp-s;
+                                spacing: 6px;
+                                Icon { cross-axis-self-alignment: center; glyph: row.folded ? Glyph.chevron-right : Glyph.chevron-down; size: 12px; tint: Theme.faint; }
+                                Text { horizontal-stretch: 1; text: row.text; font-size: Theme.type-micro; font-weight: 600; color: Theme.faint; vertical-alignment: center; }
+                            }
+                        }
+                        if row.kind == 1: Item {
+                            height: 50px;
+                            label: row.text;
+                            selected: row.selected;
+                            clicked => { FriendsView.row-clicked(index); }
+                            HorizontalLayout {
+                                padding-left: Theme.sp-s;
+                                padding-right: Theme.sp-s;
+                                spacing: 10px;
+                                Avatar {
+                                    cross-axis-self-alignment: center;
+                                    size: 34px;
+                                    initial: row.initial;
+                                    tint: row.tint;
+                                    presence: row.presence;
+                                    ring: row.selected ? Theme.select.mix(Theme.bg, 0.85) : Theme.bg;
+                                }
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    alignment: center;
+                                    spacing: 1px;
+                                    Text {
+                                        text: row.text;
+                                        font-size: Theme.type-body;
+                                        font-weight: row.bold ? 600 : 400;
+                                        color: row.strong ? Theme.ink : Theme.sub.mix(Theme.ink, 0.3);
+                                        overflow: elide;
+                                    }
+                                    Text { text: row.secondary; font-size: Theme.type-caption; color: Theme.sub; overflow: elide; }
+                                }
+                                if row.unread != "": Badge { cross-axis-self-alignment: center; text: row.unread; }
+                            }
+                        }
+                        if row.kind == 2: VerticalLayout {
+                            padding-top: Theme.sp-xs;
+                            padding-bottom: Theme.sp-xs;
+                            padding-left: Theme.sp-s;
+                            padding-right: Theme.sp-s;
+                            Text { text: row.text; font-size: Theme.type-caption; color: Theme.sub; wrap: word-wrap; }
+                        }
+                    }
+                }
+            }
+            ScrollThumb {
+                x: parent.width - 6px;
+                height: parent.height;
+                content-y: list.content-y;
+                content-height: list.content-height;
+                visible-height: list.height;
+            }
+        }
+        Rule { tint: Theme.hairline; }
+        VerticalLayout {
+            padding: Theme.sp-s;
+            spacing: 2px;
+            NavRow {
+                glyph: Glyph.inbox;
+                text: FriendsView.strings.mailbox;
+                count: FriendsView.mailbox-count;
+                badge: true;
+                selected: FriendsView.pane == 2;
+                clicked => { FriendsView.open-mailbox(); }
+            }
+            NavRow {
+                glyph: Glyph.ban;
+                text: FriendsView.strings.blocked;
+                count: FriendsView.blocked-count;
+                selected: FriendsView.pane == 3;
+                clicked => { FriendsView.open-blocked(); }
+            }
+        }
+    }
+}
+
+/// A centred label on a hairline: a day, or the "new messages" mark.
+component Divider inherits HorizontalLayout {
+    in property <string> text;
+    in property <bool> accent;
+    padding-top: 10px;
+    padding-bottom: 10px;
+    spacing: 10px;
+    Rectangle {
+        horizontal-stretch: 1;
+        Rectangle { height: 1px; background: root.accent ? Theme.accent.with-alpha(0.45) : Theme.line.with-alpha(0.8); }
+    }
+    Text { text: root.text; font-size: Theme.type-micro; font-weight: 600; color: root.accent ? Theme.accent : Theme.sub; vertical-alignment: center; }
+    Rectangle {
+        horizontal-stretch: 1;
+        Rectangle { height: 1px; background: root.accent ? Theme.accent.with-alpha(0.45) : Theme.line.with-alpha(0.8); }
+    }
+}
+
+/// A run of messages from one side: avatar and name once, then each message.
+component Group inherits HorizontalLayout {
+    in property <ChatBlock> block;
+    padding-top: 6px;
+    padding-bottom: 6px;
+    spacing: Theme.sp-m;
+    VerticalLayout {
+        alignment: start;
+        Avatar { size: 36px; mine: root.block.mine; initial: root.block.initial; tint: root.block.tint; ring: Theme.card; }
+    }
+    VerticalLayout {
+        horizontal-stretch: 1;
+        spacing: Theme.sp-xs;
+        HorizontalLayout {
+            alignment: start;
+            spacing: Theme.sp-s;
+            Text { text: root.block.who; font-size: Theme.type-body; font-weight: 600; color: root.block.mine ? Theme.accent : Theme.ink; vertical-alignment: center; }
+            if root.block.time != "": Text { text: root.block.time; font-size: Theme.type-micro; color: Theme.sub.with-alpha(0.9); vertical-alignment: center; }
+        }
+        for item in root.block.items: VerticalLayout {
+            spacing: 2px;
+            if item.subject != "": Text { text: item.subject; font-size: Theme.type-caption; font-weight: 600; color: Theme.sub; wrap: word-wrap; }
+            if item.skeleton: VerticalLayout {
+                padding-top: Theme.sp-xs;
+                padding-bottom: Theme.sp-xs;
+                spacing: 7px;
+                HorizontalLayout { alignment: start; Rectangle { width: 260px; height: 9px; border-radius: 4.5px; background: Theme.sub.with-alpha(0.18); } }
+                HorizontalLayout { alignment: start; Rectangle { width: 170px; height: 9px; border-radius: 4.5px; background: Theme.sub.with-alpha(0.18); } }
+            }
+            if !item.skeleton && item.italic: Text { text: item.text; font-size: Theme.type-small; font-italic: true; color: Theme.sub; wrap: word-wrap; }
+            if !item.skeleton && !item.italic: Text { text: item.text; font-size: Theme.type-body; color: item.pending ? Theme.ink.with-alpha(0.6) : Theme.ink; wrap: word-wrap; }
+            if item.pending: Text { text: FriendsView.strings.sending; font-size: Theme.type-micro; color: Theme.sub; }
+        }
+    }
+}
+
+/// The messages, newest at the bottom. The view keeps its distance from
+/// the bottom as the content or the pane changes height: at the bottom it follows the newest
+/// message; scrolled up into the history it stays where it was. Another friend's conversation
+/// starts at the newest.
+component Messages inherits Rectangle {
+    private property <int> key: FriendsView.chat-key;
+    changed key => {
+        flick.gap = 0px;
+        root.anchor();
+    }
+    function anchor() {
+        flick.content-y = min(0px, flick.height - flick.content-height + flick.gap);
+    }
+    flick := Flickable {
+        /// How far the view is above the bottom (0: at the newest), as the user left it.
+        property <length> gap: 0px;
+        width: parent.width - 6px;
+        x: 0;
+        content-width: self.width;
+        content-height: body.preferred-height;
+        changed content-height => { root.anchor(); }
+        changed height => { root.anchor(); }
+        flicked => { self.gap = max(0px, self.content-height - self.height + self.content-y); }
+        body := VerticalLayout {
+            width: flick.width;
+            padding-top: Theme.sp-m;
+            padding-bottom: Theme.sp-m;
+            padding-left: Theme.sp-xl;
+            padding-right: Theme.sp-xl;
+            alignment: start;
+            if FriendsView.chat-newest: Text {
+                text: FriendsView.strings.newest;
+                font-size: Theme.type-caption;
+                color: Theme.sub;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+            for block in FriendsView.chat: VerticalLayout {
+                if block.kind == 0: Divider { text: block.label; accent: block.accent; }
+                if block.kind == 1: Group { block: block; }
+            }
+        }
+    }
+    ScrollThumb {
+        x: parent.width - 6px;
+        height: parent.height;
+        content-y: flick.content-y;
+        content-height: flick.content-height;
+        visible-height: flick.height;
+    }
+}
+
+/// The message box: up to six lines tall, then it scrolls (the wheel too); Enter sends,
+/// Shift+Enter breaks the line. Privacy mode shows a fixed mask that can't be edited or copied.
+component DraftBox inherits Rectangle {
+    height: FriendsView.draft-masked ? 41px : 19px * clamp(FriendsView.draft-lines, 1, 6) + 22px;
+    if FriendsView.draft-masked: Text {
+        x: Theme.sp-m;
+        width: parent.width - 2 * Theme.sp-m;
+        text: FriendsView.mask;
+        font-size: Theme.type-body;
+        color: Theme.ink;
+        vertical-alignment: center;
+    }
+    if !FriendsView.draft-masked && FriendsView.draft == "": Text {
+        x: Theme.sp-m;
+        y: 10px;
+        width: parent.width - 2 * Theme.sp-m;
+        text: FriendsView.strings.draft-placeholder;
+        font-size: Theme.type-body;
+        color: Theme.sub.with-alpha(0.8);
+    }
+    // The wheel scrolls the box: the text input and the (cursor-driven) flickable leave it to this.
+    if !FriendsView.draft-masked: wheel := TouchArea {
+        x: Theme.sp-m;
+        y: 10px;
+        width: parent.width - 2 * Theme.sp-m;
+        height: parent.height - 20px;
+        mouse-cursor: text;
+        scroll-event(event) => {
+            if scroll.content-height <= scroll.height {
+                return reject;
+            }
+            scroll.content-y = max(scroll.height - scroll.content-height, min(0px, scroll.content-y + event.delta-y));
+            return accept;
+        }
+        scroll := Flickable {
+            width: parent.width;
+            height: parent.height;
+            content-width: self.width;
+            content-height: max(self.height, input.preferred-height);
+            interactive: false;
+            input := TextInput {
+                width: scroll.width;
+                text <=> FriendsView.draft;
+                enabled: FriendsView.draft-enabled;
+                single-line: false;
+                wrap: word-wrap;
+                font-size: Theme.type-body;
+                color: Theme.ink;
+                selection-background-color: Theme.accent.with-alpha(0.3);
+                selection-foreground-color: Theme.ink;
+                accessible-label: FriendsView.strings.draft-placeholder;
+                key-pressed(event) => {
+                    if event.text == Key.Return && !event.modifiers.shift {
+                        if FriendsView.can-send { FriendsView.send(); }
+                        return accept;
+                    }
+                    return reject;
+                }
+                edited => { FriendsView.draft-edited(self.text); }
+                cursor-position-changed(at) => {
+                    if at.y + scroll.content-y < 0px {
+                        scroll.content-y = -at.y;
+                    } else if at.y + 19px + scroll.content-y > scroll.height {
+                        scroll.content-y = min(0px, scroll.height - at.y - 19px);
+                    }
+                }
+            }
+        }
+    }
+}
+
+component ComposerView inherits VerticalLayout {
+    vertical-stretch: 0;
+    padding-top: Theme.sp-m;
+    padding-bottom: Theme.sp-m;
+    padding-left: Theme.sp-l;
+    padding-right: Theme.sp-l;
+    spacing: Theme.sp-s;
+    if FriendsView.show-subject: Field {
+        font-size: Theme.type-small;
+        // The message text's edge: the box's sp-xs padding plus the draft's sp-m.
+        pad-x: Theme.sp-xs + Theme.sp-m;
+        placeholder: FriendsView.strings.subject-placeholder;
+        enabled: FriendsView.subject-enabled;
+        text <=> FriendsView.subject;
+        edited(value) => { FriendsView.subject-edited(value); }
+    }
+    Rectangle {
+        background: Theme.field;
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: Theme.line;
+        HorizontalLayout {
+            padding: Theme.sp-xs;
+            spacing: 6px;
+            DraftBox { horizontal-stretch: 1; }
+            VerticalLayout {
+                // Centred beside one line; on the last line once the box grows.
+                alignment: FriendsView.draft-masked || FriendsView.draft-lines <= 1 ? LayoutAlignment.center : LayoutAlignment.end;
+                send := Pressable {
+                    label: FriendsView.strings.send;
+                    enabled: FriendsView.can-send;
+                    width: 34px;
+                    height: 34px;
+                    border-radius: Theme.radius-inner;
+                    background: !self.enabled ? Theme.tint : self.hot ? Theme.play-text.mix(Theme.play, 0.1) : Theme.play;
+                    border-width: self.enabled ? 0px : 1px;
+                    border-color: Theme.hairline;
+                    clicked => { FriendsView.send(); }
+                    Icon { glyph: Glyph.send; size: 16px; tint: send.enabled ? Theme.play-text : Theme.sub.with-alpha(0.6); }
+                    Tooltip { Hint { caption: FriendsView.strings.send; } }
+                }
+            }
+        }
+    }
+    HorizontalLayout {
+        padding-left: Theme.sp-xs;
+        padding-right: Theme.sp-xs;
+        Pressable {
+            label: FriendsView.subject-toggle;
+            enabled: FriendsView.subject-toggle-enabled;
+            horizontal-stretch: 0;
+            min-width: toggle.preferred-width;
+            clicked => { FriendsView.add-subject(); }
+            toggle := Text { text: FriendsView.subject-toggle; font-size: Theme.type-caption; font-weight: 600; color: Theme.accent; vertical-alignment: center; }
+        }
+        Rectangle { horizontal-stretch: 1; }
+        Text {
+            text: FriendsView.note;
+            font-size: Theme.type-micro;
+            color: FriendsView.note-tone == 2 ? Theme.danger : FriendsView.note-tone == 1 ? Theme.sub : Theme.sub.with-alpha(0.85);
+            vertical-alignment: center;
+        }
+    }
+}
+
+/// The conversation with the open friend.
+component Conversation inherits VerticalLayout {
+    PaneHeader {
+        HorizontalLayout {
+            horizontal-stretch: 1;
+            cross-axis-self-alignment: center;
+            spacing: Theme.sp-m;
+            alignment: start;
+            Avatar {
+                cross-axis-self-alignment: center;
+                size: 38px;
+                initial: FriendsView.friend-initial;
+                tint: FriendsView.friend-tint;
+                presence: FriendsView.friend-presence;
+                ring: Theme.panel;
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 1px;
+                Text { text: FriendsView.friend-name; font-size: Theme.type-heading; font-weight: 600; color: Theme.ink; overflow: elide; }
+                Text { text: FriendsView.friend-secondary; font-size: Theme.type-caption; color: Theme.sub; overflow: elide; }
+            }
+        }
+        PaneButton {
+            cross-axis-self-alignment: center;
+            glyph: Glyph.refresh;
+            hint: FriendsView.check-label;
+            enabled: FriendsView.check-enabled;
+            clicked => { FriendsView.check(); }
+        }
+        PaneButton {
+            cross-axis-self-alignment: center;
+            glyph: Glyph.user-minus;
+            hint: FriendsView.strings.remove;
+            enabled: FriendsView.remove-enabled;
+            clicked => { FriendsView.remove(); }
+        }
+    }
+    Rule { tint: Theme.hairline; }
+    // [12, 16] around the question.
+    if FriendsView.confirm-shown: VerticalLayout {
+        vertical-stretch: 0;
+        padding-top: Theme.sp-m;
+        padding-bottom: Theme.sp-m;
+        padding-left: Theme.sp-l;
+        padding-right: Theme.sp-l;
+        ConfirmBar { }
+    }
+    if FriendsView.pane-error != "": PaneBanner { text: FriendsView.pane-error; }
+    if FriendsView.pane-notice != "": PaneBanner { text: FriendsView.pane-notice; problem: false; glyph: Glyph.check-circle; }
+    if FriendsView.chat-state == 1: Empty {
+        vertical-stretch: 1;
+        glyph: Glyph.message;
+        title: FriendsView.chat-title;
+        body: FriendsView.chat-body;
+    }
+    if FriendsView.chat-state == 0: Messages { vertical-stretch: 1; }
+    Rule { tint: Theme.hairline; }
+    if FriendsView.composer == 0: InGameNotice { }
+    if FriendsView.composer == 1: ComposerView { }
+    if FriendsView.composer == 2: VerticalLayout {
+        vertical-stretch: 0;
+        padding-top: Theme.sp-l;
+        padding-bottom: Theme.sp-l;
+        padding-left: Theme.sp-xl;
+        padding-right: Theme.sp-xl;
+        Text { text: FriendsView.strings.cant-receive; font-size: Theme.type-small; color: Theme.sub; wrap: word-wrap; }
+    }
+}
+
+/// A pane's identity for the Mailbox and the block list: a round glyph, a title and a line.
+component PaneLead inherits Rectangle {
+    in property <Glyph> glyph;
+    in property <string> title;
+    in property <string> body;
+    horizontal-stretch: 1;
+    // The header's height, so the glyph and the text centre in it.
+    height: 64px;
+    HorizontalLayout {
+        spacing: Theme.sp-m;
+        alignment: start;
+        RoundGlyph { cross-axis-self-alignment: center; size: 38px; glyph: root.glyph; }
+        VerticalLayout {
+            alignment: center;
+            spacing: 1px;
+            Text { text: root.title; font-size: Theme.type-heading; font-weight: 600; color: Theme.ink; }
+            Text { text: root.body; font-size: Theme.type-caption; color: Theme.sub; overflow: elide; }
+        }
+    }
+}
+
+/// A Mailbox folder tab.
+component FolderTab inherits Pressable {
+    in property <string> text;
+    in property <bool> active;
+    label: root.text;
+    accessible-role: tab;
+    accessible-checked: root.active;
+    height: caption.preferred-height + 12px;
+    min-width: caption.preferred-width + 24px;
+    preferred-width: self.min-width;
+    horizontal-stretch: 0;
+    border-radius: Theme.radius-inner;
+    background: root.active ? Theme.select : self.hot ? Theme.select.with-alpha(0.45) : transparent;
+    caption := Text {
+        text: root.text;
+        font-size: Theme.type-small;
+        font-weight: root.active ? 600 : 400;
+        color: root.active ? Theme.accent : Theme.sub;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+/// Every stored message by folder, from anyone.
+component Mailbox inherits VerticalLayout {
+    PaneHeader {
+        PaneLead { glyph: Glyph.inbox; title: FriendsView.strings.mailbox; body: FriendsView.strings.mailbox-desc; }
+        PaneButton {
+            cross-axis-self-alignment: center;
+            glyph: Glyph.refresh;
+            hint: FriendsView.check-label;
+            enabled: FriendsView.check-enabled;
+            clicked => { FriendsView.check(); }
+        }
+    }
+    Rule { tint: Theme.hairline; }
+    if FriendsView.pane-error != "": PaneBanner { text: FriendsView.pane-error; }
+    if FriendsView.mail-changed: PaneBanner { text: FriendsView.strings.new-mail; problem: false; glyph: Glyph.inbox; }
+    if FriendsView.in-game: InGameNotice { }
+    HorizontalLayout {
+        vertical-stretch: 0;
+        padding-top: Theme.sp-m;
+        padding-bottom: Theme.sp-m;
+        padding-left: Theme.sp-l;
+        padding-right: Theme.sp-l;
+        spacing: Theme.sp-s;
+        HorizontalLayout {
+            spacing: Theme.sp-xs;
+            horizontal-stretch: 0;
+            for name[index] in FriendsView.folders: FolderTab {
+                cross-axis-self-alignment: center;
+                text: name;
+                active: index == FriendsView.folder;
+                enabled: FriendsView.folders-enabled;
+                clicked => { FriendsView.folder-picked(index); }
+            }
+        }
+        Rectangle { horizontal-stretch: 1; }
+        Text { text: FriendsView.mail-count; font-size: Theme.type-caption; color: Theme.sub; vertical-alignment: center; }
+        if FriendsView.paging: Control { cross-axis-self-alignment: center; text: FriendsView.strings.previous; enabled: FriendsView.previous-enabled; clicked => { FriendsView.previous(); } }
+        if FriendsView.paging: Control { cross-axis-self-alignment: center; text: FriendsView.strings.next; enabled: FriendsView.next-enabled; clicked => { FriendsView.next(); } }
+    }
+    Rectangle {
+        vertical-stretch: 1;
+        flick := Flickable {
+            x: 0;
+            width: parent.width;
+            content-width: self.width;
+            content-height: list.preferred-height;
+            // On the pane's sp-l edge, as the tabs and the header are.
+            list := VerticalLayout {
+                width: flick.width;
+                padding-left: Theme.sp-l;
+                padding-right: Theme.sp-l;
+                spacing: 2px;
+                alignment: start;
+                if FriendsView.opened: Rectangle {
+                    border-radius: Theme.radius-inner;
+                    background: Theme.select.with-alpha(Theme.light ? 0.7 : 0.55);
+                    VerticalLayout {
+                        padding-top: 14px;
+                        padding-bottom: 14px;
+                        padding-left: Theme.sp-l;
+                        padding-right: Theme.sp-l;
+                        spacing: 6px;
+                        Text { text: FriendsView.opened-from; font-size: Theme.type-body; font-weight: 600; color: Theme.ink; wrap: word-wrap; }
+                        if FriendsView.opened-subject != "": Text { text: FriendsView.opened-subject; font-size: Theme.type-small; font-weight: 600; color: Theme.sub; wrap: word-wrap; }
+                        Text { text: FriendsView.opened-text; font-size: Theme.type-body; color: Theme.ink; wrap: word-wrap; }
+                    }
+                }
+                if FriendsView.opened: Rectangle { height: Theme.sp-s; }
+                for line[index] in FriendsView.mail: Item {
+                    label: line.correspondent;
+                    enabled: line.enabled;
+                    height: 52px;
+                    clicked => { FriendsView.read(index); }
+                    HorizontalLayout {
+                        // A folder tab's text inset.
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 10px;
+                        Rectangle {
+                            width: 8px;
+                            if line.unread: Rectangle { width: 8px; height: 8px; border-radius: 4px; background: Theme.accent; }
+                        }
+                        Avatar { cross-axis-self-alignment: center; size: 32px; mine: line.mine; initial: line.initial; tint: line.tint; ring: Theme.card; }
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            spacing: 1px;
+                            Text { text: line.correspondent; font-size: Theme.type-body; font-weight: 600; color: Theme.ink; overflow: elide; }
+                            Text { text: line.subject; font-size: Theme.type-caption; color: Theme.sub; overflow: elide; }
+                        }
+                        Icon { cross-axis-self-alignment: center; glyph: Glyph.chevron-right; size: 14px; tint: Theme.sub; }
+                    }
+                }
+            }
+        }
+        ScrollThumb {
+            x: parent.width - 6px;
+            height: parent.height;
+            content-y: flick.content-y;
+            content-height: flick.content-height;
+            visible-height: flick.height;
+        }
+    }
+}
+
+/// The block list (list B).
+component Blocked inherits VerticalLayout {
+    PaneHeader {
+        PaneLead { glyph: Glyph.ban; title: FriendsView.strings.blocked; body: FriendsView.strings.blocked-desc; }
+    }
+    Rule { tint: Theme.hairline; }
+    // BANNER_PAD around the question.
+    if FriendsView.confirm-shown: VerticalLayout {
+        vertical-stretch: 0;
+        padding-top: Theme.sp-m;
+        padding-left: Theme.sp-l;
+        padding-right: Theme.sp-l;
+        ConfirmBar { }
+    }
+    if FriendsView.pane-error != "": PaneBanner { text: FriendsView.pane-error; }
+    if FriendsView.pane-notice != "": PaneBanner { text: FriendsView.pane-notice; problem: false; glyph: Glyph.check-circle; }
+    if FriendsView.blocked.length == 0: Empty { vertical-stretch: 1; glyph: Glyph.ban; title: FriendsView.strings.nobody; }
+    if FriendsView.blocked.length > 0 && FriendsView.in-game: InGameNotice { }
+    if FriendsView.blocked.length > 0: Rectangle {
+        vertical-stretch: 1;
+        flick := Flickable {
+            x: 0;
+            width: parent.width;
+            content-width: self.width;
+            content-height: list.preferred-height;
+            // The avatar under the header's glyph, Unblock on the pane's right edge.
+            list := VerticalLayout {
+                width: flick.width;
+                padding-top: Theme.sp-m;
+                padding-bottom: Theme.sp-m;
+                padding-left: Theme.sp-l;
+                padding-right: Theme.sp-l;
+                spacing: 2px;
+                alignment: start;
+                for line[index] in FriendsView.blocked: HorizontalLayout {
+                    padding-top: 6px;
+                    padding-bottom: 6px;
+                    spacing: Theme.sp-m;
+                    Avatar { cross-axis-self-alignment: center; size: 34px; initial: line.initial; tint: line.tint; ring: Theme.card; }
+                    Text { horizontal-stretch: 1; text: line.name; font-size: Theme.type-body; color: Theme.ink; vertical-alignment: center; overflow: elide; }
+                    Control { text: FriendsView.strings.unblock; enabled: line.enabled; clicked => { FriendsView.unblock(index); } }
+                }
+            }
+        }
+        ScrollThumb {
+            x: parent.width - 6px;
+            height: parent.height;
+            content-y: flick.content-y;
+            content-height: flick.content-height;
+            visible-height: flick.height;
+        }
+    }
+}
+
+/// The friends sidebar and the open pane, in one card.
+component TwoPane inherits Rectangle {
+    background: Theme.card;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.hairline;
+    HorizontalLayout {
+        padding: 1px;
+        Sidebar { width: FriendsView.side-w; }
+        Rectangle { width: 1px; background: Theme.line; }
+        Rectangle {
+            horizontal-stretch: 1;
+            if FriendsView.pane == 0: Empty { glyph: Glyph.message; title: FriendsView.strings.welcome; }
+            if FriendsView.pane == 1: Conversation { }
+            if FriendsView.pane == 2: Mailbox { }
+            if FriendsView.pane == 3: Blocked { }
+        }
+    }
+}
+
+/// The Friends page under the title bar.
+export component FriendsPage inherits VerticalLayout {
+    private property <float> s: Theme.scale;
+    padding-top: Theme.sp-3 * root.s;
+    padding-left: Theme.page-x * root.s;
+    padding-right: Theme.page-x * root.s;
+    padding-bottom: Theme.sp-3 * root.s;
+    spacing: Theme.sp-xl * root.s;
+    HorizontalLayout {
+        spacing: Theme.sp-l * root.s;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: Theme.sp-xs * root.s;
+            Text { text: FriendsView.strings.title; font-size: Theme.type-title * root.s; font-weight: 600; color: Theme.ink; }
+            Text { text: FriendsView.description; font-size: Theme.type-body * root.s; color: Theme.sub; overflow: elide; }
+        }
+        // Top-aligned beside the title; the buttons themselves don't scale.
+        if FriendsView.connected: HorizontalLayout {
+            spacing: Theme.sp-s;
+            Control { y: 0; text: FriendsView.strings.sign-out; enabled: FriendsView.sign-out-enabled; clicked => { FriendsView.sign-out(); } }
+            Control { y: 0; text: FriendsView.strings.start-ffxi; glyph: Glyph.play; tone: Tone.primary; enabled: FriendsView.play-enabled; clicked => { FriendsView.play(); } }
+        }
+    }
+    for problem in FriendsView.problems: Notice { text: problem; }
+    if FriendsView.shown: TwoPane { vertical-stretch: 1; }
+    if !FriendsView.shown: SignInCard { vertical-stretch: 1; }
+}

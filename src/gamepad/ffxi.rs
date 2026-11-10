@@ -13,16 +13,16 @@
 //! * `padguid000`: the DirectInput instance the game binds to (all zero: any).
 //! * `padexsin000` exists on newer installs; it is preserved, never edited.
 //!
-//! Retail FFXI (Windower, Ashita) reads the Windows registry. The original
-//! values are backed up as a `.reg` file before the first change.
+//! Retail FFXI (Windower, Ashita) reads the Windows registry, through the same
+//! key accessor and region rule as the Graphics page (`game_config`). The
+//! original values are backed up as a `.reg` file before the first change.
 use super::detect::Btn;
 use crate::i18n::{t, tf};
 use std::path::{Path, PathBuf};
 
 pub(crate) const SLOT_COUNT: usize = 27;
 pub(crate) const MODE_COUNT: usize = 6;
-/// The XInput defaults the native client ships in `ffxi.reg` (also what the
-/// FFXI config tool writes for an Xbox controller).
+/// The XInput defaults: what the FFXI config tool writes for an Xbox controller.
 pub(crate) const DEFAULT_XINPUT_SIN: [i32; SLOT_COUNT] = [
     8, 9, 13, 12, 10, 0, 1, 3, 2, 15, -1, -1, 14, -33, -33, 32, 32, -36, -36, 35, 35, 6, 7, 5, 4,
     11, -1,
@@ -264,7 +264,6 @@ impl Row {
 pub(crate) struct PadConfig {
     pub mode: Vec<i32>,
     pub sin: Vec<i32>,
-    pub guid: String,
 }
 
 impl Default for PadConfig {
@@ -272,7 +271,6 @@ impl Default for PadConfig {
         Self {
             mode: DEFAULT_MODE.to_vec(),
             sin: DEFAULT_XINPUT_SIN.to_vec(),
-            guid: String::new(),
         }
     }
 }
@@ -290,39 +288,68 @@ pub(crate) fn format_list(values: &[i32]) -> String {
     values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
 }
 
+/// Bindings a layout change unbound because the target layout has no such
+/// control (Xbox LT/RT under DirectInput, Sony touchpad/mic under XInput),
+/// with the layout they were made in, so the reverse change can put them back.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Unbound {
+    pub layout: Option<Layout>,
+    pub slots: Vec<(usize, i32)>,
+}
+
+fn is_axis(id: i32) -> bool {
+    id.unsigned_abs() >= 32
+}
+
 impl PadConfig {
     /// Builds a config from the stored strings; missing or malformed values
     /// fall back to the defaults (and lists are padded to their known length).
-    pub(crate) fn from_values(mode: Option<&str>, sin: Option<&str>, guid: Option<&str>) -> Self {
+    pub(crate) fn from_values(mode: Option<&str>, sin: Option<&str>) -> Self {
         let mut mode = mode.and_then(parse_list).unwrap_or_else(|| DEFAULT_MODE.to_vec());
         let mut sin = sin.and_then(parse_list).unwrap_or_else(|| DEFAULT_XINPUT_SIN.to_vec());
         mode.resize(mode.len().max(MODE_COUNT), 0);
         sin.resize(sin.len().max(SLOT_COUNT), -1);
-        Self {
-            mode,
-            sin,
-            guid: guid.unwrap_or_default().to_string(),
-        }
+        Self { mode, sin }
     }
     pub(crate) fn flag(&self, f: Flag) -> bool {
         self.mode.get(f as usize).is_some_and(|v| *v != 0)
     }
     /// Sets a flag. Turning XInput on or off renumbers the bindings so each
-    /// function keeps its physical control.
-    pub(crate) fn set_flag(&mut self, f: Flag, on: bool, di: Layout) {
+    /// function keeps its physical control; `unbound` carries what a previous
+    /// change could not map and receives what this one cannot.
+    pub(crate) fn set_flag(&mut self, f: Flag, on: bool, di: Layout, unbound: &mut Unbound) {
         if f == Flag::XInput && self.flag(f) != on {
             let (from, to) = if on { (di, Layout::XInput) } else { (Layout::XInput, di) };
-            self.translate(from, to);
+            let lost = self.translate(from, to);
+            if unbound.layout == Some(to) {
+                self.restore(&unbound.slots);
+            }
+            *unbound = Unbound { layout: Some(from), slots: lost };
         }
         self.mode[f as usize] = on as i32;
     }
-    pub(crate) fn translate(&mut self, from: Layout, to: Layout) {
+    /// Renumbers every binding from one layout to another; returns the
+    /// single-slot bindings (with their old ids) the target cannot express.
+    pub(crate) fn translate(&mut self, from: Layout, to: Layout) -> Vec<(usize, i32)> {
+        let mut lost = Vec::new();
         for row in ROWS {
             match row {
-                Row::Single(i) => self.sin[i] = to.encode(from.decode(self.sin[i])),
+                Row::Single(i) => {
+                    let old = self.sin[i];
+                    self.sin[i] = to.encode(from.decode(old));
+                    if old != -1 && self.sin[i] == -1 {
+                        lost.push((i, old));
+                    }
+                }
                 Row::Group(i) => {
                     if let Some(stick) = from.group_stick(&self.sin[i..i + 4]) {
-                        self.sin[i..i + 4].copy_from_slice(&to.group(stick));
+                        // Keep each reversed axis reversed (relative to the
+                        // layout's canonical group, whose Y is reversed).
+                        let (canon_from, canon_to) = (from.group(stick), to.group(stick));
+                        for j in 0..4 {
+                            let reversed = is_axis(canon_from[j]) && (self.sin[i + j] < 0) != (canon_from[j] < 0);
+                            self.sin[i + j] = if reversed && is_axis(canon_to[j]) { -canon_to[j] } else { canon_to[j] };
+                        }
                     } else {
                         for j in i..i + 4 {
                             self.sin[j] = to.encode(from.decode(self.sin[j]));
@@ -331,16 +358,25 @@ impl PadConfig {
                 }
             }
         }
+        lost
     }
-    /// The shipped defaults, in the current input mode.
+    /// Puts back bindings a layout change unbound, where the slot is still
+    /// unbound and no other function has taken that id since.
+    fn restore(&mut self, slots: &[(usize, i32)]) {
+        for &(slot, id) in slots {
+            let taken = ROWS.iter().any(|row| matches!(*row, Row::Single(other) if other != slot && self.sin[other] == id));
+            if self.sin[slot] == -1 && !taken {
+                self.sin[slot] = id;
+            }
+        }
+    }
+    /// The shipped bindings, in the current input mode. Game options (the
+    /// `padmode000` flags) are left as they are.
     pub(crate) fn reset(&mut self, di: Layout) {
         let mut fresh = PadConfig::default();
-        fresh.mode[Flag::XInput as usize] = self.flag(Flag::XInput) as i32;
-        fresh.mode[Flag::Enabled as usize] = 1;
-        if !fresh.flag(Flag::XInput) {
+        if !self.flag(Flag::XInput) {
             fresh.translate(Layout::XInput, di);
         }
-        self.mode[..MODE_COUNT].copy_from_slice(&fresh.mode);
         self.sin[..SLOT_COUNT].copy_from_slice(&fresh.sin);
     }
     /// Binds a button to a single-slot function; a function that already had
@@ -357,11 +393,14 @@ impl PadConfig {
         }
         self.sin[slot] = id;
     }
-    pub(crate) fn bind_group(&mut self, first: usize, ids: [i32; 4]) {
+    /// Binds a direction group; another group on the same stick (whatever
+    /// its axis reversal) takes this group's previous stick.
+    pub(crate) fn bind_group(&mut self, first: usize, ids: [i32; 4], layout: Layout) {
         let old: [i32; 4] = self.sin[first..first + 4].try_into().unwrap_or([-1; 4]);
+        let stick = layout.group_stick(&ids);
         for row in ROWS {
             if let Row::Group(other) = row {
-                if other != first && self.sin[other..other + 4] == ids {
+                if other != first && stick.is_some() && layout.group_stick(&self.sin[other..other + 4]) == stick {
                     self.sin[other..other + 4].copy_from_slice(&old);
                 }
             }
@@ -390,148 +429,40 @@ impl PadConfig {
             ("padsin000", format_list(&self.sin)),
         ]
     }
-}
-
-// ---- .reg files (the native client) ------------------------------------------
-
-#[cfg(test)]
-fn is_game_key(header: &str) -> bool {
-    let h = header.to_ascii_lowercase().replace("\\wow6432node", "");
-    h.starts_with("hkey_local_machine\\software\\playonline")
-        && h.ends_with("\\squareenix\\finalfantasyxi")
-}
-
-#[cfg(test)]
-fn unquote(s: &str) -> Option<String> {
-    let s = s.strip_prefix('"')?;
-    let mut out = String::new();
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => out.push(chars.next()?),
-            '"' => return Some(out),
-            c => out.push(c),
-        }
-    }
-    None
-}
-
-/// Reads a `.reg` file's text (UTF-16 with BOM, UTF-8, or ANSI).
-#[cfg(test)]
-pub(crate) fn decode_reg_bytes(bytes: &[u8]) -> (String, bool) {
-    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
-        let units: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        (String::from_utf16_lossy(&units), true)
-    } else {
-        let b = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(bytes);
-        (String::from_utf8_lossy(b).into_owned(), false)
-    }
-}
-
-pub(crate) fn encode_reg_text(text: &str, utf16: bool) -> Vec<u8> {
-    if utf16 {
-        let mut out = vec![0xFF, 0xFE];
-        for u in text.encode_utf16() {
-            out.extend_from_slice(&u.to_le_bytes());
-        }
-        out
-    } else {
-        text.as_bytes().to_vec()
-    }
-}
-
-/// A string value from the game's key in `.reg` text (the last one wins, as
-/// the client loads them).
-#[cfg(test)]
-pub(crate) fn reg_value(text: &str, name: &str) -> Option<String> {
-    let mut in_key = false;
-    let mut found = None;
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.starts_with('[') {
-            in_key = line.trim_end().ends_with(']') && is_game_key(&line[1..line.trim_end().len() - 1]);
-            continue;
-        }
-        if !in_key {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix('"') {
-            if let Some((n, v)) = rest.split_once("\"=") {
-                if n.eq_ignore_ascii_case(name) {
-                    found = unquote(v);
+    /// `base` changed to `edit` laid over `current`: every entry the user
+    /// changed from `base` takes the edit, everything else keeps `current`
+    /// (what another tool may have stored since `base` was read).
+    pub(crate) fn rebased(current: &PadConfig, base: &PadConfig, edit: &PadConfig) -> PadConfig {
+        let merge = |cur: &[i32], base: &[i32], edit: &[i32]| -> Vec<i32> {
+            let mut out = cur.to_vec();
+            out.resize(out.len().max(edit.len()), -1);
+            for (i, e) in edit.iter().enumerate() {
+                if base.get(i) != Some(e) {
+                    out[i] = *e;
                 }
             }
+            out
+        };
+        PadConfig {
+            mode: merge(&current.mode, &base.mode, &edit.mode),
+            sin: merge(&current.sin, &base.sin, &edit.sin),
         }
     }
-    found
+}
+
+// ---- registry backups (.reg) --------------------------------------------------
+
+/// UTF-16LE with a BOM: what `reg export` writes and `reg import` expects.
+fn utf16le_bom(text: &str) -> Vec<u8> {
+    let mut out = vec![0xFF, 0xFE];
+    for u in text.encode_utf16() {
+        out.extend_from_slice(&u.to_le_bytes());
+    }
+    out
 }
 
 fn reg_line(name: &str, value: &str) -> String {
     format!("\"{name}\"=\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
-/// Sets string values in the game's key of `.reg` text, replacing existing
-/// lines in place and adding missing ones (and the key) as needed. Everything
-/// else is kept byte for byte.
-#[cfg(test)]
-pub(crate) fn patch_reg_text(text: &str, values: &[(&str, String)]) -> String {
-    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
-    let mut lines: Vec<String> = text.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect();
-    if text.is_empty() {
-        lines = vec!["REGEDIT4".into(), String::new()];
-    }
-    let mut done = vec![false; values.len()];
-    let mut header = None;
-    let mut in_key = false;
-    for (i, line) in lines.iter_mut().enumerate() {
-        if line.starts_with('[') {
-            let t = line.trim_end();
-            in_key = t.ends_with(']') && is_game_key(&t[1..t.len() - 1]);
-            if in_key {
-                header = Some(i);
-            }
-            continue;
-        }
-        if !in_key {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix('"') {
-            if let Some((n, _)) = rest.split_once("\"=") {
-                if let Some(k) = values.iter().position(|(name, _)| n.eq_ignore_ascii_case(name)) {
-                    *line = reg_line(values[k].0, &values[k].1);
-                    done[k] = true;
-                }
-            }
-        }
-    }
-    let missing: Vec<String> = values
-        .iter()
-        .zip(&done)
-        .filter(|(_, d)| !**d)
-        .map(|((n, v), _)| reg_line(n, v))
-        .collect();
-    if !missing.is_empty() {
-        match header {
-            Some(h) => {
-                for (k, l) in missing.into_iter().enumerate() {
-                    lines.insert(h + 1 + k, l);
-                }
-            }
-            None => {
-                while lines.last().is_some_and(|l| l.is_empty()) {
-                    lines.pop();
-                }
-                lines.push(String::new());
-                lines.push("[HKEY_LOCAL_MACHINE\\SOFTWARE\\PlayOnlineUS\\SquareEnix\\FinalFantasyXI]".into());
-                lines.extend(missing);
-                lines.push(String::new());
-            }
-        }
-    }
-    lines.join(newline)
 }
 
 // ---- where the game keeps the values --------------------------------------------
@@ -540,55 +471,6 @@ pub(crate) struct Loaded {
     pub config: PadConfig,
     /// Where the values were read from, for the UI.
     pub source: String,
-    pub found: bool,
-}
-
-/// The account overlays the native client loads after `ffxi.reg`.
-#[cfg(test)]
-pub(crate) fn native_overlays(config: &crate::backend::Config) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(dirs) = std::fs::read_dir(config.experiment.join("test-launcher/data")) {
-        for d in dirs.flatten() {
-            let runtime = d.path().join("runtime");
-            if runtime.is_dir() {
-                out.push(runtime.join("saved.reg"));
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
-#[cfg(test)]
-fn read_reg(path: &Path) -> Option<String> {
-    std::fs::read(path).ok().map(|b| decode_reg_bytes(&b).0)
-}
-
-#[cfg(test)]
-pub(crate) fn load_native(config: &crate::backend::Config) -> Loaded {
-    let base_path = config.repository.join("ffxi.reg");
-    let base = read_reg(&base_path).unwrap_or_default();
-    // The most recently saved overlay is the one the player last played with.
-    let overlay = native_overlays(config)
-        .into_iter()
-        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
-        .max()
-        .map(|(_, p)| p);
-    let over = overlay.as_deref().and_then(read_reg).unwrap_or_default();
-    let final_path = config.experiment.join("iced-launcher/game-settings.reg");
-    let final_values = read_reg(&final_path).unwrap_or_default();
-    let get = |name: &str| reg_value(&final_values, name).or_else(|| reg_value(&over, name)).or_else(|| reg_value(&base, name));
-    let (mode, sin, guid) = (get("padmode000"), get("padsin000"), get("padguid000"));
-    let found = mode.is_some() || sin.is_some();
-    Loaded {
-        config: PadConfig::from_values(mode.as_deref(), sin.as_deref(), guid.as_deref()),
-        source: match &overlay {
-            _ if reg_value(&final_values, "padsin000").is_some() => final_path.display().to_string(),
-            Some(p) if reg_value(&over, "padsin000").is_some() => p.display().to_string(),
-            _ => base_path.display().to_string(),
-        },
-        found,
-    }
 }
 
 fn backup_dir(config: &crate::backend::Config) -> PathBuf {
@@ -596,209 +478,108 @@ fn backup_dir(config: &crate::backend::Config) -> PathBuf {
 }
 
 /// Writes `bytes` to `path` only if it does not exist yet: the first backup is
-/// the original and is never replaced.
+/// the original and is never replaced. The file appears complete or not at
+/// all, so a failed write never leaves a truncated "original" behind.
 fn backup_once(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
+    if path.exists() {
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| tf("Could not create the backup folder: {error}", &[("error", &e)]))?;
     }
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut f) => f.write_all(bytes).map_err(|e| tf("Could not write the backup: {error}", &[("error", &e)])),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(tf("Could not write the backup: {error}", &[("error", &e)])),
+    let id = crate::backend::unique_id().map_err(|e| tf("Could not write the backup: {error}", &[("error", &e)]))?;
+    let temp = path.with_extension(format!("{id}.tmp"));
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .and_then(|mut f| f.write_all(bytes).and_then(|_| f.sync_all()))
+        // A hard link never replaces an existing file (another save may have
+        // made the backup meanwhile: that one is the original).
+        .and_then(|_| match std::fs::hard_link(&temp, path) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            // No hard links here (FAT32, exFAT, some shares): write the
+            // backup in place, still never replacing an existing one.
+            Err(_) => match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+                Ok(mut f) => {
+                    let written = f.write_all(bytes).and_then(|_| f.sync_all());
+                    drop(f);
+                    if written.is_err() {
+                        // Never leave a truncated "original" behind.
+                        let _ = std::fs::remove_file(path);
+                    }
+                    written
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                Err(e) => Err(e),
+            },
+            Ok(()) => Ok(()),
+        });
+    let _ = std::fs::remove_file(&temp);
+    result.map_err(|e| tf("Could not write the backup: {error}", &[("error", &e)]))
+}
+
+fn text_value(values: &crate::game_config::RegValues, name: &str) -> Option<String> {
+    match values.get(name) {
+        Some(crate::game_config::RegData::Text(v)) => Some(v.clone()),
+        _ => None,
     }
 }
 
-/// Use the existing final override, including before an account's first launch.
-#[cfg(test)]
-pub(crate) fn save_native(config: &crate::backend::Config, pad: &PadConfig) -> Result<String, String> {
-    let path = config.experiment.join("iced-launcher/game-settings.reg");
-    let original = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(tf("Could not read {path}: {error}. Nothing was changed.", &[("path", &path.display()), ("error", &error)])),
-    };
-    let values = pad.values();
-    if path.is_file() { backup_once(&backup_dir(config).join("game-settings.reg"), &original)?; }
-    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| tf("Could not create the controller settings folder: {error}", &[("error", &e)]))?;
-    let (text, utf16) = decode_reg_bytes(&original);
-    let patched = patch_reg_text(&text, &values);
-    let tmp = path.with_extension("reg.tmp");
-    std::fs::write(&tmp, encode_reg_text(&patched, utf16))
-        .and_then(|_| std::fs::rename(&tmp, &path))
-        .map_err(|e| tf("Could not save {path}: {error}", &[("path", &path.display()), ("error", &e)]))?;
-    Ok(tf("Saved native controller settings. They apply to every native account on its next launch. Backups are in {path}.", &[("path", &backup_dir(config).display())]))
-}
-
-#[cfg(windows)]
-mod registry {
-    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-    use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE,
-        KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_WOW64_32KEY, REG_EXPAND_SZ, REG_SZ,
-    };
-
-    const REGIONS: [&str; 3] = ["PlayOnlineUS", "PlayOnline", "PlayOnlineEU"];
-
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(Some(0)).collect()
-    }
-
-    pub(super) fn key_path(region: &str) -> String {
-        format!("SOFTWARE\\{region}\\SquareEnix\\FinalFantasyXI")
-    }
-
-    struct Key(HKEY);
-    impl Drop for Key {
-        fn drop(&mut self) {
-            unsafe { RegCloseKey(self.0) };
-        }
-    }
-
-    fn open(region: &str, access: u32) -> Option<Key> {
-        let path = wide(&key_path(region));
-        let mut key: HKEY = std::ptr::null_mut();
-        // KEY_WOW64_32KEY: the 32-bit game's view (WOW6432Node on 64-bit Windows).
-        let r = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.as_ptr(), 0, access | KEY_WOW64_32KEY, &mut key) };
-        (r == ERROR_SUCCESS).then_some(Key(key))
-    }
-
-    /// The first install region whose key exists.
-    pub(super) fn region() -> Option<&'static str> {
-        REGIONS.into_iter().find(|r| open(r, KEY_QUERY_VALUE).is_some())
-    }
-
-    pub(super) fn read(region: &str, name: &str) -> Option<String> {
-        let key = open(region, KEY_QUERY_VALUE)?;
-        let name = wide(name);
-        let (mut kind, mut size) = (0u32, 0u32);
-        let r = unsafe { RegQueryValueExW(key.0, name.as_ptr(), std::ptr::null(), &mut kind, std::ptr::null_mut(), &mut size) };
-        if r != ERROR_SUCCESS || (kind != REG_SZ && kind != REG_EXPAND_SZ) {
-            return None;
-        }
-        let mut buf = vec![0u16; (size as usize).div_ceil(2) + 1];
-        let mut bytes = (buf.len() * 2) as u32;
-        let r = unsafe { RegQueryValueExW(key.0, name.as_ptr(), std::ptr::null(), &mut kind, buf.as_mut_ptr().cast(), &mut bytes) };
-        if r != ERROR_SUCCESS {
-            return None;
-        }
-        buf.truncate(bytes as usize / 2);
-        while buf.last() == Some(&0) {
-            buf.pop();
-        }
-        Some(String::from_utf16_lossy(&buf))
-    }
-
-    pub(super) fn write(region: &str, name: &str, value: &str) -> Result<(), String> {
-        let key = open(region, KEY_SET_VALUE).ok_or_else(|| {
-            crate::i18n::t("Windows refused write access to FFXI's registry key. Run the launcher as administrator.").to_string()
-        })?;
-        let name_w = wide(name);
-        let data = wide(value);
-        let r = unsafe {
-            RegSetValueExW(key.0, name_w.as_ptr(), 0, REG_SZ, data.as_ptr().cast(), (data.len() * 2) as u32)
-        };
-        if r == ERROR_SUCCESS {
-            Ok(())
-        } else {
-            Err(crate::i18n::tf("Could not write {name} to the registry (error {code}).", &[("name", &name), ("code", &r)]))
-        }
-    }
+fn key_location(vendor: &str) -> String {
+    format!("HKLM\\SOFTWARE\\WOW6432Node\\{vendor}\\SquareEnix\\FinalFantasyXI")
 }
 
 pub(crate) fn load_retail() -> Loaded {
-    #[cfg(windows)]
-    if let Some(region) = registry::region() {
-        let get = |n: &str| registry::read(region, n);
-        let (mode, sin, guid) = (get("padmode000"), get("padsin000"), get("padguid000"));
+    if let Some(vendor) = crate::game_config::controller_region() {
+        let values = crate::game_config::read_retail(vendor).ok().flatten().unwrap_or_default();
+        let (mode, sin) = (text_value(&values, "padmode000"), text_value(&values, "padsin000"));
         return Loaded {
-            found: mode.is_some() || sin.is_some(),
-            config: PadConfig::from_values(mode.as_deref(), sin.as_deref(), guid.as_deref()),
-            source: format!("HKLM\\SOFTWARE\\WOW6432Node\\{region}\\SquareEnix\\FinalFantasyXI"),
+            config: PadConfig::from_values(mode.as_deref(), sin.as_deref()),
+            source: key_location(vendor),
         };
     }
     Loaded {
         config: PadConfig::default(),
         source: t("FINAL FANTASY XI is not installed (no registry key)").into(),
-        found: false,
     }
 }
 
-/// Writes the values to the registry, backing up the originals first.
-pub(crate) fn save_retail(config: &crate::backend::Config, pad: &PadConfig) -> Result<String, String> {
-    #[cfg(windows)]
-    {
-        let region = registry::region().ok_or(t("FINAL FANTASY XI's registry key was not found."))?;
-        let mut backup = format!(
-            "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\{region}\\SquareEnix\\FinalFantasyXI]\r\n"
-        );
-        for name in ["padmode000", "padsin000", "padguid000", "padexsin000"] {
-            if let Some(v) = registry::read(region, name) {
-                backup.push_str(&reg_line(name, &v));
-                backup.push_str("\r\n");
-            }
+/// Writes `edit` to the registry, backing up the originals first. Values
+/// another tool stored since `base` was read are kept where the user did not
+/// change them; returns what was written.
+pub(crate) fn save_retail(config: &crate::backend::Config, base: &PadConfig, edit: &PadConfig) -> Result<(PadConfig, String), String> {
+    use crate::game_config::RegData as Data;
+    let vendor = crate::game_config::controller_region().ok_or(t("FINAL FANTASY XI's registry key was not found."))?;
+    let stored = crate::game_config::read_retail(vendor)?.unwrap_or_default();
+    let mut backup = format!(
+        "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\{vendor}\\SquareEnix\\FinalFantasyXI]\r\n"
+    );
+    for name in ["padmode000", "padsin000", "padguid000", "padexsin000"] {
+        if let Some(v) = text_value(&stored, name) {
+            backup.push_str(&reg_line(name, &v));
+            backup.push_str("\r\n");
         }
-        backup_once(
-            &backup_dir(config).join(format!("registry-{region}.reg")),
-            &encode_reg_text(&backup, true),
-        )?;
-        for (name, value) in pad.values() {
-            registry::write(region, name, &value)?;
-        }
-        Ok(tf(
+    }
+    backup_once(&backup_dir(config).join(format!("registry-{vendor}.reg")), &utf16le_bom(&backup))?;
+    let current = PadConfig::from_values(text_value(&stored, "padmode000").as_deref(), text_value(&stored, "padsin000").as_deref());
+    let merged = if current == *base { edit.clone() } else { PadConfig::rebased(&current, base, edit) };
+    let values: Vec<(&str, Data)> = merged.values().into_iter().map(|(name, v)| (name, Data::Text(v))).collect();
+    let changes: Vec<(&str, &Data)> = values.iter().map(|(name, d)| (*name, d)).collect();
+    crate::game_config::write_retail(vendor, &changes)?;
+    Ok((
+        merged,
+        tf(
             "Saved to the registry. The original values are backed up in {path}.",
             &[("path", &backup_dir(config).display())],
-        ))
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (config, pad);
-        Err(t("The registry exists on Windows only.").into())
-    }
+        ),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn native_controller_settings_work_before_first_launch_and_leave_account_files_intact() {
-        let root = std::env::temp_dir().join(format!("crystal-pad-save-{}", crate::backend::unique_id().unwrap()));
-        let config = crate::backend::Config { experiment: root.clone(), repository: root.join("runtime"), game_install: None, dat_overlays: Vec::new() };
-        let mut pad = PadConfig::default();
-        pad.mode[1] = 0;
-        save_native(&config, &pad).unwrap();
-        assert_eq!(load_native(&config).config, pad);
-        let final_path = root.join("iced-launcher/game-settings.reg");
-        let original = std::fs::read_to_string(&final_path).unwrap();
-        std::fs::write(&final_path, format!("{original}\n\"0001\"=dword:00000780\n\"padexsin000\"=\"preserved\"\n")).unwrap();
-        let account_file = root.join("test-launcher/data/account/runtime/saved.reg");
-        std::fs::create_dir_all(account_file.parent().unwrap()).unwrap();
-        std::fs::write(&account_file, b"account-owned configuration").unwrap();
-        pad.mode[1] = 1;
-        save_native(&config, &pad).unwrap();
-        assert_eq!(std::fs::read(&account_file).unwrap(), b"account-owned configuration");
-        let final_text = std::fs::read_to_string(&final_path).unwrap();
-        assert!(final_text.contains("00000780"));
-        assert_eq!(reg_value(&final_text, "padexsin000").as_deref(), Some("preserved"));
-        assert_eq!(load_native(&config).config.mode, pad.mode);
-        assert!(backup_dir(&config).join("game-settings.reg").is_file());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn an_unreadable_native_controller_settings_file_is_kept_unchanged() {
-        use std::os::windows::fs::OpenOptionsExt;
-        let root = std::env::temp_dir().join(format!("crystal-pad-locked-{}", crate::backend::unique_id().unwrap()));
-        let config = crate::backend::Config { experiment: root.clone(), repository: root.join("runtime"), game_install: None, dat_overlays: Vec::new() };
-        let file = root.join("iced-launcher/game-settings.reg");
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(&file, b"preserve these settings").unwrap();
-        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&file).unwrap();
-        assert!(save_native(&config, &PadConfig::default()).is_err());
-        drop(held);
-        assert_eq!(std::fs::read(&file).unwrap(), b"preserve these settings");
-    }
 
     #[test]
     fn gamepad_unknown_axis_ids_remain_unbound_to_a_direction_group() {
@@ -828,11 +609,11 @@ mod tests {
     #[test]
     fn gamepad_ps5_extra_bindings_round_trip_in_saved_directinput_values() {
         let mut config = PadConfig::default();
-        config.set_flag(Flag::XInput, false, Layout::DInputSony);
+        config.set_flag(Flag::XInput, false, Layout::DInputSony, &mut Unbound::default());
         config.bind_button(6, Layout::DInputSony.encode_button(Btn::Touchpad).unwrap());
         config.bind_button(8, Layout::DInputSony.encode_button(Btn::Mute).unwrap());
         let values = config.values();
-        let loaded = PadConfig::from_values(Some(&values[0].1), Some(&values[1].1), None);
+        let loaded = PadConfig::from_values(Some(&values[0].1), Some(&values[1].1));
         assert!(!loaded.flag(Flag::XInput));
         assert_eq!(loaded.sin[6], 13);
         assert_eq!(loaded.sin[8], 14);
@@ -845,29 +626,71 @@ mod tests {
     #[test]
     fn gamepad_lists_round_trip_and_keep_their_length() {
         let real = "-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1";
-        let c = PadConfig::from_values(Some("0,0,0,0,0,0"), Some(real), Some("{00000000-0000-0000-0000-000000000000}"));
+        let c = PadConfig::from_values(Some("0,0,0,0,0,0"), Some(real));
         assert_eq!(c.sin.len(), 32);
         assert_eq!(format_list(&c.sin), real);
         assert_eq!(c.values()[0].1, "0,0,0,0,0,0");
-        let short = PadConfig::from_values(Some("1,1"), Some("8,9"), None);
+        let short = PadConfig::from_values(Some("1,1"), Some("8,9"));
         assert_eq!(short.mode.len(), MODE_COUNT);
         assert_eq!(short.sin.len(), SLOT_COUNT);
-        assert_eq!(PadConfig::from_values(Some("x"), None, None).mode, DEFAULT_MODE.to_vec());
+        assert_eq!(PadConfig::from_values(Some("x"), None).mode, DEFAULT_MODE.to_vec());
     }
 
     #[test]
     fn gamepad_xinput_toggle_keeps_each_function_on_its_button() {
         let mut c = PadConfig::default();
-        c.set_flag(Flag::XInput, false, Layout::DInputSony);
+        let mut unbound = Unbound::default();
+        c.set_flag(Flag::XInput, false, Layout::DInputSony, &mut unbound);
         let l = Layout::DInputSony;
         assert_eq!(l.decode(c.sin[7]), Control::Button(Btn::South));
         assert_eq!(c.sin[7], 1); // DirectInput cross
         assert_eq!(l.group_stick(&c.sin[17..21]), Some(Stick::Right));
         assert_eq!(&c.sin[17..21], &[-37, -37, 34, 34]);
         assert_eq!(&c.sin[21..25], &[-41, -41, 40, 40]);
-        c.set_flag(Flag::XInput, true, Layout::DInputSony);
-        // Triggers have no DirectInput button on Xbox pads, but Sony has L2/R2.
+        c.set_flag(Flag::XInput, true, Layout::DInputSony, &mut unbound);
+        // Sony has L2/R2, so nothing was lost.
         assert_eq!(c.sin[..SLOT_COUNT], DEFAULT_XINPUT_SIN);
+    }
+
+    /// Xbox pads have no DirectInput trigger buttons: turning XInput off and
+    /// on again must give the LT/RT macro palettes back.
+    #[test]
+    fn gamepad_xinput_round_trip_on_an_xbox_pad_keeps_the_trigger_bindings() {
+        let mut c = PadConfig::default();
+        let mut unbound = Unbound::default();
+        c.set_flag(Flag::XInput, false, Layout::DInputXbox, &mut unbound);
+        assert_eq!((c.sin[1], c.sin[3]), (-1, -1));
+        c.set_flag(Flag::XInput, true, Layout::DInputXbox, &mut unbound);
+        assert_eq!(c.sin[..SLOT_COUNT], DEFAULT_XINPUT_SIN);
+        // A binding made in between keeps its button; the old one is not forced back.
+        c.set_flag(Flag::XInput, false, Layout::DInputXbox, &mut unbound);
+        c.bind_button(1, 0);
+        c.set_flag(Flag::XInput, true, Layout::DInputXbox, &mut unbound);
+        assert_ne!(c.sin[1], 9);
+        // Sony's touchpad survives an XInput round trip too.
+        let mut s = PadConfig::default();
+        let mut unbound = Unbound::default();
+        s.set_flag(Flag::XInput, false, Layout::DInputSony, &mut unbound);
+        s.bind_button(6, 13);
+        s.set_flag(Flag::XInput, true, Layout::DInputSony, &mut unbound);
+        assert_eq!(s.sin[6], -1);
+        s.set_flag(Flag::XInput, false, Layout::DInputSony, &mut unbound);
+        assert_eq!(s.sin[6], 13);
+    }
+
+    #[test]
+    fn gamepad_xinput_toggle_keeps_reversed_axes() {
+        let mut c = PadConfig::default();
+        c.sin[17..21].copy_from_slice(&[36, 36, 35, 35]); // camera Y not reversed
+        let mut unbound = Unbound::default();
+        c.set_flag(Flag::XInput, false, Layout::DInputXbox, &mut unbound);
+        assert_eq!(&c.sin[17..21], &[36, 36, 35, 35]);
+        c.set_flag(Flag::XInput, false, Layout::DInputSony, &mut unbound);
+        c.set_flag(Flag::XInput, true, Layout::DInputXbox, &mut unbound);
+        c.set_flag(Flag::XInput, false, Layout::DInputSony, &mut unbound);
+        assert_eq!(&c.sin[17..21], &[37, 37, 34, 34]);
+        c.set_flag(Flag::XInput, true, Layout::DInputSony, &mut unbound);
+        assert_eq!(&c.sin[17..21], &[36, 36, 35, 35]);
     }
 
     #[test]
@@ -876,7 +699,7 @@ mod tests {
         c.bind_button(7, 0); // confirm := B (was cancel's)
         assert_eq!(c.sin[7], 0);
         assert_eq!(c.sin[5], 3); // cancel took A
-        c.bind_group(13, Layout::XInput.group(Stick::Right));
+        c.bind_group(13, Layout::XInput.group(Stick::Right), Layout::XInput);
         assert_eq!(Layout::XInput.group_stick(&c.sin[17..21]), Some(Stick::Left));
         let d = PadConfig::default();
         assert_eq!(c.changes(&d), 4);
@@ -884,42 +707,55 @@ mod tests {
         assert_eq!(c.changes(&d), 0);
     }
 
+    /// A group on the same stick with other axis reversal still swaps, so two
+    /// functions never end up on one stick.
     #[test]
-    fn gamepad_reg_text_patch_replaces_and_inserts() {
-        let text = "REGEDIT4\n\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\PlayOnlineUS\\SquareEnix\\FinalFantasyXI]\n\"0042\"=\"\"\n\"padmode000\"=\"1,1,0,0,0,1\"\n\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\PlayOnlineUS\\Interface]\n\"x\"=\"y\"\n";
-        let out = patch_reg_text(text, &[("padmode000", "0,1,0,0,0,1".into()), ("padsin000", "1,2".into())]);
-        assert_eq!(reg_value(&out, "padmode000").as_deref(), Some("0,1,0,0,0,1"));
-        assert_eq!(reg_value(&out, "padsin000").as_deref(), Some("1,2"));
-        assert!(out.contains("\"0042\"=\"\"\n"));
-        assert!(out.ends_with("\"x\"=\"y\"\n"));
-        assert_eq!(out.matches("FinalFantasyXI]").count(), 1);
-        // A file without the key gets one; an empty file gets a header too.
-        let fresh = patch_reg_text("", &[("padsin000", "3".into())]);
-        assert!(fresh.starts_with("REGEDIT4"));
-        assert_eq!(reg_value(&fresh, "padsin000").as_deref(), Some("3"));
+    fn gamepad_group_swap_finds_a_reversed_group_on_the_same_stick() {
+        let mut c = PadConfig::default();
+        c.sin[17..21].copy_from_slice(&[36, 36, 35, 35]);
+        c.bind_group(13, Layout::XInput.group(Stick::Right), Layout::XInput);
+        assert_eq!(Layout::XInput.group_stick(&c.sin[13..17]), Some(Stick::Right));
+        assert_eq!(Layout::XInput.group_stick(&c.sin[17..21]), Some(Stick::Left));
     }
 
     #[test]
-    fn gamepad_reg_reader_folds_wow6432node_and_utf16() {
-        let text = "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\PlayOnlineUS\\SquareEnix\\FinalFantasyXI]\r\n\"padsin000\"=\"8,9\"\r\n";
-        let bytes = encode_reg_text(text, true);
-        let (decoded, utf16) = decode_reg_bytes(&bytes);
-        assert!(utf16);
-        assert_eq!(reg_value(&decoded, "padsin000").as_deref(), Some("8,9"));
-        let patched = patch_reg_text(&decoded, &[("padsin000", "1".into())]);
-        assert!(patched.contains("\"padsin000\"=\"1\"\r\n"));
+    fn gamepad_reset_keeps_the_game_options() {
+        let mut c = PadConfig::default();
+        c.mode[Flag::Background as usize] = 1;
+        c.mode[Flag::ForceFeedback as usize] = 0;
+        c.mode[Flag::Enabled as usize] = 0;
+        c.bind_button(7, 0);
+        c.reset(Layout::DInputXbox);
+        assert_eq!(c.sin[..SLOT_COUNT], DEFAULT_XINPUT_SIN);
+        assert!(c.flag(Flag::Background));
+        assert!(!c.flag(Flag::ForceFeedback));
+        assert!(!c.flag(Flag::Enabled));
     }
 
     #[test]
-    fn gamepad_reads_the_shipped_native_defaults() {
-        // Read-only: the experimental client's base registry, if present here.
-        let config = crate::backend::Config::default();
-        if let Ok(bytes) = std::fs::read(config.repository.join("ffxi.reg")) {
-            let (text, _) = decode_reg_bytes(&bytes);
-            assert_eq!(
-                reg_value(&text, "padsin000").and_then(|v| parse_list(&v)),
-                Some(DEFAULT_XINPUT_SIN.to_vec())
-            );
-        }
+    fn gamepad_saves_merge_over_values_changed_outside_the_launcher() {
+        let base = PadConfig::default();
+        let mut edit = base.clone();
+        edit.mode[Flag::ForceFeedback as usize] = 0;
+        let mut current = base.clone();
+        current.bind_button(7, 0); // rebinding in the official Config tool
+        let merged = PadConfig::rebased(&current, &base, &edit);
+        assert_eq!(merged.sin, current.sin);
+        assert!(!merged.flag(Flag::ForceFeedback));
+    }
+
+    #[test]
+    fn gamepad_backup_is_utf16_and_never_replaced_or_truncated() {
+        let bytes = utf16le_bom("Windows Registry Editor Version 5.00\r\n\"padsin000\"=\"8,9\"\r\n");
+        assert_eq!(&bytes[..2], &[0xFF, 0xFE]);
+        let units: Vec<u16> = bytes[2..].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        assert!(String::from_utf16(&units).unwrap().contains("\"padsin000\"=\"8,9\""));
+        let dir = std::env::temp_dir().join(format!("crystal-pad-backup-{}", crate::backend::unique_id().unwrap()));
+        let path = dir.join("registry-PlayOnlineUS.reg");
+        backup_once(&path, b"original").unwrap();
+        backup_once(&path, b"later").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temporary file is left behind");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

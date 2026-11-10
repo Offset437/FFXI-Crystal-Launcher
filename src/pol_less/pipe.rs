@@ -10,40 +10,35 @@
 use crate::i18n::{t, tf};
 use std::{
     io,
-    path::{Path, PathBuf},
+    path::Path,
     time::{Duration, Instant},
 };
 #[cfg(test)]
 use zeroize::Zeroizing;
 
-/// The contract's maximum line length.
-pub(crate) const MAX_LINE: usize = 1 << 20;
-/// The one protocol major version this launcher speaks.
-pub(crate) const PROTOCOL: u32 = 1;
+pub(crate) use crate::wire::{MAX_LINE, PROTOCOL};
 
 // ---- protocol -------------------------------------------------------------------------------
 
 /// A line from the loader. Unknown types and fields are tolerated.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LoaderEvent {
-    /// `viewer_check`: the loader asks for the sign-in's W2U at Connect (07c §1).
-    /// `park`: it accepts a credential-less `park` line first (pol-spec 07d §1).
-    Hello { v: u32, pid: u32, native_auth: bool, native_social: bool, native_batch: bool, viewer_check: bool, startup_sign_out: bool, park: bool },
+    Hello { v: u32, pid: u32, caps: Caps },
     /// `parked`: polcore is created and the host waits for `credentials` (07d §1.3).
     Parked { polcore_ms: Option<u64> },
+    WindowerReady,
     Started { pid: Option<u32> },
-    Presence(Vec<u8>),
     NativeAuthStage(i32),
     Authenticated,
     NativeFriends { blob: Vec<u8>, locations: Option<Vec<u8>> },
-    NativeFriendsRefresh(i32),
     NativeStatus(i32),
     NativeSessionState(bool),
     NativeOwnMode(i32),
-    NativeGameEnded { code: i32, game_returned: bool },
+    NativeGameEnded { code: i32, game_returned: bool, game_id: u64 },
     NativeSignOutComplete(i32),
     NativeControlResult { action: String, code: i32 },
     ControllerResult { id: u64, ok: bool, message: String },
+    GameShutdownResult { id: u64, game: u64, ok: bool, message: String },
     NativeSocialReady,
     /// `native_viewer_check`: the loader reached Open(0) and waits for this sign-in's
     /// W2U (:54000) verdict before Open(1) (pol-spec 07c §1).
@@ -58,6 +53,20 @@ pub(crate) enum LoaderEvent {
     Unknown,
     /// The pipe closed.
     Closed,
+}
+
+/// What a loader's hello says it supports.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Caps {
+    pub native_auth: bool,
+    pub native_social: bool,
+    pub native_batch: bool,
+    /// The loader asks for the sign-in's W2U at Connect (07c §1).
+    pub viewer_check: bool,
+    pub startup_sign_out: bool,
+    /// It accepts a credential-less `park` line first (pol-spec 07d §1).
+    pub park: bool,
+    pub windower_private: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -93,6 +102,8 @@ struct Incoming {
     #[serde(default)]
     park: bool,
     #[serde(default)]
+    windower_private: bool,
+    #[serde(default)]
     polcore_ms: Option<u64>,
     #[serde(default)]
     game: Option<bool>,
@@ -104,6 +115,8 @@ struct Incoming {
     id: Option<String>,
     #[serde(default)]
     request_id: Option<u64>,
+    #[serde(default)]
+    game_id: Option<u64>,
     #[serde(default)]
     ok: Option<bool>,
 }
@@ -121,19 +134,19 @@ pub(crate) fn parse_event(line: &[u8]) -> Result<LoaderEvent, String> {
         "hello" => LoaderEvent::Hello {
             v: value.v.and_then(|v| u32::try_from(v).ok()).ok_or("crystal-loader's hello has no protocol version.")?,
             pid: pid(value.pid).ok_or("crystal-loader's hello has no process ID.")?,
-            native_auth: value.native_auth,
-            native_social: value.native_social,
-            native_batch: value.native_batch,
-            viewer_check: value.viewer_check,
-            startup_sign_out: value.startup_sign_out,
-            park: value.park,
+            caps: Caps {
+                native_auth: value.native_auth,
+                native_social: value.native_social,
+                native_batch: value.native_batch,
+                viewer_check: value.viewer_check,
+                startup_sign_out: value.startup_sign_out,
+                park: value.park,
+                windower_private: value.windower_private,
+            },
         },
         "parked" => LoaderEvent::Parked { polcore_ms: value.polcore_ms },
+        "windower_ready" => LoaderEvent::WindowerReady,
         "started" => LoaderEvent::Started { pid: pid(value.pid) },
-        "presence" => LoaderEvent::Presence(
-            base64_decode(value.payload.as_deref().unwrap_or(""))
-                .ok_or("crystal-loader sent a presence update that is not base64.")?,
-        ),
         "native_auth_stage" => LoaderEvent::NativeAuthStage(value.code.and_then(|c| i32::try_from(c).ok()).ok_or("Invalid native POL authentication state.")?),
         "authenticated" => LoaderEvent::Authenticated,
         "native_friends" => {
@@ -151,14 +164,12 @@ pub(crate) fn parse_event(line: &[u8]) -> Result<LoaderEvent, String> {
                 .ok_or("Invalid native POL connection status.")?;
             LoaderEvent::NativeStatus(code)
         },
-        "native_friends_refresh_result" => LoaderEvent::NativeFriendsRefresh(
-            value.code.and_then(|c| i32::try_from(c).ok()).ok_or("Invalid native POL friend refresh result.")?
-        ),
         "native_session_state" => LoaderEvent::NativeSessionState(value.game.ok_or("Invalid native POL session state.")?),
         "native_own_presence" => LoaderEvent::NativeOwnMode(value.mode.and_then(|m| i32::try_from(m).ok()).filter(|m| (-1..=4).contains(m)).ok_or("Invalid native POL presence mode.")?),
         "native_game_ended" => LoaderEvent::NativeGameEnded {
             code: value.code.and_then(|c| i32::try_from(c).ok()).ok_or("Invalid game exit result.")?,
             game_returned: value.game_returned,
+            game_id: value.game_id.unwrap_or(0),
         },
         "native_sign_out_complete" => LoaderEvent::NativeSignOutComplete(
             value.code.and_then(|c| i32::try_from(c).ok()).filter(|c| *c <= 0)
@@ -167,6 +178,13 @@ pub(crate) fn parse_event(line: &[u8]) -> Result<LoaderEvent, String> {
         "native_control_result" => LoaderEvent::NativeControlResult {
             action: value.action.filter(|a| matches!(a.as_str(), "start_game" | "sign_out" | "visible" | "away" | "invisible" | "groups")).ok_or("Invalid native POL control action.")?,
             code: value.code.and_then(|c| i32::try_from(c).ok()).ok_or("Invalid native POL control result.")?,
+        },
+        "game_shutdown_result" => LoaderEvent::GameShutdownResult {
+            id: value.request_id.ok_or("Invalid shutdown request identity.")?,
+            game: value.game_id.filter(|game| *game != 0).ok_or("Invalid shutdown game identity.")?,
+            ok: value.ok.ok_or("Invalid shutdown result.")?,
+            message: value.message.filter(|text| text.len() <= 512 && !text.chars().any(char::is_control))
+                .ok_or("Invalid shutdown result message.")?,
         },
         "controller_result" => LoaderEvent::ControllerResult {
             id: value.request_id.ok_or("Invalid controller request identity.")?,
@@ -203,118 +221,12 @@ fn clean_message(message: &str) -> String {
     flat.trim().to_owned()
 }
 
-/// The values the session line carries. Secret fields are zeroized on drop. The real line
-/// comes from crystal-pol's `LoaderSession::to_contract_json`; this independent
-/// encoder backs the fake sign-in in tests and checks the two agree on the contract.
-#[cfg(test)]
-pub(crate) struct SessionSecrets {
-    pub v_key: Zeroizing<[u8; 16]>,
-    pub auth_code: Zeroizing<[u8; 52]>,
-    pub pol_records: Option<Zeroizing<Vec<u8>>>,
-    pub content_ids: Vec<u32>,
-    pub account_id: Zeroizing<u64>,
-}
-
-/// The launcher's one `session` line, `\n`-terminated. Built in a buffer sized up front so
-/// no reallocation leaves a secret copy behind; the result zeroizes itself on drop.
-#[cfg(test)]
-pub(crate) fn session_line(region: &str, install_dir: &Path, secrets: &SessionSecrets) -> Result<Zeroizing<Vec<u8>>, String> {
-    if !matches!(region, "US" | "EU" | "JP") {
-        return Err("Unsupported region.".into());
-    }
-    let install = install_dir
-        .to_str()
-        .ok_or(t("The game folder's path is not valid Unicode."))?;
-    // Non-secret parts go through serde_json for escaping.
-    let head = format!(
-        r#"{{"type":"session","v":{PROTOCOL},"region":"{region}","lang":"{region}","install_dir":{},"v_key":""#,
-        serde_json::to_string(install).map_err(|_| "Could not encode the game folder.")?
-    );
-    let ids = secrets
-        .content_ids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let tail = format!(r#","content_ids":[{ids}],"account_id":"{:016x}"}}"#, *secrets.account_id);
-    let records = secrets.pol_records.as_ref().map(|r| r.as_slice());
-    let capacity = head.len()
-        + base64_len(16)
-        + r#"","auth_code":""#.len()
-        + base64_len(52)
-        + r#"","pol_records":"#.len()
-        + records.map_or(4, |r| base64_len(r.len()) + 2)
-        + tail.len()
-        + 1;
-    let mut line = Zeroizing::new(Vec::with_capacity(capacity));
-    line.extend_from_slice(head.as_bytes());
-    base64_into(&mut line, &secrets.v_key[..]);
-    line.extend_from_slice(br#"","auth_code":""#);
-    base64_into(&mut line, &secrets.auth_code[..]);
-    line.extend_from_slice(br#"","pol_records":"#);
-    match records {
-        Some(r) => {
-            line.push(b'"');
-            base64_into(&mut line, r);
-            line.push(b'"');
-        }
-        None => line.extend_from_slice(b"null"),
-    }
-    line.extend_from_slice(tail.as_bytes());
-    line.push(b'\n');
-    debug_assert_eq!(line.len(), capacity);
-    if line.len() > MAX_LINE {
-        return Err(t("The session is larger than the loader accepts.").into());
-    }
-    Ok(line)
-}
-
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-#[cfg(test)]
-fn base64_len(n: usize) -> usize {
-    n.div_ceil(3) * 4
-}
-
 /// Standard base64 with padding, appended in place (the caller reserves the space).
-pub(crate) fn base64_into(out: &mut Vec<u8>, data: &[u8]) {
-    for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
-        out.push(B64[(n >> 18) as usize & 63]);
-        out.push(B64[(n >> 12) as usize & 63]);
-        out.push(if chunk.len() > 1 { B64[(n >> 6) as usize & 63] } else { b'=' });
-        out.push(if chunk.len() > 2 { B64[n as usize & 63] } else { b'=' });
-    }
-}
+pub(crate) use crate::b64::encode_into as base64_into;
 
+/// Canonical, padded standard base64 (the wire contract's only form).
 pub(crate) fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    let bytes = text.as_bytes();
-    if bytes.len() % 4 != 0 {
-        return None;
-    }
-    let value = |c: u8| B64.iter().position(|&b| b == c).map(|p| p as u32);
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for (index, chunk) in bytes.chunks(4).enumerate() {
-        let last = index + 1 == bytes.len() / 4;
-        let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
-        if pad > 2 || (pad > 0 && !last) {
-            return None;
-        }
-        let mut n = 0u32;
-        for &c in &chunk[..4 - pad] {
-            n = n << 6 | value(c)?;
-        }
-        n <<= 6 * pad as u32;
-        out.push((n >> 16) as u8);
-        if pad < 2 {
-            out.push((n >> 8) as u8);
-        }
-        if pad < 1 {
-            out.push(n as u8);
-        }
-    }
-    Some(out)
+    crate::b64::decode_padded(text.as_bytes())
 }
 
 // ---- pipe -------------------------------------------------------------------------------
@@ -331,17 +243,11 @@ pub(crate) enum AcceptError {
 /// The server end of one session pipe. Dropping it closes the pipe.
 pub(crate) struct LoaderPipe {
     name: String,
-    #[cfg(windows)]
     handle: std::os::windows::io::OwnedHandle,
-    #[cfg(windows)]
     event: std::os::windows::io::OwnedHandle,
     buffer: Vec<u8>,
-    native_auth: bool,
-    native_social: bool,
-    native_batch: bool,
-    viewer_check: bool,
-    startup_sign_out: bool,
-    park: bool,
+    /// What the verified hello said the loader supports.
+    caps: Caps,
     command_wake: Option<crate::session_worker::CommandWake>,
     command_wake_pending: bool,
 }
@@ -350,16 +256,21 @@ impl LoaderPipe {
     pub(crate) fn listen_for_commands(&mut self, wake: Option<crate::session_worker::CommandWake>) {
         self.command_wake = wake;
     }
-    pub(crate) fn supports_native_auth(&self)->bool { self.native_auth }
-    pub(crate) fn supports_native_social(&self)->bool { self.native_social }
-    pub(crate) fn supports_native_batch(&self)->bool { self.native_batch }
-    pub(crate) fn supports_startup_sign_out(&self)->bool { self.startup_sign_out }
+    /// A command writer's wake interrupts reads: the supervisor need not poll for commands.
+    pub(crate) fn has_command_wake(&self) -> bool {
+        self.command_wake.is_some()
+    }
+    pub(crate) fn supports_native_auth(&self)->bool { self.caps.native_auth }
+    pub(crate) fn supports_native_social(&self)->bool { self.caps.native_social }
+    pub(crate) fn supports_native_batch(&self)->bool { self.caps.native_batch }
+    pub(crate) fn supports_startup_sign_out(&self)->bool { self.caps.startup_sign_out }
     /// The launcher sends no W2U of its own; a loader without this never
     /// sends one before :51240 either.
-    pub(crate) fn supports_viewer_check(&self)->bool { self.viewer_check }
+    pub(crate) fn supports_viewer_check(&self)->bool { self.caps.viewer_check }
     /// The loader accepts a credential-less `park` line (pol-spec 07d §1); a loader without
     /// it is never parked and only gets today's `session` line.
-    pub(crate) fn supports_park(&self)->bool { self.park }
+    pub(crate) fn supports_park(&self)->bool { self.caps.park }
+    pub(crate) fn supports_private_windower(&self)->bool { self.caps.windower_private }
     /// The full `\\.\pipe\...` path the loader opens.
     pub(crate) fn name(&self) -> &str {
         &self.name
@@ -426,14 +337,9 @@ impl LoaderPipe {
                 "The process on the session pipe (PID {client}) is not the one that said hello (PID {pid}); the session was not sent.",
                 &[("client", &client), ("pid", &pid)],
             )),
-            LoaderEvent::Hello { pid, native_auth, native_social, native_batch, viewer_check, startup_sign_out, park, .. } => {
+            LoaderEvent::Hello { pid, caps, .. } => {
                 verify_image(pid, expected_image)?;
-                self.native_auth=native_auth;
-                self.native_social=native_social;
-                self.native_batch=native_batch;
-                self.startup_sign_out=startup_sign_out;
-                self.viewer_check=viewer_check;
-                self.park=park;
+                self.caps = caps;
                 Ok(pid)
             }
             _ => Err(t("crystal-loader did not start with a hello; the session was not sent.").into()),
@@ -443,7 +349,7 @@ impl LoaderPipe {
 
 /// The process's image must be the loader we pointed the injector at.
 fn verify_image(pid: u32, expected: &Path) -> Result<(), String> {
-    let actual = process_image(pid)
+    let actual = crate::win::process::image_path(pid)
         .map_err(|_| tf("Could not read the image path of PID {pid}; the session was not sent.", &[("pid", &pid)]))?;
     if same_file(&actual, expected) {
         Ok(())
@@ -455,7 +361,7 @@ fn verify_image(pid: u32, expected: &Path) -> Result<(), String> {
     }
 }
 
-fn same_file(a: &Path, b: &Path) -> bool {
+pub(super) fn same_file(a: &Path, b: &Path) -> bool {
     let norm = |p: &Path| {
         let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         crate::backend::plain_windows_path(&p).to_string_lossy().to_lowercase()
@@ -466,7 +372,6 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// 32 random hex digits from the system RNG.
 pub(crate) fn random_hex() -> io::Result<String> {
     let mut bytes = [0u8; 16];
-    #[cfg(windows)]
     {
         use windows_sys::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
         let status = unsafe {
@@ -476,10 +381,9 @@ pub(crate) fn random_hex() -> io::Result<String> {
             return Err(io::Error::other("system RNG failed"));
         }
     }
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    Ok(super::tools::embedded::hex(&bytes))
 }
 
-#[cfg(windows)]
 mod sys {
     use super::*;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -502,8 +406,8 @@ mod sys {
                 PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
             },
             Threading::{
-                CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
-                WaitForMultipleObjects, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION,
+                CreateEventW, GetCurrentProcess, OpenProcessToken,
+                WaitForMultipleObjects, WaitForSingleObject, INFINITE,
             },
             IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
         },
@@ -570,7 +474,7 @@ mod sys {
                     lpSecurityDescriptor: descriptor_ptr,
                     bInheritHandle: 0,
                 };
-                let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+                let wide = crate::win::wide(&name);
                 let handle = owned(CreateNamedPipeW(
                     wide.as_ptr(),
                     PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
@@ -582,7 +486,7 @@ mod sys {
                     &attributes,
                 ))?;
                 let event = owned(CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()))?;
-                Ok(Self { name, handle, event, buffer: Vec::new(), native_auth:false, native_social:false, native_batch:false, viewer_check:false, startup_sign_out:false, park:false,
+                Ok(Self { name, handle, event, buffer: Vec::new(), caps: Caps::default(),
                     command_wake:None, command_wake_pending:false })
             }
         }
@@ -600,7 +504,10 @@ mod sys {
             deadline: Option<Instant>,
             check: &mut dyn FnMut() -> Result<(), String>,
             idle_forever: bool,
+            sliced: bool,
         ) -> Result<u32, AcceptError> {
+            // Only `check` needs the 100 ms slices; reads and writes wait out their deadline.
+            let limit = if sliced { SLICE_MS } else { INFINITE - 1 };
             loop {
                 let slice = match deadline {
                     None if idle_forever => INFINITE,
@@ -608,7 +515,7 @@ mod sys {
                     Some(end) => end
                         .saturating_duration_since(Instant::now())
                         .as_millis()
-                        .min(SLICE_MS as u128) as u32,
+                        .min(limit as u128) as u32,
                 };
                 let wake = idle_forever.then_some(self.command_wake.as_ref()).flatten();
                 let waited = if let Some(wake) = wake {
@@ -662,7 +569,7 @@ mod sys {
             }
             match unsafe { GetLastError() } {
                 ERROR_PIPE_CONNECTED => Ok(()),
-                ERROR_IO_PENDING => self.finish(&mut overlapped, Some(deadline), &mut check, false).map(|_| ()),
+                ERROR_IO_PENDING => self.finish(&mut overlapped, Some(deadline), &mut check, false, true).map(|_| ()),
                 error => Err(AcceptError::Io(io::Error::from_raw_os_error(error as i32))),
             }
         }
@@ -687,7 +594,7 @@ mod sys {
                 Ok(read)
             } else {
                 match unsafe { GetLastError() } {
-                    ERROR_IO_PENDING => self.finish(&mut overlapped, deadline, &mut || Ok(()), true),
+                    ERROR_IO_PENDING => self.finish(&mut overlapped, deadline, &mut || Ok(()), true, false),
                     error => Err(AcceptError::Io(io::Error::from_raw_os_error(error as i32))),
                 }
             };
@@ -716,7 +623,7 @@ mod sys {
                     Ok(written)
                 } else {
                     match unsafe { GetLastError() } {
-                        ERROR_IO_PENDING => self.finish(&mut overlapped, Some(deadline), &mut || Ok(()), false),
+                        ERROR_IO_PENDING => self.finish(&mut overlapped, Some(deadline), &mut || Ok(()), false, false),
                         error => Err(AcceptError::Io(io::Error::from_raw_os_error(error as i32))),
                     }
                 };
@@ -730,51 +637,23 @@ mod sys {
             Ok(())
         }
     }
-
-    /// The full Win32 path of a process's image.
-    pub(super) fn process_image(pid: u32) -> io::Result<PathBuf> {
-        use std::os::windows::ffi::OsStringExt;
-        unsafe {
-            let process = owned(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid))?;
-            let mut buffer = vec![0u16; 32 * 1024];
-            let mut size = buffer.len() as u32;
-            if QueryFullProcessImageNameW(process.as_raw_handle() as HANDLE, 0, buffer.as_mut_ptr(), &mut size) == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..size as usize])))
-        }
-    }
 }
 
-#[cfg(windows)]
-use sys::process_image;
-#[cfg(not(windows))]
-fn process_image(_: u32) -> io::Result<PathBuf> {
-    Err(io::ErrorKind::Unsupported.into())
-}
-#[cfg(not(windows))]
-impl LoaderPipe {
-    pub(crate) fn create() -> io::Result<Self> {
-        Err(io::ErrorKind::Unsupported.into())
-    }
-    pub(crate) fn accept(&mut self, _: Duration, _: impl FnMut() -> Result<(), String>) -> Result<(), AcceptError> {
-        Err(AcceptError::Io(io::ErrorKind::Unsupported.into()))
-    }
-    pub(crate) fn client_pid(&self) -> io::Result<u32> {
-        Err(io::ErrorKind::Unsupported.into())
-    }
-    fn read_some(&mut self, _: &mut [u8], _: Option<Instant>) -> io::Result<usize> {
-        Err(io::ErrorKind::Unsupported.into())
-    }
-    pub(crate) fn send(&mut self, _: &[u8], _: Instant) -> io::Result<()> {
-        Err(io::ErrorKind::Unsupported.into())
-    }
-}
-
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
+
+    #[test]
+    fn game_shutdown_result_requires_both_scoped_identities() {
+        let line=r#"{"type":"game_shutdown_result","request_id":18446744073709551615,"game_id":7,"ok":true,"message":"Requested"}"#;
+        assert!(matches!(parse_event(line.as_bytes()),Ok(LoaderEvent::GameShutdownResult { id:u64::MAX,game:7,ok:true,.. })));
+        for value in [line.replace("\"game_id\":7", "\"game_id\":0"),
+            line.replace("\"game_id\":7,", ""),line.replace("\"ok\":true,", ""),
+            line.replace("Requested", "bad\\u0000message")] {
+            assert!(parse_event(value.as_bytes()).is_err());
+        }
+    }
 
     #[test]
     fn controller_results_keep_large_ids_and_do_not_use_social_ids() {
@@ -790,15 +669,6 @@ mod tests {
         ] { assert!(parse_event(invalid.as_bytes()).is_err()); }
     }
 
-    fn secrets() -> SessionSecrets {
-        SessionSecrets {
-            v_key: Zeroizing::new([0xA5; 16]),
-            auth_code: Zeroizing::new([0x3C; 52]),
-            pol_records: None,
-            content_ids: vec![1234567, 7654321],
-            account_id: Zeroizing::new(0x9182_7364_5546_3728),
-        }
-    }
 
     fn open_client(name: &str) -> std::fs::File {
         std::fs::OpenOptions::new().read(true).write(true).open(name).unwrap()
@@ -810,7 +680,7 @@ mod tests {
             let data: Vec<u8> = (0..n).map(|i| (i * 37 + 5) as u8).collect();
             let mut text = Vec::new();
             base64_into(&mut text, &data);
-            assert_eq!(text.len(), base64_len(n));
+            assert_eq!(text.len(), crate::b64::encoded_len(n));
             assert_eq!(base64_decode(std::str::from_utf8(&text).unwrap()).unwrap(), data);
         }
         let mut text = Vec::new();
@@ -818,39 +688,18 @@ mod tests {
         assert_eq!(text, b"TWFu");
         assert!(base64_decode("TW=u").is_none());
         assert!(base64_decode("TWF").is_none());
-    }
-
-    #[test]
-    fn session_line_matches_the_contract() {
-        let line = session_line("US", Path::new(r"C:\Games\SquareEnix\FINAL FANTASY XI"), &secrets()).unwrap();
-        assert_eq!(line.last(), Some(&b'\n'));
-        let value: serde_json::Value = serde_json::from_slice(&line).unwrap();
-        assert_eq!(value["type"], "session");
-        assert_eq!(value["v"], 1);
-        assert_eq!(value["region"], "US");
-        assert_eq!(value["lang"], "US");
-        assert_eq!(value["install_dir"], r"C:\Games\SquareEnix\FINAL FANTASY XI");
-        assert_eq!(base64_decode(value["v_key"].as_str().unwrap()).unwrap(), [0xA5; 16]);
-        assert_eq!(base64_decode(value["auth_code"].as_str().unwrap()).unwrap(), [0x3C; 52]);
-        assert!(value["pol_records"].is_null());
-        assert_eq!(value["content_ids"], serde_json::json!([1234567, 7654321]));
-        let mut with_records = secrets();
-        with_records.pol_records = Some(Zeroizing::new(vec![1, 2, 3, 4]));
-        with_records.content_ids.clear();
-        let line = session_line("US", Path::new("C:\\a \"quoted\" dir"), &with_records).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&line).unwrap();
-        assert_eq!(base64_decode(value["pol_records"].as_str().unwrap()).unwrap(), [1, 2, 3, 4]);
-        assert_eq!(value["install_dir"], "C:\\a \"quoted\" dir");
-        assert_eq!(value["content_ids"], serde_json::json!([]));
+        // Non-canonical tails (stray low bits) are refused like the loader refuses them.
+        assert!(base64_decode("Zh==").is_none());
+        assert!(base64_decode("Zm9=").is_none());
     }
 
     #[test]
     fn loader_lines_parse_and_tolerate_unknown_fields() {
-        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:false,viewer_check:false, startup_sign_out:false, park:false });
+        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true}"#).unwrap(), LoaderEvent::Hello { v: 1, pid: 1234, caps: Caps { native_auth: true, native_social: true, ..Caps::default() } });
         // A pre-round-1 loader (16e26f3): no viewer_check, so it never asks for the W2U.
-        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true,"native_batch":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:true,viewer_check:false, startup_sign_out:false, park:false });
+        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true,"native_batch":true}"#).unwrap(), LoaderEvent::Hello { v: 1, pid: 1234, caps: Caps { native_auth: true, native_social: true, native_batch: true, ..Caps::default() } });
         // crystal-loader proto::hello_line.
-        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true,"native_batch":true,"viewer_check":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:true,viewer_check:true, startup_sign_out:false, park:false });
+        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true,"native_batch":true,"viewer_check":true}"#).unwrap(), LoaderEvent::Hello { v: 1, pid: 1234, caps: Caps { native_auth: true, native_social: true, native_batch: true, viewer_check: true, ..Caps::default() } });
         assert_eq!(parse_event(br#"{"type":"native_session_state","game":false}"#).unwrap(), LoaderEvent::NativeSessionState(false));
         assert!(parse_event(br#"{"type":"native_session_state","game":1}"#).is_err());
         assert!(parse_event(br#"{"type":"native_session_state"}"#).is_err());
@@ -861,25 +710,22 @@ mod tests {
         assert_eq!(parse_event(br#"{"type":"native_sign_out_complete","code":-2046}"#).unwrap(), LoaderEvent::NativeSignOutComplete(-2046));
         assert!(parse_event(br#"{"type":"native_sign_out_complete"}"#).is_err());
         assert!(parse_event(br#"{"type":"native_sign_out_complete","code":7}"#).is_err());
-        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"extra":true}"#).unwrap(), LoaderEvent::Hello { v: 1, pid: 1234, native_auth:false, native_social:false, native_batch:false, viewer_check:false, startup_sign_out:false, park:false });
-        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:false,native_batch:false,viewer_check:false, startup_sign_out:false, park:false });
+        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"extra":true}"#).unwrap(), LoaderEvent::Hello { v: 1, pid: 1234, caps: Caps::default() });
+        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true}"#).unwrap(), LoaderEvent::Hello { v: 1, pid: 1234, caps: Caps { native_auth: true, ..Caps::default() } });
         assert_eq!(parse_event(br#"{"type":"authenticated"}"#).unwrap(),LoaderEvent::Authenticated);
         assert_eq!(parse_event(br#"{"type":"native_pol_status","code":-1025}"#).unwrap(),LoaderEvent::NativeStatus(-1025));
         assert!(parse_event(br#"{"type":"native_pol_status","code":1}"#).is_err());
-        for code in [0, 1, -10240, i32::MIN, i32::MAX] {
-            let line = format!("{{\"type\":\"native_friends_refresh_result\",\"code\":{code}}}");
-            assert_eq!(parse_event(line.as_bytes()).unwrap(), LoaderEvent::NativeFriendsRefresh(code));
-        }
-        assert!(parse_event(br#"{"type":"native_friends_refresh_result","code":2147483648}"#).is_err());
-        assert!(parse_event(br#"{"type":"native_friends_refresh_result"}"#).is_err());
         assert!(parse_event(br#"{"type":"native_friends","payload":"AQID"}"#).is_err());
         assert_eq!(parse_event(br#"{"type":"started","pid":1234}"#).unwrap(), LoaderEvent::Started { pid: Some(1234) });
-        assert_eq!(parse_event(br#"{"type":"presence","payload":"AQID"}"#).unwrap(), LoaderEvent::Presence(vec![1, 2, 3]));
+        // The launcher always signs in natively; the loader never sends the legacy presence line.
+        assert_eq!(parse_event(br#"{"type":"presence","payload":"AQID"}"#).unwrap(), LoaderEvent::Unknown);
         assert_eq!(parse_event(br#"{"type":"exit","code":-14}"#).unwrap(), LoaderEvent::Exit(-14));
         assert_eq!(parse_event(br#"{"type":"native_game_ended","code":-14}"#).unwrap(),
-            LoaderEvent::NativeGameEnded { code: -14, game_returned: false });
+            LoaderEvent::NativeGameEnded { code: -14, game_returned: false, game_id: 0 });
         assert_eq!(parse_event(br#"{"type":"native_game_ended","code":-14,"game_returned":true}"#).unwrap(),
-            LoaderEvent::NativeGameEnded { code: -14, game_returned: true });
+            LoaderEvent::NativeGameEnded { code: -14, game_returned: true, game_id: 0 });
+        assert_eq!(parse_event(br#"{"type":"native_game_ended","code":-14,"game_returned":true,"game_id":2}"#).unwrap(),
+            LoaderEvent::NativeGameEnded { code: -14, game_returned: true, game_id: 2 });
         assert!(parse_event(br#"{"type":"native_game_ended","code":-14,"game_returned":"true"}"#).is_err());
         assert_eq!(
             parse_event(b"{\"type\":\"error\",\"message\":\"FFXiMain.dll\\nmissing\"}\r").unwrap(),
@@ -918,7 +764,9 @@ mod tests {
     #[test]
     fn round2_park_hello_and_parked_events_parse() {
         let hello = br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true,"native_batch":true,"viewer_check":true,"park":true}"#;
-        assert_eq!(parse_event(hello).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:true,viewer_check:true, startup_sign_out:false, park:true });
+        assert_eq!(parse_event(hello).unwrap(), LoaderEvent::Hello { v: 1, pid: 1234, caps: Caps { native_auth: true, native_social: true, native_batch: true, viewer_check: true, park: true, ..Caps::default() } });
+        assert!(matches!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"windower_private":true}"#).unwrap(),
+            LoaderEvent::Hello { caps: Caps { windower_private: true, native_auth: false, .. }, .. }));
         assert_eq!(parse_event(br#"{"type":"parked","pid":1234,"polcore_ms":431}"#).unwrap(), LoaderEvent::Parked { polcore_ms: Some(431) });
         assert_eq!(parse_event(br#"{"type":"parked","pid":1234}"#).unwrap(), LoaderEvent::Parked { polcore_ms: None });
     }
@@ -1030,19 +878,17 @@ mod tests {
             let mut session = String::new();
             reader.read_line(&mut session).unwrap();
             writeln!(writer, r#"{{"type":"started","pid":{}}}"#, std::process::id()).unwrap();
-            writeln!(writer, r#"{{"type":"presence","payload":"AAEC"}}"#).unwrap();
             writeln!(writer, r#"{{"type":"exit","code":0}}"#).unwrap();
             session
         });
         pipe.accept(Duration::from_secs(10), || Ok(())).unwrap();
         let me = std::env::current_exe().unwrap();
         assert_eq!(pipe.handshake(&me, Duration::from_secs(10)).unwrap(), std::process::id());
-        let line = session_line("US", Path::new(r"C:\FFXI"), &secrets()).unwrap();
+        let line = Zeroizing::new(b"{\"type\":\"session\",\"v_key\":\"paWlpaWlpaWlpaWlpaWlpQ==\"}\n".to_vec());
         pipe.send(&line, Instant::now() + Duration::from_secs(10)).unwrap();
         drop(line);
         let deadline = Some(Instant::now() + Duration::from_secs(10));
         assert_eq!(pipe.next_event(deadline).unwrap().unwrap(), LoaderEvent::Started { pid: Some(std::process::id()) });
-        assert_eq!(pipe.next_event(deadline).unwrap().unwrap(), LoaderEvent::Presence(vec![0, 1, 2]));
         assert_eq!(pipe.next_event(deadline).unwrap().unwrap(), LoaderEvent::Exit(0));
         let session = client.join().unwrap();
         let value: serde_json::Value = serde_json::from_str(&session).unwrap();

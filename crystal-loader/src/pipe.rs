@@ -1,22 +1,29 @@
-//! Named-pipe transport: the loader's client end, plus a server end used by the
-//! offline harness and the tests to stand in for the launcher.
+//! Named-pipe transport: the loader's client end, plus a server end the tests
+//! (including tests/startup_handoff.rs) use to stand in for the launcher.
+//!
+//! Both ends are overlapped handles: the reply reader blocks in one kernel
+//! wait (with its timeout) while the event writer writes on the same handle,
+//! each with its own OVERLAPPED. No polling.
 
 use std::fmt;
 use std::io;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ,
-    GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA,
+    ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION,
-    SECURITY_SQOS_PRESENT,
+    CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, PeekNamedPipe, WaitNamedPipeW,
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeServerProcessId, WaitNamedPipeW,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
+use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::proto::MAX_LINE;
@@ -44,12 +51,36 @@ impl fmt::Display for PipeError {
     }
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+use crate::win::wide;
 
 fn last_error(what: &'static str) -> PipeError {
     PipeError::Io(what, io::Error::last_os_error())
+}
+
+/// The other end is gone, or another error with its stage.
+fn io_error(code: u32, what: &'static str) -> PipeError {
+    if matches!(code, ERROR_BROKEN_PIPE | ERROR_NO_DATA) { PipeError::Closed } else { PipeError::Io(what, io::Error::from_raw_os_error(code as i32)) }
+}
+
+/// One overlapped operation: its OVERLAPPED and a manual-reset event, both
+/// alive until the operation is complete.
+struct Overlapped { ov: OVERLAPPED, event: HANDLE }
+impl Overlapped {
+    fn new() -> Result<Box<Self>, PipeError> {
+        // SAFETY: an unnamed manual-reset event with default security.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() { return Err(last_error("creating a pipe event")); }
+        // SAFETY: an all-zero OVERLAPPED is its documented initial state.
+        let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+        ov.hEvent = event;
+        Ok(Box::new(Self { ov, event }))
+    }
+}
+impl Drop for Overlapped {
+    fn drop(&mut self) {
+        // SAFETY: owned; every operation using it completed before the drop.
+        unsafe { CloseHandle(self.event) };
+    }
 }
 
 pub struct Pipe {
@@ -83,7 +114,7 @@ impl Pipe {
                     0,
                     std::ptr::null(),
                     OPEN_EXISTING,
-                    SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                    SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION | FILE_FLAG_OVERLAPPED,
                     std::ptr::null_mut(),
                 )
             };
@@ -112,14 +143,15 @@ impl Pipe {
         Ok(pipe)
     }
 
-    /// Creates a single-instance, local-only server end (harness and tests).
+    /// Creates a single-instance, local-only server end (tests only; public
+    /// for the integration tests, which build the library without cfg(test)).
     pub fn create_server(path: &str) -> Result<Pipe, PipeError> {
         let name = wide(path);
         // SAFETY: name is NUL-terminated; default security (the test runs as one user).
         let h = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
                 64 * 1024,
@@ -136,10 +168,19 @@ impl Pipe {
 
     /// Server end: blocks until a client connects.
     pub fn accept(&self) -> Result<(), PipeError> {
-        // SAFETY: synchronous handle, no OVERLAPPED.
-        let ok = unsafe { ConnectNamedPipe(self.h, std::ptr::null_mut()) };
-        // SAFETY: plain FFI.
-        if ok == 0 && unsafe { GetLastError() } != ERROR_PIPE_CONNECTED {
+        let mut op = Overlapped::new()?;
+        // SAFETY: an overlapped handle; `op` outlives the operation (waited below).
+        if unsafe { ConnectNamedPipe(self.h, &mut op.ov) } == 0 {
+            // SAFETY: plain FFI.
+            match unsafe { GetLastError() } {
+                ERROR_PIPE_CONNECTED => return Ok(()),
+                ERROR_IO_PENDING => {}
+                _ => return Err(last_error("waiting for the loader")),
+            }
+        }
+        let mut ignored = 0;
+        // SAFETY: waits for this handle's pending connect on `op`.
+        if unsafe { GetOverlappedResult(self.h, &op.ov, &mut ignored, 1) } == 0 {
             return Err(last_error("waiting for the loader"));
         }
         Ok(())
@@ -154,47 +195,67 @@ impl Pipe {
         Ok(pid)
     }
 
-    pub fn client_pid(&self) -> Result<u32, PipeError> {
+    #[cfg(test)]
+    fn client_pid(&self) -> Result<u32, PipeError> {
         let mut pid = 0;
         // SAFETY: pid is a valid out pointer.
-        if unsafe { GetNamedPipeClientProcessId(self.h, &mut pid) } == 0 {
+        if unsafe { windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId(self.h, &mut pid) } == 0 {
             return Err(last_error("reading the pipe client's process id"));
         }
         Ok(pid)
     }
 
     pub fn write_all(&self, mut data: &[u8]) -> Result<(), PipeError> {
+        let mut op = Overlapped::new()?;
         while !data.is_empty() {
-            let mut n = 0;
             let chunk = data.len().min(64 * 1024) as u32;
-            // SAFETY: data is valid for `chunk` bytes.
-            if unsafe { WriteFile(self.h, data.as_ptr(), chunk, &mut n, std::ptr::null_mut()) } == 0 {
+            // SAFETY: data is valid for `chunk` bytes and, like `op`, outlives
+            // the write, which completes (GetOverlappedResult waits) before
+            // either is touched again.
+            if unsafe { WriteFile(self.h, data.as_ptr(), chunk, std::ptr::null_mut(), &mut op.ov) } == 0 {
                 // SAFETY: plain FFI.
-                return Err(if unsafe { GetLastError() } == ERROR_BROKEN_PIPE { PipeError::Closed } else { last_error("writing to the pipe") });
+                let code = unsafe { GetLastError() };
+                if code != ERROR_IO_PENDING { return Err(io_error(code, "writing to the pipe")); }
+            }
+            let mut n = 0;
+            // SAFETY: waits for this write on `op`.
+            if unsafe { GetOverlappedResult(self.h, &op.ov, &mut n, 1) } == 0 {
+                // SAFETY: plain FFI.
+                return Err(io_error(unsafe { GetLastError() }, "writing to the pipe"));
             }
             data = &data[n as usize..];
         }
         Ok(())
     }
 
-    /// Bytes waiting to be read, without blocking. `Err(Closed)` once the other end is gone.
-    fn available(&self) -> Result<u32, PipeError> {
-        let mut avail = 0;
-        // SAFETY: only the "bytes available" out pointer is used.
-        let ok = unsafe { PeekNamedPipe(self.h, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) };
-        if ok == 0 {
+    /// Reads what arrives first, waiting at most `timeout` (None: forever).
+    /// Never returns while the kernel may still write into `out`.
+    fn read_some(&self, out: &mut [u8], timeout: Option<Duration>) -> Result<usize, PipeError> {
+        let mut op = Overlapped::new()?;
+        let len = out.len().min(u32::MAX as usize) as u32;
+        // SAFETY: `out` and `op` outlive the read: it completes or is
+        // cancelled and then waited for below before this returns.
+        if unsafe { ReadFile(self.h, out.as_mut_ptr(), len, std::ptr::null_mut(), &mut op.ov) } == 0 {
             // SAFETY: plain FFI.
-            return Err(if unsafe { GetLastError() } == ERROR_BROKEN_PIPE { PipeError::Closed } else { last_error("polling the pipe") });
+            let code = unsafe { GetLastError() };
+            if code != ERROR_IO_PENDING { return Err(io_error(code, "reading from the pipe")); }
+            let ms = timeout.map_or(INFINITE, |t| t.as_millis().min(u128::from(INFINITE - 1)) as u32);
+            // SAFETY: the operation's own event.
+            if unsafe { WaitForSingleObject(op.event, ms) } == WAIT_TIMEOUT {
+                // SAFETY: cancels only this read; the result is collected below.
+                unsafe { CancelIoEx(self.h, &op.ov) };
+            }
         }
-        Ok(avail)
-    }
-
-    fn read_some(&self, out: &mut [u8]) -> Result<usize, PipeError> {
         let mut n = 0;
-        // SAFETY: out is valid for out.len() bytes.
-        if unsafe { ReadFile(self.h, out.as_mut_ptr(), out.len() as u32, &mut n, std::ptr::null_mut()) } == 0 {
+        // SAFETY: waits until the kernel is done with `out` (a cancelled read
+        // may still have completed with data in the race window).
+        if unsafe { GetOverlappedResult(self.h, &op.ov, &mut n, 1) } == 0 {
             // SAFETY: plain FFI.
-            return Err(if unsafe { GetLastError() } == ERROR_BROKEN_PIPE { PipeError::Closed } else { last_error("reading from the pipe") });
+            match unsafe { GetLastError() } {
+                ERROR_OPERATION_ABORTED if n == 0 => return Err(PipeError::Timeout("waiting for a line from the pipe")),
+                ERROR_MORE_DATA => {}
+                code => return Err(io_error(code, "reading from the pipe")),
+            }
         }
         if n == 0 {
             return Err(PipeError::Closed);
@@ -249,27 +310,13 @@ impl LineReader {
             if self.len >= self.buf.len() {
                 return Err(PipeError::LineTooLong);
             }
-            let avail = pipe.available()? as usize;
-            if avail == 0 {
-                if deadline.is_some_and(|d| Instant::now() >= d) {
-                    return Err(PipeError::Timeout("waiting for a line from the pipe"));
-                }
-                std::thread::sleep(Duration::from_millis(5));
-                continue;
-            }
-            let room = self.buf.len() - self.len;
-            let n = pipe.read_some(&mut self.buf[self.len..self.len + avail.min(room)])?;
+            let remaining = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+            let end = self.buf.len();
+            let n = pipe.read_some(&mut self.buf[self.len..end], remaining)?;
             self.len += n;
         }
     }
 
-    /// Zeroizes everything read so far.
-    pub fn wipe(&mut self) {
-        self.buf.zeroize();
-        self.buf.resize(MAX_LINE + 1, 0);
-        self.len = 0;
-        self.consumed = 0;
-    }
 }
 
 /// A fresh pipe path with 128 random bits, in the contract's naming scheme.
@@ -327,8 +374,9 @@ mod tests {
                     &mut || reader.read_parsed(&client, None, proto::parse_credentials)).unwrap();
                 park.into_session(credentials)
             }
+            FirstLine::WindowerStartup(_) => panic!("this transport fixture sends only a session or park"),
         };
-        assert!(session.native_auth.is_some() && !session.start_game);
+        assert!(!session.start_game);
         // The same kernel read must have included the commands, and no bytes
         // from the consumed credentials may remain in the allocated buffer.
         assert_eq!(&reader.buf[..reader.len], commands.as_bytes());
@@ -350,12 +398,8 @@ mod tests {
     }
 
     #[test]
-    fn cold_session_preserves_coalesced_commands_and_wipes_consumed_credentials() {
+    fn cold_and_parked_sessions_preserve_coalesced_commands_and_wipe_consumed_credentials() {
         coalesced_startup_handoff(false);
-    }
-
-    #[test]
-    fn parked_credentials_preserve_coalesced_commands_and_wipe_consumed_credentials() {
         coalesced_startup_handoff(true);
     }
 
@@ -378,6 +422,37 @@ mod tests {
         assert_eq!(r.read_line(&client, Some(Duration::from_secs(5))).unwrap(), b"three");
         t.join().unwrap();
         assert!(matches!(r.read_line(&client, Some(Duration::from_secs(1))), Err(PipeError::Closed)));
+    }
+
+    #[test]
+    fn a_timed_out_read_loses_nothing_and_writes_proceed_while_a_read_waits() {
+        let path = random_pipe_path();
+        let server = Pipe::create_server(&path).unwrap();
+        let (go, wait) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            server.accept().unwrap();
+            let mut r = LineReader::default();
+            // The client writes while its own reader is blocked in a read.
+            assert_eq!(r.read_line(&server, Some(Duration::from_secs(5))).unwrap(), b"from client");
+            wait.recv().unwrap();
+            server.write_all(b"late\n").unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let client = std::sync::Arc::new(Pipe::connect(&path, std::process::id(), Duration::from_secs(5)).unwrap());
+        let reader = {
+            let client = std::sync::Arc::clone(&client);
+            std::thread::spawn(move || {
+                let mut r = LineReader::default();
+                let started = Instant::now();
+                assert!(matches!(r.read_line(&client, Some(Duration::from_millis(50))), Err(PipeError::Timeout(_))));
+                assert!(started.elapsed() >= Duration::from_millis(45));
+                go.send(()).unwrap();
+                assert_eq!(r.read_line(&client, Some(Duration::from_secs(5))).unwrap(), b"late");
+            })
+        };
+        client.write_all(b"from client\n").unwrap();
+        reader.join().unwrap();
+        t.join().unwrap();
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! The official Windows client distribution. No unofficial repack or silent MSI install.
 //! File lengths describe the current official archive, not a cryptographic checksum.
 use crate::i18n::{t, tf};
-use crate::operation::{Operation, Part, PartState};
+use crate::operation::{Operation, Part, PartState, Stage};
 use reqwest::{header, Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,21 +16,15 @@ use std::{
 pub const INSTRUCTIONS_URL: &str =
     "https://www.playonline.com/ff11us/download/media/install_win.html";
 const BASE_URL: &str = "https://gdl.square-enix.com/ffxi/download/us/";
-// Baseline lengths verified with official HTTPS HEAD responses on 2026-10-02.
-// Downloads use current server metadata. Historical lengths cannot establish
-// provenance: untracked local volumes must be downloaded officially.
-const PARTS: [(&str, u64); 5] = [
-    ("FFXIFullSetup_US.part1.exe", 1_610_626_088),
-    ("FFXIFullSetup_US.part2.rar", 1_610_612_736),
-    ("FFXIFullSetup_US.part3.rar", 1_610_612_736),
-    ("FFXIFullSetup_US.part4.rar", 1_610_612_736),
-    ("FFXIFullSetup_US.part5.rar", 1_291_746_416),
+// Downloads use current server metadata, never stored lengths: historical lengths
+// cannot establish provenance, so untracked local volumes must be downloaded officially.
+const PARTS: [&str; 5] = [
+    "FFXIFullSetup_US.part1.exe",
+    "FFXIFullSetup_US.part2.rar",
+    "FFXIFullSetup_US.part3.rar",
+    "FFXIFullSetup_US.part4.rar",
+    "FFXIFullSetup_US.part5.rar",
 ];
-
-#[derive(Debug, Clone)]
-pub struct Report {
-    pub summary: String,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Metadata {
@@ -92,14 +86,12 @@ fn client() -> Result<Client, String> {
         .map_err(|e| e.to_string())
 }
 
+/// `future`, unless the operation is cancelled first (then the cancel message).
 async fn cancellable<F: Future>(future: F, op: &Operation) -> Result<F::Output, String> {
-    tokio::pin!(future);
-    loop {
-        op.check_cancelled()?;
-        tokio::select! {
-            result = &mut future => return Ok(result),
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-        }
+    op.check_cancelled()?;
+    tokio::select! {
+        result = future => Ok(result),
+        message = op.cancelled_wait() => Err(message),
     }
 }
 
@@ -206,17 +198,9 @@ fn file_length(path: &Path) -> Result<Option<u64>, String> {
 }
 
 fn is_reparse_file(metadata: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = metadata;
-        false
-    }
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 fn safe_directory(dir: &Path) -> Result<PathBuf, String> {
@@ -232,13 +216,10 @@ fn safe_directory(dir: &Path) -> Result<PathBuf, String> {
 fn download_lock(dir: &Path) -> Result<File, String> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // A permanent small lock file; the OS releases the exclusive handle on
-        // crash, so a stale file cannot strand a resumable multi-GB download.
-        options.share_mode(0);
-    }
+    use std::os::windows::fs::OpenOptionsExt;
+    // A permanent small lock file; the OS releases the exclusive handle on
+    // crash, so a stale file cannot strand a resumable multi-GB download.
+    options.share_mode(0);
     let path = dir.join(".crystal-official-installer.lock");
     file_length(&path)?;
     options
@@ -249,18 +230,19 @@ fn download_lock(dir: &Path) -> Result<File, String> {
 /// Downloads all five official volumes into one folder. Existing complete
 /// volumes are retained; interrupted `.part` files resume only with validators.
 /// This function does not start extraction or modify an installed game.
-pub async fn download(dir: PathBuf, operation: Operation) -> Result<Report, String> {
+/// The summary line of a completed download.
+pub async fn download(dir: PathBuf, operation: Operation) -> Result<String, String> {
     operation.check_cancelled()?;
     let dir = safe_directory(&dir)?;
     let _lock = download_lock(&dir)?;
     let client = client()?;
     let mut volumes = Vec::new();
-    for (index, (name, _)) in PARTS.iter().enumerate() {
+    for (index, name) in PARTS.iter().enumerate() {
         operation.progress_part(
-            "installer-metadata",
+            Stage::InstallerMetadata,
             index as u64,
             PARTS.len() as u64,
-            Part { number: index as u8 + 1, name: *name, state: PartState::Checking },
+            Part { number: index as u8 + 1, name, state: PartState::Checking },
         );
         let url = format!("{BASE_URL}{name}");
         let head = cancellable(
@@ -332,10 +314,10 @@ pub async fn download(dir: PathBuf, operation: Operation) -> Result<Report, Stri
             .map_err(|e| e.to_string())??;
             if Some(hex_digest(actual)) == tracked_digest.map(str::to_owned) {
                 completed += expected;
-                operation.progress_part("installer-download", completed, total, part(PartState::AlreadyComplete));
+                operation.progress_part(Stage::InstallerDownload, completed, total, part(PartState::AlreadyComplete));
                 continue;
             }
-            operation.progress_part("installer-download", completed, total, part(PartState::Changed));
+            operation.progress_part(Stage::InstallerDownload, completed, total, part(PartState::Changed));
         }
         let existing = file_length(&partial)?.unwrap_or(0);
         let offset = if existing <= expected
@@ -361,7 +343,7 @@ pub async fn download(dir: PathBuf, operation: Operation) -> Result<Report, Stri
             .await
             .map_err(|e| e.to_string())??;
             completed += expected;
-            operation.progress_part("installer-download", completed, total, part(PartState::AlreadyComplete));
+            operation.progress_part(Stage::InstallerDownload, completed, total, part(PartState::AlreadyComplete));
             continue;
         }
         let mut request = client.get(&url).header(header::ACCEPT_ENCODING, "identity");
@@ -393,14 +375,14 @@ pub async fn download(dir: PathBuf, operation: Operation) -> Result<Report, Stri
                 return Err(t("Installer changed between metadata and resumed response").into());
             }
         }
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(done == 0)
             .append(done > 0)
             .open(&partial)
             .map_err(|e| tf("Open installer part: {error}", &[("error", &e)]))?;
-        let mut hash = if done == 0 {
+        let hash = if done == 0 {
             Sha256::new()
         } else {
             let hash_path = partial.clone();
@@ -411,41 +393,50 @@ pub async fn download(dir: PathBuf, operation: Operation) -> Result<Report, Stri
         };
         let mut last_progress = Instant::now() - Duration::from_secs(1);
         operation.progress_part(
-            "installer-download",
+            Stage::InstallerDownload,
             completed + done,
             total,
             part(PartState::Downloading { done, expected }),
         );
-        while let Some(chunk) = cancellable(response.chunk(), &operation)
-            .await?
-            .map_err(|e| tf("Download {name} interrupted: {error}. Retry to resume.", &[("name", &name), ("error", &e)]))?
-        {
-            operation.check_cancelled()?;
-            let size = chunk.len() as u64;
-            if done.checked_add(size).is_none_or(|next| next > expected) {
-                return Err(tf("{name} exceeds its official expected length", &[("name", &name)]));
+        // One blocking writer for the whole volume, fed through a bounded channel, so the
+        // socket keeps draining while bytes are written and hashed.
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        let writer = spawn_writer(file, hash, receiver);
+        let streamed = async {
+            while let Some(chunk) = cancellable(response.chunk(), &operation)
+                .await?
+                .map_err(|e| tf("Download {name} interrupted: {error}. Retry to resume.", &[("name", &name), ("error", &e)]))?
+            {
+                operation.check_cancelled()?;
+                let size = chunk.len() as u64;
+                if done.checked_add(size).is_none_or(|next| next > expected) {
+                    return Err(tf("{name} exceeds its official expected length", &[("name", &name)]));
+                }
+                if sender.send(chunk).await.is_err() {
+                    break; // The writer failed; its error is reported below.
+                }
+                done += size;
+                transferred += size;
+                if last_progress.elapsed() >= Duration::from_millis(150) {
+                    operation.progress_part(
+                        Stage::InstallerDownload,
+                        completed + done,
+                        total,
+                        part(PartState::Downloading { done, expected }),
+                    );
+                    last_progress = Instant::now();
+                }
             }
-            (file, hash) =
-                tokio::task::spawn_blocking(move || -> Result<(File, Sha256), String> {
-                    file.write_all(&chunk)
-                        .map_err(|e| tf("Write installer part: {error}", &[("error", &e)]))?;
-                    hash.update(&chunk);
-                    Ok((file, hash))
-                })
-                .await
-                .map_err(|e| tf("Installer file worker: {error}", &[("error", &e)]))??;
-            done += size;
-            transferred += size;
-            if last_progress.elapsed() >= Duration::from_millis(150) {
-                operation.progress_part(
-                    "installer-download",
-                    completed + done,
-                    total,
-                    part(PartState::Downloading { done, expected }),
-                );
-                last_progress = Instant::now();
-            }
+            Ok(())
         }
+        .await;
+        // Every exit (end, interruption, cancel) lets the writer finish what it was given,
+        // so the partial file holds exactly the bytes counted for a later resume.
+        drop(sender);
+        let (file, hash) = writer
+            .await
+            .map_err(|e| tf("Installer file worker: {error}", &[("error", &e)]))??;
+        streamed?;
         if done != expected {
             return Err(tf(
                 "{name} ended at {done} of {expected} bytes; retry to resume",
@@ -462,7 +453,7 @@ pub async fn download(dir: PathBuf, operation: Operation) -> Result<Report, Stri
         publish(&partial, &target)?;
         save_metadata(&sidecar, &metadata, true)?;
         completed += expected;
-        operation.progress_part("installer-download", completed, total, part(PartState::Complete));
+        operation.progress_part(Stage::InstallerDownload, completed, total, part(PartState::Complete));
     }
     let verify_dir = dir.clone();
     let verify_op = operation.clone();
@@ -470,11 +461,29 @@ pub async fn download(dir: PathBuf, operation: Operation) -> Result<Report, Stri
         .await
         .map_err(|e| e.to_string())??;
     operation.check_cancelled()?;
-    Ok(Report {
-        summary: tf(
-            "All five official installer files are complete in {folder}. Downloaded {bytes} bytes this run. Transfer lengths were checked; Square Enix publishes no checksum on the download page. Extract next, then run the official setup and select all applications for a first installation.",
-            &[("folder", &dir.display()), ("bytes", &transferred)],
-        ),
+    Ok(tf(
+        "All five official installer files are complete in {folder}. Downloaded {bytes} bytes this run. Transfer lengths were checked; Square Enix publishes no checksum on the download page. Extract next, then run the official setup and select all applications for a first installation.",
+        &[("folder", &dir.display()), ("bytes", &transferred)],
+    ))
+}
+
+/// Append every chunk `receiver` yields to `file` (buffered) and `hash`, until the sender is
+/// dropped; then flush and hand both back. A write error ends it early, which the sender
+/// sees as a closed channel.
+fn spawn_writer<T: AsRef<[u8]> + Send + 'static>(
+    file: File,
+    mut hash: Sha256,
+    mut receiver: tokio::sync::mpsc::Receiver<T>,
+) -> tokio::task::JoinHandle<Result<(File, Sha256), String>> {
+    tokio::task::spawn_blocking(move || {
+        let write_error = |e: std::io::Error| tf("Write installer part: {error}", &[("error", &e)]);
+        let mut out = std::io::BufWriter::with_capacity(4 << 20, file);
+        while let Some(chunk) = receiver.blocking_recv() {
+            out.write_all(chunk.as_ref()).map_err(write_error)?;
+            hash.update(chunk.as_ref());
+        }
+        let file = out.into_inner().map_err(|e| write_error(e.into_error()))?;
+        Ok((file, hash))
     })
 }
 
@@ -529,33 +538,15 @@ fn save_metadata(path: &Path, metadata: &Metadata, complete: bool) -> Result<(),
     metadata.complete = complete;
     let json = serde_json::to_vec(&metadata).map_err(|e| e.to_string())?;
     file_length(path)?;
-    let mut temporary_name = path.as_os_str().to_owned();
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_nanos();
-    temporary_name.push(format!(".tmp-{}-{timestamp}", std::process::id()));
-    let temporary = PathBuf::from(temporary_name);
-    // create_new does not follow or overwrite a planted temporary path. Flush
-    // the full new JSON before replacing the old sidecar, so a crash cannot
-    // truncate the only copy of the validators/completion state.
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|e| tf("Create installer resume metadata: {error}", &[("error", &e)]))?;
-    let result = (|| {
-        file.write_all(&json)
-            .map_err(|e| tf("Write installer resume metadata: {error}", &[("error", &e)]))?;
-        file.sync_all()
-            .map_err(|e| tf("Flush installer resume metadata: {error}", &[("error", &e)]))?;
-        drop(file);
-        publish(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    // The full new JSON is flushed before the old sidecar is replaced, so a crash
+    // cannot truncate the only copy of the validators/completion state.
+    crate::fsutil::write_atomic(path, &json).map_err(|failed| {
+        if failed.replacing {
+            tf("Publish installer file: {error}", &[("error", &failed.error)])
+        } else {
+            tf("Write installer resume metadata: {error}", &[("error", &failed.error)])
+        }
+    })
 }
 
 fn publish(partial: &Path, target: &Path) -> Result<(), String> {
@@ -563,38 +554,12 @@ fn publish(partial: &Path, target: &Path) -> Result<(), String> {
     // file until the new volume is fully flushed, then atomically replace it.
     file_length(partial)?.ok_or(t("Completed installer file disappeared before publishing"))?;
     file_length(target)?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-        };
-        let from: Vec<u16> = partial.as_os_str().encode_wide().chain(Some(0)).collect();
-        let to: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
-        // SAFETY: NUL-terminated paths live through the synchronous call.
-        if unsafe {
-            MoveFileExW(
-                from.as_ptr(),
-                to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        } == 0
-        {
-            return Err(tf(
-                "Publish installer file: {error}",
-                &[("error", &std::io::Error::last_os_error())],
-            ));
-        }
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        fs::rename(partial, target).map_err(|e| tf("Publish installer file: {error}", &[("error", &e)]))
-    }
+    crate::fsutil::replace(partial, target)
+        .map_err(|error| tf("Publish installer file: {error}", &[("error", &error)]))
 }
 
 fn validate_volumes(dir: &Path, operation: Option<&Operation>) -> Result<(), String> {
-    for (name, _) in PARTS {
+    for name in PARTS {
         let sidecar = dir.join(format!("{name}.download.json"));
         let metadata = match file_length(&sidecar)? {
             Some(_) => {
@@ -638,7 +603,7 @@ pub fn extract(dir: &Path) -> Result<(), String> {
     let dir = fs::canonicalize(dir).map_err(|e| tf("Installer folder: {error}", &[("error", &e)]))?;
     let _lock = download_lock(&dir)?;
     validate_volumes(&dir, None)?;
-    launch(&dir.join(PARTS[0].0), &dir)
+    launch(&dir.join(PARTS[0]), &dir)
 }
 
 /// Runs and waits for the official client installer interactively, preserving DirectX,
@@ -661,52 +626,32 @@ fn setup_executable(dir: &Path) -> Result<PathBuf, String> {
     Err(t("FFXISetup.exe was not found or is empty. Extract the official download, then browse to its FFXIFullSetup_US folder. In setup, select PlayOnline Viewer and FINAL FANTASY XI.").into())
 }
 
-#[cfg(windows)]
 fn launch(executable: &Path, cwd: &Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
-    use windows_sys::Win32::UI::Shell::{
-        ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    use crate::prereqs::wait_exit_code;
+    use crate::win::{shell_execute, ShellError};
+    // The verified read handle stays open until the installer exits.
+    let _file = {
+        let file = lock_executable(executable)?;
+        verify_authenticode(executable, &file)?;
+        file
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
-    let file = lock_executable(executable)?;
-    verify_authenticode(executable, &file)?;
-    let wide = |value: &std::ffi::OsStr| value.encode_wide().chain(Some(0)).collect::<Vec<u16>>();
-    let verb = wide(std::ffi::OsStr::new("open"));
-    let executable = wide(executable.as_os_str());
-    let cwd = wide(cwd.as_os_str());
+    let untracked = || t("Could not track the official installer; wait for it to close before continuing.").to_owned();
     // Let the executable's manifest request UAC when needed. CreateProcess
     // (Command::status) only returns ERROR_ELEVATION_REQUIRED to a normal user.
-    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
-    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
-    info.lpVerb = verb.as_ptr();
-    info.lpFile = executable.as_ptr();
-    info.lpDirectory = cwd.as_ptr();
-    info.nShow = SW_SHOWNORMAL;
-    // All path buffers and the verified read handle remain live through exit.
-    if unsafe { ShellExecuteExW(&mut info) } == 0 {
-        return Err(tf("Run official installer: {error}", &[("error", &std::io::Error::last_os_error())]));
-    }
-    if info.hProcess.is_null() {
-        return Err(t("Could not track the official installer; wait for it to close before continuing.").into());
-    }
-    let waited = unsafe { WaitForSingleObject(info.hProcess, INFINITE) };
-    let mut status = 0;
-    let obtained = unsafe { GetExitCodeProcess(info.hProcess, &mut status) };
-    unsafe { CloseHandle(info.hProcess); }
-    if waited != WAIT_OBJECT_0 || obtained == 0 {
-        return Err(t("Could not track the official installer; wait for it to close before continuing.").into());
-    }
+    let process = shell_execute("open", executable, None, Some(cwd), windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL, true)
+        .map_err(|error| match error {
+            ShellError::Failed(code) => {
+                tf("Run official installer: {error}", &[("error", &std::io::Error::from_raw_os_error(code as i32))])
+            }
+            ShellError::NoProcess => untracked(),
+        })?;
+    let status = wait_exit_code(process).ok_or_else(untracked)?;
     if status != 0 {
         return Err(tf("Official installer exited with {status}", &[("status", &status)]));
     }
     Ok(())
 }
 
-#[cfg(windows)]
 fn lock_executable(executable: &Path) -> Result<File, String> {
     use std::os::windows::fs::OpenOptionsExt;
     file_length(executable)?.ok_or(t("Official installer executable is missing"))?;
@@ -716,54 +661,8 @@ fn lock_executable(executable: &Path) -> Result<File, String> {
         .map_err(|e| tf("Run official installer: {error}", &[("error", &e)]))
 }
 
-#[cfg(not(windows))]
-fn launch(_: &Path, _: &Path) -> Result<(), String> {
-    Err(crate::i18n::t("Official client extraction and installation require Windows").into())
-}
-
-#[cfg(windows)]
 fn verify_authenticode(executable: &Path, file: &File) -> Result<(), String> {
-    use std::{mem::size_of, os::windows::{ffi::OsStrExt, io::AsRawHandle}, ptr};
-    use windows_sys::Win32::Security::WinTrust::*;
-    let path: Vec<u16> = executable
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    let mut info = WINTRUST_FILE_INFO {
-        cbStruct: size_of::<WINTRUST_FILE_INFO>() as u32,
-        pcwszFilePath: path.as_ptr(),
-        hFile: file.as_raw_handle() as _,
-        ..Default::default()
-    };
-    let mut data = WINTRUST_DATA {
-        cbStruct: size_of::<WINTRUST_DATA>() as u32,
-        dwUIChoice: WTD_UI_NONE,
-        fdwRevocationChecks: WTD_REVOKE_WHOLECHAIN,
-        dwUnionChoice: WTD_CHOICE_FILE,
-        Anonymous: WINTRUST_DATA_0 { pFile: &mut info },
-        dwStateAction: WTD_STATEACTION_VERIFY,
-        dwProvFlags: WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
-        ..Default::default()
-    };
-    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-    // SAFETY: all pointed-to buffers and structures are live, initialized and
-    // correctly sized. CLOSE frees the provider's state for every verify call.
-    let status = unsafe {
-        WinVerifyTrust(
-            ptr::null_mut(),
-            &mut action,
-            (&mut data as *mut WINTRUST_DATA).cast(),
-        )
-    };
-    data.dwStateAction = WTD_STATEACTION_CLOSE;
-    unsafe {
-        WinVerifyTrust(
-            ptr::null_mut(),
-            &mut action,
-            (&mut data as *mut WINTRUST_DATA).cast(),
-        );
-    }
+    let status = crate::prereqs::win_verify_trust(executable, file, |status, _| status);
     // WinRAR self-extractors may legitimately have no signature. HTTPS origin
     // and transfer checks do not imply Authenticode; do not claim they do.
     // Reject signatures that are present but fail Windows trust validation.
@@ -780,7 +679,6 @@ fn verify_authenticode(executable: &Path, file: &File) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
 fn has_embedded_signature(executable: &Path) -> Result<bool, String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = File::open(executable).map_err(|e| tf("Read installer PE header: {error}", &[("error", &e)]))?;
@@ -839,6 +737,9 @@ fn embedded_signature_directory(optional: &[u8], file_length: u64) -> Result<boo
 mod tests {
     use super::*;
 
+    /// The volumes' lengths, verified with official HTTPS HEAD responses on 2026-10-02.
+    const BASELINE_LENGTHS: [u64; 5] = [1_610_626_088, 1_610_612_736, 1_610_612_736, 1_610_612_736, 1_291_746_416];
+
     fn fixture(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("crystal-installer-{label}-{}-{}",
             std::process::id(), crate::backend::unique_id().unwrap()));
@@ -849,11 +750,11 @@ mod tests {
     #[test]
     fn a_completed_partial_is_flushed_published_and_tracked_without_downloading() {
         let dir = fixture("complete-part");
-        let target = dir.join(PARTS[0].0);
-        let partial = dir.join(format!("{}.part", PARTS[0].0));
-        let sidecar = dir.join(format!("{}.download.json", PARTS[0].0));
+        let target = dir.join(PARTS[0]);
+        let partial = dir.join(format!("{}.part", PARTS[0]));
+        let sidecar = dir.join(format!("{}.download.json", PARTS[0]));
         fs::write(&partial, b"complete archive fixture").unwrap();
-        let mut metadata = Metadata { url: format!("{BASE_URL}{}", PARTS[0].0),
+        let mut metadata = Metadata { url: format!("{BASE_URL}{}", PARTS[0]),
             length: 24, etag: Some("\"fixture\"".into()), modified: None,
             complete: false, sha256: None, format: 1 };
         save_metadata(&sidecar, &metadata, false).unwrap();
@@ -869,7 +770,6 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    #[cfg(windows)]
     #[test]
     fn extraction_refuses_a_folder_locked_by_another_download() {
         let dir = fixture("download-lock");
@@ -882,7 +782,6 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    #[cfg(windows)]
     #[test]
     fn verified_executable_handle_prevents_replacement_until_it_is_released() {
         let dir = fixture("executable-lock");
@@ -900,7 +799,7 @@ mod tests {
     #[ignore = "read-only official HTTPS installer metadata and bounded range probe"]
     async fn official_installer_metadata_and_first_bytes_are_reachable() {
         let client = client().unwrap();
-        for (name, _) in PARTS {
+        for name in PARTS {
             let url = format!("{BASE_URL}{name}");
             let head = client.head(&url).header(header::ACCEPT_ENCODING, "identity").send().await
                 .unwrap_or_else(|error| panic!("{name}: {error:?}"));
@@ -909,7 +808,7 @@ mod tests {
             identity_encoding(head.headers()).unwrap();
             assert!(length_header(head.headers()).unwrap() > 0);
         }
-        let mut response = client.get(format!("{BASE_URL}{}", PARTS[0].0))
+        let mut response = client.get(format!("{BASE_URL}{}", PARTS[0]))
             .header(header::ACCEPT_ENCODING, "identity").header(header::RANGE, "bytes=0-4095")
             .send().await.unwrap_or_else(|error| panic!("installer range: {error:?}"));
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
@@ -1005,8 +904,8 @@ mod tests {
     #[test]
     fn resume_metadata_requires_identity_validator() {
         let current = Metadata {
-            url: format!("{BASE_URL}{}", PARTS[0].0),
-            length: PARTS[0].1,
+            url: format!("{BASE_URL}{}", PARTS[0]),
+            length: BASELINE_LENGTHS[0],
             etag: Some("\"one\"".into()),
             modified: None,
             complete: false,
@@ -1032,7 +931,7 @@ mod tests {
     #[test]
     fn only_official_https_without_credentials() {
         assert!(official_url(
-            &Url::parse(&format!("{BASE_URL}{}", PARTS[0].0)).unwrap()
+            &Url::parse(&format!("{BASE_URL}{}", PARTS[0])).unwrap()
         ));
         for url in [
             "http://gdl.square-enix.com/x",
@@ -1052,7 +951,7 @@ mod tests {
             None
         )
         .is_err());
-        assert_eq!(PARTS.iter().map(|(_, n)| *n).sum::<u64>(), 7_734_210_712);
+        assert_eq!(BASELINE_LENGTHS.iter().sum::<u64>(), 7_734_210_712);
     }
 
     #[test]
@@ -1064,7 +963,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("xi-installer-hash-{}-{unique}", std::process::id()));
         fs::create_dir(&dir).unwrap();
-        for (name, _) in PARTS {
+        for name in PARTS {
             let path = dir.join(name);
             fs::write(&path, b"abc").unwrap();
             let metadata = Metadata {
@@ -1079,15 +978,37 @@ mod tests {
             save_metadata(&dir.join(format!("{name}.download.json")), &metadata, true).unwrap();
         }
         assert!(validate_volumes(&dir, None).is_ok());
-        fs::write(dir.join(PARTS[0].0), b"xyz").unwrap();
+        fs::write(dir.join(PARTS[0]), b"xyz").unwrap();
         assert!(validate_volumes(&dir, None)
             .unwrap_err()
             .contains("changed after"));
-        fs::remove_file(dir.join(format!("{}.download.json", PARTS[0].0))).unwrap();
+        fs::remove_file(dir.join(format!("{}.download.json", PARTS[0]))).unwrap();
         assert!(validate_volumes(&dir, None)
             .unwrap_err()
             .contains("no official-download metadata"));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The volume writer keeps every byte it was given, in order, when the sender stops early
+    /// (an interrupted or cancelled download), so a resume starts from an exact offset.
+    #[tokio::test]
+    async fn the_volume_writer_flushes_everything_it_was_sent() {
+        let dir = fixture("writer");
+        let path = dir.join("volume.part");
+        fs::write(&path, b"head-").unwrap();
+        let file = OpenOptions::new().append(true).open(&path).unwrap();
+        let mut start = Sha256::new();
+        start.update(b"head-");
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+        let writer = spawn_writer(file, start, receiver);
+        for piece in [&b"one-"[..], b"two-", b"three"] {
+            sender.send(piece.to_vec()).await.unwrap();
+        }
+        drop(sender);
+        let (_file, hash) = writer.await.unwrap().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"head-one-two-three");
+        assert_eq!(hex_digest(hash), hex_digest(hash_file(&path, 18, None).unwrap()));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

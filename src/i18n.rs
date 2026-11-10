@@ -82,6 +82,11 @@ pub(crate) fn t_in(lang: Lang, en: &'static str) -> &'static str {
     lookup(lang, en)
 }
 
+/// `tf` in `lang`, whatever language is showing.
+pub(crate) fn tf_in(lang: Lang, en: &'static str, args: &[(&str, &dyn Display)]) -> String {
+    fill(lookup(lang, en), args)
+}
+
 fn lookup(lang: Lang, en: &'static str) -> &'static str {
     match lang {
         Lang::En => en,
@@ -118,75 +123,10 @@ fn fill(template: &str, args: &[(&str, &dyn Display)]) -> String {
 /// The language a launcher without a saved choice starts in: Japanese when
 /// the Windows display language is Japanese, else English.
 pub(crate) fn system_default() -> Lang {
-    #[cfg(windows)]
-    {
-        const LANG_JAPANESE: u16 = 0x11;
-        // The low 10 bits of a LANGID are the primary language.
-        let id = unsafe { windows_sys::Win32::Globalization::GetUserDefaultUILanguage() };
-        if id & 0x3ff == LANG_JAPANESE {
-            return Lang::Ja;
-        }
-    }
-    Lang::En
-}
-
-/// Japanese UI fonts, best first. Windows 10/11 always has Yu Gothic UI; Meiryo
-/// and MS UI Gothic cover older or trimmed installs.
-const JAPANESE_FONTS: &[&str] = &["Yu Gothic UI", "Meiryo UI", "Meiryo", "MS UI Gothic", "Yu Gothic", "MS Gothic"];
-
-/// cosmic-text's Windows fallback with Japanese first for kana and kanji.
-///
-/// The UI text font stays Segoe UI in both languages, so English looks exactly
-/// as before. Glyphs Segoe UI lacks are shaped per glyph from the fallback
-/// fonts, as Windows' own font linking does. The stock list sends kana to the
-/// thin "Yu Gothic" and, on a non-Japanese Windows, kanji to the Chinese
-/// "Microsoft YaHei UI", which draws Japanese kanji in Chinese forms.
-struct LauncherFallback;
-
-impl iced::advanced::graphics::text::cosmic_text::Fallback for LauncherFallback {
-    fn common_fallback(&self) -> &[&'static str] {
-        // After the stock Segoe UI family, so Japanese punctuation and symbols
-        // outside a kana/kanji word still land on a Japanese font.
-        const COMMON: &[&str] = &[
-            "Segoe UI",
-            "Segoe UI Emoji",
-            "Segoe UI Symbol",
-            "Segoe UI Historic",
-            "Yu Gothic UI",
-            "Meiryo UI",
-            "Meiryo",
-            "MS UI Gothic",
-        ];
-        COMMON
-    }
-
-    fn forbidden_fallback(&self) -> &[&'static str] {
-        &[]
-    }
-
-    fn script_fallback(&self, script: unicode_script::Script, locale: &str) -> &[&'static str] {
-        use unicode_script::Script;
-        match script {
-            Script::Han | Script::Hiragana | Script::Katakana => JAPANESE_FONTS,
-            _ => iced::advanced::graphics::text::cosmic_text::PlatformFallback.script_fallback(script, locale),
-        }
-    }
-}
-
-/// Installs `LauncherFallback` in iced's shared font system. Call once at
-/// start-up, before the first text is shaped; it keeps the loaded font
-/// database, so the face ids stay the same.
-pub(crate) fn install_font_fallback() {
-    use iced::advanced::graphics::text::{cosmic_text, font_system};
-    let Ok(mut system) = font_system().write() else { return };
-    let raw = system.raw();
-    let placeholder = cosmic_text::FontSystem::new_with_locale_and_db_and_fallback(
-        String::new(),
-        cosmic_text::fontdb::Database::new(),
-        cosmic_text::PlatformFallback,
-    );
-    let (locale, db) = std::mem::replace(raw, placeholder).into_locale_and_db();
-    *raw = cosmic_text::FontSystem::new_with_locale_and_db_and_fallback(locale, db, LauncherFallback);
+    const LANG_JAPANESE: u16 = 0x11;
+    // The low 10 bits of a LANGID are the primary language.
+    let id = unsafe { windows_sys::Win32::Globalization::GetUserDefaultUILanguage() };
+    if id & 0x3ff == LANG_JAPANESE { Lang::Ja } else { Lang::En }
 }
 
 #[cfg(test)]
@@ -254,53 +194,6 @@ mod tests {
         let list: String = missing.iter().map(|(key, at)| format!("\n  {at}: {key:?}")).collect();
         assert!(missing.is_empty(), "{} t()/tf() strings have no Japanese entry:{list}", missing.len());
     }
-
-    /// Shapes mixed text the way the UI does (Segoe UI, regular and semibold)
-    /// with the system's fonts: Latin stays Segoe UI, kana, kanji and Japanese
-    /// punctuation come from Yu Gothic UI at the same weight, never a Chinese
-    /// face. Skipped where Windows has no Japanese UI font installed.
-    #[test]
-    fn japanese_glyphs_fall_back_to_yu_gothic_ui_and_latin_keeps_segoe_ui() {
-        use iced::advanced::graphics::text::cosmic_text::{
-            fontdb, Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Weight,
-        };
-        let mut db = fontdb::Database::new();
-        db.load_system_fonts();
-        let has = |db: &fontdb::Database, family: &str| db.faces().any(|f| f.families.iter().any(|(n, _)| n == family));
-        if !has(&db, "Yu Gothic UI") || !has(&db, "Segoe UI") {
-            eprintln!("skipped: Yu Gothic UI or Segoe UI is not installed");
-            return;
-        }
-        // An English-locale Windows, where the stock fallback picks Chinese faces.
-        let mut fonts = FontSystem::new_with_locale_and_db_and_fallback("en-US".into(), db, LauncherFallback);
-        let sample = "設定 ホーム「言語」、Home";
-        for weight in [Weight::NORMAL, Weight::SEMIBOLD] {
-            let mut buffer = Buffer::new(&mut fonts, Metrics::new(14.0, 18.0));
-            let attrs = Attrs::new().family(Family::Name("Segoe UI")).weight(weight);
-            buffer.set_text(&mut fonts, sample, &attrs, Shaping::Advanced, None);
-            buffer.shape_until_scroll(&mut fonts, false);
-            let mut checked = 0;
-            for run in buffer.layout_runs() {
-                for glyph in run.glyphs {
-                    let piece = &run.text[glyph.start..glyph.end];
-                    if piece.trim().is_empty() {
-                        continue;
-                    }
-                    let face = fonts.db().face(glyph.font_id).unwrap();
-                    let want = if piece.is_ascii() { "Segoe UI" } else { "Yu Gothic UI" };
-                    assert!(
-                        face.families.iter().any(|(n, _)| n == want),
-                        "{piece:?} at {weight:?} drew with {:?}, wanted {want}",
-                        face.families
-                    );
-                    assert_eq!(face.weight, weight, "{piece:?} drew with {:?} {:?}", face.families, face.weight);
-                    checked += 1;
-                }
-            }
-            assert!(checked >= 12);
-        }
-    }
-
     #[test]
     fn scanner_reads_keys_and_skips_comments_and_raw_strings() {
         let source = r####"

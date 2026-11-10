@@ -3,10 +3,6 @@
 use crate::{i18n::{t, tf}, patch::{self, PatchReport, PatchState}, updater};
 use std::{fs, io::{Read, Seek, SeekFrom}, path::{Path, PathBuf}};
 
-// Matches the embedded loader's verified layout in crystal-loader/src/game.rs.
-// Its timestamp, image bounds and native entry checks remain authoritative.
-const SUPPORTED_CORE_TIMESTAMP: u32 = 0x4E4E_5917;
-
 #[derive(Clone, Debug)]
 pub(crate) struct Status {
     pub folder: Option<PathBuf>,
@@ -23,9 +19,7 @@ impl Status {
             "PlayOnline Viewer matches the official version.",
             "A PlayOnline Viewer update is required before a new sign-in. Choose Update.",
             "PlayOnline has not completed its initial update. Press Update to finish it.",
-            "PlayOnline version has not been verified.",
-            "Installed PlayOnline components are too old for Crystal. Press Update to update them.",
-            "This PlayOnline core build is unsupported by Crystal. A compatible Crystal build is required before a new sign-in."];
+            "PlayOnline version has not been verified."];
         for text in [&mut self.version.local_version, &mut self.version.remote_version, &mut self.version.detail]
             .into_iter().chain(self.core_error.iter_mut()) {
             if let Some(shown) = crate::retranslated(text, from, &keys) { *text = shown.into(); }
@@ -103,7 +97,7 @@ pub(crate) fn outdated(known: Option<Status>, local: String, remote: String) -> 
     let (folder, core_error) = known.map_or((None, None), |status| (status.folder, status.core_error));
     Status { folder, core_error, version: PatchReport { state: PatchState::Required, local_version: local, remote_version: remote,
         detail: t("A PlayOnline Viewer update is required before a new sign-in. Choose Update.").into(),
-        files_verified: None, source_url: None } }
+        files_verified: None } }
 }
 
 /// One W2U for one Connect with its attempts and phases (07d §2.2).
@@ -118,7 +112,7 @@ pub(crate) struct ConnectCheck {
 /// Called only off the UI thread, by the session worker answering the loader's
 /// `native_viewer_check`; never at launcher start, on a gate, or from the window (07c §3).
 pub(crate) fn check_at_connect_timed() -> ConnectCheck {
-    match patch::registry_install_folder("1000") {
+    match patch::install_folder(crate::updater::Product::Viewer) {
         Some(folder) => patch::viewer_connect_check_timed(&folder),
         None => ConnectCheck {
             verdict: ConnectVerdict::Failed(t("PlayOnline Viewer is not installed. Run official setup and select PlayOnline Viewer.").into()),
@@ -144,7 +138,7 @@ pub(crate) fn is_network_not_ready_message(message: &str) -> bool {
 /// core compatibility. Never touches the network; the UI and every pre-launch
 /// gate use this (07c §3). The server's verdict arrives only at Connect.
 pub(crate) fn local_status() -> Status {
-    match patch::registry_install_folder("1000") {
+    match patch::install_folder(crate::updater::Product::Viewer) {
         Some(folder) => after_check(folder, None),
         None => Status { folder: None, version: unknown(t("PlayOnline Viewer is not installed. Run official setup and select PlayOnline Viewer.").into()), core_error: None },
     }
@@ -152,11 +146,11 @@ pub(crate) fn local_status() -> Status {
 
 fn unknown(detail: String) -> PatchReport {
     PatchReport { state: PatchState::Unknown, local_version: t("Unavailable").into(),
-        remote_version: t("Not checked").into(), detail, files_verified: None, source_url: None }
+        remote_version: t("Not checked").into(), detail, files_verified: None }
 }
 
 pub(crate) fn unavailable(error: String) -> Status {
-    Status { folder: patch::registry_install_folder("1000"), version: unknown(error.clone()), core_error: Some(error) }
+    Status { folder: patch::install_folder(crate::updater::Product::Viewer), version: unknown(error.clone()), core_error: Some(error) }
 }
 
 /// Read local readiness against the version already checked by the updater
@@ -183,13 +177,11 @@ pub(crate) fn gate(report: &Status) -> Result<(), String> {
     Ok(())
 }
 
+/// The installed core is a readable, plain 32-bit x86 PE file. Its build is
+/// not judged here: the game host checks the loaded core's contract by
+/// structure (crystal-loader pol_core) and names anything that fails.
 fn core_compatibility(folder: &Path) -> Result<(), String> {
-    let timestamp = core_timestamp(&folder.join("viewer/com/polcore.dll"))?;
-    match timestamp.cmp(&SUPPORTED_CORE_TIMESTAMP) {
-        std::cmp::Ordering::Equal => Ok(()),
-        std::cmp::Ordering::Less => Err(t("Installed PlayOnline components are too old for Crystal. Press Update to update them.").into()),
-        std::cmp::Ordering::Greater => Err(t("This PlayOnline core build is unsupported by Crystal. A compatible Crystal build is required before a new sign-in.").into()),
-    }
+    core_timestamp(&folder.join("viewer/com/polcore.dll")).map(|_| ())
 }
 
 fn core_timestamp(path: &Path) -> Result<u32, String> {
@@ -230,20 +222,22 @@ mod tests {
         bytes[64..68].copy_from_slice(b"PE\0\0"); bytes[68..70].copy_from_slice(&0x14cu16.to_le_bytes());
         bytes[72..76].copy_from_slice(&timestamp.to_le_bytes()); bytes
     }
+    /// The 1.18.15e and 1.18.15f cores, and any later build: the launcher
+    /// never refuses a core by its build stamp (the host checks its contract).
+    const LEGACY_CORE: u32 = 0x4E4E_5917;
+    const UPDATED_CORE: u32 = 0x6ABA_1641;
+
     #[test]
-    fn incompatible_missing_and_malformed_cores_cannot_start_a_new_session() {
+    fn any_plain_x86_core_build_may_start_and_missing_or_malformed_ones_cannot() {
         let root = fixture(); fs::create_dir_all(root.join("viewer/com")).unwrap();
         let core = root.join("viewer/com/polcore.dll");
         let mut report = Status { folder: Some(root.clone()), version: unknown("offline".into()), core_error: None };
-        for timestamp in [0x45c83316, SUPPORTED_CORE_TIMESTAMP + 1] {
+        for timestamp in [0x45c83316, LEGACY_CORE, UPDATED_CORE, UPDATED_CORE + 1, u32::MAX] {
             fs::write(&core, core_bytes(timestamp)).unwrap();
             report.core_error = core_compatibility(&root).err();
-            assert!(report.requires_update()); assert!(gate(&report).is_err());
+            assert!(!report.requires_update(), "{timestamp:08X}"); assert!(gate(&report).is_ok());
         }
-        fs::write(&core, core_bytes(SUPPORTED_CORE_TIMESTAMP)).unwrap();
-        report.core_error = core_compatibility(&root).err();
-        assert!(!report.requires_update()); assert!(gate(&report).is_ok());
-        let mut wrong_machine = core_bytes(SUPPORTED_CORE_TIMESTAMP); wrong_machine[68..70].copy_from_slice(&0x8664u16.to_le_bytes());
+        let mut wrong_machine = core_bytes(UPDATED_CORE); wrong_machine[68..70].copy_from_slice(&0x8664u16.to_le_bytes());
         for bytes in [wrong_machine, b"invalid core".to_vec()] {
             fs::write(&core, bytes).unwrap(); assert!(core_compatibility(&root).is_err());
         }
@@ -256,9 +250,9 @@ mod tests {
     #[test]
     fn update_readiness_reuses_the_updaters_remote_verdict() {
         let root = fixture(); fs::create_dir_all(root.join("viewer/com")).unwrap();
-        fs::write(root.join("viewer/com/polcore.dll"), core_bytes(SUPPORTED_CORE_TIMESTAMP)).unwrap();
-        let seed = patch::applied_seed_for(&root, "1000").unwrap();
-        fs::write(root.join("patch.ver"), patch::encode_applied_record_for("20110829_E", seed, "1000").unwrap()).unwrap();
+        fs::write(root.join("viewer/com/polcore.dll"), core_bytes(UPDATED_CORE)).unwrap();
+        let seed = patch::applied_seed_for(&root, crate::updater::Product::Viewer).unwrap();
+        fs::write(root.join("patch.ver"), patch::encode_applied_record_for("20110829_E", seed, crate::updater::Product::Viewer).unwrap()).unwrap();
         let report = after_check(root.clone(), Some("20110829_E"));
         assert_eq!(report.version.state, PatchState::Current); assert!(gate(&report).is_ok());
         let later = after_check(root.clone(), Some("20110830_0"));
@@ -270,9 +264,9 @@ mod tests {
     #[test]
     fn cached_ready_viewer_is_blocked_by_a_new_interrupted_update() {
         let root = fixture(); fs::create_dir_all(root.join("viewer/com")).unwrap();
-        fs::write(root.join("viewer/com/polcore.dll"), core_bytes(SUPPORTED_CORE_TIMESTAMP)).unwrap();
-        let seed = patch::applied_seed_for(&root, "1000").unwrap();
-        fs::write(root.join("patch.ver"), patch::encode_applied_record_for("20110829_E", seed, "1000").unwrap()).unwrap();
+        fs::write(root.join("viewer/com/polcore.dll"), core_bytes(UPDATED_CORE)).unwrap();
+        let seed = patch::applied_seed_for(&root, crate::updater::Product::Viewer).unwrap();
+        fs::write(root.join("patch.ver"), patch::encode_applied_record_for("20110829_E", seed, crate::updater::Product::Viewer).unwrap()).unwrap();
         let report = after_check(root.clone(), Some("20110829_E"));
         assert_eq!(report.version.state, PatchState::Current);
         assert!(gate(&report).is_ok());
@@ -288,9 +282,9 @@ mod tests {
     #[test]
     fn local_readiness_never_opens_a_socket() {
         let root = fixture(); fs::create_dir_all(root.join("viewer/com")).unwrap();
-        fs::write(root.join("viewer/com/polcore.dll"), core_bytes(SUPPORTED_CORE_TIMESTAMP)).unwrap();
-        let seed = patch::applied_seed_for(&root, "1000").unwrap();
-        fs::write(root.join("patch.ver"), patch::encode_applied_record_for("20110829_E", seed, "1000").unwrap()).unwrap();
+        fs::write(root.join("viewer/com/polcore.dll"), core_bytes(UPDATED_CORE)).unwrap();
+        let seed = patch::applied_seed_for(&root, crate::updater::Product::Viewer).unwrap();
+        fs::write(root.join("patch.ver"), patch::encode_applied_record_for("20110829_E", seed, crate::updater::Product::Viewer).unwrap()).unwrap();
         // Counted per thread, so parallel network tests cannot mask an opened socket.
         let opened = crate::stock_socket::OPENED.with(|n| n.get());
         let report = after_check(root.clone(), None);

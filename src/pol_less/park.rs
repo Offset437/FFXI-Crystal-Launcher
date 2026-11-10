@@ -79,7 +79,8 @@ impl ParkKey {
 /// re-park (07d §1.5): the `park` line itself (folders, auto-login, FFXI settings), the
 /// tool settings (folders, profile, boot ini, loader, dgVoodoo, ReShade), the loader's
 /// size and mtime, patch.ver (Viewer and FFXI), polcore.dll, for Windower its settings.xml
-/// (by content), Windower.exe, Hook.dll and plugins\*.dll, and for Ashita its base boot ini.
+/// (by content), Windower.exe, Hook.dll, plugins\*.dll, the primary display mode and
+/// padmode000, and for Ashita its base boot ini.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Fingerprint {
     /// (what, value) in a fixed order; values are digests, sizes or mtimes, never secrets.
@@ -144,6 +145,10 @@ pub(crate) fn fingerprint(config: &Config, plan: &super::Plan) -> Fingerprint {
                     format!("{:?}", files.iter().find(|(file, _)| file == name).and_then(|(_, stamp)| *stamp))));
             }
             parts.push(("Windower plugins", format!("{:?}", files.iter().filter(|(file, _)| file.starts_with("plugins\\")).collect::<Vec<_>>())));
+            // The park line's ffxi_settings also read these (`ffxi_settings::for_windower`): the
+            // desktop size for a profile without one, and every padmode000 field but the fifth.
+            parts.push(("display mode", format!("{:?}", super::ffxi_settings::primary_display_mode())));
+            parts.push(("padmode000", format!("{:?}", super::ffxi_settings::registry_padmode())));
         }
         Tool::Ashita => {
             // The base boot ini each Ashita start copies (pol_less prepare): Ashita's profile.
@@ -209,18 +214,19 @@ pub(crate) struct Parked {
 pub(crate) fn park(config: &Config, plan: &super::Plan, account: &Account, abort: &'static std::sync::atomic::AtomicBool,
     progress: &mut dyn FnMut(&str)) -> Result<Parked, String> {
     let mut timing = Timeline::begin_at(Instant::now());
-    let p = super::prepare_with_progress(config, plan, account, &mut timing, progress)?;
+    let p = super::prepare_with_progress(config, plan, account, &mut timing, progress,
+        &|| abort.load(std::sync::atomic::Ordering::Acquire))?;
     if let Some(line) = crate::dgvoodoo::sync_for_launch(&p.loader, plan.settings.dgvoodoo) {
         progress(&line);
     }
     let profile = ParkKey::for_plan(account, plan).profile;
-    park_prepared(p, &profile, plan.auto_login, timing, progress, &mut super::spawn_injector, &super::TURNS,
+    park_prepared(p, &profile, plan.auto_login, timing, progress, &mut super::spawn_injector, &super::windower_gate,
         super::Timeouts { abort: Some(abort), ..super::TIMEOUTS }, PARKED_LIMIT)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn park_prepared(mut p: Prepared, profile: &str, auto_login: AutoLogin, mut timing: Timeline, progress: &mut dyn FnMut(&str),
-    spawn: &mut super::Spawner<'_>, turns: &'static super::Turns, limits: super::Timeouts, parked_limit: Duration) -> Result<Parked, String> {
+    spawn: &mut super::Spawner<'_>, turns: &super::TurnGate<'_>, limits: super::Timeouts, parked_limit: Duration) -> Result<Parked, String> {
     let started = Instant::now();
     let mut log = super::open_launch_log(&p, &mut timing, Some(&format!("park start: {} {profile}", p.tool.name())))?;
     let log_path = p.session.log.clone();
@@ -321,31 +327,27 @@ impl Parked {
         progress: &mut dyn FnMut(&str), cold: impl FnOnce(Account, Zeroizing<String>, &mut dyn FnMut(&str)) -> Result<LaunchResult, String>) -> Result<LaunchResult, String> {
         // A Play that fails before its credentials go out ends the park like an EOF would.
         let refuse = |parked: Parked, error: String| { parked.kill(); Err(error) };
-        if account.region != 0 {
-            return refuse(self, t("Retail login currently supports the verified US install only. EU and JP protocol region values are not verified yet.").into());
-        }
-        crate::patch::warm_dns();
-        crate::dns::warm(crate::dns::POL_LOGIN_HOST);
         let fallback = (account.clone(), otp.clone());
-        let mut auth = match super::native_auth::NativeAuth::new(&account, otp, config.account_directory(&account)) {
+        let auth = match super::native_auth_for(config, plan, &account, otp) {
             Ok(auth) => auth,
             Err(error) => return refuse(self, error),
         };
-        super::configure(&mut auth, plan);
         drop(account);
         let mut timing = Timeline::begin_at(clicked);
         self.p.trigger = plan.trigger;
         super::clock_lines(&mut self.log, &timing, plan.trigger);
         self.log.line(&format!("parked for {:.1} s", self.since.elapsed().as_secs_f64()));
-        let lost = |parked: Parked, why: &str, progress: &mut dyn FnMut(&str)| {
+        // The fallback is an argument, not a capture: it must be dropped (and zeroized) as soon
+        // as the credentials are out, not when `play` returns.
+        let lost = |parked: Parked, why: &str, progress: &mut dyn FnMut(&str), (account, otp): (Account, Zeroizing<String>)| {
             let mut parked = parked;
             parked.log.line(&format!("parked host lost before Play ({why}); starting cold"));
             parked.kill();
-            cold(fallback.0, fallback.1, progress)
+            cold(account, otp, progress)
         };
         if let Some(why) = self.watch(Duration::ZERO) {
             drop(auth);
-            return lost(self, &why, progress);
+            return lost(self, &why, progress, fallback);
         }
         // dgVoodoo may have been installed since the park (a cold Play syncs at its start):
         // FFXiMain loads d3d8.dll beside the loader only at GameStart, so placing it now counts.
@@ -366,13 +368,14 @@ impl Parked {
         drop(line);
         if sent.is_err() {
             drop(supervision);
-            return lost(self, "the pipe did not take the credentials", progress);
+            return lost(self, "the pipe did not take the credentials", progress, fallback);
         }
+        drop(fallback);
         self.log.line("Credentials sent; launcher copy cleared.");
         self.log.reached(&mut timing, Milestone::CredentialsSent);
         let Parked { p, mut log, host, limits, .. } = self;
         let super::Host { pipe, pid, injector } = host;
-        if p.tool == Tool::Windower {
+        if p.tool == Tool::Windower && p.private_bootstrap.is_none() {
             // Windower.exe exits once the game window shows; keep the profile guard until then.
             // The credentials went out, so the session goes on whatever happens here.
             let now = Instant::now();
@@ -391,35 +394,24 @@ impl Parked {
 /// its PID. Empty for this process (the tests' fake loaders say hello with the test's own PID)
 /// or when it cannot be opened (an elevated Ashita host).
 struct LoaderProcess {
-    #[cfg(windows)]
     handle: Option<std::os::windows::io::OwnedHandle>,
 }
 impl LoaderProcess {
     fn open(pid: u32) -> LoaderProcess {
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::FromRawHandle;
-            use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
-            let raw = if pid == std::process::id() { std::ptr::null_mut() } else { unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) } };
-            LoaderProcess { handle: (!raw.is_null()).then(|| unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw as _) }) }
-        }
-        #[cfg(not(windows))]
-        { let _ = pid; LoaderProcess {} }
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
+        let raw = if pid == std::process::id() { std::ptr::null_mut() } else { unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) } };
+        LoaderProcess { handle: (!raw.is_null()).then(|| unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw as _) }) }
     }
 
     /// TerminateProcess through the handle, unless the host already ended. False without a
     /// handle or when it would not end.
     fn terminate(self) -> bool {
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::{Foundation::WAIT_OBJECT_0, System::Threading::{TerminateProcess, WaitForSingleObject}};
-            let Some(handle) = self.handle else { return false };
-            let raw = handle.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-            unsafe { WaitForSingleObject(raw, 0) == WAIT_OBJECT_0 || TerminateProcess(raw, 1) != 0 }
-        }
-        #[cfg(not(windows))]
-        false
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{Foundation::WAIT_OBJECT_0, System::Threading::{TerminateProcess, WaitForSingleObject}};
+        let Some(handle) = self.handle else { return false };
+        let raw = handle.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        unsafe { WaitForSingleObject(raw, 0) == WAIT_OBJECT_0 || TerminateProcess(raw, 1) != 0 }
     }
 }
 
@@ -443,6 +435,33 @@ pub(crate) trait Worker: Send + 'static {
     fn terminate(&mut self);
     /// It reported `Parked` (polled here or by the pool).
     fn parked(&self) -> bool;
+    /// Wait until it exited, and the host it reported parked too, at most until `deadline`.
+    /// False when either still runs then.
+    fn wait_exit(&mut self, deadline: Instant) -> bool {
+        while !self.exited() {
+            if Instant::now() >= deadline { return false; }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+}
+
+/// How long work that changes the files a parked host holds (an Update, a Repair, setup, a
+/// launcher update) waits for closed workers, a park still starting included, to exit.
+pub(crate) const EXIT_WAIT: Duration = Duration::from_secs(10);
+
+/// `close_workers`, then wait up to `exit_wait` for every worker (and the host each one
+/// parked) to exit: a worker still parking is never terminated, so this is what guarantees no
+/// pol.exe still holds polcore.dll. `Err` when one still runs; the caller writes nothing.
+pub(crate) fn close_workers_and_wait<W: Worker>(mut workers: Vec<W>, exit_wait: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + exit_wait;
+    close_all(&mut workers);
+    let mut running = 0;
+    for worker in &mut workers {
+        if !worker.wait_exit(deadline) { running += 1; }
+    }
+    if running == 0 { return Ok(()); }
+    Err(tf("A parked game host did not close within {seconds} s. No files were changed.", &[("seconds", &exit_wait.as_secs())]))
 }
 
 /// Close parked workers: release them all, wait up to CLOSE_WAIT for them to clean up,
@@ -451,12 +470,16 @@ pub(crate) trait Worker: Send + 'static {
 /// loader (07a: else `Core.Stop(save: true)` rewrites settings.xml). Its stdin ended, so it
 /// aborts at its next step (`ABORTED`) and exits on its own.
 pub(crate) fn close_workers<W: Worker>(mut workers: Vec<W>) {
-    for worker in &mut workers { worker.release(); }
+    close_all(&mut workers);
+}
+
+fn close_all<W: Worker>(workers: &mut [W]) {
+    for worker in workers.iter_mut() { worker.release(); }
     let deadline = Instant::now() + CLOSE_WAIT;
     while workers.iter_mut().any(|worker| !worker.exited()) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
-    for worker in &mut workers {
+    for worker in workers.iter_mut() {
         while worker.poll().is_some() {}
         if worker.parked() && !worker.exited() { worker.terminate(); }
     }
@@ -572,6 +595,15 @@ impl<W: Worker> Pool<W> {
         })
     }
 
+    /// Nothing for the next tend to start or collect: every slot parked, and every wanted
+    /// key parked or blocked (an unsupported loader, or too many failures) at its fingerprint.
+    pub(crate) fn settled<P>(&self, wanted: &[Wanted<P>]) -> bool {
+        self.slots.values().all(|slot| slot.parked)
+            && wanted.iter().all(|want| self.slots.contains_key(&want.key)
+                || self.unsupported.get(&want.key).is_some_and(|at| *at == want.fingerprint)
+                || self.failures.get(&want.key).is_some_and(|(count, at)| *count >= PARK_FAILURE_LIMIT && *at == want.fingerprint))
+    }
+
     pub(crate) fn insert(&mut self, key: ParkKey, row: String, fingerprint: Fingerprint, worker: W) {
         self.wanted_since.remove(&key);
         self.slots.insert(key, Slot { row, fingerprint, worker, parked: false });
@@ -664,11 +696,15 @@ mod tests {
         let loader = root.join("pol.exe");
         std::fs::write(&loader, b"loader").unwrap();
         let config = Config { experiment: root.clone(), repository: root.clone(), game_install: Some(root.join("missing-game")), dat_overlays: Vec::new() };
-        let plan = super::super::Plan { tool: Tool::Windower, social_only: false, invisible_login: false, auto_away_minutes: 10,
-            auto_login: AutoLogin::default(), viewer_gaps: false, trigger: Default::default(),
+        let plan = super::super::Plan { tool: Tool::Windower, social_only: false, auto_away_minutes: 10,
+            auto_login: AutoLogin::default(), keep_session: false, viewer_gaps: false, trigger: Default::default(),
             settings: super::super::ToolSettings { windower: windower.to_string_lossy().into_owned(), loader: loader.to_string_lossy().into_owned(), ..Default::default() } };
         let before = fingerprint(&config, &plan);
         assert_eq!(before, fingerprint(&config, &plan));
+        // Finding: the park line's settings also read the desktop mode and padmode000.
+        let part = |name: &str| before.parts.iter().find(|(n, _)| *n == name).map(|(_, value)| value.clone());
+        assert_eq!(part("display mode"), Some(format!("{:?}", crate::pol_less::ffxi_settings::primary_display_mode())));
+        assert_eq!(part("padmode000"), Some(format!("{:?}", crate::pol_less::ffxi_settings::registry_padmode())));
         std::fs::write(windower.join(r"updates\manifest.xml"), b"v2 updated").unwrap();
         assert!(before.changed(&fingerprint(&config, &plan)).is_empty(), "update records only change at a start");
         // Windower's exit save rewrites settings.xml as it read it (new mtime, maybe new
@@ -724,7 +760,9 @@ mod tests {
     #[derive(Default)]
     struct Fake { notes: Vec<Note>, released: Arc<Mutex<Vec<String>>>, name: String, done: bool,
         /// Ignores its released stdin for now (a worker still in `park`, or a hung one).
-        busy: bool, parked: bool, terminated: bool }
+        busy: bool, parked: bool, terminated: bool,
+        /// A busy worker that aborts and exits on its own at this time.
+        exits_at: Option<Instant> }
     impl Worker for Fake {
         fn poll(&mut self) -> Option<Note> {
             let note = (!self.notes.is_empty()).then(|| self.notes.remove(0));
@@ -732,9 +770,26 @@ mod tests {
             note
         }
         fn release(&mut self) { self.released.lock().unwrap().push(self.name.clone()); self.done = !self.busy; }
-        fn exited(&mut self) -> bool { self.done }
+        fn exited(&mut self) -> bool { self.done || self.exits_at.is_some_and(|at| Instant::now() >= at) }
         fn terminate(&mut self) { self.done = true; self.terminated = true; }
         fn parked(&self) -> bool { self.parked }
+    }
+
+    /// Audit 2026-11-09: an Update must not write while a park still starting holds polcore.dll.
+    /// The close waits for such a worker to exit on its own (never terminating it), and says
+    /// so when it does not within the limit.
+    #[test]
+    fn closing_before_files_change_waits_for_parks_still_starting() {
+        let soon = Fake { name: "parking, aborts".into(), busy: true, exits_at: Some(Instant::now() + CLOSE_WAIT + Duration::from_millis(300)), ..Fake::default() };
+        let started = Instant::now();
+        assert!(close_workers_and_wait(vec![soon, Fake { name: "parked".into(), parked: true, ..Fake::default() }], EXIT_WAIT).is_ok());
+        assert!(started.elapsed() >= CLOSE_WAIT + Duration::from_millis(300), "it waited for the parking worker");
+        assert!(started.elapsed() < EXIT_WAIT);
+        let started = Instant::now();
+        let error = close_workers_and_wait(vec![Fake { name: "parking, hung".into(), busy: true, ..Fake::default() }], CLOSE_WAIT + Duration::from_millis(200)).unwrap_err();
+        assert!(started.elapsed() >= CLOSE_WAIT + Duration::from_millis(200) && started.elapsed() < EXIT_WAIT);
+        assert!(error.contains("did not close") && error.contains("No files were changed"), "{error}");
+        assert!(close_workers_and_wait(Vec::<Fake>::new(), EXIT_WAIT).is_ok());
     }
 
     /// Finding: closing a park still starting must never TerminateProcess its worker, which
@@ -767,6 +822,25 @@ mod tests {
             fingerprint: Fingerprint { parts: vec![("settings.xml", print.into())] }, payload: () }
     }
 
+    /// The window's idle Tick may go quiet only once every wanted park is parked (or blocked).
+    #[test]
+    fn a_pool_is_settled_once_every_wanted_key_is_parked_or_blocked() {
+        let mut pool: Pool<Fake> = Pool::default();
+        let a = want("a", "1");
+        assert!(pool.settled::<()>(&[]), "nothing wanted");
+        assert!(!pool.settled(std::slice::from_ref(&a)), "wanted, not started");
+        let parked = Note::Parked(ParkedInfo { loader_pid: 1, tool_pid: None, polcore_ms: None, hello_ms: 0 });
+        pool.insert(a.key.clone(), "a".into(), a.fingerprint.clone(), Fake { notes: vec![parked], ..Fake::default() });
+        assert!(!pool.settled(std::slice::from_ref(&a)), "still parking");
+        pool.poll();
+        assert!(pool.settled(std::slice::from_ref(&a)));
+        // A key past its failure limit at this fingerprint waits for a change: settled too.
+        let b = want("b", "1");
+        pool.failures.insert(b.key.clone(), (PARK_FAILURE_LIMIT, b.fingerprint.clone()));
+        assert!(pool.settled(&[a, b]));
+        assert!(!pool.settled(&[want("a", "1"), want("b", "2")]), "a new fingerprint parks again");
+    }
+
     #[test]
     fn play_rejects_changed_or_unsettled_settings_before_periodic_retirement() {
         let root = std::env::temp_dir().join(format!("crystal-park-adopt-{}", crate::backend::unique_id().unwrap()));
@@ -783,8 +857,8 @@ mod tests {
         let menu = root.join("iced-launcher/menu-playonlineus.json");
         std::fs::create_dir_all(menu.parent().unwrap()).unwrap();
         let config = Config { experiment: root.clone(), repository: root.clone(), game_install: Some(root.join("game-a")), dat_overlays: Vec::new() };
-        let plan = super::super::Plan { tool: Tool::Windower, social_only: false, invisible_login: false, auto_away_minutes: 10,
-            auto_login: AutoLogin::default(), viewer_gaps: false, trigger: Default::default(),
+        let plan = super::super::Plan { tool: Tool::Windower, social_only: false, auto_away_minutes: 10,
+            auto_login: AutoLogin::default(), keep_session: false, viewer_gaps: false, trigger: Default::default(),
             settings: super::super::ToolSettings { windower: windower.to_string_lossy().into_owned(), loader: loader.to_string_lossy().into_owned(), ..Default::default() } };
 
         for change in ["game folder", "settings.xml", "menu size", "unsettled XML", "unsettled menu"] {

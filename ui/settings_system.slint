@@ -1,0 +1,592 @@
+// Settings → System: launcher updates, controller
+// navigation, sign-in, background mode, launch tools, Open with the game, the loader's feature
+// check, the Windows components and the ownership notice. Every size follows the layout scale.
+import { Theme } from "theme.slint";
+import { SettingsView, Shade, Program, ComponentCard } from "settings_state.slint";
+import { Glyph, Icon, Control, IconButton, Field, Select, Toggle, Chip, Bar, QuietButton, Note } from "widgets.slint";
+import { Card, Divider, CardTitle, SwitchNotes, ActButton } from "settings_kit.slint";
+
+/// A heading with its muted line under it (the launch tools, Open with the game).
+component CardHead inherits VerticalLayout {
+    in property <string> title;
+    in property <string> sub;
+    spacing: 6px * Theme.scale;
+    CardTitle { text: root.title; }
+    if root.sub != "": Text { text: root.sub; font-size: Theme.type-detail * Theme.scale; color: Theme.sub; wrap: word-wrap; }
+}
+
+/// launch_tools::labelled: a 170 px label column (with an optional Found chip) beside the body.
+component Labelled inherits HorizontalLayout {
+    in property <string> label;
+    in property <bool> has-chip;
+    in property <bool> found;
+    spacing: 16px * Theme.scale;
+    VerticalLayout {
+        width: 170px * Theme.scale;
+        spacing: 6px * Theme.scale;
+        alignment: start;
+        // At least a control's height and centred in it, so the label sits on its control's line.
+        Text { min-height: Theme.control-h * Theme.scale; text: root.label; font-size: Theme.type-body * Theme.scale; font-weight: 600; color: Theme.ink; vertical-alignment: center; wrap: word-wrap; }
+        if root.has-chip: HorizontalLayout {
+            alignment: start;
+            Chip {
+                scale: Theme.scale;
+                text: root.found ? SettingsView.strings.found : SettingsView.strings.not-found;
+                tone: SettingsView.shade(root.found ? Shade.ok : Shade.warn);
+            }
+        }
+    }
+    VerticalLayout {
+        horizontal-stretch: 1;
+        spacing: 6px * Theme.scale;
+        alignment: start;
+        @children
+    }
+}
+
+/// One launch tool's folder or file: the field with Browse, then where it was found or what to do.
+component ToolField inherits Labelled {
+    in property <string> name;
+    in property <bool> is-found;
+    in property <string> placeholder;
+    in property <bool> editable;
+    in property <string> caption;
+    in property <bool> caption-path;
+    in-out property <string> text;
+    callback edited(string);
+    callback browse();
+    label: root.name;
+    has-chip: true;
+    found: root.is-found;
+    HorizontalLayout {
+        spacing: 8px * Theme.scale;
+        Field {
+            height: Theme.control-h * Theme.scale;
+            font-size: Theme.type-body * Theme.scale;
+            pad-x: 11px * Theme.scale;
+            label: root.name;
+            placeholder: root.placeholder;
+            text <=> root.text;
+            enabled: root.editable;
+            edited(value) => { root.edited(value); }
+        }
+        IconButton {
+            side: Theme.control-h * Theme.scale;
+            glyph-size: 15px * Theme.scale;
+            label: root.name;
+            glyph: Glyph.folder;
+            bordered: true;
+            clicked => { root.browse(); }
+        }
+    }
+    if root.caption-path: Text { text: root.caption; font-family: Theme.mono; font-size: Theme.type-caption * Theme.scale; color: Theme.sub; wrap: word-wrap; }
+    if !root.caption-path: Text { text: root.caption; font-size: Theme.type-caption * Theme.scale; color: SettingsView.shade(Shade.warn); wrap: word-wrap; }
+}
+
+/// One program of Open with the game: its path (with Browse) and arguments; Enabled and Remove.
+component ProgramRow inherits HorizontalLayout {
+    in property <int> index;
+    in property <Program> program;
+    // A model update re-shows the stored value (a typed field keeps its own text otherwise).
+    changed program => {
+        if path-field.text != root.program.path { path-field.text = root.program.path; }
+        if args-field.text != root.program.args { args-field.text = root.program.args; }
+    }
+    spacing: 16px * Theme.scale;
+    VerticalLayout {
+        horizontal-stretch: 1;
+        spacing: 8px * Theme.scale;
+        HorizontalLayout {
+            spacing: 8px * Theme.scale;
+            path-field := Field {
+                height: Theme.control-h * Theme.scale;
+                font-size: Theme.type-body * Theme.scale;
+                pad-x: 11px * Theme.scale;
+                label: SettingsView.strings.program-path;
+                placeholder: SettingsView.strings.program-path;
+                text: root.program.path;
+                enabled: SettingsView.programs-editable;
+                edited(value) => { SettingsView.program-path(root.index, value); }
+            }
+            IconButton {
+                side: Theme.control-h * Theme.scale;
+                glyph-size: 15px * Theme.scale;
+                label: SettingsView.strings.program-path;
+                glyph: Glyph.folder;
+                bordered: true;
+                clicked => { SettingsView.program-browse(root.index); }
+            }
+        }
+        args-field := Field {
+            height: Theme.control-h * Theme.scale;
+            font-size: Theme.type-body * Theme.scale;
+            pad-x: 11px * Theme.scale;
+            label: SettingsView.strings.arguments;
+            placeholder: SettingsView.strings.arguments;
+            text: root.program.args;
+            enabled: SettingsView.programs-editable;
+            edited(value) => { SettingsView.program-args(root.index, value); }
+        }
+    }
+    VerticalLayout {
+        spacing: 8px * Theme.scale;
+        alignment: start;
+        Toggle {
+            horizontal-stretch: 0;
+            text: SettingsView.strings.enabled;
+            on: root.program.enabled;
+            toggled(on) => { SettingsView.program-enabled(root.index, on); }
+        }
+        Control {
+            scale: Theme.scale;
+            text: SettingsView.strings.remove;
+            glyph: Glyph.trash;
+            clicked => { SettingsView.program-remove(root.index); }
+        }
+    }
+}
+
+/// The 38 px status badge at the start of a component card.
+component Badge inherits Rectangle {
+    in property <Glyph> glyph;
+    in property <color> tone;
+    width: 38px * Theme.scale;
+    height: 38px * Theme.scale;
+    border-radius: self.width / 2;
+    background: root.tone.with-alpha(0.12);
+    border-width: 1px;
+    border-color: root.tone.with-alpha(0.28);
+    Icon { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; glyph: root.glyph; size: 19px * Theme.scale; tint: root.tone; }
+}
+
+/// One Windows component (prereqs::component_card).
+component ComponentView inherits Card {
+    in property <int> index;
+    in property <ComponentCard> card;
+    private property <float> s: Theme.scale;
+    gap: 16px * root.s;
+    HorizontalLayout {
+        spacing: 16px * root.s;
+        Badge { cross-axis-self-alignment: center; glyph: root.card.glyph; tone: SettingsView.shade(root.card.shade); }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 5px * root.s;
+            alignment: center;
+            HorizontalLayout {
+                spacing: 10px * root.s;
+                alignment: start;
+                Text { text: root.card.name; font-size: Theme.type-heading * root.s; font-weight: 600; color: Theme.ink; vertical-alignment: center; }
+                Chip { cross-axis-self-alignment: center; scale: root.s; text: root.card.label; tone: SettingsView.shade(root.card.shade); }
+                if root.card.version != "": Text {
+                    text: root.card.version;
+                    font-family: Theme.mono;
+                    font-size: Theme.type-caption * root.s;
+                    color: Theme.sub;
+                    vertical-alignment: center;
+                }
+            }
+            Text { text: root.card.why; font-size: Theme.type-small * root.s; color: Theme.sub; wrap: word-wrap; }
+            if root.card.checked != "": Text { text: root.card.checked; font-size: Theme.type-fine * root.s; color: Theme.sub.with-alpha(0.8); wrap: word-wrap; }
+        }
+        if root.card.has-button: ActButton {
+            cross-axis-self-alignment: center;
+            act: root.card.button;
+            clicked => { SettingsView.component-button(root.index); }
+        }
+    }
+    if root.card.confirm: Divider { }
+    if root.card.confirm: VerticalLayout {
+        spacing: 12px * root.s;
+        Text { text: root.card.heading; font-size: Theme.type-body * root.s; font-weight: 600; color: Theme.ink; wrap: word-wrap; }
+        VerticalLayout {
+            spacing: 6px * root.s;
+            for step in root.card.steps: HorizontalLayout {
+                spacing: 8px * root.s;
+                Text { text: "•"; font-size: Theme.type-small * root.s; color: Theme.sub; horizontal-stretch: 0; }
+                Text { text: step; font-size: Theme.type-small * root.s; color: Theme.ink; wrap: word-wrap; horizontal-stretch: 1; }
+            }
+        }
+        VerticalLayout {
+            spacing: 6px * root.s;
+            Text { text: SettingsView.strings.will-run; font-size: Theme.type-caption * root.s; color: Theme.sub; }
+            Rectangle {
+                background: Theme.field;
+                border-width: 1px;
+                border-color: Theme.line;
+                border-radius: Theme.radius-inner;
+                HorizontalLayout {
+                    padding-top: 8px * root.s;
+                    padding-bottom: 8px * root.s;
+                    padding-left: 12px * root.s;
+                    padding-right: 12px * root.s;
+                    Text { text: root.card.command; font-family: Theme.mono; font-size: Theme.type-caption * root.s; color: Theme.ink; wrap: word-wrap; }
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: 10px * root.s;
+            Text { text: root.card.permission; font-size: Theme.type-caption * root.s; color: Theme.sub; wrap: word-wrap; vertical-alignment: center; horizontal-stretch: 1; }
+            ActButton { act: root.card.not-now; clicked => { SettingsView.component-not-now(root.index); } }
+            ActButton { act: root.card.confirm-act; clicked => { SettingsView.component-confirm(root.index); } }
+        }
+    }
+    if root.card.progress: Divider { }
+    if root.card.progress: VerticalLayout {
+        spacing: 10px * root.s;
+        HorizontalLayout {
+            spacing: 12px * root.s;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 3px * root.s;
+                alignment: center;
+                Text { text: root.card.head; font-size: Theme.type-body * root.s; color: Theme.ink; wrap: word-wrap; }
+                Text { text: root.card.detail; font-size: Theme.type-caption * root.s; color: Theme.sub; wrap: word-wrap; }
+            }
+            if root.card.can-cancel: ActButton {
+                cross-axis-self-alignment: center;
+                act: root.card.cancel;
+                clicked => { SettingsView.component-cancel(root.index); }
+            }
+        }
+        Bar {
+            girth: 6px * root.s;
+            track: Theme.select;
+            fraction: root.card.fraction;
+            indeterminate: root.card.fraction < 0;
+        }
+    }
+    if root.card.has-result: HorizontalLayout {
+        spacing: 10px * root.s;
+        VerticalLayout {
+            padding-top: 2px * root.s;
+            alignment: start;
+            Icon { glyph: root.card.result-glyph; size: 14px * root.s; tint: SettingsView.shade(root.card.result-shade); }
+        }
+        Text { text: root.card.result; font-size: Theme.type-small * root.s; color: Theme.ink; wrap: word-wrap; horizontal-stretch: 1; }
+    }
+    if root.card.has-manual: VerticalLayout {
+        spacing: 10px * root.s;
+        // The toggle's words and the steps start at the card's content edge.
+        HorizontalLayout {
+            alignment: start;
+            QuietButton {
+                text: SettingsView.strings.manual-toggle;
+                glyph: Glyph.chevron-down;
+                trailing: true;
+                pad-x: 0px;
+                pad-y: 4px * root.s;
+                clicked => { SettingsView.components-manual(); }
+            }
+        }
+        if root.card.manual-open: VerticalLayout {
+            spacing: 6px * root.s;
+            for step[n] in root.card.manual-steps: HorizontalLayout {
+                spacing: 6px * root.s;
+                Text { width: 18px * root.s; text: (n + 1) + "."; font-size: Theme.type-small * root.s; font-weight: 600; color: Theme.accent; }
+                Text { text: step; font-size: Theme.type-small * root.s; color: Theme.ink; wrap: word-wrap; horizontal-stretch: 1; }
+            }
+        }
+        if root.card.manual-open: HorizontalLayout {
+            alignment: start;
+            Control { scale: root.s; text: SettingsView.strings.open-features; glyph: Glyph.external-link; clicked => { SettingsView.components-features(); } }
+        }
+    }
+}
+
+/// A launch tool's dropdown: the well fill and TYPE_BODY, at the layout scale.
+component ToolSelect inherits Select {
+    scale: Theme.scale;
+    fill: Theme.well;
+    font-size: Theme.type-body * Theme.scale;
+}
+
+export component SystemTab inherits VerticalLayout {
+    private property <float> s: Theme.scale;
+    spacing: 16px * root.s;
+
+    // Launcher updates.
+    Card {
+        HorizontalLayout {
+            Text { text: SettingsView.strings.updates-title; font-size: Theme.type-heading * root.s; font-weight: 600; color: Theme.ink; horizontal-stretch: 1; }
+            Text { text: SettingsView.version; font-size: Theme.type-small * root.s; color: Theme.sub; }
+        }
+        HorizontalLayout {
+            spacing: 16px * root.s;
+            Text { text: SettingsView.system.updates-status; font-size: Theme.type-small * root.s; color: Theme.sub; wrap: word-wrap; vertical-alignment: center; horizontal-stretch: 1; }
+            if SettingsView.system.updates-action != "": Control {
+                scale: root.s;
+                text: SettingsView.system.updates-action;
+                clicked => { SettingsView.update-action(); }
+            }
+        }
+        SwitchNotes {
+            text: SettingsView.strings.updates-auto;
+            on: SettingsView.system.updates-auto;
+            note-1: SettingsView.strings.updates-note;
+            toggled(on) => { SettingsView.update-auto(on); }
+        }
+    }
+
+    // Controller navigation.
+    Card {
+        SwitchNotes {
+            text: SettingsView.strings.nav-label;
+            on: SettingsView.system.nav;
+            note-1: SettingsView.strings.nav-note-1;
+            note-2: SettingsView.strings.nav-note-2;
+            toggled(on) => { SettingsView.set-nav(on); }
+        }
+    }
+
+    // Sign-in.
+    Card {
+        gap: 16px * root.s;
+        SwitchNotes {
+            text: SettingsView.strings.sign-in-label;
+            on: SettingsView.system.sign-in;
+            note-1: SettingsView.strings.sign-in-note;
+            toggled(on) => { SettingsView.set-sign-in(on); }
+        }
+        SwitchNotes {
+            text: SettingsView.strings.keep-label;
+            on: SettingsView.system.keep;
+            note-1: SettingsView.strings.keep-note;
+            toggled(on) => { SettingsView.set-keep(on); }
+        }
+    }
+
+    // Background mode.
+    Card {
+        gap: 16px * root.s;
+        SwitchNotes {
+            text: SettingsView.strings.start-label;
+            on: SettingsView.system.start;
+            enabled: SettingsView.system.start-enabled;
+            toggled(on) => { SettingsView.set-start(on); }
+        }
+        SwitchNotes {
+            text: SettingsView.strings.tray-label;
+            on: SettingsView.system.tray;
+            note-1: SettingsView.strings.tray-note;
+            toggled(on) => { SettingsView.set-tray(on); }
+        }
+    }
+
+    // Launch tools.
+    Card {
+        gap: 14px * root.s;
+        HorizontalLayout {
+            spacing: 16px * root.s;
+            CardHead { horizontal-stretch: 1; title: SettingsView.strings.tools-title; sub: SettingsView.strings.tools-sub; }
+            Control {
+                cross-axis-self-alignment: center;
+                scale: root.s;
+                text: SettingsView.strings.detect-again;
+                glyph: Glyph.refresh;
+                clicked => { SettingsView.tools-detect(); }
+            }
+        }
+        Divider { }
+        Labelled {
+            label: SettingsView.strings.default-launcher;
+            ToolSelect {
+                label: SettingsView.strings.default-launcher;
+                items: SettingsView.launchers;
+                current: SettingsView.tools.default-current;
+                picked(index) => { SettingsView.tools-default(index); }
+            }
+            Note { scale: root.s; text: SettingsView.strings.default-note; }
+        }
+        Divider { }
+        ToolField {
+            name: SettingsView.tools.ashita.name;
+            is-found: SettingsView.tools.ashita.found;
+            placeholder: SettingsView.tools.ashita.placeholder;
+            editable: SettingsView.tools.ashita.editable;
+            caption: SettingsView.tools.ashita.caption;
+            caption-path: SettingsView.tools.ashita.caption-path;
+            text <=> SettingsView.ashita-path;
+            edited(value) => { SettingsView.tools-path(0, value); }
+            browse => { SettingsView.tools-browse(0); }
+        }
+        Labelled {
+            label: SettingsView.strings.boot-label;
+            ToolSelect {
+                label: SettingsView.strings.boot-label;
+                items: SettingsView.boot-items;
+                current: SettingsView.tools.boot-current;
+                placeholder: SettingsView.strings.boot-placeholder;
+                picked(index) => { SettingsView.tools-boot(index); }
+            }
+            Note { scale: root.s; text: SettingsView.tools.boot-note; }
+        }
+        Divider { }
+        ToolField {
+            name: SettingsView.tools.windower.name;
+            is-found: SettingsView.tools.windower.found;
+            placeholder: SettingsView.tools.windower.placeholder;
+            editable: SettingsView.tools.windower.editable;
+            caption: SettingsView.tools.windower.caption;
+            caption-path: SettingsView.tools.windower.caption-path;
+            text <=> SettingsView.windower-path;
+            edited(value) => { SettingsView.tools-path(1, value); }
+            browse => { SettingsView.tools-browse(1); }
+        }
+        Labelled {
+            label: SettingsView.strings.profile-label;
+            ToolSelect {
+                label: SettingsView.strings.profile-label;
+                items: SettingsView.profile-items;
+                current: SettingsView.tools.profile-current;
+                placeholder: SettingsView.strings.profile-placeholder;
+                picked(index) => { SettingsView.tools-profile(index); }
+            }
+            HorizontalLayout {
+                alignment: start;
+                Control {
+                    scale: root.s;
+                    text: SettingsView.strings.edit-profiles;
+                    glyph: Glyph.edit;
+                    enabled: SettingsView.tools.edit-enabled;
+                    clicked => { SettingsView.edit-profiles(); }
+                }
+            }
+            Note { scale: root.s; text: SettingsView.strings.profile-note; }
+        }
+        Divider { }
+        ToolField {
+            name: SettingsView.tools.loader.name;
+            is-found: SettingsView.tools.loader.found;
+            placeholder: SettingsView.tools.loader.placeholder;
+            editable: SettingsView.tools.loader.editable;
+            caption: SettingsView.tools.loader.caption;
+            caption-path: SettingsView.tools.loader.caption-path;
+            text <=> SettingsView.loader-path;
+            edited(value) => { SettingsView.tools-path(2, value); }
+            browse => { SettingsView.tools-browse(2); }
+        }
+        Rectangle {
+            background: Theme.accent.with-alpha(0.06);
+            border-width: 1px;
+            border-color: Theme.accent.with-alpha(0.22);
+            border-radius: Theme.radius-inner;
+            HorizontalLayout {
+                padding-top: 8px * root.s;
+                padding-bottom: 8px * root.s;
+                padding-left: 12px * root.s;
+                padding-right: 12px * root.s;
+                Note { scale: root.s; text: SettingsView.strings.admin-note; }
+            }
+        }
+    }
+
+    // Open with the game.
+    Card {
+        gap: 14px * root.s;
+        CardHead { title: SettingsView.strings.owg-title; sub: SettingsView.strings.owg-sub; }
+        for program[i] in SettingsView.programs: VerticalLayout {
+            spacing: 14px * root.s;
+            Divider { }
+            ProgramRow { index: i; program: program; }
+        }
+        HorizontalLayout {
+            alignment: start;
+            Control { scale: root.s; text: SettingsView.strings.add-program; glyph: Glyph.plus; clicked => { SettingsView.program-add(); } }
+        }
+    }
+
+    // Game compatibility.
+    Card {
+        gap: 10px * root.s;
+        CardTitle { text: SettingsView.strings.compat-title; }
+        VerticalLayout {
+            spacing: 8px * root.s;
+            if !SettingsView.compat.has: Text { text: SettingsView.strings.compat-none; font-size: Theme.type-detail * root.s; color: Theme.sub; wrap: word-wrap; }
+            if SettingsView.compat.has: HorizontalLayout {
+                spacing: 12px * root.s;
+                Text { text: SettingsView.compat.builds; font-size: Theme.type-detail * root.s; color: Theme.sub; wrap: word-wrap; vertical-alignment: center; horizontal-stretch: 1; }
+                Chip {
+                    cross-axis-self-alignment: center;
+                    scale: root.s;
+                    text: SettingsView.compat.chip;
+                    tone: SettingsView.shade(SettingsView.compat.ok ? Shade.ok : Shade.warn);
+                }
+            }
+            for off in SettingsView.features-off: VerticalLayout {
+                spacing: 2px * root.s;
+                Text { text: off.name; font-size: Theme.type-small * root.s; font-weight: 600; color: Theme.ink; wrap: word-wrap; }
+                Text { text: off.reason; font-size: Theme.type-caption * root.s; color: Theme.sub; wrap: word-wrap; }
+            }
+        }
+    }
+
+    // Windows components.
+    VerticalLayout {
+        spacing: 16px * root.s;
+        Card {
+            gap: 14px * root.s;
+            HorizontalLayout {
+                spacing: 16px * root.s;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 6px * root.s;
+                    CardTitle { text: SettingsView.strings.components-title; }
+                    HorizontalLayout {
+                        spacing: 8px * root.s;
+                        alignment: start;
+                        Icon {
+                            cross-axis-self-alignment: center;
+                            glyph: SettingsView.components.glyph;
+                            size: 15px * root.s;
+                            tint: SettingsView.shade(SettingsView.components.shade);
+                        }
+                        Text {
+                            text: SettingsView.components.summary;
+                            font-size: Theme.type-small * root.s;
+                            color: SettingsView.shade(SettingsView.components.shade);
+                            vertical-alignment: center;
+                        }
+                        if SettingsView.components.when != "": Text {
+                            text: "·  " + SettingsView.components.when;
+                            font-size: Theme.type-small * root.s;
+                            color: Theme.sub;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                Control {
+                    cross-axis-self-alignment: center;
+                    scale: root.s;
+                    text: SettingsView.strings.check-again;
+                    glyph: Glyph.refresh;
+                    enabled: SettingsView.components.check-enabled;
+                    clicked => { SettingsView.components-check(); }
+                }
+            }
+            Divider { }
+            HorizontalLayout {
+                spacing: 10px * root.s;
+                VerticalLayout {
+                    padding-top: 2px * root.s;
+                    alignment: start;
+                    Icon { glyph: Glyph.help; size: 14px * root.s; tint: Theme.sub; }
+                }
+                Text { text: SettingsView.strings.components-intro; font-size: Theme.type-detail * root.s; color: Theme.sub; wrap: word-wrap; horizontal-stretch: 1; }
+            }
+        }
+        for card[i] in SettingsView.component-cards: ComponentView { index: i; card: card; }
+    }
+
+    // Ownership notice.
+    VerticalLayout {
+        padding-top: 12px * root.s;
+        padding-bottom: 12px * root.s;
+        spacing: 8px * root.s;
+        Text { text: SettingsView.strings.about-name; font-size: Theme.type-heading * root.s; color: Theme.ink; }
+        Note { scale: root.s; text: SettingsView.strings.about-version; }
+        Note { scale: root.s; text: SettingsView.strings.about-1; }
+        Note { scale: root.s; text: SettingsView.strings.about-3; }
+        Note { scale: root.s; text: SettingsView.strings.about-4; }
+        Note { scale: root.s; text: SettingsView.strings.about-2; }
+    }
+}

@@ -4,136 +4,92 @@
 //! A result is sent only after a later frame observes the new values and the
 //! recreation flag cleared. No external memory writes or synthetic keys.
 
-use std::{ffi::c_void, sync::{mpsc, Mutex}, thread, time::{Duration, Instant}};
+use std::{sync::{mpsc, Mutex}, thread, time::{Duration, Instant}};
 use windows_sys::Win32::{
     Foundation::HWND,
-    Security::Cryptography::{BCryptHash, BCRYPT_SHA256_ALG_HANDLE},
-    System::{Diagnostics::Debug::ReadProcessMemory, SystemInformation::GetTickCount64,
-        Threading::{GetCurrentProcess, GetCurrentThreadId}},
-    UI::WindowsAndMessaging::{GetClassNameW, GetWindowThreadProcessId, IsWindow},
+    System::{SystemInformation::GetTickCount64,
+        Threading::GetCurrentThreadId},
 };
-use crate::{ffxi_settings::{FfxiSettings, SettingValue}, game_layout::Resolution, log};
+use crate::{ffxi_settings::{FfxiSettings, SettingValue}, game_layout::{controls::{self, CONFIG_MEMBER, CONFIG_READY, CONFIG_SIZE, CONTROLLER_CODE, DELIMITERS, SLOT_MAP}, Controller, Resolution}, log, sigscan::Pattern};
 
 const LIMIT: Duration = Duration::from_secs(4);
 const UNAVAILABLE: &str = "Live controller settings are unavailable for this game session; saved changes apply after restarting it.";
 const EXPIRED: &str = "The controller update could not be confirmed before the request expired; saved changes apply after restarting the game.";
 const EXITED: &str = "The game closed before the controller update could be confirmed.";
-const RELOAD: usize = 0x2840;
-const SUSPEND: usize = 0x5600;
-const CONFIG: usize = 0x3D3CB8;
-const KEYBOARD: usize = 0x455C20;
-const FLAGS: usize = 0x455C34;
-const BINDINGS: usize = 0x455B20;
-const GUID: usize = 0x455B10;
-const CONFIG_TOOL: usize = 0x662DBC;
+// game_layout's controller group finds every function, global, table and
+// vtable below by signature (any client build). Reload takes (this, initial:
+// u32) and returns with ret 4; suspend takes (keyboard, suspended: u32), also
+// ret 4. The native WndProc calls reload with false; config launch/finish
+// call suspend. The entire parsers and pad recreation branch are re-checked
+// live before each use, not just their prologues: their global addresses and
+// field offsets are used below.
 
-// Exact bodies and parser tables in the two independently dumped clients. Relocation operands
-// are restored to the preferred base before hashing, so ASLR is supported.
-// Reload 2840 takes (this, initial: u32) and returns with ret 4. Suspend 5600
-// takes (keyboard, suspended: u32), also ret 4. The native WndProc uses reload
-// with false at 16D32; config launch/finish use suspend at 1BCE13/1BCE8E.
-// Keep the entire parsers and pad recreation branch in the check, not just
-// their prologues: their global addresses and field offsets are used below.
-const CODE: &[(usize, usize, &[usize])] = &[
-    (0x2840, 0x2D5, &[0x28, 0x46, 0x66, 0x7A, 0x89, 0xAC, 0xC5, 0xD3, 0xE2, 0xF8, 0x106, 0x131, 0x142, 0x150, 0x167, 0x175, 0x183, 0x191, 0x196, 0x19C, 0x1AD, 0x1B2, 0x1CF, 0x24C, 0x27B, 0x2B3, 0x2BD]),
-    (0x5130, 0x355, &[0x27, 0x33, 0x47, 0x4C, 0x62, 0x81, 0x86, 0x8C, 0x92, 0x98, 0xA4, 0xA9, 0xAF, 0xB6, 0xE9, 0xF0, 0x105, 0x10C, 0x114, 0x11C, 0x14C, 0x154, 0x170, 0x18A, 0x190, 0x1B8, 0x1CB, 0x1D5, 0x1E0, 0x219, 0x21E, 0x224, 0x22E, 0x241, 0x246, 0x25A, 0x25F, 0x276, 0x2BD, 0x2C4, 0x2D9, 0x2E0, 0x318, 0x32C, 0x332, 0x33B, 0x346]),
-    (0x5490, 0x1C4, &[0x4, 0xA, 0x10, 0x19, 0x2D, 0x35, 0x3D, 0x45, 0x4D, 0x77, 0xA0, 0xC6, 0xD3, 0xE1, 0xEB, 0xF2, 0xF8, 0xFF, 0x11C, 0x135, 0x13F, 0x149, 0x151, 0x159, 0x179, 0x184, 0x18A, 0x18F, 0x195, 0x1A1, 0x1A7, 0x1AC, 0x1BD]),
-    (0x60EB, 0x78, &[0x1, 0x1A, 0x29, 0x35, 0x5D, 0x6E]),
-    (0x83D0, 0x3A0, &[0x1, 0x30, 0x3C, 0x58, 0x7A, 0x12F, 0x14F, 0x16F, 0x2A6, 0x2B9, 0x2BE, 0x2D2, 0x2E2, 0x31E, 0x37A]),
-    (0x8D90, 0x104, &[0x1, 0x19, 0x36, 0x3F, 0x47, 0x51, 0x5B, 0x64, 0x71, 0x81, 0x92, 0x99, 0xA2, 0xA7, 0xAF, 0xB4, 0xB9, 0xC2, 0xC7, 0xCD, 0xD4, 0xE1, 0xEA, 0xF5, 0xFB]),
-    (0x18FC0, 0x40, &[0x25]),
-    (0x19060, 0x7A, &[0x35, 0x60]),
-    (0x1286A, 0x16, &[0x2, 0xD]),
-    (0x1BCC30, 0x65, &[0x2, 0xC, 0x3B, 0x5D]),
-    (0x1BCE07, 0x11, &[0x2]),
-    (0x1BCE30, 0x78, &[0x14, 0x2C, 0x47, 0x4F, 0x59]),
-    (0x34F930, 0x84, &[]), // source-slot map, including its terminating -1
-    (0x34F9EC, 0x3, &[]), // strtok delimiters
-    (0x34F47C, 0xB, &[]), // padmode000
-    (0x34F424, 0xA, &[]), // padsin000
-    (0x34F3D0, 0xC, &[]), // padexsin000
-    (0x34F374, 0xB, &[]), // padguid000
-];
-const OLD_HASH: &str = "cb153e02eb44290e529b4e50a6f4ff7e492391ceaadd688517539d4fd2b86abb";
-const CURRENT_HASH: &str = "7141598351ddfb55a56c88d7b7fd5355a73db76b122ce9b5eb5fe0c990101ab2";
+use crate::mem::{read, read_into as read_bytes};
 
-fn read<T: Copy>(address: usize) -> Option<T> {
-    let mut value = std::mem::MaybeUninit::<T>::uninit();
-    let mut count = 0;
-    let size = std::mem::size_of::<T>();
-    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), address as *const c_void,
-        value.as_mut_ptr().cast(), size, &mut count) };
-    (ok != 0 && count == size).then(|| unsafe { value.assume_init() })
-}
+fn pointer(address: usize) -> Option<usize> { crate::mem::pointer(address, 0x10000) }
 
-fn read_bytes(address: usize, bytes: &mut [u8]) -> bool {
-    let mut count = 0;
-    // Windows rejects stale/unmapped objects; Rust never dereferences them.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), address as *const c_void,
-        bytes.as_mut_ptr().cast(), bytes.len(), &mut count) != 0 && count == bytes.len() }
-}
-
-fn pointer(address: usize) -> Option<usize> {
-    read::<u32>(address).map(|value| value as usize)
-        .filter(|value| *value >= 0x10000 && *value <= usize::MAX - 0x10000 && value % 4 == 0)
-}
-
-fn code_hash(base: usize, mut read: impl FnMut(usize, &mut [u8]) -> bool) -> Option<String> {
-    let mut joined = Vec::new();
-    for &(rva, length, relocations) in CODE {
-        let mut bytes = vec![0u8; length];
-        if !read(rva, &mut bytes) { return None; }
-        for &offset in relocations {
-            let actual = u32::from_le_bytes(bytes[offset..offset + 4].try_into().ok()?) as usize;
-            let target = actual.checked_sub(base).filter(|rva| *rva < 0xC15000)?;
-            bytes[offset..offset + 4].copy_from_slice(&(0x10000000u32 + target as u32).to_le_bytes());
-        }
-        joined.extend_from_slice(&bytes);
+/// Re-reads every scanned controller site through `read` (RVA reads of the
+/// module at `base`): each locator's signature, the operands this module
+/// relies on relocated to `base`, the call targets, and the parser tables.
+fn code_valid(base: usize, c: &Controller, mut read: impl FnMut(usize, &mut [u8]) -> bool) -> bool {
+    let mut code = Vec::new();
+    for (name, &rva) in CONTROLLER_CODE.iter().zip(&c.code) {
+        let Some(pattern) = controls::pattern(name).and_then(Pattern::parse) else { return false; };
+        let mut bytes = vec![0u8; pattern.len()];
+        if !read(rva, &mut bytes) || !pattern.matches(&bytes, 0) { return false; }
+        code.push(bytes);
     }
-    let mut digest = [0u8; 32];
-    let result = unsafe { BCryptHash(BCRYPT_SHA256_ALG_HANDLE, std::ptr::null(), 0,
-        joined.as_ptr(), joined.len() as u32, digest.as_mut_ptr(), digest.len() as u32) };
-    (result == 0).then(|| digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    let [reload, slots, mode, _, _, _, _, _, _, tool_finish, factory, ready, _, tool_frame, tool_suspend] = &code[..] else { return false; };
+    let operand = |bytes: &[u8], at: usize, rva: usize| crate::sigscan::operand_at(base, bytes, at, rva);
+    let call = |bytes: &[u8], at: usize, site: usize, target: usize| crate::auto_login::call_lands(bytes, site, at, target);
+    let (finish_rva, ready_rva, suspend_rva) = (c.code[9], c.code[11], c.code[14]);
+    // The two parser tables the binding parser's operands point at.
+    let target = |bytes: &[u8], at: usize| bytes.get(at..at + 4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes)
+        .and_then(|va| (va as usize).checked_sub(base));
+    let mut map = [0u8; SLOT_MAP.len() * 4];
+    let mut delimiters = [0u8; 3];
+    let tables = target(slots, 0x4C).is_some_and(|rva| read(rva, &mut map))
+        && target(slots, 0x27).is_some_and(|rva| read(rva, &mut delimiters))
+        && map.chunks(4).zip(SLOT_MAP).all(|(bytes, want)| bytes == want.to_le_bytes())
+        && delimiters[..2] == *DELIMITERS && delimiters[2] == 0;
+    tables
+        && operand(reload, 0x66, c.keyboard) && operand(reload, 0xC5, c.flags) && operand(slots, 0x33, c.bindings)
+        && operand(mode, 0x11C, c.guid) && operand(tool_frame, 2, c.config_tool) && operand(factory, 0x1B, c.config)
+        && operand(tool_suspend, 2, c.keyboard)
+        && call(tool_finish, 0x5E, finish_rva, c.suspend) && call(ready, 0xC, ready_rva, c.reload)
+        && call(tool_suspend, 0xC, suspend_rva, c.suspend)
 }
 
 #[derive(Clone, Copy)]
-struct Layout { base: usize, window: usize }
+struct Layout { base: usize, window: usize, controller: Controller }
 impl Layout {
-    fn resolve(resolution: &Resolution) -> Result<Self, &'static str> {
-        if resolution.size != 0xC15000
-            || resolution.input.as_ref().map(|keys| keys.keyboard).ok() != Some(KEYBOARD) {
-            return Err(UNAVAILABLE);
-        }
-        let window = resolution.menus.as_ref().map_err(|_| UNAVAILABLE)?.window;
-        let layout = Self { base: resolution.base, window };
-        layout.verify().then_some(layout).ok_or(UNAVAILABLE)
+    /// The scanned groups this needs, then a live re-check. Every refusal
+    /// names its reason (logged by the caller); the user sees UNAVAILABLE.
+    fn resolve(resolution: &Resolution) -> Result<Self, String> {
+        let group = |what: &str, reason: &String| format!("{what} unavailable: {reason}");
+        let controller = *resolution.controller.as_ref().map_err(|e| group("controller code", e))?;
+        let window = resolution.menus.as_ref().map_err(|e| group("login menus (game window)", e))?.window;
+        let layout = Self { base: resolution.base, window, controller };
+        layout.verify().then_some(layout).ok_or_else(|| "the scanned controller code differs in live memory".to_string())
     }
 
     fn verify(self) -> bool {
-        matches!(code_hash(self.base, |rva, out| read_bytes(self.base + rva, out)).as_deref(),
-            Some(OLD_HASH | CURRENT_HASH))
+        code_valid(self.base, &self.controller, |rva, out| read_bytes(self.base + rva, out))
     }
 
     fn context(self, data: *mut u8) -> Option<Context> {
-        let keyboard = pointer(self.base + KEYBOARD)?;
-        if keyboard.checked_add(crate::auto_login::KEYBOARD_BUFFER) != Some(data as usize) { return None; }
+        let keyboard = crate::auto_login::frame_keyboard(self.base, self.controller.keyboard, data)?;
         let window = read::<u32>(self.base + self.window)? as usize as HWND;
-        let mut pid = 0;
-        let mut class = [0u16; 32];
-        let owned = unsafe { !window.is_null() && IsWindow(window) != 0
-            && GetWindowThreadProcessId(window, &mut pid) == GetCurrentThreadId()
-            && pid == std::process::id()
-            && GetClassNameW(window, class.as_mut_ptr(), class.len() as i32) == 9
-            && class[..9] == [70, 70, 88, 105, 67, 108, 97, 115, 115] };
-        owned.then_some(Context { keyboard, window: window as usize })
+        crate::auto_login::owned_window(window, unsafe { GetCurrentThreadId() })
+            .then_some(Context { keyboard, window: window as usize })
     }
 
-    fn flags(self) -> Option<[u8; 15]> { read(self.base + FLAGS) }
+    fn flags(self) -> Option<[u8; 15]> { read(self.base + self.controller.flags) }
 
     fn applied(self, expected: &Expected) -> bool {
         let Some(flags) = self.flags() else { return false; };
-        let Some(bindings) = read::<[i8; 32]>(self.base + BINDINGS) else { return false; };
-        let Some(guid) = read::<[u8; 16]>(self.base + GUID) else { return false; };
+        let Some(bindings) = read::<[i8; 32]>(self.base + self.controller.bindings) else { return false; };
+        let Some(guid) = read::<[u8; 16]>(self.base + self.controller.guid) else { return false; };
         expected.matches(&flags, &bindings, &guid)
     }
 }
@@ -146,7 +102,7 @@ struct Expected { mode: [u8; 6], bindings: Vec<i8>, guid: Option<[u8; 16]> }
 impl Expected {
     fn parse(settings: &FfxiSettings) -> Result<Self, &'static str> {
         const INVALID: &str = "The live request contains invalid controller settings.";
-        if settings.names().any(|name| !["padmode000", "padsin000", "padguid000"].iter().any(|key| name.eq_ignore_ascii_case(key))) {
+        if settings.names().any(|name| !crate::ffxi_settings::is_controller_key(name)) {
             return Err(INVALID);
         }
         let text = |name| match settings.get(name) { Some(SettingValue::Text(value)) if value.is_ascii() && value.len() < 256 => Ok(value.as_str()), _ => Err(INVALID) };
@@ -283,17 +239,18 @@ fn apply(layout: Layout, context: Context, request: &Request) -> Result<(), &'st
     let flags = layout.flags().ok_or(UNAVAILABLE)?;
     // The config UI sets +4 before launching its asynchronous worker, which
     // suspends input later. Checking only the suspended flag would race it.
-    let stock_config = pointer(layout.base + CONFIG_TOOL).and_then(|object| read::<u8>(object + 4)).ok_or(UNAVAILABLE)?;
+    let stock_config = pointer(layout.base + layout.controller.config_tool).and_then(|object| read::<u8>(object + 4)).ok_or(UNAVAILABLE)?;
     transition(&flags, &request.expected, stock_config)?;
-    let config = pointer(layout.base + CONFIG).ok_or(UNAVAILABLE)?;
+    let config = pointer(layout.base + layout.controller.config).ok_or(UNAVAILABLE)?;
     // Exact constructor/registry ownership and object extents. The keyboard
     // pointer is also the currently executing frame's +298 buffer owner.
-    if read::<u32>(config) != Some((layout.base + 0x3295FC) as u32)
-        || read::<u32>(config + 0x8C) != Some((layout.base + 0x32A064) as u32)
-        || read::<u32>(config + 0x94) != Some(1)
-        || read::<[u8; 0xB4]>(config).is_none()
+    let c = layout.controller;
+    if read::<u32>(config) != Some((layout.base + c.config_vtable) as u32)
+        || read::<u32>(config + CONFIG_MEMBER) != Some((layout.base + c.member_vtable) as u32)
+        || read::<u32>(config + CONFIG_READY) != Some(1)
+        || read::<[u8; CONFIG_SIZE]>(config).is_none()
         || read::<[u8; 0xDC4]>(context.keyboard).is_none()
-        || pointer(layout.base + KEYBOARD) != Some(context.keyboard) {
+        || pointer(layout.base + c.keyboard) != Some(context.keyboard) {
         return Err(UNAVAILABLE);
     }
     let key = read::<u32>(config + 0x90).filter(|key| *key != 0).ok_or(UNAVAILABLE)? as usize;
@@ -307,8 +264,8 @@ fn apply(layout: Layout, context: Context, request: &Request) -> Result<(), &'st
         // Exact bodies/ret 4 ABIs are checked immediately above. These are
         // the game's own official config calls on the current input thread.
         unsafe {
-            let suspend: Method = std::mem::transmute(layout.base + SUSPEND);
-            let reload: Method = std::mem::transmute(layout.base + RELOAD);
+            let suspend: Method = std::mem::transmute(layout.base + c.suspend);
+            let reload: Method = std::mem::transmute(layout.base + c.reload);
             suspend(context.keyboard, 1);
             reload(config, 0);
             suspend(context.keyboard, 0);
@@ -340,13 +297,19 @@ impl Worker {
                 let Some(resolution) = crate::game_layout::ffximain() else { continue; };
                 if !crate::ffxi_settings::controller_ready() { continue; }
                 let prepared = Layout::resolve(resolution).and_then(|layout| {
-                    crate::auto_login::input_hook(resolution).map(|hook| (layout, hook)).map_err(|_| UNAVAILABLE)
+                    crate::auto_login::input_hook(resolution).map(|hook| (layout, hook))
+                        .map_err(|reason| format!("game input could not be prepared: {reason}"))
                 });
                 let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(state) = guard.as_mut() else { break; };
                 match prepared {
                     Ok((layout, lease)) => { state.layout = Some(layout); hook = Some(lease); result(0, Ok(())); }
-                    Err(error) => { state.unsupported = true; state.cancel(error); result(0, Err(error)); log!("controller settings: {error}"); }
+                    Err(reason) => {
+                        state.unsupported = true;
+                        state.cancel(UNAVAILABLE);
+                        result(0, Err(UNAVAILABLE));
+                        log!("note: live controller settings unavailable: {reason}");
+                    }
                 }
             }
             drop(hook);
@@ -450,7 +413,7 @@ mod tests {
         let request = Request::new(2, config, 1500, now, 1000).unwrap();
         assert!(request.expired(now, 1500), "elapsed IPC time is not a new four-second lease");
         assert_eq!(request.expires, now + Duration::from_millis(500));
-        let layout = Layout { base: 0, window: 0 };
+        let layout = Layout { base: 0, window: 0, controller: crate::game_layout::BUILD_6AC37846.controller };
         let request = Request { deadline_ms: 0, ..request };
         assert_eq!(apply(layout, Context { keyboard: 0, window: 0 }, &request), Err(EXPIRED),
             "an expired request returns before any game read, registry mutation or native call");
@@ -458,26 +421,29 @@ mod tests {
 
     #[test]
     #[ignore = "reads the two local unpacked FFXiMain images; no game launch"]
-    fn controller_bodies_match_both_clients_rebases_and_reject_changed_code() {
+    fn controller_code_matches_both_clients_and_rejects_changed_code() {
         let Some(root) = std::env::var_os("CRYSTAL_FFXIMAIN_DUMPS").map(std::path::PathBuf::from) else { return; };
-        for (name, expected) in [("6A995428", OLD_HASH), ("6AC37846", CURRENT_HASH)] {
+        for (name, known) in [("6A995428", &crate::game_layout::BUILD_6A995428), ("6AC37846", &crate::game_layout::BUILD_6AC37846)] {
             let bytes = std::fs::read(root.join(format!("FFXiMain-{name}.img"))).unwrap();
-            for base in [0x10000000usize, 0x18000000] {
-                let mut moved = bytes.clone();
-                for &(rva, _, relocations) in CODE {
-                    for &offset in relocations {
-                        let at = rva + offset;
-                        let value = u32::from_le_bytes(moved[at..at+4].try_into().unwrap()).wrapping_add((base - 0x10000000) as u32);
-                        moved[at..at+4].copy_from_slice(&value.to_le_bytes());
-                    }
+            let c = known.controller;
+            let check = |image: &[u8], base: usize| code_valid(base, &c, |rva, out| {
+                let Some(source) = image.get(rva..rva + out.len()) else { return false; };
+                out.copy_from_slice(source);
+                true
+            });
+            // The dump is relocated for its preferred base.
+            assert!(check(&bytes, 0x1000_0000), "{name}");
+            assert!(!check(&bytes, 0x1800_0000), "{name}: operands are relocated for another base");
+            for (what, at) in [("suspend's ret 4", c.suspend + 0x51), ("a reload stack displacement", c.reload + 2),
+                ("the slot map", c.code[1] + 0x4C)] {
+                let mut changed = bytes.clone();
+                if what == "the slot map" {
+                    let map = u32::from_le_bytes(changed[at..at + 4].try_into().unwrap()) as usize - 0x1000_0000;
+                    changed[map] ^= 1;
+                } else {
+                    changed[at] ^= 1;
                 }
-                let hash = |image: &[u8]| code_hash(base, |rva, out| {
-                    let Some(source) = image.get(rva..rva+out.len()) else { return false; };
-                    out.copy_from_slice(source); true
-                });
-                assert_eq!(hash(&moved).as_deref(), Some(expected), "{name} at {base:x}");
-                moved[SUSPEND + 0x51] ^= 1;
-                assert_ne!(hash(&moved).as_deref(), Some(expected), "changed native return ABI is refused");
+                assert!(!check(&changed, 0x1000_0000), "{name}: changed {what} is refused");
             }
         }
     }

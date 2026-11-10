@@ -74,15 +74,15 @@ impl Component {
 pub(crate) enum Status {
     /// Present. `version` is a short display string when one is known.
     Installed { version: Option<String> },
-    /// Not present (or incomplete); `detail` says what is missing.
-    Missing { detail: String },
+    /// Not present (or incomplete); the finding's evidence says what is missing.
+    Missing,
     /// Windows reports the change but needs a restart to finish it.
     RestartPending,
 }
 
 impl Status {
     pub(crate) fn is_missing(&self) -> bool {
-        matches!(self, Status::Missing { .. })
+        matches!(self, Status::Missing)
     }
 }
 
@@ -109,8 +109,6 @@ pub(crate) enum Evidence {
     VcFilesOnly,
     /// Neither the VC++ installer record nor its files.
     VcNothing,
-    #[cfg_attr(windows, allow(dead_code))] // Built only off Windows.
-    NotApplicable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,7 +145,6 @@ impl Evidence {
             }
             Evidence::VcFilesOnly => t("Runtime files present in SysWOW64 (no installer record)").into(),
             Evidence::VcNothing => t("No x86 runtime installer record; runtime files not in SysWOW64").into(),
-            Evidence::NotApplicable => t("Not applicable on this OS").into(),
         }
     }
 }
@@ -218,29 +215,26 @@ pub(crate) fn decide_directplay(
         return if files_ok && selection != Some(0) {
             Finding { status: Status::Installed { version: None }, evidence }
         } else {
-            Finding { status: Status::Missing { detail: "Turned off in Windows Features".into() }, evidence }
+            Finding { status: Status::Missing, evidence }
         };
     }
     let installed = states.iter().any(|s| matches!(*s, CBS_INSTALLED | CBS_PERMANENT));
-    let pending = states
-        .iter()
-        .any(|s| matches!(*s, CBS_INSTALL_PENDING | CBS_PARTIALLY_INSTALLED | CBS_UNINSTALL_PENDING));
-    if pending {
-        return Finding { status: Status::RestartPending, evidence: evidence(FeatureState::Pending) };
-    }
-    if installed && files_ok {
-        Finding { status: Status::Installed { version: None }, evidence: evidence(FeatureState::On) }
+    let install_pending = states.iter().any(|s| matches!(*s, CBS_INSTALL_PENDING | CBS_PARTIALLY_INSTALLED));
+    let uninstall_pending = states.contains(&CBS_UNINSTALL_PENDING);
+    // An active package wins over a newer one a cumulative update has staged for the reboot.
+    let (status, state) = if installed && files_ok {
+        (Status::Installed { version: None }, FeatureState::On)
+    } else if install_pending {
+        (Status::RestartPending, FeatureState::Pending)
     } else if installed {
-        Finding {
-            status: Status::Missing { detail: format!("Feature is on but {} is missing", missing_files.join(", ")) },
-            evidence: evidence(FeatureState::On),
-        }
+        (Status::Missing, FeatureState::On)
+    } else if uninstall_pending {
+        // Being turned off: nothing to finish setting up.
+        (Status::Missing, FeatureState::Pending)
     } else {
-        Finding {
-            status: Status::Missing { detail: "Turned off in Windows Features".into() },
-            evidence: evidence(FeatureState::Off),
-        }
-    }
+        (Status::Missing, FeatureState::Off)
+    };
+    Finding { status, evidence: evidence(state) }
 }
 
 /// DirectX June 2010 from the SysWOW64 files (name, file version if present).
@@ -255,7 +249,7 @@ pub(crate) fn decide_directx(files: &[(&str, Option<String>)]) -> Finding {
         }
     } else {
         Finding {
-            status: Status::Missing { detail: format!("{} not found", missing.join(", ")) },
+            status: Status::Missing,
             evidence: Evidence::FilesMissing(missing.iter().map(|n| n.to_string()).collect()),
         }
     }
@@ -291,20 +285,19 @@ pub(crate) fn decide_vc(installed: Option<u32>, version: Option<&str>, files: &[
     }
     if installed == Some(1) {
         return Finding {
-            status: Status::Missing { detail: format!("Installed record found but {} is missing", missing.join(", ")) },
+            status: Status::Missing,
             evidence: Evidence::FilesMissing(missing.iter().map(|n| n.to_string()).collect()),
         };
     }
     if missing.is_empty() {
         return Finding { status: Status::Installed { version: file_version }, evidence: Evidence::VcFilesOnly };
     }
-    Finding { status: Status::Missing { detail: "Not installed".into() }, evidence: Evidence::VcNothing }
+    Finding { status: Status::Missing, evidence: Evidence::VcNothing }
 }
 
-// ---- machine reads (Windows only) ------------------------------------------
+// ---- machine reads ------------------------------------------------------------
 
 /// Runs every check. Blocking; call from a worker thread.
-#[cfg(windows)]
 pub(crate) fn detect() -> Report {
     let wow = sys::syswow64();
     let directplay_files: Vec<(&str, bool)> =
@@ -328,31 +321,13 @@ pub(crate) fn detect() -> Report {
     Report { findings: [directplay, directx, vc] }
 }
 
-#[cfg(not(windows))]
-pub(crate) fn detect() -> Report {
-    let na = || Finding { status: Status::Installed { version: None }, evidence: Evidence::NotApplicable };
-    Report { findings: [na(), na(), na()] }
-}
-
-#[cfg(windows)]
 pub(crate) mod sys {
+    use crate::win::reg::{Key, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, RRF_RT_REG_SZ};
+    use crate::win::{wide, wide_os};
     use std::path::{Path, PathBuf};
-    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
     };
-    use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
-        KEY_WOW64_64KEY, REG_DWORD, REG_SZ,
-    };
-
-    pub(crate) fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-    pub(crate) fn wide_os(s: &std::ffi::OsStr) -> Vec<u16> {
-        use std::os::windows::ffi::OsStrExt;
-        s.encode_wide().chain(std::iter::once(0)).collect()
-    }
 
     pub(crate) fn windows_dir() -> PathBuf {
         std::env::var_os("SystemRoot")
@@ -404,50 +379,14 @@ pub(crate) mod sys {
         }
     }
 
-    struct Key(HKEY);
-    impl Drop for Key {
-        fn drop(&mut self) {
-            unsafe {
-                RegCloseKey(self.0);
-            }
-        }
-    }
     fn open(path: &str) -> Option<Key> {
-        let path = wide(path);
-        let mut key: HKEY = std::ptr::null_mut();
-        let status = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.as_ptr(), 0, KEY_READ | KEY_WOW64_64KEY, &mut key) };
-        (status == ERROR_SUCCESS).then_some(Key(key))
-    }
-    fn query_dword(key: &Key, value: &str) -> Option<u32> {
-        let value = wide(value);
-        let mut kind = 0u32;
-        let mut data = 0u32;
-        let mut len = 4u32;
-        let status = unsafe {
-            RegQueryValueExW(key.0, value.as_ptr(), std::ptr::null(), &mut kind, (&mut data as *mut u32).cast(), &mut len)
-        };
-        (status == ERROR_SUCCESS && kind == REG_DWORD && len == 4).then_some(data)
+        Key::open(HKEY_LOCAL_MACHINE, path, KEY_READ | KEY_WOW64_64KEY).ok()
     }
     pub(crate) fn reg_dword(path: &str, value: &str) -> Option<u32> {
-        query_dword(&open(path)?, value)
+        open(path)?.dword(value)
     }
     pub(crate) fn reg_string(path: &str, value: &str) -> Option<String> {
-        let key = open(path)?;
-        let value = wide(value);
-        let mut kind = 0u32;
-        let mut buf = vec![0u16; 256];
-        let mut len = (buf.len() * 2) as u32;
-        let status = unsafe {
-            RegQueryValueExW(key.0, value.as_ptr(), std::ptr::null(), &mut kind, buf.as_mut_ptr().cast(), &mut len)
-        };
-        if status != ERROR_SUCCESS || kind != REG_SZ {
-            return None;
-        }
-        buf.truncate(len as usize / 2);
-        while buf.last() == Some(&0) {
-            buf.pop();
-        }
-        Some(String::from_utf16_lossy(&buf))
+        open(path)?.string(value, RRF_RT_REG_SZ, 256).map(|units| String::from_utf16_lossy(&units))
     }
 
     /// Every CBS package whose name starts with `prefix`, with its
@@ -458,64 +397,15 @@ pub(crate) mod sys {
             return Vec::new();
         };
         let prefix = prefix.to_ascii_lowercase();
-        let mut found = Vec::new();
-        let mut index = 0u32;
-        loop {
-            let mut name = [0u16; 512];
-            let mut len = name.len() as u32;
-            let status = unsafe {
-                RegEnumKeyExW(
-                    root.0,
-                    index,
-                    name.as_mut_ptr(),
-                    &mut len,
-                    std::ptr::null(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            };
-            index += 1;
-            if status != ERROR_SUCCESS {
-                // ERROR_NO_MORE_ITEMS ends the walk; a too-long name is skipped.
-                if status == windows_sys::Win32::Foundation::ERROR_MORE_DATA {
-                    continue;
-                }
-                break;
-            }
-            let name = String::from_utf16_lossy(&name[..len as usize]);
-            if !name.to_ascii_lowercase().starts_with(&prefix) {
-                continue;
-            }
-            if let Some(state) = reg_dword(&format!(r"{ROOT}\{name}"), "CurrentState") {
-                found.push((name, state));
-            }
-        }
-        found
-    }
-
-    /// Whether this process runs with an elevated token.
-    pub(crate) fn is_elevated() -> bool {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
-        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-        unsafe {
-            let mut token = std::ptr::null_mut();
-            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-                return false;
-            }
-            let mut elevation: TOKEN_ELEVATION = std::mem::zeroed();
-            let mut returned = 0;
-            let ok = GetTokenInformation(
-                token,
-                TokenElevation,
-                &mut elevation as *mut _ as _,
-                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-                &mut returned,
-            );
-            CloseHandle(token);
-            ok != 0 && elevation.TokenIsElevated != 0
-        }
+        // A too-long name is skipped; ERROR_NO_MORE_ITEMS ends the walk.
+        root.subkeys(u32::MAX)
+            .into_iter()
+            .filter(|name| name.to_ascii_lowercase().starts_with(&prefix))
+            .filter_map(|name| {
+                let state = reg_dword(&format!(r"{ROOT}\{name}"), "CurrentState")?;
+                Some((name, state))
+            })
+            .collect()
     }
 }
 
@@ -553,14 +443,30 @@ mod tests {
         assert_eq!(decide_directplay(&p, Some(1), &ALL_FILES).status, Status::RestartPending);
     }
 
+    /// A cumulative update stages the next DirectPlay package at Install Pending beside the
+    /// active one; that is not a restart FFXI needs. Turning it off is no "finish setting up".
+    #[test]
+    fn directplay_active_package_wins_over_a_staged_one_and_uninstall_is_not_setup() {
+        let p = pkgs(&[
+            ("Microsoft-Windows-DirectPlay-OC-WOW64-Package~x~amd64~~10.0.1", 0x70),
+            ("Microsoft-Windows-DirectPlay-OC-WOW64-Package~x~amd64~~10.0.2", 0x60),
+        ]);
+        assert_eq!(decide_directplay(&p, Some(1), &ALL_FILES).status, Status::Installed { version: None });
+        let files = [("dpnhpast.dll", false), ("dplayx.dll", true), ("dpnet.dll", true)];
+        assert_eq!(decide_directplay(&p, Some(1), &files).status, Status::RestartPending);
+        let off = pkgs(&[("Microsoft-Windows-DirectPlay-OC-WOW64-Package~x~amd64~~10.0.1", 0x05)]);
+        let finding = decide_directplay(&off, Some(0), &ALL_FILES);
+        assert_eq!(finding.status, Status::Missing);
+        assert!(matches!(finding.evidence, Evidence::Feature { state: FeatureState::Pending, .. }));
+    }
+
     #[test]
     fn directplay_on_but_file_missing() {
         let p = pkgs(&[("Microsoft-Windows-DirectPlay-OC-WOW64-Package~x~amd64~~10.0.1", 0x70)]);
         let files = [("dpnhpast.dll", false), ("dplayx.dll", true), ("dpnet.dll", true)];
-        match decide_directplay(&p, Some(1), &files).status {
-            Status::Missing { detail } => assert!(detail.contains("dpnhpast.dll")),
-            other => panic!("{other:?}"),
-        }
+        let finding = decide_directplay(&p, Some(1), &files);
+        assert_eq!(finding.status, Status::Missing);
+        assert_eq!(finding.evidence, Evidence::Feature { state: FeatureState::On, missing: vec!["dpnhpast.dll".into()] });
     }
 
     #[test]
@@ -583,10 +489,9 @@ mod tests {
         assert_eq!(shown_version(Component::DirectX9, "9.26.1590.0"), "9.26.1590.0");
         assert_eq!(shown_version(Component::VcRedist, "9.29.952.1"), "9.29.952.1");
         let partial = [("d3dx9_43.dll", Some("9.29.952.3111".to_owned())), ("xinput1_3.dll", None)];
-        match decide_directx(&partial).status {
-            Status::Missing { detail } => assert_eq!(detail, "xinput1_3.dll not found"),
-            other => panic!("{other:?}"),
-        }
+        let finding = decide_directx(&partial);
+        assert_eq!(finding.status, Status::Missing);
+        assert_eq!(finding.evidence, Evidence::FilesMissing(vec!["xinput1_3.dll".into()]));
     }
 
     #[test]
@@ -646,15 +551,5 @@ mod tests {
             )
         );
         crate::i18n::set(crate::i18n::Lang::En);
-    }
-
-    /// Live, read-only detection on this machine (`cargo test prereqs -- --ignored --nocapture`).
-    #[test]
-    #[ignore]
-    fn live_detection() {
-        let report = detect();
-        for c in Component::ALL {
-            println!("{}: {:?} — {}", c.name(), report.get(c).status, report.get(c).evidence.text());
-        }
     }
 }

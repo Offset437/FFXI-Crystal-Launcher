@@ -29,6 +29,15 @@ RequestExecutionLevel user
 SetCompressor zlib
 AllowSkipFiles off
 BrandingText "Crystal Launcher"
+; Version information on Setup itself (APP_VERSION is x.y.z; Windows wants four parts).
+VIProductVersion "${APP_VERSION}.0"
+VIFileVersion "${APP_VERSION}.0"
+VIAddVersionKey /LANG=0 "ProductName" "Crystal Launcher"
+VIAddVersionKey /LANG=0 "CompanyName" "Crystal Launcher project"
+VIAddVersionKey /LANG=0 "FileDescription" "Crystal Launcher Setup"
+VIAddVersionKey /LANG=0 "FileVersion" "${APP_VERSION}"
+VIAddVersionKey /LANG=0 "ProductVersion" "${APP_VERSION}"
+VIAddVersionKey /LANG=0 "LegalCopyright" "GPL-3.0-only. FINAL FANTASY XI and PlayOnline are trademarks of Square Enix."
 Icon "${__FILEDIR__}\..\assets\crystal.ico"
 UninstallIcon "${__FILEDIR__}\..\assets\crystal.ico"
 
@@ -46,6 +55,7 @@ UninstallIcon "${__FILEDIR__}\..\assets\crystal.ico"
 
 Var StageDir
 Var CreatedDestination
+Var CreatedHostDirectory
 Var Transaction
 Var BackupFiles
 Var InstalledFiles
@@ -69,7 +79,7 @@ Var RegistryInstalled
 Var RollbackFailed
 Var SetupMutex
 
-; Only these six package files are ever replaced or removed. A failed rename
+; Only these seven package files are ever replaced or removed. A failed rename
 ; leaves the original in place; a later failure restores the exact saved file.
 !macro BackupFile NAME BIT
   System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\${NAME}") i.r0 ?e'
@@ -119,6 +129,8 @@ Var SetupMutex
 !macroend
 
 !macro DeletePackage DIRECTORY
+  Delete "${DIRECTORY}\crystal\pol.exe"
+  RMDir "${DIRECTORY}\crystal"
   Delete "${DIRECTORY}\Crystal-Launcher.exe"
   Delete "${DIRECTORY}\README.md"
   Delete "${DIRECTORY}\LICENSE"
@@ -259,6 +271,7 @@ Function RollbackInstall
   ${If} $DesktopShortcutNew != ""
     Delete "$DesktopShortcutNew"
   ${EndIf}
+  !insertmacro RestoreFile "crystal\pol.exe" 64
   !insertmacro RestoreFile "Uninstall.exe" 32
   !insertmacro RestoreFile "THIRD_PARTY_LICENSES.txt" 16
   !insertmacro RestoreFile "THIRD_PARTY.md" 8
@@ -269,8 +282,12 @@ Function RollbackInstall
   ${If} $StageDir != ""
     SetOutPath "$TEMP"
     !insertmacro DeletePackage "$StageDir\new"
+    RMDir "$StageDir\previous\crystal"
     RMDir "$StageDir\previous"
     RMDir "$StageDir"
+  ${EndIf}
+  ${If} $CreatedHostDirectory == 1
+    RMDir "$INSTDIR\crystal"
   ${EndIf}
   ${If} $CreatedDestination == 1
     RMDir "$INSTDIR"
@@ -357,6 +374,7 @@ Section "Crystal Launcher"
   StrCpy $DesktopShortcutBackedUp 0
   StrCpy $DesktopShortcutInstalled 0
   StrCpy $CreatedDestination 0
+  StrCpy $CreatedHostDirectory 0
   System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR") i.r0'
   ${If} $0 == -1
     StrCpy $CreatedDestination 1
@@ -364,14 +382,32 @@ Section "Crystal Launcher"
   ClearErrors
   CreateDirectory "$INSTDIR"
   IfErrors install_failed
+  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\crystal") i.r0 ?e'
+  Pop $1
+  ${If} $0 == -1
+    ${If} $1 != 2
+    ${AndIf} $1 != 3
+      Goto install_failed
+    ${EndIf}
+    StrCpy $CreatedHostDirectory 1
+    ClearErrors
+    CreateDirectory "$INSTDIR\crystal"
+    IfErrors install_failed
+  ${Else}
+    ; The installed host must stay inside the installation, never a linked folder.
+    IntOp $0 $0 & 0x410
+    ${If} $0 != 16
+      Goto install_failed
+    ${EndIf}
+  ${EndIf}
   ; Stage on the destination volume so commit/rollback use renames, not writes.
   GetTempFileName $StageDir "$INSTDIR"
   IfErrors install_failed
   Delete "$StageDir"
   IfErrors install_failed
-  CreateDirectory "$StageDir\new"
+  CreateDirectory "$StageDir\new\crystal"
   IfErrors install_failed
-  CreateDirectory "$StageDir\previous"
+  CreateDirectory "$StageDir\previous\crystal"
   IfErrors install_failed
   SetOutPath "$StageDir\new"
   IfErrors install_failed
@@ -382,6 +418,10 @@ Section "Crystal Launcher"
   File "${PACKAGE_DIR}\LICENSE"
   File "${PACKAGE_DIR}\THIRD_PARTY.md"
   File "${PACKAGE_DIR}\THIRD_PARTY_LICENSES.txt"
+  IfErrors install_failed
+  SetOutPath "$StageDir\new\crystal"
+  IfErrors install_failed
+  File "${PACKAGE_DIR}\crystal\pol.exe"
   IfErrors install_failed
   WriteUninstaller "$StageDir\new\Uninstall.exe"
   IfErrors install_failed
@@ -453,7 +493,7 @@ Section "Crystal Launcher"
   !insertmacro StageReg Str "DisplayIcon" "$INSTDIR\Crystal-Launcher.exe"
   !insertmacro StageReg Str "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
   !insertmacro StageReg Str "QuietUninstallString" '$\"$INSTDIR\Uninstall.exe$\" /S'
-  !insertmacro StageReg Str "URLInfoAbout" "https://github.com/Offset437/Crystal-Launcher"
+  !insertmacro StageReg Str "URLInfoAbout" "https://github.com/Offset437/FFXI-Crystal-Launcher"
   !insertmacro StageReg DWORD "NoModify" 1
   !insertmacro StageReg DWORD "NoRepair" 1
 
@@ -463,12 +503,14 @@ Section "Crystal Launcher"
   !insertmacro BackupFile "THIRD_PARTY.md" 8
   !insertmacro BackupFile "THIRD_PARTY_LICENSES.txt" 16
   !insertmacro BackupFile "Uninstall.exe" 32
+  !insertmacro BackupFile "crystal\pol.exe" 64
   !insertmacro InstallFile "Crystal-Launcher.exe" 1
   !insertmacro InstallFile "README.md" 2
   !insertmacro InstallFile "LICENSE" 4
   !insertmacro InstallFile "THIRD_PARTY.md" 8
   !insertmacro InstallFile "THIRD_PARTY_LICENSES.txt" 16
   !insertmacro InstallFile "Uninstall.exe" 32
+  !insertmacro InstallFile "crystal\pol.exe" 64
   System::Call 'kernel32::GetFileAttributesW(w "$SMPROGRAMS\${SHORTCUT_NAME}.lnk") i.r0 ?e'
   Pop $1
   ${If} $0 != -1
@@ -572,6 +614,29 @@ Section "Uninstall"
     SetErrorLevel 1
     Abort
   ${EndIf}
+  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\crystal") i.r0 ?e'
+  Pop $1
+  ${If} $0 != -1
+    IntOp $0 $0 & 0x410
+    ${If} $0 != 16
+      MessageBox MB_OK|MB_ICONSTOP "Crystal's game-host folder is not a regular installation directory. Restore the original folder before uninstalling." /SD IDOK
+      SetErrorLevel 1
+      Abort
+    ${EndIf}
+  ${ElseIf} $1 != 2
+  ${AndIf} $1 != 3
+    MessageBox MB_OK|MB_ICONSTOP "Crystal's game-host folder could not be checked. Close programs using this installation and try again." /SD IDOK
+    SetErrorLevel 1
+    Abort
+  ${EndIf}
+  ClearErrors
+  Delete "$INSTDIR\crystal\pol.exe"
+  ${If} ${Errors}
+    MessageBox MB_OK|MB_ICONSTOP "Close games using this launcher installation, then try uninstalling again." /SD IDOK
+    SetErrorLevel 1
+    Abort
+  ${EndIf}
+  RMDir "$INSTDIR\crystal"
   ClearErrors
   IfFileExists "$INSTDIR\Crystal-Launcher.exe" 0 launcher_removed
     Delete "$INSTDIR\Crystal-Launcher.exe"

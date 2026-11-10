@@ -13,12 +13,6 @@ default = []
 native-backup-diagnostics = []
 # Temporary socket-call metadata only; never changes native POL transport.
 native-login-diagnostics = ["windows-sys/Win32_Networking_WinSock"]
-# A/B pilot only: disable Nagle on transient startup PML requests, with the
-# same read-only diagnostics as the control. Never enabled by default.
-native-login-nodelay = ["native-login-diagnostics"]
-# Comparison pilot only, never shipped: 1 ms initial sign-in and mail-list polling,
-# turnarounds no stock Viewer produces (07a stock-faithful-pacing).
-native-fast-login-poll = []
 
 # Own workspace root: this crate never joins the launcher build.
 [workspace]
@@ -31,24 +25,27 @@ path = "src/lib.rs"
 name = "pol"
 path = "src/main.rs"
 
-# Offline harness: a stand-in launcher that serves dummy session values and
-# listens on loopback for the lobby connection attempt. Never signs in.
+# Credential-free probe of private Windower startup against an installed Hook.
 [[bin]]
-name = "crystal-harness"
-path = "src/bin/crystal-harness.rs"
+name = "windower-bootstrap-probe"
+path = "src/bin/windower-bootstrap-probe.rs"
 
 [dependencies]
+roxmltree = "=0.20.0"
 zeroize = { version = "=1.9.0", default-features = false, features = ["alloc", "zeroize_derive"] }
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Security",
-    # BCryptHash: pins the exact Windower Hook.dll build (windower_exit.rs).
+    # BCryptHash: pins the verified FFXIDB plugin file (windower_plugin_settings.rs).
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Diagnostics_Debug",
+    # Process-only thread lists for Windower Hook startup (windower_threads.rs).
+    "Win32_System_Diagnostics_ProcessSnapshotting",
+    "Win32_System_Kernel",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_LibraryLoader",
@@ -61,7 +58,13 @@ windows-sys = { version = "=0.61.2", features = [
     # Scoped game-window verification and optional login-menu input.
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
+    # Controller discovery: Raw Input device fingerprint (controller_catalog.rs).
+    "Win32_UI_Input",
 ] }
+
+[build-dependencies]
+# Version information and icon resources (build.rs); build-time only.
+embed-resource = "=3.0.12"
 
 [profile.release]
 opt-level = "s"

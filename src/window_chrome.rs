@@ -1,7 +1,6 @@
 //! Native window chrome for the undecorated launcher window: Windows 11
 //! rounded corners, the system drop shadow and a theme-matched 1 px border,
 //! plus the title-bar double-click rule.
-use iced::window;
 use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -9,23 +8,15 @@ use std::time::Instant;
 static HWND: AtomicIsize = AtomicIsize::new(0);
 
 pub(crate) fn is_foreground() -> bool {
-    #[cfg(windows)]
-    {
-        let hwnd = HWND.load(Ordering::Relaxed);
-        hwnd != 0 && unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() } as isize == hwnd
-    }
-    #[cfg(not(windows))]
-    { false }
+    let hwnd = HWND.load(Ordering::Relaxed);
+    hwnd != 0 && unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() } as isize == hwnd
 }
 
-/// Reads the Win32 window handle behind an iced window.
-pub(crate) fn native_handle(window: &dyn window::Window) -> isize {
-    use window::raw_window_handle::RawWindowHandle;
-    match window.window_handle().map(|handle| handle.as_raw()) {
-        Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get(),
-        _ => 0,
-    }
+/// The window closed (Crystal runs in the background): nothing is foreground any more.
+pub(crate) fn detach() {
+    HWND.store(0, Ordering::Relaxed);
 }
+
 
 /// Rounds the corners, turns on the DWM shadow and tints the border for the
 /// current theme. Safe to call again; a zero handle is ignored.
@@ -34,7 +25,6 @@ pub(crate) fn attach(hwnd: isize, light: bool) {
         return;
     }
     HWND.store(hwnd, Ordering::Relaxed);
-    #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::Graphics::Dwm::{
             DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -71,13 +61,12 @@ pub(crate) fn set_theme(light: bool) {
     if hwnd == 0 {
         return;
     }
-    #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::Graphics::Dwm::{
             DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
         };
         let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
-        let line = crate::ui::colors(light).line;
+        let line = crate::palette::colors(light).line;
         let [r, g, b, _] = line.into_rgba8();
         // COLORREF is 0x00BBGGRR.
         let colorref: u32 = (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
@@ -117,7 +106,6 @@ pub(crate) fn title_press_is_double() -> bool {
 }
 
 fn double_click_ms() -> u64 {
-    #[cfg(windows)]
     {
         let ms = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
         if ms > 0 {

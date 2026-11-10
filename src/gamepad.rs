@@ -14,35 +14,56 @@ mod art;
 pub(crate) mod detect;
 mod ffxi;
 
-use crate::i18n::{self, t, tf};
-use crate::ui::{colors, panel, primary, quiet, scale, Colors, BODY, SEMI};
-use crate::{App, Message};
+use crate::i18n::{t, tf};
+use crate::palette::{colors, Color};
+use crate::App;
 use detect::{Btn, Family, Input, Pad};
 use ffxi::{Control, Flag, Layout, PadConfig, Row, Stick, ROWS};
-use iced::widget::{button, column, container, row, svg, text, Space};
-use iced::{Alignment, Background, Border, Color, Element, Length, Subscription, Task};
+use crate::effect::Effect;
 
 struct Target {
     source: String,
-    found: bool,
     saved: PadConfig,
     edit: PadConfig,
+    /// Bindings the last XInput toggle could not map, for the reverse toggle.
+    unbound: ffxi::Unbound,
 }
 
 impl Target {
     fn from(loaded: ffxi::Loaded) -> Self {
         Self {
             source: loaded.source,
-            found: loaded.found,
             saved: loaded.config.clone(),
             edit: loaded.config,
+            unbound: ffxi::Unbound::default(),
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoticeKind {
+    Info,
+    /// The pressed control cannot be bound; capture continues.
+    Capture,
+    /// Writing the registry failed.
+    Save,
+    /// Running games did not take the settings.
+    Live,
+}
+
 struct Notice {
-    error: bool,
+    kind: NoticeKind,
     text: String,
+}
+
+impl Notice {
+    fn error(&self) -> bool {
+        self.kind != NoticeKind::Info
+    }
+    /// Re-applying can fix it.
+    fn retry(&self) -> bool {
+        matches!(self.kind, NoticeKind::Save | NoticeKind::Live)
+    }
 }
 
 #[derive(Default)]
@@ -67,7 +88,7 @@ pub(crate) struct State {
 
 impl Default for State {
     fn default() -> Self {
-        if std::env::args().any(|a| a.starts_with("--preview")) {
+        if crate::preview::flags().is_some() {
             return Self::preview();
         }
         Self {
@@ -130,17 +151,13 @@ impl State {
         let target = |source: &str| {
             let mut t = Target {
                 source: source.into(),
-                found: true,
                 saved: PadConfig::default(),
                 edit: PadConfig::default(),
+                unbound: ffxi::Unbound::default(),
             };
-            // Pending edits show the unsaved-changes bar.
-            t.edit.sin[25] = -1;
             if ps5 {
-                t.saved.set_flag(Flag::XInput, false, Layout::DInputSony);
-                t.edit.set_flag(Flag::XInput, false, Layout::DInputSony);
-                t.edit.bind_button(6, 13);
-                t.edit.bind_button(8, 14);
+                t.saved.set_flag(Flag::XInput, false, Layout::DInputSony, &mut ffxi::Unbound::default());
+                t.edit = t.saved.clone();
             }
             t
         };
@@ -170,10 +187,22 @@ impl State {
     }
     /// The controller's DirectInput numbering that FFXI sees when XInput is off.
     fn di_layout(&self) -> Layout {
-        match self.pad().map(|p| p.family) {
-            Some(f) if f.is_playstation() => Layout::DInputSony,
-            _ => Layout::DInputXbox,
+        self.known_di_layout().unwrap_or(Layout::DInputXbox)
+    }
+    /// The DirectInput numbering the bindings are in, when it is known: Sony
+    /// ids in stored DirectInput bindings, else the connected controller.
+    /// Without either, renumbering would guess, so the XInput toggle waits.
+    fn known_di_layout(&self) -> Option<Layout> {
+        let edit = &self.retail.edit;
+        let sony_ids = !edit.flag(Flag::XInput)
+            && ROWS.iter().any(|row| match *row {
+                Row::Single(i) => matches!(edit.sin[i], 13 | 14),
+                Row::Group(i) => edit.sin[i..i + 4].iter().any(|id| matches!(id.unsigned_abs(), 34 | 37)),
+            });
+        if sony_ids {
+            return Some(Layout::DInputSony);
         }
+        self.pad().map(|p| if p.family.is_playstation() { Layout::DInputSony } else { Layout::DInputXbox })
     }
     fn layout(&self) -> Layout {
         if self.retail.edit.flag(Flag::XInput) {
@@ -200,7 +229,7 @@ impl State {
                     }
                     None => {
                         self.notice = Some(Notice {
-                            error: true,
+                            kind: NoticeKind::Capture,
                             text: if matches!(b, Btn::Touchpad | Btn::Mute) && layout == Layout::XInput {
                                 t("Touchpad click and Mic button need DirectInput. Turn XInput mode off, then press the button again.").into()
                             } else {
@@ -224,7 +253,7 @@ impl State {
                     None
                 };
                 if let Some(stick) = stick {
-                    self.retail.edit.bind_group(first, layout.group(stick));
+                    self.retail.edit.bind_group(first, layout.group(stick), layout);
                     self.capture = None;
                     self.notice = None;
                 }
@@ -242,16 +271,17 @@ pub(crate) enum Msg {
     CancelCapture,
     Clear(Row),
     Reset,
-    Discard,
     Apply,
     SaveLater(u64),
-    Saved(u64, PadConfig, Result<String, String>),
+    /// The revision, the edit it saved, and what was written (or the error).
+    Saved(u64, PadConfig, Result<(PadConfig, String), String>),
     LiveResult(u64, Result<String, String>),
     Rumble,
 }
 
-pub(crate) fn update(state: &mut State, msg: Msg, config: &crate::backend::Config) -> Task<Msg> {
+pub(crate) fn update(state: &mut State, msg: Msg, config: &crate::backend::Config) -> Effect<Msg> {
     let before = state.retail.edit.clone();
+    let toggles_xinput = matches!(msg, Msg::SetFlag(Flag::XInput, _));
     match msg {
         Msg::Pads(pads) => {
             state.pads = pads;
@@ -269,15 +299,23 @@ pub(crate) fn update(state: &mut State, msg: Msg, config: &crate::backend::Confi
             state.prev = state.pad().map(|p| p.input).unwrap_or_default();
         }
         Msg::SetFlag(flag, on) => {
-            let di = state.di_layout();
-            state.retail.edit.set_flag(flag, on, di);
+            let di = if flag == Flag::XInput { state.known_di_layout() } else { Some(state.di_layout()) };
+            if let Some(di) = di {
+                let t = &mut state.retail;
+                t.edit.set_flag(flag, on, di, &mut t.unbound);
+            }
         }
         Msg::Capture(row) => {
             state.capture = Some(row);
             state.prev = state.pad().map(|p| p.input).unwrap_or_default();
             state.notice = None;
         }
-        Msg::CancelCapture => state.capture = None,
+        Msg::CancelCapture => {
+            state.capture = None;
+            if state.notice.as_ref().is_some_and(|n| n.kind == NoticeKind::Capture) {
+                state.notice = None;
+            }
+        }
         Msg::Clear(row) => {
             let t = &mut state.retail;
             match row {
@@ -291,12 +329,7 @@ pub(crate) fn update(state: &mut State, msg: Msg, config: &crate::backend::Confi
             state.retail.edit.reset(di);
             state.capture = None;
         }
-        Msg::Discard => {
-            let t = &mut state.retail;
-            t.edit = t.saved.clone();
-            state.capture = None;
-            state.notice = None;
-        }
+
         Msg::Apply => {
             state.capture = None;
             if !state.preview {
@@ -308,44 +341,57 @@ pub(crate) fn update(state: &mut State, msg: Msg, config: &crate::backend::Confi
         }
         Msg::SaveLater(revision) => {
             if state.preview || revision != state.saving.revision || state.saving.in_flight.is_some()
-                || state.retail.edit == state.retail.saved { return Task::none(); }
+                || state.retail.edit == state.retail.saved { return Effect::none(); }
             state.saving.in_flight = Some(revision);
             let pad = state.retail.edit.clone();
+            let base = state.retail.saved.clone();
             let config = config.clone();
-            return Task::perform(async move {
+            return Effect::perform(async move {
                 let snapshot = pad.clone();
-                let result = tokio::task::spawn_blocking(move || ffxi::save_retail(&config, &snapshot)).await
+                let result = tokio::task::spawn_blocking(move || ffxi::save_retail(&config, &base, &snapshot)).await
                     .unwrap_or_else(|_| Err(t("Could not save controller settings.").into()));
                 Msg::Saved(revision, pad, result)
             }, |result| result);
         }
         Msg::Saved(revision, pad, result) => {
-            if state.saving.in_flight != Some(revision) { return Task::none(); }
+            if state.saving.in_flight != Some(revision) { return Effect::none(); }
             state.saving.in_flight = None;
             let failed = result.is_err();
             match result {
-                Ok(_) => {
-                    state.retail.saved = pad;
-                    state.retail.found = true;
+                Ok((written, _)) => {
+                    // Values another tool stored meanwhile were kept in what was
+                    // written; follow them wherever the user has not edited since.
+                    if written != pad {
+                        let t = &mut state.retail;
+                        t.edit = PadConfig::rebased(&written, &pad, &t.edit);
+                    }
+                    state.retail.saved = written;
                     state.saving.persisted = true;
                     if revision == state.saving.revision {
                         state.saving.live = Some((revision, controller_values(&state.retail.edit)));
-                        state.notice = Some(Notice { error: false, text: t("Saved. Applying to running games…").into() });
+                        state.notice = Some(Notice { kind: NoticeKind::Info, text: t("Saved. Applying to running games…").into() });
                     }
                 }
-                Err(text) => state.notice = Some(Notice { error: true, text }),
+                Err(text) => state.notice = Some(Notice { kind: NoticeKind::Save, text }),
             }
+            if state.retail.edit != before {
+                // Rebased onto another tool's values: not the user's toggle.
+                state.retail.unbound = ffxi::Unbound::default();
+            }
+            // A rebase is not a user edit: skip the shared block, which would
+            // drop the live update and notice set above.
             if state.retail.edit != state.retail.saved && (!failed || revision != state.saving.revision) {
                 return save_later(state.saving.revision);
             }
+            return Effect::none();
         }
         Msg::LiveResult(revision, result) => {
-            if state.saving.applying != Some(revision) { return Task::none(); }
+            if state.saving.applying != Some(revision) { return Effect::none(); }
             state.saving.applying = None;
             if revision == state.saving.revision && state.retail.edit == state.retail.saved {
                 state.notice = Some(match result {
-                    Ok(text) => Notice { error: false, text },
-                    Err(text) => Notice { error: true, text },
+                    Ok(text) => Notice { kind: NoticeKind::Info, text },
+                    Err(text) => Notice { kind: NoticeKind::Live, text },
                 });
             }
         }
@@ -356,61 +402,29 @@ pub(crate) fn update(state: &mut State, msg: Msg, config: &crate::backend::Confi
         }
     }
     if state.retail.edit != before {
+        if !toggles_xinput {
+            // Bound, cleared or reset since: a reverse toggle restores nothing.
+            state.retail.unbound = ffxi::Unbound::default();
+        }
         state.saving.revision = state.saving.revision.wrapping_add(1);
         state.saving.live = None;
         state.notice = None;
         if !state.preview && state.retail.edit != state.retail.saved { return save_later(state.saving.revision); }
     }
-    Task::none()
+    Effect::none()
 }
 
 fn controller_values(pad: &PadConfig) -> std::collections::BTreeMap<String, String> {
     pad.values().into_iter().map(|(name, value)| (name.to_owned(), value)).collect()
 }
 
-fn save_later(revision: u64) -> Task<Msg> {
-    Task::perform(async move { tokio::time::sleep(std::time::Duration::from_millis(200)).await; revision }, Msg::SaveLater)
+fn save_later(revision: u64) -> Effect<Msg> {
+    Effect::perform(async move { tokio::time::sleep(std::time::Duration::from_millis(200)).await; revision }, Msg::SaveLater)
 }
 
-fn watch() -> impl iced::futures::Stream<Item = Msg> {
-    iced::stream::channel(64, async move |output: iced::futures::channel::mpsc::Sender<Msg>| {
-        let mut tx = output.clone();
-        let _ = std::thread::Builder::new()
-            .name("gamepad".into())
-            .spawn(move || {
-                detect::run(|pads| {
-                    let mut msg = Msg::Pads(pads);
-                    loop {
-                        match tx.try_send(msg) {
-                            Ok(()) => return true,
-                            Err(e) if e.is_full() => {
-                                msg = e.into_inner();
-                                std::thread::sleep(std::time::Duration::from_millis(4));
-                            }
-                            Err(_) => return false,
-                        }
-                    }
-                })
-            });
-        std::future::pending::<()>().await;
-    })
-}
-
-pub(crate) fn subscription(state: &State) -> Subscription<Msg> {
-    if state.preview {
-        Subscription::none()
-    } else {
-        Subscription::run(watch)
-    }
-}
-
-// ---- view -----------------------------------------------------------------------
-
-fn glyph<'a>(doc: String, size: f32) -> Element<'a, Message> {
-    svg(svg::Handle::from_memory(doc.into_bytes()))
-        .width(size)
-        .height(size)
-        .into()
+/// Whether the controller thread should run (not in a design preview's capture).
+pub(crate) fn watching(state: &State) -> bool {
+    !(state.preview && !crate::preview_idle())
 }
 
 fn btn_label(family: Family, b: Btn) -> &'static str {
@@ -453,544 +467,319 @@ fn btn_label(family: Family, b: Btn) -> &'static str {
     }
 }
 
-/// A small bordered label, like the keycaps in the bindings list.
-fn keycap<'a>(label: String, c: Colors, s: f32, lit: bool) -> Element<'a, Message> {
-    container(text(label).font(SEMI).size(12.0 * s).color(if lit { c.play_text } else { c.ink }))
-        .padding([2.0 * s, 8.0 * s])
-        .style(move |_| container::Style {
-            background: Some(if lit { c.accent } else { c.field }.into()),
-            border: Border {
-                color: if lit { c.accent } else { c.line },
-                width: 1.0,
-                radius: 5.0.into(),
+
+/// Settings > Controller as plain data: the lines, chips and pictures (`art`'s SVG documents)
+/// the Slint page shows, and the messages its controls send.
+
+pub(crate) mod front {
+    use super::*;
+
+    /// How one binding reads (`binding_chip`).
+    #[derive(Clone, Debug, PartialEq)]
+    pub(crate) enum Chip {
+        /// Muted words ("Not set").
+        Words(&'static str),
+        /// A small bordered label, lit while its control is held.
+        Keycap { label: String, lit: bool },
+        /// A drawn glyph, with words beside it when it has any.
+        Picture { svg: String, label: String },
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub(crate) struct Binding {
+        pub row: Row,
+        pub label: &'static str,
+        /// Edited since the last save.
+        pub changed: bool,
+        /// Waiting for a press: `prompt` shows with Unbind instead of the chip.
+        pub capturing: bool,
+        pub prompt: &'static str,
+        pub chip: Chip,
+        /// Its control is held right now.
+        pub live: bool,
+    }
+
+    /// A note's colour: the muted ink, or the theme palette's warning, success or danger.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Tone {
+        Sub,
+        Warning,
+        Success,
+        Danger,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub(crate) struct Switch {
+        pub label: &'static str,
+        pub flag: Flag,
+        pub on: bool,
+        pub enabled: bool,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub(crate) struct Front {
+        // The device bar.
+        pub badge: String,
+        pub title: String,
+        pub sub: String,
+        /// Every controller, when there are several: (id, name, selected).
+        pub pads: Vec<(usize, String, bool)>,
+        pub status: &'static str,
+        pub retry: bool,
+        // Live test.
+        pub picture: String,
+        pub connected: bool,
+        pub caption: &'static str,
+        /// The triggers' names and pulls, then the sticks' read-outs.
+        pub triggers: [(&'static str, f32); 2],
+        pub sticks: [String; 2],
+        pub rumble: bool,
+        /// The PlayStation extras' keycaps: (label, held).
+        pub extras: Vec<(&'static str, bool)>,
+        // Button bindings.
+        pub bindings_sub: String,
+        pub bindings: Vec<Binding>,
+        // Game options.
+        pub switches: [Switch; 4],
+        pub notes: Vec<(String, Tone)>,
+    }
+
+    /// The muted ink, accent and ink of `light`'s palette (the chips are drawn in them).
+    fn inks(light: bool) -> (Color, Color, Color) {
+        let c = colors(light);
+        (c.sub, c.accent, c.ink)
+    }
+
+    fn chip(family: Family, layout: Layout, row: Row, pad: &PadConfig, input: &Input, light: bool) -> (Chip, bool) {
+        let (sub, accent, ink) = inks(light);
+        match row {
+            Row::Group(first) => {
+                let ids = &pad.sin[first..first + 4];
+                match layout.group_stick(ids) {
+                    Some(Stick::Dpad) => {
+                        let all = [Btn::DUp, Btn::DDown, Btn::DLeft, Btn::DRight];
+                        let lit: Vec<Btn> = all.into_iter().filter(|b| input.pressed(*b)).collect();
+                        let svg = art::dpad_chip(if lit.is_empty() { &all } else { &lit }, sub, if lit.is_empty() { sub } else { accent });
+                        (Chip::Picture { svg, label: t("D-pad").into() }, !lit.is_empty())
+                    }
+                    Some(stick) => {
+                        let (x, y, name) = match stick {
+                            Stick::Left => (input.lx, input.ly, t("Left stick")),
+                            _ => (input.rx, input.ry, t("Right stick")),
+                        };
+                        let live = x.abs().max(y.abs()) > 0.3;
+                        (Chip::Picture { svg: art::stick_chip(sub, if live { accent } else { sub }), label: name.into() }, live)
+                    }
+                    None if ids.iter().all(|v| *v == -1) => (Chip::Words(t("Not set")), false),
+                    None => (Chip::Keycap { label: t("Custom").into(), lit: false }, false),
+                }
+            }
+            Row::Single(slot) => match layout.decode(pad.sin[slot]) {
+                Control::None => (Chip::Words(t("Not set")), false),
+                Control::Button(b) if matches!(b, Btn::South | Btn::East | Btn::West | Btn::North) => {
+                    let lit = input.pressed(b);
+                    if family == Family::Generic {
+                        let name = match b {
+                            Btn::South => t("Bottom button"),
+                            Btn::East => t("Right button"),
+                            Btn::West => t("Left button"),
+                            _ => t("Top button"),
+                        };
+                        return (Chip::Keycap { label: name.into(), lit }, lit);
+                    }
+                    (Chip::Picture { svg: art::face_chip(family, b, light, lit), label: String::new() }, lit)
+                }
+                Control::Button(b) if b.is_dpad() => {
+                    let lit = input.pressed(b);
+                    let label = tf("D-pad {direction}", &[("direction", &btn_label(family, b).to_lowercase())]);
+                    (Chip::Picture { svg: art::dpad_chip(&[b], sub, if lit { accent } else { ink }), label }, lit)
+                }
+                Control::Button(b) => {
+                    let lit = input.pressed(b);
+                    (Chip::Keycap { label: btn_label(family, b).into(), lit }, lit)
+                }
+                Control::Axis(stick, dir, neg) => {
+                    let name = match stick {
+                        Stick::Left => t("Left stick"),
+                        Stick::Right => t("Right stick"),
+                        Stick::Dpad => t("D-pad"),
+                    };
+                    let d = match (dir, neg) {
+                        (ffxi::AxisDir::X, false) => "→",
+                        (ffxi::AxisDir::X, true) => "←",
+                        (ffxi::AxisDir::Y, false) => "↓",
+                        (ffxi::AxisDir::Y, true) => "↑",
+                    };
+                    (Chip::Keycap { label: format!("{name} {d}"), lit: false }, false)
+                }
+                Control::Raw(id) if !(-1..32).contains(&id) => (Chip::Keycap { label: tf("Axis {id}", &[("id", &id)]), lit: false }, false),
+                Control::Raw(id) => (Chip::Keycap { label: tf("Button {number}", &[("number", &(id + 1))]), lit: false }, false),
             },
-            ..Default::default()
-        })
-        .into()
-}
-
-/// How one binding row reads, in the connected controller's own style.
-fn binding_chip<'a>(
-    family: Family,
-    layout: Layout,
-    row: Row,
-    pad: &PadConfig,
-    input: &Input,
-    c: Colors,
-    light: bool,
-    s: f32,
-) -> (Element<'a, Message>, bool) {
-    let size = 22.0 * s;
-    match row {
-        Row::Group(first) => {
-            let ids = &pad.sin[first..first + 4];
-            match layout.group_stick(ids) {
-                Some(Stick::Dpad) => {
-                    let lit: Vec<Btn> = [Btn::DUp, Btn::DDown, Btn::DLeft, Btn::DRight]
-                        .into_iter()
-                        .filter(|b| input.pressed(*b))
-                        .collect();
-                    let all = [Btn::DUp, Btn::DDown, Btn::DLeft, Btn::DRight];
-                    let doc = art::dpad_chip(if lit.is_empty() { &all } else { &lit }, c.sub, if lit.is_empty() { c.sub } else { c.accent });
-                    (row![glyph(doc, size), text(t("D-pad")).font(BODY).size(12.5 * s).color(c.ink)].spacing(6.0 * s).align_y(Alignment::Center).into(), !lit.is_empty())
-                }
-                Some(stick) => {
-                    let (x, y, name) = match stick {
-                        Stick::Left => (input.lx, input.ly, t("Left stick")),
-                        _ => (input.rx, input.ry, t("Right stick")),
-                    };
-                    let live = x.abs().max(y.abs()) > 0.3;
-                    let doc = art::stick_chip(c.sub, if live { c.accent } else { c.sub });
-                    (row![glyph(doc, size), text(name).font(BODY).size(12.5 * s).color(c.ink)].spacing(6.0 * s).align_y(Alignment::Center).into(), live)
-                }
-                None if ids.iter().all(|v| *v == -1) => (text(t("Not set")).font(BODY).size(12.5 * s).color(c.sub).into(), false),
-                None => (keycap(t("Custom").into(), c, s, false), false),
-            }
         }
-        Row::Single(slot) => match layout.decode(pad.sin[slot]) {
-            Control::None => (text(t("Not set")).font(BODY).size(12.5 * s).color(c.sub).into(), false),
-            Control::Button(b) if matches!(b, Btn::South | Btn::East | Btn::West | Btn::North) => {
-                let lit = input.pressed(b);
-                if family == Family::Generic {
-                    let name = match b {
-                        Btn::South => t("Bottom button"),
-                        Btn::East => t("Right button"),
-                        Btn::West => t("Left button"),
-                        _ => t("Top button"),
-                    };
-                    return (keycap(name.into(), c, s, lit), lit);
-                }
-                (glyph(art::face_chip(family, b, light, lit), size), lit)
-            }
-            Control::Button(b) if b.is_dpad() => {
-                let lit = input.pressed(b);
-                let doc = art::dpad_chip(&[b], c.sub, if lit { c.accent } else { c.ink });
-                (row![glyph(doc, size), text(tf("D-pad {direction}", &[("direction", &btn_label(family, b).to_lowercase())])).font(BODY).size(12.5 * s).color(c.ink)].spacing(6.0 * s).align_y(Alignment::Center).into(), lit)
-            }
-            Control::Button(b) => {
-                let lit = input.pressed(b);
-                (keycap(btn_label(family, b).into(), c, s, lit), lit)
-            }
-            Control::Axis(stick, dir, neg) => {
-                let name = match stick {
-                    Stick::Left => t("Left stick"),
-                    Stick::Right => t("Right stick"),
-                    Stick::Dpad => t("D-pad"),
+    }
+
+    pub(crate) fn front(app: &App) -> Front {
+        let st = &app.gamepad;
+        let light = app.settings.light_theme;
+        let (sub, accent, _) = inks(light);
+        let target = &st.retail;
+        let pad = st.pad();
+        let input = pad.map(|p| p.input).unwrap_or_default();
+        let layout = st.layout();
+
+        // The device bar (`device_bar`).
+        let (badge, title, sub_line) = match pad {
+            Some(p) => {
+                let ids = match (p.vid, p.pid) {
+                    (Some(v), Some(d)) => format!(" · USB {v:04X}:{d:04X}"),
+                    _ => String::new(),
                 };
-                let d = match (dir, neg) {
-                    (ffxi::AxisDir::X, false) => "→",
-                    (ffxi::AxisDir::X, true) => "←",
-                    (ffxi::AxisDir::Y, false) => "↓",
-                    (ffxi::AxisDir::Y, true) => "↑",
-                };
-                (keycap(format!("{name} {d}"), c, s, false), false)
+                let badge = if p.family == Family::Generic { art::stick_chip(sub, accent) } else { art::face_chip(p.family, Btn::South, light, false) };
+                (badge, p.name.clone(), format!("{} · {}{}", p.family.label(), p.connection(), ids))
             }
-            Control::Raw(id) if id >= 32 || id < -1 => (keycap(tf("Axis {id}", &[("id", &id)]), c, s, false), false),
-            Control::Raw(id) => (keycap(tf("Button {number}", &[("number", &(id + 1))]), c, s, false), false),
-        },
-    }
-}
-
-fn card<'a>(content: impl Into<Element<'a, Message>>, s: f32) -> container::Container<'a, Message> {
-    container(content).padding([16.0 * s, 18.0 * s]).style(panel)
-}
-
-fn heading<'a>(title: &'a str, c: Colors, s: f32) -> Element<'a, Message> {
-    text(title).font(SEMI).size(15.0 * s).color(c.ink).into()
-}
-
-fn meter<'a>(label: &'a str, value: f32, c: Colors, s: f32) -> Element<'a, Message> {
-    let w = 64.0 * s;
-    let fill = (value.clamp(0.0, 1.0) * w).max(0.0);
-    row![
-        text(label).font(SEMI).size(11.5 * s).color(c.sub).width(22.0 * s),
-        container(
-            container(Space::new())
-                .width(fill)
-                .height(6.0 * s)
-                .style(move |_| container::Style {
-                    background: Some(c.accent.into()),
-                    border: Border { radius: 3.0.into(), ..Default::default() },
-                    ..Default::default()
-                })
-        )
-        .width(w)
-        .height(6.0 * s)
-        .style(move |_| container::Style {
-            background: Some(c.field.into()),
-            border: Border { radius: 3.0.into(), color: c.line, width: 1.0 },
-            ..Default::default()
-        })
-    ]
-    .spacing(6.0 * s)
-    .align_y(Alignment::Center)
-    .into()
-}
-
-fn stick_readout<'a>(label: &'a str, x: f32, y: f32, c: Colors, s: f32) -> Element<'a, Message> {
-    row![
-        text(label).font(SEMI).size(11.5 * s).color(c.sub),
-        text(format!("{x:+.2}  {y:+.2}")).font(iced::Font::MONOSPACE).size(11.5 * s).color(c.ink),
-    ]
-    .spacing(6.0 * s)
-    .into()
-}
-
-fn device_bar<'a>(st: &'a State, c: Colors, light: bool, s: f32) -> Element<'a, Message> {
-    let t = &st.retail;
-    let changes = t.edit.changes(&t.saved);
-    let (badge, title, sub): (Element<'a, Message>, String, String) = match st.pad() {
-        Some(p) => {
-            let ids = match (p.vid, p.pid) {
-                (Some(v), Some(d)) => format!(" · USB {v:04X}:{d:04X}"),
-                _ => String::new(),
-            };
-            let badge = if p.family == Family::Generic {
-                glyph(art::stick_chip(c.sub, c.accent), 26.0 * s)
-            } else {
-                glyph(art::face_chip(p.family, Btn::South, light, false), 26.0 * s)
-            };
-            (badge, p.name.clone(), format!("{} · {}{}", p.family.label(), p.connection(), ids))
-        }
-        None => (
-            glyph(art::stick_chip(c.sub, c.sub), 26.0 * s),
-            i18n::t("No controller connected").into(),
-            i18n::t("Plug in an Xbox or PlayStation controller, or pair it over Bluetooth. It appears here straight away.").into(),
-        ),
-    };
-    let badge = container(badge)
-        .center(44.0 * s)
-        .style(move |_| container::Style {
-            background: Some(c.select.into()),
-            border: Border { radius: 10.0.into(), ..Default::default() },
-            ..Default::default()
-        });
-    let mut others = row![].spacing(6.0 * s);
-    if st.pads.len() > 1 {
-        for p in &st.pads {
-            let active = Some(p.id) == st.pad().map(|x| x.id);
-            others = others.push(
-                crate::controller_nav::button(text(p.name.clone()).font(BODY).size(12.0 * s))
-                    .padding([5.0 * s, 10.0 * s])
-                    .style(move |theme, status| {
-                        let mut b = quiet(theme, status);
-                        if active {
-                            b.background = Some(c.select.into());
-                        }
-                        b.border = Border { radius: 6.0.into(), color: c.line, width: 1.0 };
-                        b
-                    })
-                    .on_press(Message::Gamepad(Msg::Select(p.id))),
-            );
-        }
-    }
-    let status: Element<'a, Message> = if !st.preview {
-        let label = if changes > 0 && st.notice.as_ref().is_some_and(|notice| notice.error) { i18n::t("Controller settings could not be saved") }
-            else if st.saving.in_flight.is_some() || changes > 0 { i18n::t("Saving controller settings…") }
-            else { i18n::t("Controller settings save automatically") };
-        let mut status = row![text(label).font(BODY).size(12.5 * s).color(c.sub)].spacing(10.0 * s).align_y(Alignment::Center);
-        if st.notice.as_ref().is_some_and(|notice| notice.error) {
-            status = status.push(crate::controller_nav::button(text(i18n::t("Retry")).font(BODY).size(13.0 * s))
-                .padding([6.0 * s, 12.0 * s]).style(quiet).on_press(Message::Gamepad(Msg::Apply)));
-        }
-        status.into()
-    } else if changes > 0 {
-        row![
-            container(Space::new()).width(8.0 * s).height(8.0 * s).style(move |_| container::Style {
-                background: Some(c.accent.into()),
-                border: Border { radius: 4.0.into(), ..Default::default() },
-                ..Default::default()
-            }),
-            text(if changes == 1 {
-                tf("{count} unsaved change", &[("count", &changes)])
-            } else {
-                tf("{count} unsaved changes", &[("count", &changes)])
-            })
-                .font(SEMI)
-                .size(13.0 * s)
-                .color(c.ink),
-            crate::controller_nav::button(text(i18n::t("Discard")).font(BODY).size(13.0 * s))
-                .padding([8.0 * s, 14.0 * s])
-                .style(quiet)
-                .on_press(Message::Gamepad(Msg::Discard)),
-            crate::controller_nav::button(text(i18n::t("Apply")).font(SEMI).size(13.0 * s))
-                .padding([8.0 * s, 20.0 * s])
-                .style(primary)
-                .on_press_maybe((!st.preview).then_some(Message::Gamepad(Msg::Apply))),
-        ]
-        .spacing(10.0 * s)
-        .align_y(Alignment::Center)
-        .into()
-    } else {
-        row![
-            crate::icons::icon(crate::icons::Icon::CheckCircle, 15.0 * s, c.sub),
-            text(if t.found { i18n::t("Matches the game's saved settings") } else { i18n::t("Using FFXI defaults") })
-                .font(BODY)
-                .size(12.5 * s)
-                .color(c.sub)
-        ]
-        .spacing(6.0 * s)
-        .align_y(Alignment::Center)
-        .into()
-    };
-    card(
-        row![
-            badge,
-            column![
-                text(title).font(SEMI).size(16.0 * s).color(c.ink),
-                text(sub).font(BODY).size(12.5 * s).color(c.sub),
-            ]
-            .spacing(2.0 * s),
-            others,
-            Space::new().width(Length::Fill),
-            status,
-        ]
-        .spacing(14.0 * s)
-        .align_y(Alignment::Center),
-        s,
-    )
-    .padding([12.0 * s, 16.0 * s])
-    .width(Length::Fill)
-    .into()
-}
-
-fn live_card<'a>(st: &'a State, c: Colors, light: bool, s: f32) -> Element<'a, Message> {
-    let pad = st.pad();
-    let family = pad.map_or(Family::Generic, |p| p.family);
-    let input = pad.map(|p| p.input).unwrap_or_default();
-    let doc = art::controller(family, &input, light, c.accent);
-    let picture = svg(svg::Handle::from_memory(doc.into_bytes()))
-        .width(Length::Fill)
-        .height(318.0 * s)
-        .opacity(if pad.is_some() { 1.0_f32 } else { 0.35 });
-    let caption = match pad {
-        Some(p) if p.family.is_playstation() => t("Press any button, move the sticks or pull L2/R2 to test it."),
-        Some(p) if p.family.is_xbox() => t("Press any button, move the sticks or pull LT/RT to test it."),
-        Some(_) => t("Press any button or move the sticks to test it."),
-        None => t("Waiting for a controller…"),
-    };
-    let (lt, rt) = match family {
-        f if f.is_playstation() => ("L2", "R2"),
-        Family::SwitchPro => ("ZL", "ZR"),
-        _ => ("LT", "RT"),
-    };
-    let mut readout = row![
-        meter(lt, input.lt, c, s),
-        meter(rt, input.rt, c, s),
-        stick_readout("L", input.lx, input.ly, c, s),
-        stick_readout("R", input.rx, input.ry, c, s),
-        Space::new().width(Length::Fill),
-    ]
-    .spacing(18.0 * s)
-    .align_y(Alignment::Center);
-    if pad.is_some_and(|p| p.rumble) {
-        readout = readout.push(
-            crate::controller_nav::button(text(t("Test vibration")).font(BODY).size(12.5 * s))
-                .padding([6.0 * s, 10.0 * s])
-                .style(quiet)
-                .on_press(Message::Gamepad(Msg::Rumble)),
-        );
-    }
-    let mut content = column![
-        row![
-            heading(t("Live test"), c, s),
-            Space::new().width(Length::Fill),
-            text(caption).font(BODY).size(12.0 * s).color(c.sub)
-        ]
-        .align_y(Alignment::Center),
-        picture,
-        readout,
-    ]
-    .spacing(10.0 * s);
-    if family.is_playstation() {
-        let mut extras = row![keycap(btn_label(family, Btn::Touchpad).into(), c, s, input.pressed(Btn::Touchpad))]
-            .spacing(10.0 * s);
-        if matches!(family, Family::DualSense | Family::DualSenseEdge) {
-            extras = extras.push(keycap(btn_label(family, Btn::Mute).into(), c, s, input.pressed(Btn::Mute)));
-        }
-        content = content.push(extras);
-    }
-    card(content, s).width(Length::FillPortion(11)).into()
-}
-
-fn bindings_card<'a>(st: &'a State, c: Colors, light: bool, s: f32) -> Element<'a, Message> {
-    let t = &st.retail;
-    let layout = st.layout();
-    let pad = st.pad();
-    let input = pad.map(|p| p.input).unwrap_or_default();
-    let family = pad.map_or(
-        if layout == Layout::DInputSony { Family::DualSense } else { Family::Xbox },
-        |p| p.family,
-    );
-    let rows: Vec<Element<'a, Message>> = ROWS
-        .iter()
-        .map(|r| {
-            let r = *r;
-            let label = r.label();
-            let capturing = st.capture == Some(r);
-            let changed = match r {
-                Row::Single(i) => t.edit.sin[i] != t.saved.sin[i],
-                Row::Group(i) => t.edit.sin[i..i + 4] != t.saved.sin[i..i + 4],
-            };
-            let (chip, live) = binding_chip(family, layout, r, &t.edit, &input, c, light, s);
-            let right: Element<'a, Message> = if capturing {
-                row![
-                    text(match r {
-                        Row::Group(_) => i18n::t("Move a stick or press the D-pad…"),
-                        Row::Single(_) => i18n::t("Press a button…"),
-                    })
-                    .font(SEMI)
-                    .size(12.5 * s)
-                    .color(c.accent),
-                    crate::controller_nav::button(text(i18n::t("Unbind")).font(BODY).size(12.0 * s))
-                        .padding([3.0 * s, 8.0 * s])
-                        .style(quiet)
-                        .on_press(Message::Gamepad(Msg::Clear(r))),
-                ]
-                .spacing(4.0 * s)
-                .align_y(Alignment::Center)
-                .into()
-            } else {
-                chip
-            };
-            let label_row = row![
-                text(label).font(BODY).size(13.0 * s).color(c.ink),
-                if changed {
-                    Element::from(
-                        container(Space::new()).width(6.0 * s).height(6.0 * s).style(move |_| container::Style {
-                            background: Some(c.accent.into()),
-                            border: Border { radius: 3.0.into(), ..Default::default() },
-                            ..Default::default()
-                        }),
-                    )
-                } else {
-                    Space::new().width(0).into()
-                },
-            ]
-            .spacing(6.0 * s)
-            .align_y(Alignment::Center);
-            crate::controller_nav::button(
-                row![label_row, Space::new().width(Length::Fill), right]
-                    .align_y(Alignment::Center)
-                    .height(26.0 * s),
-            )
-            .width(Length::Fill)
-            .padding([5.0 * s, 10.0 * s])
-            .style(move |_, status| {
-                let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-                button::Style {
-                    background: Some(Background::Color(if capturing || live {
-                        c.select
-                    } else if hovered {
-                        c.field
-                    } else {
-                        Color::TRANSPARENT
-                    })),
-                    text_color: c.ink,
-                    border: Border {
-                        color: if capturing { c.accent } else { c.line },
-                        width: if capturing { 1.0 } else { 0.0 },
-                        radius: 6.0.into(),
-                    },
-                    ..Default::default()
-                }
-            })
-            .on_press(Message::Gamepad(if capturing { Msg::CancelCapture } else { Msg::Capture(r) }))
-            .into()
-        })
-        .collect();
-    let half = rows.len().div_ceil(2);
-    let mut left = column![].spacing(2.0 * s).width(Length::Fill);
-    let mut right = column![].spacing(2.0 * s).width(Length::Fill);
-    for (i, r) in rows.into_iter().enumerate() {
-        if i < half {
-            left = left.push(r);
+            None => (art::stick_chip(sub, sub), t("No controller connected").into(), t("Plug in or pair a controller.").into()),
+        };
+        let selected = pad.map(|p| p.id);
+        let pads = if st.pads.len() > 1 { st.pads.iter().map(|p| (p.id, p.name.clone(), Some(p.id) == selected)).collect() } else { Vec::new() };
+        let changes = target.edit.changes(&target.saved);
+        let failed = st.notice.as_ref().is_some_and(|n| n.kind == NoticeKind::Save);
+        let status = if changes > 0 && failed {
+            t("Controller settings could not be saved")
+        } else if st.saving.in_flight.is_some() || changes > 0 {
+            t("Saving controller settings…")
         } else {
-            right = right.push(r);
+            ""
+        };
+
+        // Live test (`live_card`).
+        let family = pad.map_or(Family::Generic, |p| p.family);
+        let caption = match pad {
+            Some(p) if p.family.is_playstation() => t("Press any button, move the sticks or pull L2/R2 to test it."),
+            Some(p) if p.family.is_xbox() => t("Press any button, move the sticks or pull LT/RT to test it."),
+            Some(_) => t("Press any button or move the sticks to test it."),
+            None => t("Waiting for a controller…"),
+        };
+        let (lt, rt) = match family {
+            f if f.is_playstation() => ("L2", "R2"),
+            Family::SwitchPro => ("ZL", "ZR"),
+            _ => ("LT", "RT"),
+        };
+        let mut extras = Vec::new();
+        if family.is_playstation() {
+            extras.push((btn_label(family, Btn::Touchpad), input.pressed(Btn::Touchpad)));
+            if matches!(family, Family::DualSense | Family::DualSenseEdge) {
+                extras.push((btn_label(family, Btn::Mute), input.pressed(Btn::Mute)));
+            }
+        }
+
+        // Button bindings (`bindings_card`).
+        let chip_family = pad.map_or(if layout == Layout::DInputSony { Family::DualSense } else { Family::Xbox }, |p| p.family);
+        let bindings = ROWS
+            .iter()
+            .map(|&row| {
+                let changed = match row {
+                    Row::Single(i) => target.edit.sin[i] != target.saved.sin[i],
+                    Row::Group(i) => target.edit.sin[i..i + 4] != target.saved.sin[i..i + 4],
+                };
+                let (chip, live) = chip(chip_family, layout, row, &target.edit, &input, light);
+                Binding {
+                    row,
+                    label: row.label(),
+                    changed,
+                    capturing: st.capture == Some(row),
+                    prompt: match row {
+                        Row::Group(_) => t("Move a stick or press the D-pad…"),
+                        Row::Single(_) => t("Press a button…"),
+                    },
+                    chip,
+                    live,
+                }
+            })
+            .collect();
+        let mode = if layout == Layout::XInput { "XInput" } else { "DirectInput" };
+        let bindings_sub = tf(
+            "FINAL FANTASY XI · {client} · {mode} · click an action, then press the button for it",
+            &[("client", &t("Windower / Ashita")), ("mode", &mode)],
+        );
+
+        // Game options (`options_card`).
+        let switch = |label: &'static str, flag: Flag| Switch {
+            label,
+            flag,
+            on: target.edit.flag(flag),
+            // Renumbering for XInput needs to know which controller the bindings are for.
+            enabled: flag != Flag::XInput || st.known_di_layout().is_some(),
+        };
+        let switches = [
+            switch(t("Use a controller in FFXI"), Flag::Enabled),
+            switch(t("Vibration (force feedback)"), Flag::ForceFeedback),
+            switch(t("XInput mode"), Flag::XInput),
+            switch(t("Keep working in the background"), Flag::Background),
+        ];
+        let mut notes = Vec::new();
+        let family_known = pad.map(|p| p.family);
+        if st.preview {
+            notes.push((t("Design preview: a synthetic controller is shown and nothing is ever written.").to_owned(), Tone::Sub));
+        }
+        if matches!(family_known, Some(Family::DualSense | Family::DualSenseEdge)) {
+            notes.push((t("Touchpad click and Mic button can be bound with XInput mode off. Connect by USB to use the Mic button; Bluetooth does not expose it to FFXI.").to_owned(), Tone::Sub));
+        }
+        if family_known.is_some_and(|f| f.is_playstation()) && target.edit.flag(Flag::XInput) {
+            notes.push((t("FFXI's XInput mode only sees Xbox-compatible controllers. Turn it off to use this PlayStation controller through DirectInput, or map it with Steam Input.").to_owned(), Tone::Warning));
+        }
+        if app.settings.launch_with == crate::backend::LaunchWith::Ashita {
+            notes.push((t("Ashita's boot controller settings take priority at launch. Changes here also apply to running games.").to_owned(), Tone::Sub));
+        }
+        notes.push((tf("Stored in {source}", &[("source", &target.source)]), Tone::Sub));
+        if let Some(n) = st.notice.as_ref() {
+            notes.push((n.text.clone(), if n.error() { Tone::Danger } else { Tone::Success }));
+        }
+
+        Front {
+            badge,
+            title,
+            sub: sub_line,
+            pads,
+            status,
+            retry: st.notice.as_ref().is_some_and(Notice::retry),
+            picture: art::controller(family, &input, light, accent),
+            connected: pad.is_some(),
+            caption,
+            triggers: [(lt, input.lt), (rt, input.rt)],
+            sticks: [format!("{:+.2}  {:+.2}", input.lx, input.ly), format!("{:+.2}  {:+.2}", input.rx, input.ry)],
+            rumble: pad.is_some_and(|p| p.rumble),
+            extras,
+            bindings_sub,
+            bindings,
+            switches,
+            notes,
         }
     }
-    let client_name = i18n::t("Windower / Ashita");
-    let mode = match layout {
-        Layout::XInput => "XInput",
-        _ => "DirectInput",
-    };
-    card(
-        column![
-            row![
-                column![
-                    heading(i18n::t("Button bindings"), c, s),
-                    text(tf("FINAL FANTASY XI · {client} · {mode} · click an action, then press the button for it", &[("client", &client_name), ("mode", &mode)]))
-                        .font(BODY)
-                        .size(12.0 * s)
-                        .color(c.sub),
-                ]
-                .spacing(2.0 * s),
-                Space::new().width(Length::Fill),
-                crate::controller_nav::button(text(i18n::t("Reset to default")).font(BODY).size(12.5 * s))
-                    .padding([6.0 * s, 10.0 * s])
-                    .style(quiet)
-                    .on_press(Message::Gamepad(Msg::Reset)),
-            ]
-            .align_y(Alignment::Center),
-            row![left, right].spacing(12.0 * s),
-        ]
-        .spacing(10.0 * s),
-        s,
-    )
-    .width(Length::FillPortion(12))
-    .into()
-}
 
-fn options_card<'a>(st: &'a State, app: &'a App, c: Colors, s: f32) -> Element<'a, Message> {
-    let t = &st.retail;
-    let family = st.pad().map(|p| p.family);
-    let switch = |label: &'a str, flag: Flag| -> Element<'a, Message> {
-        crate::controller_nav::toggler(t.edit.flag(flag))
-            .label(label)
-            .font(BODY)
-            .text_size(13.0 * s)
-            .size(18.0 * s)
-            .spacing(10.0 * s)
-            .on_toggle(move |on| Message::Gamepad(Msg::SetFlag(flag, on)))
-            .into()
-    };
-    let mut notes = column![].spacing(4.0 * s);
-    let note = |s_: String, color: Color| text(s_).font(BODY).size(12.0 * s).color(color);
-    if st.preview {
-        notes = notes.push(note(i18n::t("Design preview: a synthetic controller is shown and nothing is ever written.").into(), c.sub));
-    }
-    if matches!(family, Some(Family::DualSense | Family::DualSenseEdge)) {
-        notes = notes.push(note(
-            i18n::t("Touchpad click and Mic button can be bound with XInput mode off. Connect by USB to use the Mic button; Bluetooth does not expose it to FFXI.").into(),
-            c.sub,
-        ));
-    }
-    if family.is_some_and(|f| f.is_playstation()) && t.edit.flag(Flag::XInput) {
-        notes = notes.push(note(
-            i18n::t("FFXI's XInput mode only sees Xbox-compatible controllers. Turn it off to use this PlayStation controller through DirectInput, or map it with Steam Input.").into(),
-            crate::ui::theme(app.settings.light_theme).palette().warning,
-        ));
-    }
-    if app.settings.launch_with == crate::ui::LaunchWith::Ashita {
-        notes = notes.push(note(
-            i18n::t("Ashita's boot controller settings take priority at launch. Changes here also apply to running games.").into(),
-            c.sub,
-        ));
-    }
-    notes = notes.push(note(tf("Stored in {source}", &[("source", &t.source)]), c.sub));
-    if let Some(n) = st.notice.as_ref() {
-        let palette = crate::ui::theme(app.settings.light_theme).palette();
-        notes = notes.push(note(n.text.clone(), if n.error { palette.danger } else { palette.success }));
-    }
-    card(
-        column![
-            heading(i18n::t("Game options"), c, s),
-            row![
-                switch(i18n::t("Use a controller in FFXI"), Flag::Enabled),
-                switch(i18n::t("Vibration (force feedback)"), Flag::ForceFeedback),
-                switch(i18n::t("XInput mode"), Flag::XInput),
-                switch(i18n::t("Keep working in the background"), Flag::Background),
-            ]
-            .spacing(28.0 * s)
-            .align_y(Alignment::Center),
-            notes,
-        ]
-        .spacing(12.0 * s),
-        s,
-    )
-    .width(Length::Fill)
-    .into()
-}
-
-pub(crate) fn view(app: &App) -> Element<'_, Message> {
-    let st = &app.gamepad;
-    let light = app.settings.light_theme;
-    let c = colors(light);
-    let s = scale(app);
-    column![
-        device_bar(st, c, light, s),
-        row![live_card(st, c, light, s), bindings_card(st, c, light, s)].spacing(14.0 * s),
-        options_card(st, app, c, s),
-    ]
-    .spacing(14.0 * s)
-    // Room for the page's scrollbar on the right.
-    .padding(iced::Padding::ZERO.bottom(8.0 * s).right(14.0 * s))
-    .into()
+    /// The messages the page's controls send, as `view` sends them.
+    pub(crate) fn select(id: usize) -> Msg { Msg::Select(id) }
+    pub(crate) fn retry() -> Msg { Msg::Apply }
+    pub(crate) fn rumble() -> Msg { Msg::Rumble }
+    pub(crate) fn reset() -> Msg { Msg::Reset }
+    pub(crate) fn set_flag(flag: Flag, on: bool) -> Msg { Msg::SetFlag(flag, on) }
+    /// A binding row's press: capture its control, or stop capturing.
+    pub(crate) fn press(binding: &Binding) -> Msg { if binding.capturing { Msg::CancelCapture } else { Msg::Capture(binding.row) } }
+    pub(crate) fn unbind(binding: &Binding) -> Msg { Msg::Clear(binding.row) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn update(state: &mut State, message: Msg) -> Task<Msg> {
+    fn update(state: &mut State, message: Msg) -> Effect<Msg> {
         super::update(state, message, &crate::backend::Config::default())
     }
 
     fn ps5_state(xinput: bool) -> State {
         let target = || {
             let mut config = PadConfig::default();
-            config.set_flag(Flag::XInput, xinput, Layout::DInputSony);
-            Target { source: "test fixture".into(), found: true, saved: config.clone(), edit: config }
+            config.set_flag(Flag::XInput, xinput, Layout::DInputSony, &mut ffxi::Unbound::default());
+            Target { source: "test fixture".into(), saved: config.clone(), edit: config, unbound: ffxi::Unbound::default() }
         };
         State {
             preview: true,
@@ -1032,14 +821,14 @@ mod tests {
         assert_ne!(latest, first);
         let _ = update(&mut state, Msg::SaveLater(latest));
         assert_eq!(state.saving.in_flight, Some(first));
-        let _ = update(&mut state, Msg::Saved(first, first_pad, Ok("Saved".into())));
+        let _ = update(&mut state, Msg::Saved(first, first_pad.clone(), Ok((first_pad, "Saved".into()))));
         assert!(state.take_persisted_change());
         assert!(state.take_live_update().is_none(), "an older disk snapshot must not be applied live");
         let _ = update(&mut state, Msg::SaveLater(first));
         assert!(state.saving.in_flight.is_none(), "a stale debounce must not start another write");
         let snapshot = state.retail.edit.clone();
         let _ = update(&mut state, Msg::SaveLater(latest));
-        let _ = update(&mut state, Msg::Saved(latest, snapshot.clone(), Ok("Saved".into())));
+        let _ = update(&mut state, Msg::Saved(latest, snapshot.clone(), Ok((snapshot.clone(), "Saved".into()))));
         let (revision, values) = state.take_live_update().unwrap();
         assert_eq!(revision, latest);
         assert_eq!(values, controller_values(&snapshot));
@@ -1056,10 +845,10 @@ mod tests {
         let latest = state.saving.revision;
         let snapshot = state.retail.edit.clone();
         let _ = update(&mut state, Msg::SaveLater(latest));
-        let _ = update(&mut state, Msg::Saved(latest, snapshot, Ok("Saved".into())));
+        let _ = update(&mut state, Msg::Saved(latest, snapshot.clone(), Ok((snapshot, "Saved".into()))));
         assert!(state.take_live_update().is_none(), "one confirmation wait per launcher");
         let _ = update(&mut state, Msg::LiveResult(first, Err("old failure".into())));
-        assert!(!state.notice.as_ref().unwrap().error);
+        assert!(!state.notice.as_ref().unwrap().error());
         assert_eq!(state.take_live_update().unwrap().0, latest);
         let _ = update(&mut state, Msg::LiveResult(first, Err("old failure".into())));
         assert_eq!(state.saving.applying, Some(latest));
@@ -1086,7 +875,7 @@ mod tests {
         assert_eq!(state.retail.saved, before);
         assert_eq!(state.retail.edit, snapshot);
         assert!(state.saving.in_flight.is_none());
-        assert!(state.notice.as_ref().unwrap().error);
+        assert!(state.notice.as_ref().unwrap().retry());
         assert!(!state.take_persisted_change());
         assert!(state.take_live_update().is_none());
         let _ = update(&mut state, Msg::Apply);
@@ -1144,9 +933,9 @@ mod tests {
     fn back_cancels_gamepad_capture_before_closing_the_active_page() {
         let mut app = crate::tests::app();
         app.page = crate::Page::Settings;
-        let _ = app.update(Message::Gamepad(Msg::Capture(Row::Group(17))));
+        let _ = app.update(crate::Message::Gamepad(Msg::Capture(Row::Group(17))));
         assert!(app.gamepad.capturing());
-        let _ = app.update(Message::ControllerBack);
+        let _ = app.update(crate::Message::ControllerBack);
         assert!(!app.gamepad.capturing());
         assert!(app.page == crate::Page::Settings);
     }
@@ -1161,7 +950,8 @@ mod tests {
             assert_eq!(state.capture, Some(Row::Single(6)));
             assert_eq!(state.retail.edit, state.retail.saved);
             let notice = state.notice.as_ref().unwrap();
-            assert!(notice.error);
+            assert_eq!(notice.kind, NoticeKind::Capture);
+            assert!(!notice.retry(), "a capture error offers no Retry save");
             assert!(notice.text.contains("Turn XInput mode off"));
         }
         let _ = update(&mut state, Msg::SetFlag(Flag::XInput, false));
@@ -1170,5 +960,54 @@ mod tests {
         assert!(state.capture.is_none());
         assert!(state.notice.is_none());
         assert_eq!(state.retail.edit.sin[6], 14);
+    }
+
+    #[test]
+    fn cancelling_a_capture_clears_its_error() {
+        let mut state = ps5_state(true);
+        press(&mut state, 0);
+        let _ = update(&mut state, Msg::Capture(Row::Single(6)));
+        press(&mut state, Btn::Touchpad.bit());
+        assert!(state.notice.is_some());
+        let _ = update(&mut state, Msg::CancelCapture);
+        assert!(state.notice.is_none());
+    }
+
+    /// A save that kept values another tool stored meanwhile carries them
+    /// into the page wherever the user has not edited since.
+    #[test]
+    fn a_merged_save_rebases_the_page_onto_what_was_written() {
+        let mut state = ps5_state(false);
+        state.preview = false;
+        let _ = update(&mut state, Msg::SetFlag(Flag::Background, true));
+        let revision = state.saving.revision;
+        let snapshot = state.retail.edit.clone();
+        let _ = update(&mut state, Msg::SaveLater(revision));
+        let mut written = snapshot.clone();
+        written.sin[7] = 2; // rebound outside the launcher
+        let _ = update(&mut state, Msg::Saved(revision, snapshot, Ok((written.clone(), "Saved".into()))));
+        assert_eq!(state.retail.saved, written);
+        assert_eq!(state.retail.edit, written);
+        assert!(state.saving.in_flight.is_none());
+        // Running games get the merged values too.
+        let (_, live) = state.take_live_update().expect("merged save is applied live");
+        assert_eq!(live, controller_values(&written));
+    }
+
+    /// Without a controller or Sony ids, renumbering for XInput would guess
+    /// the bindings' layout, so the toggle does nothing.
+    #[test]
+    fn xinput_toggle_waits_for_a_known_directinput_layout() {
+        let mut state = ps5_state(false);
+        state.pads.clear();
+        // Sony ids in the stored bindings name the layout without a pad.
+        assert_eq!(state.known_di_layout(), Some(Layout::DInputSony));
+        let _ = update(&mut state, Msg::SetFlag(Flag::XInput, true));
+        assert!(state.retail.edit.flag(Flag::XInput));
+        // XInput bindings say nothing about the DirectInput layout.
+        assert_eq!(state.known_di_layout(), None);
+        let before = state.retail.edit.clone();
+        let _ = update(&mut state, Msg::SetFlag(Flag::XInput, false));
+        assert_eq!(state.retail.edit, before);
     }
 }

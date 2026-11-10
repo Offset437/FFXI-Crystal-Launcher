@@ -120,10 +120,10 @@ pub(crate) fn warm(host: &'static str) {
 /// 2026-10-13: every pt008.pol.com and pc001W2U.pol.com query was type A). std's and
 /// tokio's lookups use AF_UNSPEC, which on this machine sends an AAAA query beside each A
 /// query that stock never sends. An IPv4 literal resolves locally, without a query.
-pub(crate) fn resolve_a(host: &str, port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+pub(crate) fn resolve_a(host: &str, port: u16) -> std::io::Result<Vec<std::net::SocketAddrV4>> {
     use windows_sys::Win32::Networking::WinSock::{FreeAddrInfoW, GetAddrInfoW, ADDRINFOW, AF_INET, IPPROTO_TCP, SOCKADDR_IN, SOCK_STREAM};
     crate::stock_socket::startup();
-    let name: Vec<u16> = host.encode_utf16().chain(Some(0)).collect();
+    let name = crate::win::wide(host);
     // SAFETY: zero is a valid ADDRINFOW (all integers and null pointers).
     let mut hints: ADDRINFOW = unsafe { std::mem::zeroed() };
     hints.ai_family = AF_INET as i32;
@@ -143,7 +143,7 @@ pub(crate) fn resolve_a(host: &str, port: u16) -> std::io::Result<Vec<std::net::
             let address = unsafe { &*(info.ai_addr as *const SOCKADDR_IN) };
             // IN_ADDR is stored in network byte order.
             let ip = Ipv4Addr::from(unsafe { address.sin_addr.S_un.S_addr }.to_ne_bytes());
-            found.push(std::net::SocketAddr::from((ip, port)));
+            found.push(std::net::SocketAddrV4::new(ip, port));
         }
         at = info.ai_next;
     }
@@ -154,7 +154,7 @@ pub(crate) fn resolve_a(host: &str, port: u16) -> std::io::Result<Vec<std::net::
 }
 
 /// `resolve_a` for a "host:port" server string.
-pub(crate) fn resolve_server(server: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+pub(crate) fn resolve_server(server: &str) -> std::io::Result<Vec<std::net::SocketAddrV4>> {
     let (host, port) = server.rsplit_once(':')
         .and_then(|(host, port)| Some((host, port.parse::<u16>().ok()?)))
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{server}: no port")))?;
@@ -194,7 +194,7 @@ fn query_a(host: &str) -> Result<Vec<Ipv4Addr>, i32> {
     use windows_sys::Win32::NetworkManagement::Dns::{
         DnsFree, DnsFreeRecordList, DnsQuery_W, DNS_QUERY_BYPASS_CACHE, DNS_RECORDA, DNS_TYPE_A,
     };
-    let name: Vec<u16> = host.encode_utf16().chain(Some(0)).collect();
+    let name = crate::win::wide(host);
     let mut records: *mut DNS_RECORDA = std::ptr::null_mut();
     // windows-sys types the out-list as DNS_RECORDA; DnsQuery_W fills DNS_RECORDW, whose
     // layout differs only in pName (not read here).
@@ -240,7 +240,7 @@ fn flush_entries(hosts: &[&str]) {
     // sibling of DnsFlushResolverCache), so it is looked up once from System32.
     static FLUSH: std::sync::OnceLock<Option<Flush>> = std::sync::OnceLock::new();
     let flush = *FLUSH.get_or_init(|| unsafe {
-        let dll: Vec<u16> = "dnsapi.dll".encode_utf16().chain(Some(0)).collect();
+        let dll = crate::win::wide("dnsapi.dll");
         let module = LoadLibraryExW(dll.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
         if module.is_null() { return None; }
         GetProcAddress(module, c"DnsFlushResolverCacheEntry_W".as_ptr().cast())
@@ -248,7 +248,7 @@ fn flush_entries(hosts: &[&str]) {
     });
     let Some(flush) = flush else { return };
     for host in hosts {
-        let name: Vec<u16> = host.encode_utf16().chain(Some(0)).collect();
+        let name = crate::win::wide(host);
         unsafe { flush(name.as_ptr()); }
     }
 }
@@ -304,8 +304,8 @@ mod tests {
     /// IPv4 literals only: unit tests never send a real query.
     #[test]
     fn patch_hosts_resolve_through_getaddrinfo_to_ipv4() {
-        assert_eq!(resolve_a("124.150.156.107", 53001).unwrap(), [std::net::SocketAddr::from((Ipv4Addr::new(124, 150, 156, 107), 53001))]);
-        assert_eq!(resolve_server("127.0.0.1:54000").unwrap(), [std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, 54000))]);
+        assert_eq!(resolve_a("124.150.156.107", 53001).unwrap(), [std::net::SocketAddrV4::new(Ipv4Addr::new(124, 150, 156, 107), 53001)]);
+        assert_eq!(resolve_server("127.0.0.1:54000").unwrap(), [std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 54000)]);
         assert!(resolve_server("pc001W2U.pol.com").is_err(), "a server string needs its port");
         // Every lookup of a patch host goes through resolve_a (A only); the AF_UNSPEC
         // resolvers appear nowhere outside tests.

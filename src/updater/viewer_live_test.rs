@@ -13,7 +13,11 @@ async fn official_viewer_copy_updates_and_verifies_both_deployment_targets() {
     assert_eq!(fs::read(root.join(".crystal-pol-test")).unwrap(), b"disposable PlayOnline copy\n");
     assert!(!root.join(STATE_DIR).exists());
     let user_file = root.join("keep-user-file"); fs::write(&user_file, b"keep this").unwrap();
-    let before = run_for(Product::Viewer, root.clone(), Mode::Check, Operation::new()).await.unwrap();
+    // The PlayOnline update production runs (main.rs: run_combined(Some(viewer), None, ..)).
+    let viewer = |root: PathBuf, mode, op| async move {
+        run_combined(Some(root), None, mode, op).await.map(|c| c.viewer.unwrap()).map_err(|f| f.message)
+    };
+    let before = viewer(root.clone(), Mode::Check, Operation::new()).await.unwrap();
     eprintln!("POL baseline: {}", before.summary);
     assert!(!before.verified, "Use a fresh/outdated POL copy for the live update exercise");
     let op = Operation::new(); let watched = op.clone();
@@ -24,14 +28,14 @@ async fn official_viewer_copy_updates_and_verifies_both_deployment_targets() {
             eprintln!("POL {}: {}/{} {}", progress.stage, progress.done, progress.total, progress.detail);
         }
     });
-    let updated = run_for(Product::Viewer, root.clone(), Mode::Update, op.clone()).await;
+    let updated = viewer(root.clone(), Mode::Update, op.clone()).await;
     watcher.abort();
     let updated = updated.unwrap();
     eprintln!("POL updated: {}", updated.summary);
     assert!(updated.verified); assert!(updated.repaired > 0);
-    assert_eq!(crate::patch::installed_for_request_for(&root, "1000"), updated.version);
+    assert_eq!(crate::patch::installed_for_request_for(&root, crate::updater::Product::Viewer), updated.version);
     assert!(op.snapshot().overall.unwrap().complete);
-    let after = run_for(Product::Viewer, root.clone(), Mode::Check, Operation::new()).await.unwrap();
+    let after = viewer(root.clone(), Mode::Check, Operation::new()).await.unwrap();
     assert!(after.verified); assert_eq!(after.current, after.total); assert_eq!(after.version, updated.version);
     for name in ["app.dll", "polcore.dll"] {
         assert_eq!(fs::read(root.join(format!("viewer/com/{name}"))).unwrap(),

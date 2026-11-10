@@ -11,15 +11,16 @@ use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::Globalization::{MultiByteToWideChar, WideCharToMultiByte, CP_ACP};
 use windows_sys::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
-use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW, GetProcAddress, LoadLibraryExW, LOAD_WITH_ALTERED_SEARCH_PATH};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryExW, LOAD_WITH_ALTERED_SEARCH_PATH};
 use windows_sys::Win32::System::Memory::{VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_READWRITE, PAGE_WRITECOPY};
 
 use crate::log;
 use crate::proto::{self, Region};
 use crate::registry;
-use crate::slots::{self, TABLE_LEN};
 
 type HRESULT = i32;
+
+use crate::pol_core::TABLE_LEN;
 
 const CLSID_POLCORE: [GUID; 3] = [
     GUID::from_u128(0x07974581_0DF6_4EF0_BD05_604B3ADA9BE9), // JP
@@ -49,18 +50,8 @@ const VT_GAME_START: usize = 3;
 // IClassFactory
 const VT_CREATE_INSTANCE: usize = 3;
 
-// Core initialization slots for the legacy offline session path.
-const POLFUNC_REGISTRY_LANG: usize = 965;
-const POLFUNC_FFXI_LANG: usize = 420;
-const POLFUNC_REGISTRY_KEY: usize = 367;
-const POLFUNC_INSTALL_FOLDER: usize = 125;
-const POLFUNC_FILE_INIT: usize = 932;
-const POLFUNC_INET_MUTEX: usize = 815;
 const SLOT_EXIT_CODE: usize = 970;
 const SLOT_EXIT_MESSAGE: usize = 1027;
-
-/// The polcore build the slot specs were read from.
-const POLCORE_TIMESTAMP: u32 = 0x4E4E_5917;
 
 /// app 102afa80: the game language the Viewer gives 1528 for its region:
 /// Japanese 0, North America 1, Europe the Viewer's registry Language.
@@ -68,11 +59,41 @@ fn pol_language(area: i32, registry_language: i32) -> u32 {
     match area { 0 => 0, 1 => 1, _ => u32::try_from(registry_language).unwrap_or(1) }
 }
 
-fn validate_polcore_build(timestamp: u32) -> Result<(), String> {
-    if timestamp != POLCORE_TIMESTAMP {
-        return Err(format!("Unsupported PlayOnline core build {timestamp:08X}; this loader's function-table layout was verified for {POLCORE_TIMESTAMP:08X}. Use the supported viewer before launching through Crystal."));
+/// The core's COM interface, checked by structure before any of its methods
+/// runs (`pol_core::check_com`). Returns the core's layout for the table check.
+unsafe fn check_core_interface(core: &Com, module: HMODULE) -> Result<crate::pol_core::Layout, String> {
+    let layout = crate::pol_core::Layout::live(module as usize)?;
+    let vtable = crate::mem::read::<usize>(core.0 as usize).ok_or("PlayOnline core check failed: its COM object is unreadable.")?;
+    let mut methods = [0usize; crate::pol_core::COM_VTABLE_WORDS];
+    if !crate::mem::read_into(vtable, &mut methods) {
+        return Err("PlayOnline core check failed: its COM vtable is unreadable.".into());
     }
-    Ok(())
+    crate::pol_core::check_com(&layout, vtable, &methods)?;
+    Ok(layout)
+}
+
+/// The function table GetCommonFunctionTable returned, checked by structure
+/// before any service is called (`pol_core::check_table`).
+fn check_function_table(layout: &crate::pol_core::Layout, table: *mut usize) -> Result<crate::pol_core::Table, String> {
+    let mut words = vec![0usize; TABLE_LEN];
+    if !crate::mem::read_into(table as usize, &mut words) {
+        return Err(format!("PlayOnline core check failed: the function table {:#x} is unreadable.", table as usize));
+    }
+    crate::pol_core::check_table(layout, table as usize, &words)
+}
+
+/// The installed Viewer's ticker sets the stock frame the Viewer's
+/// frame-counted timers (auto-away, mail) run on.
+fn adopt_viewer_frame(viewer: &Path, region: Region) {
+    let folder = viewer.join("viewer").join("com");
+    let file = if region == Region::Eu && folder.join("appEU.dll").is_file() { folder.join("appEU.dll") } else { folder.join("app.dll") };
+    match std::fs::read(&file).map_err(|e| e.to_string()).and_then(|bytes| crate::pol_core::viewer_ticker(&bytes)) {
+        Ok(us) => {
+            crate::native_jobs::set_stock_frame_us(us);
+            log!("stage: Viewer frame {:.2} ms from {} (3600 Viewer frames = {:.1} s)", us as f64 / 1000.0, file.display(), us as f64 * 3600.0 / 1e6);
+        }
+        Err(error) => log!("note: Viewer frame unknown ({error}); keeping {:.2} ms", crate::native_jobs::stock_frame_us() as f64 / 1000.0),
+    }
 }
 
 pub struct GameOutcome {
@@ -81,6 +102,9 @@ pub struct GameOutcome {
     /// Native GameStart returned S_OK with no message object or POL error text.
     /// This is evidence for the launcher, never a replacement for the exit code.
     pub game_returned: bool,
+    /// FFXi.dll and FFXiMain.dll were unloaded after this game, so another
+    /// game in this host would map fresh copies (game_modules).
+    pub modules_released: bool,
 }
 
 pub struct GameConfig {
@@ -94,8 +118,6 @@ pub struct GameConfig {
     pub viewer_gaps: bool,
     pub auto_away_minutes: u32,
     pub auto_login: proto::AutoLogin,
-    pub selftest: bool,
-    pub trace_slots: bool,
 }
 
 /// # Safety-relevant
@@ -137,7 +159,7 @@ fn checked_viewer_slot(vtable: usize, base: usize, size: usize) -> Result<usize,
     let slot = vtable.checked_add(VT_POL_VIEWER_EXEC * pointer_size)
         .ok_or("PlayOnline viewer vtable address overflows")?;
     let end = slot.checked_add(pointer_size).ok_or("PlayOnline viewer slot address overflows")?;
-    if vtable < base || vtable % pointer_size != 0 || end > base.checked_add(size).ok_or("PlayOnline core image address overflows")? {
+    if vtable < base || !vtable.is_multiple_of(pointer_size) || end > base.checked_add(size).ok_or("PlayOnline core image address overflows")? {
         return Err("PlayOnline viewer vtable is outside the verified core image".into());
     }
     Ok(slot)
@@ -156,32 +178,26 @@ impl ViewerReturn {
         let original = slot.read();
         if original == 0 { return Err("PlayOnline viewer method is null".into()); }
         let patch = Self { slot, original };
-        patch.write(pol_viewer_exec as *const () as usize)?;
+        patch.write(original, pol_viewer_exec as *const () as usize)?;
         log!("stage: in-game PlayOnline Viewer requests answered without a viewer");
         Ok(patch)
     }
 
-    fn write(&self, function: usize) -> Result<(), String> {
-        let mut protection = 0;
-        // SAFETY: a validated pointer-sized slot. Windows gives this process a
-        // private writable image page; restore its protection after the write.
-        unsafe {
-            if VirtualProtect(self.slot.cast(), std::mem::size_of::<usize>(), PAGE_READWRITE, &mut protection) == 0 {
-                return Err(format!("Could not prepare PlayOnline viewer return: {}", std::io::Error::last_os_error()));
-            }
-            self.slot.write_volatile(function);
-            let mut ignored = 0;
-            if VirtualProtect(self.slot.cast(), std::mem::size_of::<usize>(), protection, &mut ignored) == 0 {
-                return Err(format!("Could not restore PlayOnline core page protection: {}", std::io::Error::last_os_error()));
-            }
+    /// Swaps `from` for `to` in the slot. Windows gives this process a private
+    /// writable image page; its protection is restored after the swap.
+    fn write(&self, from: usize, to: usize) -> Result<(), String> {
+        let done = crate::iat::swap(self.slot as usize, from, to)
+            .map_err(|error| format!("Could not prepare PlayOnline viewer return: {error}"))?;
+        if !done.changed {
+            return Err("PlayOnline viewer method was changed by another module; left as is".into());
         }
-        Ok(())
+        done.restored.map_err(|error| format!("Could not restore PlayOnline core page protection: {error}"))
     }
 }
 
 impl Drop for ViewerReturn {
     fn drop(&mut self) {
-        if let Err(error) = self.write(self.original) { log!("error: {error}"); }
+        if let Err(error) = self.write(pol_viewer_exec as *const () as usize, self.original) { log!("error: {error}"); }
     }
 }
 
@@ -192,9 +208,7 @@ unsafe extern "system" fn pol_viewer_exec(_: *mut c_void, _: *mut u32) -> HRESUL
     0
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+use crate::win::wide;
 
 /// ANSI (registry) bytes to a Rust string via the active code page.
 pub(crate) fn ansi_to_string(bytes: &[u8]) -> String {
@@ -210,23 +224,17 @@ pub(crate) fn ansi_to_string(bytes: &[u8]) -> String {
     }
 }
 
+/// The module's full path; empty when it cannot be read whole (a truncated
+/// path never matches the selected DLL).
 fn module_path(m: HMODULE) -> String {
-    let mut buf = vec![0u16; 1024];
-    // SAFETY: buf is valid for its length.
-    let n = unsafe { GetModuleFileNameW(m, buf.as_mut_ptr(), buf.len() as u32) } as usize;
-    String::from_utf16_lossy(&buf[..n])
+    crate::win::module_path(m).map(|path| path.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-/// (base, SizeOfImage, TimeDateStamp) of a loaded module.
+/// (base, SizeOfImage, TimeDateStamp) of a loaded module; size and timestamp
+/// are 0 when its headers can't be read (no build or bounds check passes).
 fn module_image(m: HMODULE) -> (usize, usize, u32) {
     let base = m as usize;
-    // SAFETY: a loaded module's PE headers are mapped and readable.
-    unsafe {
-        let nt = base + *((base + 0x3C) as *const u32) as usize;
-        let ts = *((nt + 8) as *const u32);
-        let size = *((nt + 24 + 56) as *const u32) as usize;
-        (base, size, ts)
-    }
+    crate::pe::identity(base).map_or((base, 0, 0), |image| (base, image.size, image.timestamp))
 }
 
 /// POL uses its registered viewer, with a direct-DLL fallback for portable installs.
@@ -249,8 +257,8 @@ fn create(clsid: &GUID, iid: &GUID, dll: &Path, what: &str) -> Result<Com, Strin
 }
 
 /// Create from the selected DLL's class factory, bypassing global COM registration.
-/// Keep a successful load resident until process exit, as the injector's hooks may
-/// retain addresses in this module after the COM object is released.
+/// polcore stays resident for the whole host; the game DLLs are released after
+/// each game (game_modules), like stock pol.exe's CoFreeUnusedLibraries.
 fn create_from_dll(clsid: &GUID, iid: &GUID, dll: &Path, what: &str) -> Result<Com, String> {
     create_from_dll_with_outer(clsid, iid, std::ptr::null_mut(), dll, what)
 }
@@ -271,6 +279,12 @@ fn create_from_dll_with_outer(clsid: &GUID, iid: &GUID, outer: *mut c_void, dll:
         unsafe { FreeLibrary(m) };
         return Err(format!("{what}: loaded {} instead of the selected {}", loaded.display(), dll.display()));
     }
+    // The game DLLs live for one game: game_modules releases this reference
+    // after GameStart returns (stock pol.exe frees them there too).
+    let counted = crate::game_modules::is_game_module(&loaded);
+    if counted {
+        crate::game_modules::note_reference(m);
+    }
     // Patch imports before constructing GameMain: its constructor may itself create
     // other game components. LoadLibraryEx still passes through the injector's hooks.
     if what == "GameMain" && !crate::ffxi_settings::apply_to_ffximain() {
@@ -278,8 +292,10 @@ fn create_from_dll_with_outer(clsid: &GUID, iid: &GUID, outer: *mut c_void, dll:
     }
     // SAFETY: m is a loaded module; the export has the documented COM signature.
     unsafe {
-        let Some(get) = GetProcAddress(m, b"DllGetClassObject\0".as_ptr()) else {
-            FreeLibrary(m);
+        // A counted game-DLL reference stays, like every later failure:
+        // game_modules releases it once after GameStart.
+        let Some(get) = GetProcAddress(m, c"DllGetClassObject".as_ptr().cast()) else {
+            if !counted { FreeLibrary(m); }
             return Err(format!("{what}: {} has no DllGetClassObject", dll.display()));
         };
         let get: unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(get);
@@ -394,7 +410,7 @@ unsafe fn table_slice(tbl: *mut usize, polcore: HMODULE) -> Result<&'static mut 
     let bytes = TABLE_LEN * std::mem::size_of::<usize>();
     let end = start.checked_add(bytes).ok_or("function-table address overflows")?;
     let image_end = base.checked_add(size).ok_or("polcore image address overflows")?;
-    if start < base || end > image_end || start % std::mem::size_of::<usize>() != 0 {
+    if start < base || end > image_end || !start.is_multiple_of(std::mem::size_of::<usize>()) {
         return Err(format!("function table {start:#x} is not inside polcore ({base:#x}+{size:#x})"));
     }
     // Every region the table spans must be writable (it is .data in the verified build).
@@ -410,7 +426,7 @@ unsafe fn table_slice(tbl: *mut usize, polcore: HMODULE) -> Result<&'static mut 
     }
     if !writable {
         let mut old = 0;
-        if VirtualProtect(tbl as *const c_void, TABLE_LEN * 4, PAGE_READWRITE, &mut old) == 0 {
+        if VirtualProtect(tbl as *const c_void, bytes, PAGE_READWRITE, &mut old) == 0 {
             return Err(format!("function table is not writable ({})", std::io::Error::last_os_error()));
         }
         log!("function table made writable (protect was {old:#x})");
@@ -464,14 +480,15 @@ fn run_with(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<GameOutc
     }
     log!("stage: COM initialised (STA)");
     let result = run_in_apartment(cfg, park);
+    log!("stage: closing COM apartment");
     // SAFETY: balances CoInitializeEx above.
     unsafe { CoUninitialize() };
+    log!("stage: COM apartment closed");
     result
 }
 
 fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<GameOutcome, String> {
-    // A park exists only for a native sign-in (07d §1.1).
-    let native_host = cfg.native_auth.is_some() || park.is_some();
+    crate::controller_catalog::prefetch();
     let region = cfg.region;
     let area = region.area_code();
     if region != Region::Us {
@@ -511,19 +528,28 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
     if pmod.is_null() {
         return Err(format!("{polcore_name} is not loaded after creating polcore"));
     }
-    let (_, _, pts) = module_image(pmod);
-    log!("stage: polcore loaded from {} (ts={pts:#010x}{})", module_path(pmod), if pts == POLCORE_TIMESTAMP { ", verified build" } else { ", UNVERIFIED build" });
-    validate_polcore_build(pts)?;
-    // SAFETY: a live core interface; timestamp and image bounds are checked
-    // before changing its viewer method. Keep the patch through FFXi release.
+    #[cfg_attr(not(feature = "native-login-diagnostics"), allow(unused_variables))]
+    let (pbase, _psize, _) = module_image(pmod);
+    // SAFETY: a live core interface; only its vtable and methods are read.
+    let layout = match unsafe { check_core_interface(&polcore, pmod) } {
+        Ok(layout) => layout,
+        Err(error) => {
+            crate::feature_check::report_pol(crate::pol_core::Layout::live(pmod as usize).ok().as_ref(), Err(&error));
+            return Err(error);
+        }
+    };
+    log!("stage: polcore loaded from {} (build {})", module_path(pmod), layout.name());
+    adopt_viewer_frame(&viewer, region);
+    // SAFETY: a live core interface whose vtable passed the structural check;
+    // its slot is bounds-checked again before the change. Keep the patch
+    // through FFXi release.
     let viewer_return = unsafe { ViewerReturn::install(&polcore, pmod)? };
 
     // The strings polcore keeps pointers to must outlive it: leak them.
     let cmd: &'static mut [u8] = Box::leak(b"\0".to_vec().into_boxed_slice());
     let regkey: &'static CString = Box::leak(Box::new(CString::new(registry::playonline_key(region)).expect("no NUL")));
-    let mut viewer_c = viewer_ansi.clone();
-    viewer_c.retain(|&b| b != 0);
-    let viewer_c: &'static CString = Box::leak(Box::new(CString::new(viewer_c).expect("NULs removed")));
+    // ansi_path refuses a path with a NUL byte.
+    let viewer_c: &'static CString = Box::leak(Box::new(CString::new(viewer_ansi).expect("no NUL")));
 
     let tbl: *mut usize = unsafe {
         // SAFETY: live IPOLCoreCom object; method indices and signatures match its layout.
@@ -542,24 +568,22 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
         }
         t
     };
-    // SAFETY: validated against polcore's image before use.
+    let checked = check_function_table(&layout, tbl);
+    crate::feature_check::report_pol(Some(&layout), checked.as_ref().map_err(|e| e.as_str()));
+    let checked = checked?;
+    log!("{}", checked.summary(&layout));
+    // SAFETY: the table passed the structural check (inside polcore's data).
     let table = unsafe { table_slice(tbl, pmod)? };
     log!("stage: polcore SetAreaCode/SetParamInit done; function table at {:#x}", tbl as usize);
-    if native_host {
-        crate::native_auth::validate_entries(table,module_image(pmod).0)?;
-    }
 
     // A pilot records socket metadata only during native sign-in/idle. The
     // forwarding imports stay valid for the process lifetime, including error
     // teardown and native worker calls; dropping this guard only stops logging.
     #[cfg(feature = "native-login-diagnostics")]
-    let socket_trace = if native_host {
-        let (base, size, _) = module_image(pmod);
-        match unsafe { crate::native_socket_trace::Recording::install(base, size) } {
-            Ok(trace) => Some(trace),
-            Err(error) => { log!("native POL socket trace unavailable: {error}"); None }
-        }
-    } else { None };
+    let socket_trace = match unsafe { crate::native_socket_trace::Recording::install(pbase, _psize) } {
+        Ok(trace) => Some(trace),
+        Err(error) => { log!("native POL socket trace unavailable: {error}"); None }
+    };
 
     // --- park end point (07d §1.3 step 3): polcore and its validated table
     // only. No restore_viewer_policy, no bootstrap, no member select, no Open
@@ -567,134 +591,111 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
     if let Some(park) = park {
         if !park(cfg, polcore_time) {
             log!("stage: parked host released without a Play; nothing was networked");
-            return Ok(GameOutcome { code: crate::EXIT_PIPE, message: String::new(), game_returned: false });
+            return Ok(GameOutcome { code: crate::EXIT_PIPE, message: String::new(), game_returned: false, modules_released: false });
         }
-        if cfg.native_auth.is_none() { return Err("The parked host received no credentials.".into()); }
     }
+    let Some(credentials) = cfg.native_auth.take() else { return Err("The game host received no credentials.".into()) };
 
     // --- native: the Viewer's own startup and sign-in (pol-spec 01 §8) ---
-    let mut native = if let Some(credentials) = cfg.native_auth.take() {
-        let (base, _, _) = module_image(pmod);
-        #[cfg(feature = "native-login-diagnostics")]
-        let bootstrap_started = crate::startup_timing::Stamp::capture();
-        // SAFETY: the supported core owns this table and outlives native's
-        // scope; the leaked strings outlive the core.
-        let mut session = unsafe { crate::native_auth::NativeSession::bootstrap(table, base, &viewer, viewer_c, regkey, area, pol_language(area, lang), cfg.auto_away_minutes)? };
-        #[cfg(feature = "native-login-diagnostics")]
-        crate::startup_timing::report("native-bootstrap-complete", bootstrap_started, crate::startup_timing::Stamp::capture());
-        session.set_viewer_gaps(cfg.viewer_gaps);
-        let signed_in = session.sign_in(credentials);
-        #[cfg(feature = "native-login-diagnostics")]
-        if let Some(trace) = &socket_trace { trace.finish_startup(); }
-        if let Err(error) = signed_in {
-            #[cfg(feature = "native-login-diagnostics")]
-            if let Some(trace) = &socket_trace { trace.stop(); }
-            return Err(error);
+    #[cfg(feature = "native-login-diagnostics")]
+    let bootstrap_started = crate::startup_timing::Stamp::capture();
+    // SAFETY: the supported core owns this table and outlives the session's
+    // scope; the leaked strings outlive the core.
+    let mut session = unsafe { crate::native_auth::NativeSession::bootstrap(table, &checked, &viewer, viewer_c, regkey, area, pol_language(area, lang), cfg.auto_away_minutes)? };
+    #[cfg(feature = "native-login-diagnostics")]
+    crate::startup_timing::report("native-bootstrap-complete", bootstrap_started, crate::startup_timing::Stamp::capture());
+    session.set_viewer_gaps(cfg.viewer_gaps);
+    let signed_in = session.sign_in(credentials);
+    #[cfg(feature = "native-login-diagnostics")]
+    if let Some(trace) = &socket_trace { trace.stop(); }
+    if let Err(error) = signed_in {
+        // The launcher's startup sign-out is the user's choice, not a
+        // failure: end cleanly (exit 0) after the session's sign-out.
+        if crate::native_auth::sign_in_cancelled() {
+            log!("stage: native sign-in cancelled by the launcher ({error})");
+            return Ok(GameOutcome { code: 0, message: String::new(), game_returned: false, modules_released: false });
         }
-        Some(session)
-    } else { None };
-
-    // Core initialization for offline fixtures only.
-    // SAFETY: live polcore entries with their matching cdecl argument types.
-    if native.is_none() { unsafe {
-        let f1 = |slot: usize| -> extern "C" fn(usize) -> u32 { std::mem::transmute::<usize, extern "C" fn(usize) -> u32>(table[slot]) };
-        let f0 = |slot: usize| -> extern "C" fn() -> u32 { std::mem::transmute::<usize, extern "C" fn() -> u32>(table[slot]) };
-        for slot in [POLFUNC_REGISTRY_LANG, POLFUNC_FFXI_LANG, POLFUNC_REGISTRY_KEY, POLFUNC_INSTALL_FOLDER, POLFUNC_FILE_INIT, POLFUNC_INET_MUTEX] {
-            if table[slot] == 0 {
-                return Err(format!("polcore init slot {slot} is null"));
-            }
-        }
-        let r965 = f1(POLFUNC_REGISTRY_LANG)(area as usize);
-        let r420 = f1(POLFUNC_FFXI_LANG)(lang as usize);
-        let r367 = f1(POLFUNC_REGISTRY_KEY)(regkey.as_ptr() as usize);
-        let r125 = f1(POLFUNC_INSTALL_FOLDER)(viewer_c.as_ptr() as usize);
-        let r932 = f0(POLFUNC_FILE_INIT)();
-        // One initial step initializes Winsock before POLCON_OPEN(3) jumps
-        // directly to member login. This step cannot connect in a fresh core.
-        let r815 = f0(POLFUNC_INET_MUTEX)();
-        log!("stage: polcore init calls 965={r965:#x} 420={r420:#x} 367={r367:#x} 125={r125:#x} 932={r932:#x} 815={r815:#x}");
-    } }
-
-    // --- overrides ---
-    let patched = if native.is_none() {
-        let set = slots::override_set(cfg.selftest);
-        let patched = slots::patch(table, &set).map_err(|e| format!("patching the function table: {e}"))?;
-        let nulls = patched.null_originals();
-        if !nulls.is_empty() { log!("note: overridden slots that were null in polcore: {nulls:?}"); }
-        log!("stage: function table patched ({} slots{})", patched.len(), if cfg.selftest { ", selftest DNS on loopback" } else { "" });
-        Some(patched)
-    } else {
-        log!("stage: original POL service table retained (0 overrides)");
-        None
-    };
-    #[cfg(feature = "native-backup-diagnostics")]
-    let backup_trace = if native.is_some() {
-        // Pilot-only transparent forwarding; native arguments/results and all
-        // other entries stay unchanged. Restore after every game caller exits.
-        Some(unsafe { crate::native_backup::BackupTrace::install(table, module_image(pmod).0)? })
-    } else { None };
-    let traced = if cfg.trace_slots && native.is_none() {
-        // SAFETY: the live table, before any game thread exists.
-        match unsafe { crate::trace::install(table) } {
-            Ok(orig) => Some(orig),
-            Err(e) => {
-                log!("trace: not installed: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Keep the injector shutdown guard through every game in this owner.
-    #[cfg(target_arch = "x86")]
-    let windower_exit = crate::windower_exit::Wakeup::install();
-    #[cfg(target_arch = "x86")]
-    if crate::windower_plugin_settings::install()? {
-        log!("stage: Windower plugin settings coordinator prepared");
+        return Err(error);
     }
-    let mut outcome = GameOutcome { code: 0, message: String::new(), game_returned: false };
+    log!("stage: original POL service table retained (0 overrides)");
+    #[cfg(feature = "native-backup-diagnostics")]
+    // Pilot-only transparent forwarding; native arguments/results and all
+    // other entries stay unchanged. Restore after every game caller exits.
+    let backup_trace = match unsafe { crate::native_backup::BackupTrace::install(table, &layout) } {
+        Ok(trace) => Some(trace),
+        Err(error) => { log!("note: {error}"); None }
+    };
+
+    #[cfg(target_arch = "x86")]
+    // A protection that cannot be installed is switched off with its reason;
+    // it never stops the game from starting.
+    match crate::windower_plugin_settings::install() {
+        Ok(true) => log!("stage: Windower plugin settings coordinator prepared"),
+        Ok(false) => {}
+        Err(reason) => log!("note: FFXIDB shared-settings protection unavailable: {reason}"),
+    }
     let mut play = cfg.start_game;
-    loop {
-        if !play {
-            let Some(session) = native.as_mut() else { break };
-            if !session.wait_for_game()? {
-                outcome = GameOutcome { code: 0, message: String::new(), game_returned: false };
-                break;
-            }
+    let outcome = loop {
+        if !play && !session.wait_for_game()? {
+            break GameOutcome { code: 0, message: String::new(), game_returned: false, modules_released: false };
         }
         #[cfg(feature = "native-login-diagnostics")]
         if let Some(trace) = &socket_trace { trace.stop(); }
-        outcome = run_game(&polcore, &ffxi_dir, table, native.as_mut(), cfg.auto_login)?;
+        // A batch must release every signed-in owner before any takes this turn.
+        // Windower saves on the first main window, so protect game DLL loading and
+        // COM construction too, rather than waiting until the GameStart call.
+        // A failed batch loaded no game DLL: this Play is refused and the
+        // signed-in owner returns to the idle Viewer.
+        if let Err(reason) = crate::native_auth::wait_batch_game() {
+            log!("stage: batch game start refused ({reason}); staying signed in");
+            events_game_ended(&GameOutcome { code: crate::EXIT_GAME_START, message: reason, game_returned: false, modules_released: false });
+            play = false;
+            continue;
+        }
+        let outcome = run_game(&polcore, &ffxi_dir, table, &mut session, cfg.auto_login)?;
         events_game_ended(&outcome);
-        if native.is_none() || !cfg.keep_session { break; }
+        if !retain_native_session(cfg.keep_session, &outcome) {
+            if cfg.keep_session && outcome.game_returned && !outcome.modules_released {
+                log!("stage: this host ends after its game because the game DLLs stayed loaded; the next game signs in a new host");
+            }
+            break outcome;
+        }
         play = false;
-    }
+    };
     #[cfg(feature = "native-backup-diagnostics")]
     drop(backup_trace);
-    #[cfg(target_arch = "x86")]
-    drop(windower_exit);
-    if let Some(orig) = traced {
-        table.copy_from_slice(&orig);
-    }
-    if let Some(patched) = patched { patched.restore(table); }
-    drop(native); // Viewer sign-out and close teardown, file worker last
+    log!("stage: native POL session cleanup starting");
+    drop(session); // Viewer sign-out and close teardown, file worker last
+    log!("stage: native POL session cleanup finished");
     drop(viewer_return);
+    log!("stage: releasing PlayOnline core interface");
     drop(polcore);
+    log!("stage: PlayOnline core interface released");
     Ok(outcome)
 }
 
 fn events_game_ended(outcome: &GameOutcome) {
-    crate::events::send(format!("{{\"type\":\"native_game_ended\",\"code\":{},\"game_returned\":{}}}\n", outcome.code, outcome.game_returned));
+    crate::events::send(format!("{{\"type\":\"native_game_ended\",\"code\":{},\"game_returned\":{},\"game_id\":{}}}\n", outcome.code, outcome.game_returned, crate::game_shutdown::last_game()));
 }
 
-fn successful_native_return(native: bool, hr: HRESULT, has_message_object: bool, message: &str) -> bool {
-    native && hr == 0 && !has_message_object && message.is_empty()
+fn successful_native_return(hr: HRESULT, has_message_object: bool, message: &str) -> bool {
+    hr == 0 && !has_message_object && message.is_empty()
 }
 
-fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], mut native: Option<&mut crate::native_auth::NativeSession>, auto_login: proto::AutoLogin) -> Result<GameOutcome, String> {
+/// Another game may follow in this host only on fresh game DLLs.
+fn retain_native_session(enabled: bool, outcome: &GameOutcome) -> bool {
+    enabled && outcome.game_returned && outcome.modules_released && matches!(outcome.code, 0 | -14)
+}
+
+fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], session: &mut crate::native_auth::NativeSession, auto_login: proto::AutoLogin) -> Result<GameOutcome, String> {
+    #[cfg(target_arch = "x86")]
+    crate::windower_start::coordinate(&mut || session.startup_frame())?;
+    // A game never starts on an earlier game's memory: both game DLLs must be
+    // absent here, so this GameStart maps fresh copies.
+    crate::game_modules::refuse_reuse()?;
     // --- FFXi.dll ---
-    if let Err(e) = std::env::set_current_dir(&ffxi_dir) {
+    let _boot_timing = crate::boot_timing::Run::begin();
+    if let Err(e) = std::env::set_current_dir(ffxi_dir) {
         log!("note: cannot set the working directory to {}: {e}", ffxi_dir.display());
     }
     let ffxi = create_from_dll(&CLSID_FFXIENTRY, &IID_IFFXIENTRY, &ffxi_dir.join("FFXi.dll"), "FFXiEntry")?;
@@ -712,39 +713,19 @@ fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], mut native: Option<
     }
 
     // Read-only during play: no request is issued while FFXI runs (B1).
-    let native_friends = native.as_deref().map(|n| n.observe_friends()).transpose()?;
+    let native_friends = session.observe_friends()?;
     let lobby_observer = crate::lobby::Observer::start();
-    // All native requests and local game setup have completed. A batch's one
-    // kernel event releases every owner here; no supervisor polling delay.
-    let ready = crate::native_auth::wait_batch_game().and_then(|()| {
-        #[cfg(target_arch = "x86")]
-        return crate::windower_start::coordinate(&mut || {
-            if let Some(session) = native.as_deref_mut() {
-                session.startup_frame()
-            } else {
-                crate::native_auth::pump_idle_messages();
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                !crate::events::pipe_closed()
-            }
-        });
-        #[cfg(not(target_arch = "x86"))]
-        Ok(())
-    });
-    if let Err(error) = ready {
-        if let Some(observer) = lobby_observer { observer.finish(); }
-        drop(native_friends);
-        return Err(error);
-    }
     // Keep Viewer push ownership until all local waits have finished. Pumping
     // while waiting for Windower must happen before the game takes that over.
-    if let Some(session) = native.as_deref_mut() {
-        let handoff_started = Instant::now();
-        session.attach_game();
-        log!("local launch timing: native POL handoff {:.3}s", handoff_started.elapsed().as_secs_f64());
-    }
+    let handoff_started = Instant::now();
+    session.attach_game();
+    log!("local launch timing: native POL handoff {:.3}s", handoff_started.elapsed().as_secs_f64());
     crate::events::send(proto::started_line(std::process::id()));
     let auto_login = crate::auto_login::Worker::start(auto_login);
     let live_controller = crate::controller_settings::Worker::start();
+    let shutdown = crate::game_shutdown::Worker::start();
+    #[cfg(target_arch = "x86")]
+    crate::windower_plugin_settings::game_starting();
     log!("stage: calling FFXiEntry::GameStart");
     let mut message: *mut c_void = std::ptr::null_mut();
     // SAFETY: IFFXiEntry::GameStart(this, IUnknown* pol, IUnknown** msg); blocks for the session.
@@ -752,13 +733,19 @@ fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], mut native: Option<
         let start: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> HRESULT = ffxi.method(VT_GAME_START);
         start(ffxi.0, polcore.0, &mut message)
     };
+    log!("stage: GameStart returned hr={hr:#010x}");
     // Stop all input before game callbacks/interfaces can be detached or freed.
+    log!("stage: stopping background shutdown worker");
+    drop(shutdown);
+    log!("stage: stopping live controller worker");
     drop(live_controller);
+    log!("stage: stopping auto-login worker");
     drop(auto_login);
+    log!("stage: stopping game observers");
     if let Some(observer) = lobby_observer { observer.finish(); }
     drop(native_friends);
-    if let Some(native) = native.as_deref_mut() { native.detach_game(); }
-    log!("stage: GameStart returned hr={hr:#010x}");
+    session.detach_game();
+    log!("stage: game observers stopped and native game callbacks detached");
     crate::ffxi_settings::report();
     let has_message_object = !message.is_null();
     drop(Com(message));
@@ -777,7 +764,21 @@ fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], mut native: Option<
         };
         (code, msg)
     };
+    log!("stage: releasing FFXI game interface");
     drop(ffxi);
+    log!("stage: FFXI game interface released");
+    // Stock pol.exe's CoFreeUnusedLibraries point (414456).
+    let unload_started = Instant::now();
+    let modules_released = match crate::game_modules::release_after_game() {
+        crate::game_modules::Release::Unloaded => {
+            log!("stage: FFXi.dll and FFXiMain.dll unloaded after the game in {:.3}s; a next game maps fresh copies", unload_started.elapsed().as_secs_f64());
+            true
+        }
+        crate::game_modules::Release::Kept(reason) => {
+            log!("stage: game DLLs kept loaded ({reason}); this host runs no further game");
+            false
+        }
+    };
     if hr < 0 {
         return Err(format!("GameStart failed (hr={hr:#010x}){}", if msg.is_empty() { String::new() } else { format!(": {msg}") }));
     }
@@ -786,13 +787,9 @@ fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], mut native: Option<
     // the numeric result and independently report the successful native return.
     // The launcher additionally requires GameStarted and native sign-out before
     // it can present -14 as a normal close. Other errors retain their meaning.
-    let game_returned = successful_native_return(native.is_some(), hr, has_message_object, &msg);
-    Ok(GameOutcome { code, message: msg, game_returned })
+    let game_returned = successful_native_return(hr, has_message_object, &msg);
+    Ok(GameOutcome { code, message: msg, game_returned, modules_released })
 }
-
-#[cfg(test)]
-#[path = "clock_probe.rs"]
-mod clock_probe;
 
 #[cfg(test)]
 mod tests {
@@ -849,7 +846,7 @@ mod tests {
             let core = create(&CLSID_POLCORE[1], &IID_POLCORE[1], &dll, "polcore exit check").unwrap();
             let module = GetModuleHandleW(wide("polcore.dll").as_ptr());
             assert!(!module.is_null());
-            validate_polcore_build(module_image(module).2).unwrap();
+            check_core_interface(&core, module).unwrap();
             let area: unsafe extern "system" fn(*mut c_void, i32) -> HRESULT = core.method(VT_SET_AREA_CODE);
             assert!(area(core.0, 1) >= 0);
             let original: usize = core.method(VT_POL_VIEWER_EXEC);
@@ -912,7 +909,7 @@ mod tests {
             assert!(!module.is_null());
             assert!(same_dll_path(&PathBuf::from(module_path(module)), &dll), "Activation must use the selected installed core");
             let (base, size, timestamp) = module_image(module);
-            validate_polcore_build(timestamp).unwrap();
+            check_core_interface(&core, module).unwrap();
             let vtable = *(core.0 as *const *const usize) as usize;
             assert!(vtable >= base && vtable.checked_add((VT_SET_AREA_CODE + 1) * std::mem::size_of::<usize>()).is_some_and(|end| end <= base + size));
             let indices = [0, VT_RELEASE, VT_SET_PARAM_INIT, VT_GET_COMMON_FUNCTION_TABLE, VT_SET_AREA_CODE];
@@ -946,33 +943,6 @@ mod tests {
         benchmark_installed_polcore_activation(false);
     }
 
-    #[cfg(feature = "native-login-nodelay")]
-    #[test]
-    #[ignore = "Private fresh-process installed US core TCP layout check; no sign-in, pump, connect or game"]
-    fn installed_polcore_supports_tcp_buffering_trial_offline() {
-        struct Apartment;
-        impl Drop for Apartment { fn drop(&mut self) { unsafe { CoUninitialize(); } } }
-        unsafe {
-            assert!(GetModuleHandleW(wide("polcore.dll").as_ptr()).is_null(), "Run only this test in a fresh process");
-            assert!(CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) >= 0);
-            let _apartment = Apartment;
-            let viewer = registry::install_folder(Region::Us, "1000").expect("installed US viewer");
-            let dll = PathBuf::from(ansi_to_string(&viewer)).join("viewer/com/polcore.dll");
-            let core = create(&CLSID_POLCORE[1], &IID_POLCORE[1], &dll, "offline TCP trial layout check").unwrap();
-            let module = GetModuleHandleW(wide("polcore.dll").as_ptr());
-            assert!(same_dll_path(&PathBuf::from(module_path(module)), &dll));
-            let (base, size, timestamp) = module_image(module);
-            validate_polcore_build(timestamp).unwrap();
-            assert!(crate::native_socket_trace::supported_pml_layout(base, size));
-            let trace = crate::native_socket_trace::Recording::install(base, size).expect("verified imports and PML layout");
-            trace.finish_startup();
-            trace.stop();
-            drop(trace);
-            drop(core);
-            eprintln!("PML_TRIAL_LAYOUT verified mapped code and imports; size={size:#x}, timestamp={timestamp:08x}; no network calls");
-        }
-    }
-
     #[test]
     #[ignore = "Installed-core ABI check with synthetic credentials; never drives connect or loads the game"]
     fn installed_polcore_accepts_native_credential_bootstrap_offline() {
@@ -982,21 +952,51 @@ mod tests {
             let viewer=PathBuf::from(ansi_to_string(&viewer));
             let core=create(&CLSID_POLCORE[1],&IID_POLCORE[1],&viewer.join("viewer/com/polcore.dll"),"native POL ABI check").unwrap();
             let module=GetModuleHandleW(wide("polcore.dll").as_ptr());
-            let (base,_,timestamp)=module_image(module);validate_polcore_build(timestamp).unwrap();
+            let (base,_,_)=module_image(module);let layout=check_core_interface(&core,module).unwrap();
             let area:unsafe extern "system" fn(*mut c_void,i32)->HRESULT=core.method(VT_SET_AREA_CODE);
             assert!(area(core.0,1)>=0);
             let param:unsafe extern "system" fn(*mut c_void,HMODULE,*mut u8)->HRESULT=core.method(VT_SET_PARAM_INIT);
             let mut command=[0u8];assert!(param(core.0,GetModuleHandleW(std::ptr::null()),command.as_mut_ptr())>=0);
             let getter:unsafe extern "system" fn(*mut c_void,*mut *mut usize)->HRESULT=core.method(VT_GET_COMMON_FUNCTION_TABLE);
             let mut pointer=std::ptr::null_mut();assert!(getter(core.0,&mut pointer)>=0);
-            let table=table_slice(pointer,module).unwrap();let before=table.to_vec();
+            check_function_table(&layout,pointer).unwrap();let table=table_slice(pointer,module).unwrap();let before=table.to_vec();
             crate::native_auth::smoke_prepare(table,base,&viewer);
-            crate::native_auth::smoke_message_files(table,base);
+            crate::native_auth::smoke_message_files(table);
             crate::native_social::smoke_builders(table);
             // Never 814/815/816/818: no connect, pump or close step runs here.
-            crate::native_backup::smoke_entrypoints(table,base);
+            crate::native_backup::smoke_entrypoints(table,&layout);
             assert_eq!(table,before,"native login must not patch any POL callback");
             drop(core);CoUninitialize();
+        }
+    }
+
+    #[test]
+    #[ignore = "Installed-core handle ABI check; synthetic local cache only, no sign-in or game"]
+    fn installed_polcore_accepts_handle_setup_offline() {
+        unsafe {
+            assert!(GetModuleHandleW(wide("polcore.dll").as_ptr()).is_null(), "run this test alone in a fresh process");
+            assert!(CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) >= 0);
+            let viewer = registry::install_folder(Region::Us, "1000").expect("installed US viewer");
+            let dll = PathBuf::from(ansi_to_string(&viewer)).join("viewer/com/polcore.dll");
+            let core = create_from_dll(&CLSID_POLCORE[1], &IID_POLCORE[1], &dll, "offline handle ABI check").unwrap();
+            let module = GetModuleHandleW(wide("polcore.dll").as_ptr());
+            let (base, _, _) = module_image(module);
+            let layout = check_core_interface(&core, module).unwrap();
+            let area: unsafe extern "system" fn(*mut c_void, i32) -> HRESULT = core.method(VT_SET_AREA_CODE);
+            assert!(area(core.0, 1) >= 0);
+            let param: unsafe extern "system" fn(*mut c_void, HMODULE, *mut u8) -> HRESULT = core.method(VT_SET_PARAM_INIT);
+            let mut command = [0u8];
+            assert!(param(core.0, GetModuleHandleW(std::ptr::null()), command.as_mut_ptr()) >= 0);
+            let getter: unsafe extern "system" fn(*mut c_void, *mut *mut usize) -> HRESULT = core.method(VT_GET_COMMON_FUNCTION_TABLE);
+            let mut pointer = std::ptr::null_mut();
+            assert!(getter(core.0, &mut pointer) >= 0);
+            check_function_table(&layout, pointer).unwrap();
+            let table = table_slice(pointer, module).unwrap();
+            let before = table.to_vec();
+            crate::native_handles::smoke_local(table, base);
+            assert_eq!(table, before);
+            drop(core);
+            CoUninitialize();
         }
     }
 
@@ -1009,20 +1009,36 @@ mod tests {
     }
 
     #[test]
-    fn unknown_polcore_layouts_stop_before_function_table_calls() {
-        assert!(validate_polcore_build(POLCORE_TIMESTAMP).is_ok());
-        assert!(validate_polcore_build(0).is_err());
-        assert!(validate_polcore_build(POLCORE_TIMESTAMP.wrapping_add(1)).unwrap_err().contains("Unsupported PlayOnline core build"));
+    fn the_vtable_indices_called_here_are_the_ones_the_core_check_covers() {
+        let checked: Vec<usize> = crate::pol_core::COM_METHODS.iter().map(|m| m.0).collect();
+        for index in [0, VT_RELEASE, VT_SET_PARAM_INIT, VT_GET_COMMON_FUNCTION_TABLE, VT_POL_VIEWER_EXEC, VT_SET_AREA_CODE] {
+            assert!(checked.contains(&index), "vtable {index} is called but not checked");
+        }
+        assert!(VT_SET_AREA_CODE < crate::pol_core::COM_VTABLE_WORDS);
+        assert!(crate::pol_core::service(SLOT_EXIT_CODE).is_some() && crate::pol_core::service(SLOT_EXIT_MESSAGE).is_some());
     }
 
     #[test]
     fn native_return_evidence_requires_success_and_no_error_message() {
-        assert!(successful_native_return(true, 0, false, ""));
-        assert!(!successful_native_return(false, 0, false, ""));
-        assert!(!successful_native_return(true, 1, false, ""));
-        assert!(!successful_native_return(true, -1, false, ""));
-        assert!(!successful_native_return(true, 0, true, ""));
-        assert!(!successful_native_return(true, 0, false, "native session failed"));
+        assert!(successful_native_return(0, false, ""));
+        assert!(!successful_native_return(1, false, ""));
+        assert!(!successful_native_return(-1, false, ""));
+        assert!(!successful_native_return(0, true, ""));
+        assert!(!successful_native_return(0, false, "native session failed"));
+    }
+
+    #[test]
+    fn only_clean_native_game_returns_can_reuse_the_signed_in_owner() {
+        for code in [0, -14, -1, 19] {
+            for returned in [false, true] {
+                for released in [false, true] {
+                    let outcome = GameOutcome { code, message: String::new(), game_returned: returned, modules_released: released };
+                    // A game whose DLLs stayed loaded ends its host: no game runs on its memory.
+                    assert_eq!(retain_native_session(true, &outcome), returned && released && matches!(code, 0 | -14));
+                    assert!(!retain_native_session(false, &outcome));
+                }
+            }
+        }
     }
 
     #[test]

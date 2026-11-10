@@ -9,8 +9,6 @@ pub(crate) mod polp;
 #[cfg(test)]
 mod live_test;
 #[cfg(test)]
-mod download_bench;
-#[cfg(test)]
 mod product_tests;
 #[cfg(test)]
 mod viewer_live_test;
@@ -20,7 +18,7 @@ mod fresh_install_bench;
 mod traffic_tests;
 
 use crate::i18n::{t, tf};
-use crate::operation::{Operation, UpdateWork};
+use crate::operation::{Operation, Stage, UpdateWork};
 use manifest::{FileHistory, FileSig, Manifest};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -34,9 +32,8 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-// The patch hosts stock looks up (`dns::GAME_PATCH_HOST`, `dns::VIEWER_PATCH_HOST`).
+#[cfg(test)]
 const SERVER: &str = "pc001W2U.pol.com:53001";
-const VIEWER_SERVER: &str = "pt008.pol.com:54000";
 const MAX_MANIFEST: usize = 64 * 1024 * 1024;
 const MAX_FILE: u64 = 512 * 1024 * 1024;
 const STATE_DIR: &str = ".xi-updater";
@@ -63,8 +60,7 @@ const ACTIVE_GAME_CHECK_WORKERS: usize = 4;
 // 62 full files), 14 MB, FIN 100 ms after the last reply. No version check followed the
 // update. Crystal used 8 parallel plain sockets before. Each rule here is one setting.
 // Every wire-visible pause runs on a high-resolution timer (`precise_sleep`).
-/// Download connections open at once; each one is stop-and-wait (`Session::exchange`).
-const MAX_DOWNLOAD_WORKERS: usize = 1;
+// Downloads use that one stop-and-wait connection (`stage_plan_shared`, `Session::exchange`).
 /// Least time from the last reply of one file to the request for the next file, drawn per
 /// file by what the previous file was (`next_file_pause`); Crystal's own processing of the
 /// finished file counts toward it. Stock's gap there is processing time
@@ -81,41 +77,65 @@ const SMALL_DIRECT: u64 = 1024;
 const NEXT_CONNECTION_GAP: (Duration, Duration) = (Duration::from_millis(103), Duration::from_millis(112));
 /// Resolve plus connect for one patch-server connection.
 const CONNECT_LIMIT: Duration = Duration::from_secs(30);
-const DOWNLOAD_BUDGET_MIB: usize = 1024;
 #[cfg(test)]
 const MAX_BENCHMARK_CHECK_WORKERS: usize = 12;
 
+/// The two products the patch service knows, and everything that identifies one: its patch
+/// host and port (`53000 + product number`), its POLP tags, its registry title and record key,
+/// and its version-stamp rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Product { Ffxi, Viewer }
 impl Product {
     fn label(self) -> &'static str {
         match self { Self::Ffxi => t("FINAL FANTASY XI"), Self::Viewer => t("PlayOnline") }
     }
-    pub(crate) fn server(self) -> &'static str {
-        match self { Self::Ffxi => SERVER, Self::Viewer => VIEWER_SERVER }
+    /// The patch host stock looks up (`dns::GAME_PATCH_HOST`, `dns::VIEWER_PATCH_HOST`).
+    pub(crate) fn host(self) -> &'static str {
+        match self { Self::Ffxi => crate::dns::GAME_PATCH_HOST, Self::Viewer => crate::dns::VIEWER_PATCH_HOST }
     }
-    fn title(self) -> &'static str {
+    /// W20 :53001, W2U :54000 (53000 + the product number).
+    pub(crate) fn port(self) -> u16 { 53000 + self.number() as u16 }
+    /// "host:port" (a test keeps it equal to `host()` and `port()`).
+    pub(crate) fn server(self) -> &'static str {
+        match self { Self::Ffxi => "pc001W2U.pol.com:53001", Self::Viewer => "pt008.pol.com:54000" }
+    }
+    /// The product id: the registry `Interface` value name and the POLP title tag.
+    pub(crate) fn title(self) -> &'static str {
         match self { Self::Ffxi => "0001", Self::Viewer => "1000" }
     }
-    fn tags(self) -> polp::Tags {
+    /// The product number (1 FFXI, 1000 the Viewer): the port offset and the record-key addend.
+    pub(crate) fn number(self) -> u64 {
+        match self { Self::Ffxi => 1, Self::Viewer => 1000 }
+    }
+    pub(crate) fn tags(self) -> polp::Tags {
         polp::Tags { platform: match self { Self::Ffxi => *b"W20\0", Self::Viewer => *b"W2U\0" },
             title: match self { Self::Ffxi => *b"0001", Self::Viewer => *b"1000" } }
     }
-    fn valid_stamp(self, version: &str) -> bool {
-        match self { Self::Ffxi => valid_stamp(version), Self::Viewer => crate::patch::valid_viewer_version(version) }
+    /// The stock 88-byte version frame carrying `installed` (empty only for a fresh install).
+    pub(crate) fn request(self, installed: &str) -> Vec<u8> {
+        polp::version(&self.tags(), installed.as_bytes())
     }
-    fn latest_stamp<'a>(self, manifest: &'a Manifest) -> Option<&'a str> {
-        match self {
-            Self::Ffxi => manifest.latest_stamp(),
-            // Viewer revisions are hexadecimal digits in the live manifest.
-            // The fixed-width date sorts chronologically before its revision.
-            Self::Viewer => manifest.files.iter().flat_map(|h| h.versions.iter()).map(|v| v.stamp.as_str())
-                .max_by_key(|s| s.split_once('_').map(|(date, revision)|
-                    (date.parse::<u64>().unwrap_or(0), u64::from_str_radix(revision, 16).unwrap_or(0)))),
-        }
+    pub(crate) fn discovery(self) -> crate::discovery::Product {
+        match self { Self::Ffxi => crate::discovery::Product::Ffxi, Self::Viewer => crate::discovery::Product::PlayOnline }
+    }
+    /// A version stamp of this product: FFXI `30260904_1` (8 digits starting 3, decimal
+    /// revision), the Viewer `20110829_E` (8 digits starting 2, up to 16 letters or digits).
+    pub(crate) fn valid_stamp(self, version: &str) -> bool {
+        version.split_once('_').is_some_and(|(date, revision)| {
+            date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) && !revision.is_empty()
+                && match self {
+                    Self::Ffxi => date.starts_with('3') && revision.bytes().all(|b| b.is_ascii_digit()),
+                    Self::Viewer => date.starts_with('2') && revision.len() <= 16 && revision.bytes().all(|b| b.is_ascii_alphanumeric()),
+                }
+        })
+    }
+    /// The newest stamp in `manifest` (validated: every stamp is this product's).
+    fn latest_stamp(self, manifest: &Manifest) -> Option<&str> {
+        manifest.files.iter().flat_map(|h| &h.versions).map(|v| v.stamp.as_str()).max_by_key(|s| self.stamp_order(s))
     }
     /// A stamp's place in time (date, then revision), `None` when it is not this product's.
-    fn stamp_order(self, stamp: &str) -> Option<(u64, u64)> {
+    /// Viewer revisions are hexadecimal digits in the live manifest.
+    pub(crate) fn stamp_order(self, stamp: &str) -> Option<(u64, u64)> {
         if !self.valid_stamp(stamp) { return None; }
         let (date, revision) = stamp.split_once('_')?;
         let radix = match self { Self::Ffxi => 10, Self::Viewer => 16 };
@@ -235,155 +255,11 @@ fn stage_groups(product: Product, manifest: &Manifest, planned: &[Planned]) -> V
     groups
 }
 
-/// Exercise live POL transports and both codecs entirely in memory. This does
-/// not create updater state, stage downloads, or change an applied record.
-pub async fn probe(install: PathBuf, operation: Operation) -> Result<String, String> {
-    operation.check_cancelled()?;
-    ensure_plain(&install)?;
-    let root = fs::canonicalize(&install).map_err(|e| format!("Install directory: {e}"))?;
-    ensure_plain(&root)?;
-    if !root.is_dir() {
-        return Err("Install must be a directory".into());
-    }
-    operation.progress("Probe", 0, 5, "Fetching canonical manifest into memory");
-    // A diagnostic (`--patch-probe`), not an update: no stock flow fetches files without
-    // one, so it keeps a single connection. It still uses the stock socket shape.
-    let mut session = Session::connect_to(Product::Ffxi, SERVER, &operation).await?;
-    // The stock shape: FFXI's installed version (empty only for a fresh install).
-    let installed = crate::patch::installed_for_request(&root);
-    let reply = session
-        .exchange(&polp::version(&tags(), installed.as_bytes()), 8, &operation)
-        .await?;
-    let version = polp::parse_version_reply(&reply[16..])?;
-    if version.label == "unknown" || !valid_stamp(&version.version) {
-        return Err("Invalid official version reply".into());
-    }
-    let reply = session
-        .exchange(&polp::hello(&tags()), 2, &operation)
-        .await?;
-    let text = decode_payload(&reply[16..], MAX_MANIFEST)?;
-    let m = manifest::parse(std::str::from_utf8(&text).map_err(|_| "Manifest is not UTF-8")?)?;
-    validate_manifest(&m)?;
-    if m.latest_stamp() != Some(version.version.as_str()) {
-        return Err("Official manifest/version changed during probe".into());
-    }
-    let mut lines = vec![format!(
-        "Official manifest: version {}, {} files, {} decoded bytes, MD5 {:x}.",
-        version.version,
-        m.files.len(),
-        text.len(),
-        md5::compute(&text)
-    )];
-    for (i, path) in ["patch.sin", "patch.txt", "ROM/285/40.DAT"]
-        .iter()
-        .enumerate()
-    {
-        operation.check_cancelled()?;
-        let history = m
-            .files
-            .iter()
-            .find(|h| h.path == *path)
-            .ok_or_else(|| format!("Canonical manifest lacks {path}"))?;
-        operation.progress(
-            "Probe",
-            i as u64 + 1,
-            5,
-            format!("Downloading {path} into memory"),
-        );
-        let raw = session
-            .fetch(
-                &history.current().direct,
-                history.current().direct_len,
-                &operation,
-            )
-            .await?;
-        let decoded = decode_payload(&raw, history.current().sig.len as usize)?;
-        let remote = FileSig::of(&decoded);
-        if remote != history.current().sig {
-            return Err(format!(
-                "{path}: live direct download does not match canonical signature"
-            ));
-        }
-        let local_path = confined(&root, path)?;
-        let local = fs::read(&local_path)
-            .map_err(|e| format!("{path}: cannot read local comparison: {e}"))?;
-        operation.check_cancelled()?;
-        if FileSig::of(&local) != remote || local != decoded {
-            return Err(format!(
-                "{path}: live direct download verified, but local bytes differ"
-            ));
-        }
-        lines.push(format!("{path}: direct payload mode {}, {} downloaded bytes -> {} decoded bytes; signature ({}, {}, {}) and local bytes match.",raw[0],raw.len(),decoded.len(),remote.len,remote.byte_sum,remote.md5_word));
-    }
-    // Exercise an adjacent historical pair; never assume an arbitrary local
-    // file is the correct delta base. Both base and delta come from the server.
-    let candidate = m
-        .files
-        .iter()
-        .flat_map(|h| h.versions.windows(2).map(move |pair| (h, pair)))
-        .filter(|(_, pair)| {
-            pair[1]
-                .indirect
-                .as_ref()
-                .is_some_and(|d| d.len <= 1024 * 1024)
-                && pair[0].direct_len <= 1024 * 1024
-                && pair[0].sig.len <= 1024 * 1024
-                && pair[1].sig.len <= 1024 * 1024
-        })
-        .min_by_key(|(_, pair)| pair[0].direct_len + pair[1].indirect.as_ref().unwrap().len);
-    if let Some((history, pair)) = candidate {
-        operation.progress(
-            "Probe",
-            4,
-            5,
-            format!("Testing a historical delta for {} in memory", history.path),
-        );
-        let raw = session
-            .fetch(&pair[0].direct, pair[0].direct_len, &operation)
-            .await?;
-        let base = decode_payload(&raw, pair[0].sig.len as usize)?;
-        if FileSig::of(&base) != pair[0].sig {
-            return Err("Downloaded historical delta base failed signature verification".into());
-        }
-        let delta = pair[1].indirect.as_ref().unwrap();
-        let raw = session.fetch_delta(&delta.path, delta.len, &operation).await?;
-        operation.check_cancelled()?;
-        let target = lz::apply_indirect_bounded(&raw, &base, pair[1].sig.len as usize)?;
-        if FileSig::of(&target) != pair[1].sig {
-            return Err("Live historical delta result failed signature verification".into());
-        }
-        let direct = session
-            .fetch(&pair[1].direct, pair[1].direct_len, &operation)
-            .await?;
-        let direct = decode_payload(&direct, pair[1].sig.len as usize)?;
-        if direct != target {
-            return Err(
-                "Live historical delta differs from the same version's direct download".into(),
-            );
-        }
-        lines.push(format!("{}: delta {} -> {}, {} delta bytes; old base, delta result and independent target direct download all verify.",history.path,pair[0].stamp,pair[1].stamp,raw.len()));
-    } else {
-        lines.push("No small historical delta pair is available in the current manifest.".into());
-    }
-    operation.check_cancelled()?;
-    operation.progress(
-        "Probe",
-        5,
-        5,
-        "Read-only direct/delta verification complete",
-    );
-    lines.push("All downloads remained in memory. No installation files or applied-version metadata changed.".into());
-    session.close().await;
-    Ok(lines.join("\n"))
-}
-
-/// Read-only full verification, or a recoverable update/explicit repair.
+/// Read-only full verification, or a recoverable update/explicit repair, of FFXI alone
+/// (`live_test`; the app goes through `run_combined`).
+#[cfg(test)]
 pub async fn run(install: PathBuf, mode: Mode, operation: Operation) -> Result<Report, String> {
-    run_for(Product::Ffxi, install, mode, operation).await
-}
-
-pub(crate) async fn run_for(product: Product, install: PathBuf, mode: Mode, operation: Operation) -> Result<Report, String> {
-    let prepared = prepare(product, install, mode, &operation).await?;
+    let prepared = prepare_at(Product::Ffxi, install, mode, &operation, Product::Ffxi.server(), ensure_idle).await?;
     let mut reports = execute(vec![prepared], &operation, true, ensure_idle).await?;
     Ok(reports.remove(0))
 }
@@ -470,15 +346,28 @@ impl PreparedUpdate {
     fn full_verify(&self) -> bool { self.mode == Mode::Repair || self.product == Product::Viewer }
 }
 
-async fn prepare(product: Product, install: PathBuf, mode: Mode, operation: &Operation) -> Result<PreparedUpdate, String> {
-    prepare_at(product, install, mode, operation, product.server(), ensure_idle).await
-}
-
 /// The liveness check a step that changes an install runs first (`ensure_idle`; fixture
 /// tests pass their own).
 type Guard = fn(&Path) -> Result<(), String>;
 
 async fn prepare_at(product: Product, install: PathBuf, mode: Mode, operation: &Operation, server: &str, guard: Guard) -> Result<PreparedUpdate, String> {
+    prepare_with(product, install, mode, operation, server, guard, None).await
+}
+
+/// What a Play's own version check already told an update that follows it in the same
+/// signed-in session (proposal 09 phase 2): the official version, and how long the "update?"
+/// prompt's idle connection stays open (`PROMPT_HOLD`).
+pub(crate) struct AfterPlay {
+    pub official: String,
+    pub prompt: Duration,
+}
+
+/// `prepare_at`, or with `play` the update a Play's W20 asked for: no second version request
+/// (stock sends none: capture stock-update-20261013-004932), the idle prompt connection, then
+/// the file list. Its downloads may go ahead while a game uses the folder: only an
+/// interrupted update's recovery and the commit wait for `guard`.
+async fn prepare_with(product: Product, install: PathBuf, mode: Mode, operation: &Operation, server: &str, guard: Guard,
+    play: Option<&AfterPlay>) -> Result<PreparedUpdate, String> {
     operation.check_cancelled()?;
     if mode != Mode::Check { operation.begin_update(); }
     ensure_plain(&install)?;
@@ -487,28 +376,31 @@ async fn prepare_at(product: Product, install: PathBuf, mode: Mode, operation: &
     if !root.is_dir() { return Err(t("Install must be a directory").into()); }
     validate_installation(product, &root)?;
     let lock = if mode != Mode::Check {
-        guard(&root)?;
+        if play.is_none() { guard(&root)?; }
         let state = confined(&root, STATE_DIR)?;
         fs::create_dir_all(&state).map_err(|e| e.to_string())?;
-        let mut options = fs::OpenOptions::new();
-        options.create(true).truncate(false).read(true).write(true);
-        #[cfg(windows)] {
-            use std::os::windows::fs::OpenOptionsExt;
-            options.share_mode(0);
-        }
-        Some(options.open(confined(&root, &format!("{STATE_DIR}/lock"))?)
-            .map_err(|e| tf("Another updater may be using this install: {error}", &[("error", &e)]))?)
+        // Another account's Play check holds the lock read-shared for at most its W20; the
+        // update that Play asked for waits that out rather than failing.
+        let wait = if play.is_some() { PLAY_LOCK_WAIT } else { Duration::ZERO };
+        Some(wait_for_update_lock(&confined(&root, &format!("{STATE_DIR}/lock"))?, wait, operation).await?)
     } else { None };
     if mode != Mode::Check {
-        guard(&root)?;
+        if play.is_none() { guard(&root)?; }
         // An interrupted update leaves files nobody vouches for: check them all next.
         if recover_with_guard(&root, guard)? { mark_full_check(&root); }
     }
-    let installed = crate::patch::installed_for_request_for(&root, product.title());
+    // The record this update replaces must be one it can re-encode; refuse before any network
+    // or scan work. After recovery (which can restore patch.ver); the lock keeps it stable.
+    let seed = if mode == Mode::Check { None } else {
+        confined(&root, "patch.ver")?;
+        Some(if mode == Mode::Repair { crate::patch::repair_seed_for(&root, product)? }
+            else { crate::patch::applied_seed_for(&root, product)? })
+    };
+    let installed = crate::patch::installed_for_request_for(&root, product);
     let (version, text, manifest) = if mode == Mode::Check {
         // Check compares the files with the installed file list (the patch.cfg the last
         // update wrote) and never contacts Square Enix: stock has no such request.
-        operation.progress("Manifest", 0, 1, t("Reading the installed file list"));
+        operation.progress(Stage::Manifest, 0, 1, t("Reading the installed file list"));
         let Some(text) = read_installed_list(&root)? else {
             let report = Report { summary: t("No installed file list (patch.cfg) to compare with yet, so nothing was checked. Press Update or use Repair files.").into(),
                 ..Default::default() };
@@ -519,14 +411,24 @@ async fn prepare_at(product: Product, install: PathBuf, mode: Mode, operation: &
         let version = product.latest_stamp(&manifest).unwrap_or_default().to_owned();
         (version, text, manifest)
     } else {
-        operation.progress("Manifest", 0, 1, t("Downloading the official file manifest"));
-        let version = official_version(product, server, &installed, operation).await?;
-        // Phase 2 hook (Play is the update): stock opens one more connection here, ~110 ms
-        // after the W20's FIN, and holds it idle, no data, while its "update?" prompt shows
-        // (captures 2026-10-13: 5.5 s at 00:21, ~1 s at 00:49), then closes it and opens the
-        // file-list connection ~105-110 ms later. Crystal adds it with the Play-driven update,
-        // where that prompt's moment exists (and reuses the Play's W20 instead of sending a
-        // second one); until then the list connection keeps the same FIN → SYN spacing.
+        let version = match play {
+            // Play is the update (phase 2): the Play's W20 told the version. Stock then opens one
+            // more connection ~110 ms after that W20's FIN and holds it idle, no data, while its
+            // "update?" prompt shows (captures 2026-10-13: 5.5 s at 00:21, ~1 s at 00:49), closes
+            // it and opens the file-list connection ~105-110 ms later (`NEXT_CONNECTION_GAP`
+            // spaces both from the FIN before them; the W20's is noted by `note_patch_closed`).
+            Some(play) => {
+                if !product.valid_stamp(&play.official) { return Err(t("Official version response is invalid").into()); }
+                operation.progress(Stage::Manifest, 0, 1, t("Starting the update"));
+                hold_prompt(product, server, play.prompt, operation).await?;
+                play.official.clone()
+            }
+            None => {
+                operation.progress(Stage::Manifest, 0, 1, t("Downloading the official file manifest"));
+                official_version(product, server, &installed, operation).await?
+            }
+        };
+        if play.is_some() { operation.progress(Stage::Manifest, 0, 1, t("Downloading the official file manifest")); }
         let text = official_list(product, server, operation).await?;
         let manifest = parse_list(product, &text)?;
         if product.latest_stamp(&manifest) != Some(version.as_str()) {
@@ -535,9 +437,9 @@ async fn prepare_at(product: Product, install: PathBuf, mode: Mode, operation: &
         (version, text, manifest)
     };
     let manifest = product.deployment(&root, manifest)?;
-    operation.progress("Manifest", 1, 1, tf("{count} files, version {version}",
+    operation.progress(Stage::Manifest, 1, 1, tf("{count} files, version {version}",
         &[("count", &manifest.files.len()), ("version", &version)]));
-    let scan_root = root.clone(); let scan_manifest = manifest.clone(); let scan_operation = operation.clone();
+    let scan_root = root.clone(); let scan_operation = operation.clone();
     // POL's official update restores canonical components. Fresh installer
     // DLLs are not necessarily in the retained patch history. POL originals
     // still receive transaction backups.
@@ -548,23 +450,22 @@ async fn prepare_at(product: Product, install: PathBuf, mode: Mode, operation: &
     // pending full check (interrupted or failed update), or any failure of the plan.
     let applied = (scan_mode == Mode::Update && product == Product::Ffxi && !full_check_due(&root))
         .then(|| applied_list(&root, product, installed.as_deref())).flatten();
-    let ((mut report, planned), full_scan) = tokio::task::spawn_blocking(move || {
-        if let Some(applied) = applied {
-            let workers = check_workers(&scan_root, scan_mode);
-            match plan_from_applied(product, &scan_root, &applied, &scan_manifest, scan_mode, &scan_operation, workers) {
-                Ok(plan) => return Ok((plan, false)),
-                Err(error) if scan_operation.cancelled() => return Err(error),
-                Err(_) => {}
+    // The manifest moves to the scan's thread and comes back with the plan (no copy).
+    let (((mut report, planned), full_scan), manifest) = tokio::task::spawn_blocking(move || {
+        let planned = (|| {
+            if let Some(applied) = applied {
+                let workers = check_workers(&scan_root);
+                match plan_from_applied(product, &scan_root, &applied, &manifest, scan_mode, &scan_operation, workers) {
+                    Ok(plan) => return Ok((plan, false)),
+                    Err(error) if scan_operation.cancelled() => return Err(error),
+                    Err(_) => {}
+                }
             }
-        }
-        scan_for(product, &scan_root, &scan_manifest, scan_mode, &scan_operation, installed.as_deref()).map(|plan| (plan, true))
+            scan_for(product, &scan_root, &manifest, scan_mode, &scan_operation, installed.as_deref()).map(|plan| (plan, true))
+        })();
+        planned.map(|planned| (planned, manifest))
     }).await.map_err(|e| e.to_string())??;
     report.version = version;
-    let seed = if mode == Mode::Check { None } else {
-        confined(&root, "patch.ver")?;
-        Some(if mode == Mode::Repair { crate::patch::repair_seed_for(&root, product.title())? }
-            else { crate::patch::applied_seed_for(&root, product.title())? })
-    };
     if mode == Mode::Check {
         report.verified = report.current == report.total;
         let counts: [(&str, &dyn std::fmt::Display); 5] = [("total", &report.total), ("current", &report.current),
@@ -623,7 +524,7 @@ fn parse_list(product: Product, text: &[u8]) -> Result<Manifest, String> {
 /// (capture 2026-10-13 00:21: 88 B request, 103 B reply, FIN ~110 ms later).
 async fn official_version(product: Product, server: &str, installed: &str, operation: &Operation) -> Result<String, String> {
     let mut session = Session::connect_to(product, server, operation).await?;
-    let frame = session.exchange(&polp::version(&product.tags(), installed.as_bytes()), 8, operation).await?;
+    let frame = session.exchange(&polp::version(&product.tags(), installed.as_bytes()), polp::kind::VERSION_REPLY, operation).await?;
     session.close().await;
     let version = polp::parse_version_reply(&frame[16..])?;
     if version.label == "unknown" || !product.valid_stamp(&version.version) {
@@ -632,11 +533,24 @@ async fn official_version(product: Product, server: &str, installed: &str, opera
     Ok(version.version)
 }
 
+/// The idle connection stock opens while its "update?" prompt shows (`PROMPT_HOLD`): connect
+/// (after `NEXT_CONNECTION_GAP` from the W20's FIN), send nothing for `hold`, then FIN. A
+/// cancel closes it at once.
+async fn hold_prompt(product: Product, server: &str, hold: Duration, operation: &Operation) -> Result<(), String> {
+    let session = Session::connect_to(product, server, operation).await?;
+    let held = tokio::select! {
+        _ = tokio::time::sleep(hold) => Ok(()),
+        cancelled = operation.cancelled_wait() => Err(cancelled),
+    };
+    session.close().await;
+    held
+}
+
 /// The file list (POLP command 1, 24 B) on a new stock connection, closed like stock
 /// ~0.1 s after the reply. Returns the decoded list text.
 async fn official_list(product: Product, server: &str, operation: &Operation) -> Result<Vec<u8>, String> {
     let mut session = Session::connect_to(product, server, operation).await?;
-    let frame = session.exchange(&polp::hello(&product.tags()), 2, operation).await?;
+    let frame = session.exchange(&polp::hello(&product.tags()), polp::kind::MANIFEST_REPLY, operation).await?;
     session.close().await;
     decode_payload(&frame[16..], MAX_MANIFEST)
 }
@@ -667,7 +581,114 @@ async fn execute(updates: Vec<PreparedUpdate>, operation: &Operation, finish: bo
     if updates.iter().all(|update| update.mode == Mode::Check) {
         return Ok(updates.into_iter().map(|u| u.report).collect());
     }
-    let sizes: Vec<u64> = updates.iter().flat_map(|u| stage_groups(u.product, &u.manifest, &u.planned).into_iter()
+    let staged_updates = stage_updates(updates, operation).await?;
+    let mut reports = Vec::new();
+    for (update, ready) in staged_updates {
+        let op = operation.component(update.product.label());
+        reports.push(tokio::task::spawn_blocking(move || commit_with_guard(update, ready, &op, guard)).await.map_err(|e| e.to_string())??);
+    }
+    if finish {
+        operation.progress(Stage::Finish, 0, 0, t("Finalizing update…"));
+        operation.finish_update();
+    }
+    Ok(reports)
+}
+
+/// An update a Play asked for, downloaded into the verified cache and waiting to be installed
+/// (`install_staged`). It holds the install's updater lock.
+pub(crate) struct Staged {
+    update: PreparedUpdate,
+    ready: Vec<Ready>,
+}
+impl Staged {
+    /// The canonical game folder it installs into.
+    pub(crate) fn root(&self) -> &Path { &self.update.root }
+
+    /// Installed files this update replaces that another process holds open (or mapped): an
+    /// exclusive read-only open fails with a sharing or lock violation. Nothing is changed.
+    /// The process scan (`folder_users`) finds what maps a module from the folder; this finds
+    /// a plain open data file too.
+    pub(crate) fn held_files(&self) -> Vec<String> {
+        self.ready.iter().filter(|(path, ..)| confined(&self.update.root, path).is_ok_and(|file| held(&file)))
+            .map(|(path, ..)| path.clone()).collect()
+    }
+}
+
+/// How long a Play's update waits for another account's W20, which holds the updater lock
+/// read-shared for at most its exchange (`patch::CHECK_TIMEOUT`) plus the record read.
+const PLAY_LOCK_WAIT: Duration = Duration::from_secs(crate::patch::CHECK_TIMEOUT.as_secs() + 2);
+
+/// The install's exclusive updater lock.
+fn open_update_lock(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).share_mode(0).open(path)
+}
+
+/// `open_update_lock`, retrying a sharing violation (another holder) for up to `wait`.
+async fn wait_for_update_lock(path: &Path, wait: Duration, operation: &Operation) -> Result<fs::File, String> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match open_update_lock(path) {
+            Err(error) if error.raw_os_error() == Some(32) && Instant::now() < deadline => {
+                operation.check_cancelled()?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            result => return result.map_err(|e| tf("Another updater may be using this install: {error}", &[("error", &e)])),
+        }
+    }
+}
+
+/// Another process has `file` open in a way that would stop its replacement.
+fn held(file: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION. A missing or read-only file is not held.
+    matches!(fs::OpenOptions::new().read(true).share_mode(0).open(file).map_err(|e| e.raw_os_error()), Err(Some(32 | 33)))
+}
+
+/// The idle "update?" prompt connection: stock holds it open, sending nothing, for as long as
+/// the prompt shows, about one human confirmation (1.0 s and 5.5 s observed). Crystal has no
+/// prompt (Play already said yes), so it holds a plausible quick confirmation instead: never
+/// one machine constant, and kept short because the user is waiting. Below 1 s would be faster
+/// than the quickest stock answer seen; past 3 s only makes the user wait.
+pub(crate) const PROMPT_HOLD: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(3));
+
+/// Download the update a Play's W20 asked for (`official`): the prompt connection, the file
+/// list and the downloads, in stock's order, with no second version request. Games may keep
+/// running from the folder meanwhile; `install_staged` waits for them.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) async fn stage_after_play(install: PathBuf, official: String, operation: &Operation) -> Result<Staged, String> {
+    let play = AfterPlay { official, prompt: crate::stock_socket::uniform(PROMPT_HOLD) };
+    stage_after_play_at(install, play, operation, Product::Ffxi.server(), ensure_idle).await
+}
+
+/// `stage_after_play` with the patch server and the recovery guard as test seams.
+async fn stage_after_play_at(install: PathBuf, play: AfterPlay, operation: &Operation, server: &str, guard: Guard) -> Result<Staged, String> {
+    let update = prepare_with(Product::Ffxi, install, Mode::Update, operation, server, guard, Some(&play)).await?;
+    let (update, ready) = stage_updates(vec![update], operation).await?.remove(0);
+    Ok(Staged { update, ready })
+}
+
+/// Install a staged update once nothing uses its folder (the commit's own liveness check
+/// refuses otherwise), and finish the operation. No version check follows (stock sends none
+/// between its update and the game start).
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) async fn install_staged(staged: Staged, operation: &Operation) -> Result<Report, String> {
+    install_staged_with(staged, operation, ensure_idle).await
+}
+
+async fn install_staged_with(staged: Staged, operation: &Operation, guard: Guard) -> Result<Report, String> {
+    let Staged { update, ready } = staged;
+    let op = operation.component(update.product.label());
+    let report = tokio::task::spawn_blocking(move || commit_with_guard(update, ready, &op, guard)).await.map_err(|e| e.to_string())??;
+    operation.progress(Stage::Finish, 0, 0, t("Finalizing update…"));
+    operation.finish_update();
+    Ok(report)
+}
+
+/// Stage every planned download of `updates`, in order, into each install's verified cache.
+async fn stage_updates(updates: Vec<PreparedUpdate>, operation: &Operation) -> Result<Vec<(PreparedUpdate, Vec<Ready>)>, String> {
+    let groups: Vec<Vec<StageGroup>> = updates.iter().map(|u| stage_groups(u.product, &u.manifest, &u.planned)).collect();
+    let sizes: Vec<u64> = updates.iter().zip(&groups).flat_map(|(u, groups)| groups.iter()
         .map(|g| download_size(&u.manifest.files[g.source.index], &g.source.action))).collect();
     operation.plan_update(sizes.iter().sum(),
         updates.iter().flat_map(|u| u.planned.iter().map(|p| staging_work(&u.manifest.files[p.index], p))).sum(),
@@ -679,26 +700,17 @@ async fn execute(updates: Vec<PreparedUpdate>, operation: &Operation, finish: bo
         }).sum());
     let downloads = Downloads::new(operation.clone(), sizes);
     let mut staged_updates = Vec::new(); let mut first = 0;
-    for mut update in updates {
+    for (mut update, groups) in updates.into_iter().zip(groups) {
         operation.check_cancelled()?;
         let op = operation.component(update.product.label());
         let staged = confined(&update.root, &format!("{STATE_DIR}/staged"))?;
         fs::create_dir_all(&staged).map_err(|e| e.to_string())?;
         let (ready, bytes) = stage_plan_shared(update.product, &update.server, &update.root, &staged, &update.manifest,
-            &update.planned, &op, downloads.clone(), first).await?;
-        first += stage_groups(update.product, &update.manifest, &update.planned).len(); update.report.bytes = bytes;
+            &groups, &op, &downloads, first).await?;
+        first += groups.len(); update.report.bytes = bytes;
         staged_updates.push((update, ready));
     }
-    let mut reports = Vec::new();
-    for (update, ready) in staged_updates {
-        let op = operation.component(update.product.label());
-        reports.push(tokio::task::spawn_blocking(move || commit_with_guard(update, ready, &op, guard)).await.map_err(|e| e.to_string())??);
-    }
-    if finish {
-        operation.progress("Finish", 0, 0, t("Finalizing update…"));
-        operation.finish_update();
-    }
-    Ok(reports)
+    Ok(staged_updates)
 }
 
 #[cfg(test)]
@@ -723,7 +735,7 @@ fn commit_with_guard(mut update: PreparedUpdate, ready: Vec<Ready>, operation: &
         if full_verify {
             // Repair proves every official file, on the same worker pool as a check.
             let workers = file_check_workers(std::thread::available_parallelism().map_or(1, |n| n.get()), false);
-            let found = scan_signatures(&update.root, &update.manifest, operation, workers, "Verify")?;
+            let found = scan_signatures(&update.root, &update.manifest.files.iter().collect::<Vec<_>>(), operation, workers, Stage::Verify)?;
             for (history, local) in update.manifest.files.iter().zip(found) {
                 if local.map(|file| file.sig) != Some(history.current().sig) {
                     return Err(tf("{path}: final file verification failed", &[("path", &history.path)]));
@@ -734,7 +746,7 @@ fn commit_with_guard(mut update: PreparedUpdate, ready: Vec<Ready>, operation: &
             let mut buffer = vec![0u8; SIGNATURE_BUFFER_LEN];
             for (i, (path, _, sig, _)) in ready.iter().enumerate() {
                 operation.check_cancelled()?;
-                operation.progress("Verify", i as u64, ready.len() as u64, path.clone());
+                operation.progress(Stage::Verify, i as u64, ready.len() as u64, path.clone());
                 let file = confined(&update.root, path)?;
                 if !file.is_file() || signature_with_buffer(&file, operation, &mut buffer)? != *sig {
                     return Err(tf("{path}: final file verification failed", &[("path", path)]));
@@ -742,18 +754,12 @@ fn commit_with_guard(mut update: PreparedUpdate, ready: Vec<Ready>, operation: &
                 operation.complete_update_work(UpdateWork::Verify, io_work(*sig), None);
             }
         }
-        operation.progress("Verify", 1, 1, t("Verifying downloaded files"));
+        operation.progress(Stage::Verify, 1, 1, t("Verifying downloaded files"));
         operation.check_cancelled()?;
-        Ok(Some((update.text.clone(), crate::patch::encode_applied_record_for(&update.report.version, update.seed.unwrap(), update.product.title())?)))
+        Ok(Some((update.text.clone(), crate::patch::encode_applied_record_for(&update.report.version, update.seed.unwrap(), update.product)?)))
     }, &guard);
-    let committed = match applied {
-        Ok(committed) => committed,
-        Err(error) => {
-            // The install was touched: the next update checks every file.
-            mark_full_check(&update.root);
-            return Err(error);
-        }
-    };
+    // A failure that touched the install marked the full check (`apply_keeping`).
+    let committed = applied?;
     if committed && update.full_scan {
         if let Ok(marker) = confined(&update.root, FULL_CHECK_MARKER) { let _ = fs::remove_file(marker); }
     }
@@ -773,21 +779,6 @@ fn commit_with_guard(mut update: PreparedUpdate, ready: Vec<Ready>, operation: &
     Ok(update.report)
 }
 
-fn tags() -> polp::Tags {
-    polp::Tags {
-        platform: *b"W20\0",
-        title: *b"0001",
-    }
-}
-fn valid_stamp(s: &str) -> bool {
-    s.split_once('_').is_some_and(|(d, r)| {
-        d.len() == 8
-            && d.starts_with('3')
-            && d.bytes().all(|x| x.is_ascii_digit())
-            && !r.is_empty()
-            && r.bytes().all(|x| x.is_ascii_digit())
-    })
-}
 fn hex_md5(b: &[u8]) -> String {
     format!("{:x}", md5::compute(b))
 }
@@ -796,9 +787,9 @@ type Ready = (String, PathBuf, FileSig, Option<FileSig>);
 
 fn io_work(sig: FileSig) -> u64 { sig.len.max(1) }
 fn applying_work(sig: FileSig, original: Option<FileSig>) -> u64 {
-    // Four original-file signature reads plus the backup read/write; two
+    // Three original-file signature reads plus the backup read/write; two
     // target signature reads plus the replacement copy's read/write.
-    original.map(io_work).unwrap_or(0) * 6 + io_work(sig) * 4
+    original.map(io_work).unwrap_or(0) * 5 + io_work(sig) * 4
 }
 fn staging_work(history: &FileHistory, item: &Planned) -> u64 {
     let base = if matches!(item.action, Action::Deltas(_)) {
@@ -834,7 +825,7 @@ impl Downloads {
                 files: sizes.into_iter().map(|size| (0, size)).collect(), done: 0, total,
             })),
         };
-        downloads.operation.progress_bytes("Download", 0, total, t("Downloading official files"));
+        downloads.operation.progress_bytes(Stage::Download, 0, total, t("Downloading official files"));
         downloads
     }
     #[cfg(test)]
@@ -850,12 +841,11 @@ impl FileProgress {
         let next = if reused { expected } else { received.saturating_add(bytes).min(expected) };
         state.files[self.index].0 = next;
         state.done += next - received;
-        // Publish under this lock so out-of-order workers cannot move the
-        // progress backwards after another worker has already advanced it.
+        // Published under this lock, so progress stays monotonic.
         if reused {
-            self.operation.progress_bytes_rebased("Download", state.done, state.total, detail);
+            self.operation.progress_bytes_rebased(Stage::Download, state.done, state.total, detail);
         } else {
-            self.operation.progress_bytes("Download", state.done, state.total, detail);
+            self.operation.progress_bytes(Stage::Download, state.done, state.total, detail);
         }
     }
     fn fallback(&self, full_size: u64, detail: String) {
@@ -864,7 +854,7 @@ impl FileProgress {
         state.files[self.index].1 = received + full_size;
         // Keep transferred bytes, replace only the untransferred delta work.
         state.total = state.total - (expected - received) + full_size;
-        self.operation.progress_bytes_rebased("Download", state.done, state.total, detail);
+        self.operation.progress_bytes_rebased(Stage::Download, state.done, state.total, detail);
     }
 }
 fn download_size(history: &FileHistory, action: &Action) -> u64 {
@@ -872,45 +862,6 @@ fn download_size(history: &FileHistory, action: &Action) -> u64 {
         Action::Direct => history.current().direct_len,
         Action::Deltas(from) => history.versions[*from..].iter()
             .filter_map(|version| version.indirect.as_ref()).map(|delta| delta.len).sum(),
-    }
-}
-
-/// Reserve estimated encoded/decoded buffers, including Vec growth and the
-/// direct fallback for a failed delta. Oversized files own the entire budget
-/// and run alone; this is a scheduling bound, not a process memory limit.
-fn download_memory_mib(history: &FileHistory, action: &Action) -> u32 {
-    let output = |sig: FileSig| sig.len.saturating_add(1).saturating_mul(2);
-    let current = history.current();
-    let mut peak = current.direct_len.saturating_add(output(current.sig));
-    if let Action::Deltas(from) = action {
-        let mut base = history.versions[from - 1].sig;
-        for version in &history.versions[*from..] {
-            let raw = version.indirect.as_ref().map_or(0, |delta| delta.len);
-            peak = peak.max(output(base).saturating_add(raw).saturating_add(output(version.sig)));
-            base = version.sig;
-        }
-    }
-    peak.saturating_add(2 * SIGNATURE_BUFFER_LEN as u64)
-        .div_ceil(1 << 20).clamp(1, DOWNLOAD_BUDGET_MIB as u64) as u32
-}
-
-async fn reserve_download_memory(
-    budget: Arc<tokio::sync::Semaphore>,
-    amount: u32,
-    op: &Operation,
-) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
-    op.check_cancelled()?;
-    let acquire = budget.acquire_many_owned(amount);
-    tokio::pin!(acquire);
-    loop {
-        tokio::select! {
-            result = &mut acquire => {
-                let permit = result.map_err(|e| e.to_string())?;
-                op.check_cancelled()?;
-                return Ok(permit);
-            }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => op.check_cancelled()?,
-        }
     }
 }
 
@@ -923,11 +874,16 @@ async fn stage_plan(
     op: &Operation,
 ) -> Result<(Vec<Ready>, u64), String> {
     let product = Product::Ffxi;
-    let downloads = Downloads::new(op.clone(), stage_groups(product, m, planned).iter()
+    let groups = stage_groups(product, m, planned);
+    let downloads = Downloads::new(op.clone(), groups.iter()
         .map(|g| download_size(&m.files[g.source.index], &g.source.action)).collect());
-    stage_plan_shared(product, product.server(), root, staged, m, planned, op, downloads, 0).await
+    stage_plan_shared(product, product.server(), root, staged, m, &groups, op, &downloads, 0).await
 }
 
+/// Stage `groups` (`stage_groups`) in order into the verified cache `staged`: each one reused
+/// when its verified copy is there, else downloaded on the one stop-and-wait connection
+/// (opened at the first download, closed like stock at the end). `first` is the first group's
+/// index in `downloads`.
 #[allow(clippy::too_many_arguments)]
 async fn stage_plan_shared(
     product: Product,
@@ -935,117 +891,69 @@ async fn stage_plan_shared(
     root: &Path,
     staged: &Path,
     m: &Manifest,
-    planned: &[Planned],
+    groups: &[StageGroup],
     op: &Operation,
-    downloads: Downloads,
+    downloads: &Downloads,
     first: usize,
 ) -> Result<(Vec<Ready>, u64), String> {
-    if planned.is_empty() {
-        return Ok((Vec::new(), 0));
-    }
-    let m = Arc::new(m.clone());
-    let planned = Arc::new(stage_groups(product, &m, planned));
-    let next = Arc::new(AtomicUsize::new(0));
-    let memory = Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_BUDGET_MIB));
-    let mut tasks = tokio::task::JoinSet::new();
-    for _ in 0..planned.len().min(MAX_DOWNLOAD_WORKERS) {
-        let server: Arc<str> = server.into();
-        let root = root.to_path_buf();
-        let staged = staged.to_path_buf();
-        let op = op.clone();
-        let m = m.clone();
-        let planned = planned.clone();
-        let next = next.clone();
-        let downloads = downloads.clone();
-        let memory = memory.clone();
-        tasks.spawn(async move {
-            let mut session = None;
-            let mut mine = Vec::new();
-            let mut bytes = 0u64;
-            loop {
-                op.check_cancelled()?;
-                let n = next.fetch_add(1, Ordering::Relaxed);
-                let Some(group) = planned.get(n) else {
-                    break;
-                };
-                let item = &group.source;
-                let history = &m.files[item.index];
-                let current = history.current();
-                let transfer = downloads.file_scoped(first + n, op.clone());
-                let cache = staged.join(format!(
-                    "{}-{}.bin",
-                    hex_md5(if product == Product::Viewer { current.direct.as_bytes() } else { history.path.as_bytes() }),
-                    hex_md5(format!("{:?}", current.sig).as_bytes())
-                ));
-                ensure_plain(&cache)?;
-                if cache.is_file() && signature(&cache, &op)? == current.sig {
-                    transfer.advance(
-                        0,
-                        tf("Reusing verified {path}", &[("path", &history.path)]),
-                        true,
-                    );
-                } else {
-                    let _reservation = reserve_download_memory(memory.clone(), download_memory_mib(history, &item.action), &op).await?;
-                    if session.is_none() { session = Some(Session::connect_to(product, &server, &op).await?); }
-                    let session = session.as_mut().unwrap();
-                    let produced = produce(session, &root, history, &item.action, &op, Some(&transfer)).await;
-                    let data = match produced {
-                        Ok(data) => data,
-                        Err(e) if matches!(item.action, Action::Deltas(_)) && !op.cancelled() => {
-                            transfer.fallback(
-                                current.direct_len,
-                                tf(
-                                    "Delta failed for {path}; using full file ({error})",
-                                    &[("path", &history.path), ("error", &e)],
-                                ),
-                            );
-                            produce(session, &root, history, &Action::Direct, &op, Some(&transfer)).await?
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    if FileSig::of(&data) != current.sig {
-                        return Err(tf("{path}: downloaded signature mismatch", &[("path", &history.path)]));
-                    }
-                    op.check_cancelled()?;
-                    save(&cache, &data)?;
-                    if signature(&cache, &op)? != current.sig {
-                        return Err(tf("{path}: staged file did not verify", &[("path", &history.path)]));
-                    }
-                    bytes = bytes.saturating_add(data.len() as u64);
-                }
-                for target in &group.targets {
-                    let history = &m.files[target.index];
-                    op.complete_update_work(UpdateWork::Staging, staging_work(history, target), None);
-                    mine.push((target.index, (history.path.clone(), cache.clone(), current.sig, target.original)));
-                }
-            }
-            if let Some(session) = session { session.close().await; }
-            Ok::<_, String>((mine, bytes))
-        });
-    }
+    let mut session: Option<Session> = None;
     let mut ready = Vec::new();
     let mut bytes = 0u64;
-    while let Some(result) = tasks.join_next().await {
-        match result {
-            Ok(Ok((mut mine, n))) => {
-                ready.append(&mut mine);
-                bytes = bytes.saturating_add(n);
+    for (n, group) in groups.iter().enumerate() {
+        op.check_cancelled()?;
+        let item = &group.source;
+        let history = &m.files[item.index];
+        let current = history.current();
+        let transfer = downloads.file_scoped(first + n, op.clone());
+        let cache = staged.join(format!(
+            "{}-{}.bin",
+            hex_md5(if product == Product::Viewer { current.direct.as_bytes() } else { history.path.as_bytes() }),
+            hex_md5(format!("{:?}", current.sig).as_bytes())
+        ));
+        ensure_plain(&cache)?;
+        if cache.is_file() && signature(&cache, op)? == current.sig {
+            transfer.advance(0, tf("Reusing verified {path}", &[("path", &history.path)]), true);
+        } else {
+            if session.is_none() { session = Some(Session::connect_to(product, server, op).await?); }
+            let produced = produce(session.as_mut().unwrap(), root, history, &item.action, op, Some(&transfer)).await;
+            let data = match produced {
+                Ok(data) => data,
+                Err(e) if matches!(item.action, Action::Deltas(_)) && !op.cancelled() => {
+                    transfer.fallback(
+                        current.direct_len,
+                        tf("Delta failed for {path}; using full file ({error})", &[("path", &history.path), ("error", &e)]),
+                    );
+                    // A connection whose exchange stopped partway may still carry that reply:
+                    // close it like stock and open a new one, never a second request on it.
+                    if session.as_ref().is_none_or(|session| session.broken || session.stream.is_none()) {
+                        if let Some(old) = session.take() { old.close().await; }
+                        session = Some(Session::connect_to(product, server, op).await?);
+                    }
+                    produce(session.as_mut().unwrap(), root, history, &Action::Direct, op, Some(&transfer)).await?
+                }
+                Err(e) => return Err(e),
+            };
+            if FileSig::of(&data) != current.sig {
+                return Err(tf("{path}: downloaded signature mismatch", &[("path", &history.path)]));
             }
-            failure => {
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
-                return Err(match failure {
-                    Ok(Err(e)) => e,
-                    Err(e) => e.to_string(),
-                    _ => unreachable!(),
-                });
+            op.check_cancelled()?;
+            save(&cache, &data)?;
+            if signature(&cache, op)? != current.sig {
+                return Err(tf("{path}: staged file did not verify", &[("path", &history.path)]));
             }
+            bytes = bytes.saturating_add(data.len() as u64);
+        }
+        for target in &group.targets {
+            let history = &m.files[target.index];
+            op.complete_update_work(UpdateWork::Staging, staging_work(history, target), None);
+            ready.push((history.path.clone(), cache.clone(), current.sig, target.original));
         }
     }
-    ready.sort_by_key(|(n, _)| *n);
-    Ok((ready.into_iter().map(|(_, item)| item).collect(), bytes))
+    if let Some(session) = session { session.close().await; }
+    Ok((ready, bytes))
 }
 
+#[cfg(test)]
 fn validate_manifest(m: &Manifest) -> Result<(), String> {
     validate_manifest_for(Product::Ffxi, m)
 }
@@ -1099,14 +1007,15 @@ fn scan(
 /// which files this update changes, for the modified-file rule; `None` counts all.
 fn scan_for(product: Product, root: &Path, m: &Manifest, mode: Mode, op: &Operation, installed: Option<&str>) -> Result<(Report, Vec<Planned>), String> {
     op.check_cancelled()?;
-    scan_with_workers_for(product, root, m, mode, op, check_workers(root, mode), installed)
+    scan_with_workers_for(product, root, m, mode, op, check_workers(root), installed)
 }
 
-fn check_workers(root: &Path, mode: Mode) -> usize {
+fn check_workers(root: &Path) -> usize {
     let available = std::thread::available_parallelism().map_or(1, |count| count.get());
-    // This snapshot is only a scheduling hint. Check remains read-only and is
-    // allowed while playing; mutation guards still run independently of it.
-    let game_may_be_running = mode == Mode::Check && ensure_idle(root).is_err();
+    // This snapshot is only a scheduling hint. Check, and a Play's update (which downloads and
+    // plans while other accounts play from the folder), read beside running games; the
+    // mutation guards still run independently of it. Other updates already passed the guard.
+    let game_may_be_running = ensure_idle(root).is_err();
     file_check_workers(available, game_may_be_running)
 }
 
@@ -1127,7 +1036,7 @@ fn plan_from_applied(product: Product, root: &Path, installed: &Manifest, m: &Ma
         .map(|history| (history.path.to_ascii_lowercase(), history)).collect();
     let changed: Vec<bool> = m.files.iter().map(|history| before.get(&history.path.to_ascii_lowercase())
         .is_none_or(|old| old.current().stamp != history.current().stamp || old.current().sig != history.current().sig)).collect();
-    op.progress("Check", 0, m.files.len() as u64, t("Checking game files"));
+    op.progress(Stage::Check, 0, m.files.len() as u64, t("Checking game files"));
     let mut signatures = vec![None; m.files.len()];
     let mut read = Vec::new();
     for (index, history) in m.files.iter().enumerate() {
@@ -1145,8 +1054,8 @@ fn plan_from_applied(product: Product, root: &Path, installed: &Manifest, m: &Ma
             Err(e) => return Err(format!("{}: {e}", path.display())),
         }
     }
-    let subset = Manifest { files: read.iter().map(|&index| m.files[index].clone()).collect() };
-    for (local, &index) in scan_signatures(root, &subset, op, workers, "Check")?.into_iter().zip(&read) {
+    let subset: Vec<&FileHistory> = read.iter().map(|&index| &m.files[index]).collect();
+    for (local, &index) in scan_signatures(root, &subset, op, workers, Stage::Check)?.into_iter().zip(&read) {
         signatures[index] = local;
     }
     plan_from_signatures(product, m, mode, op, signatures, &|index| changed[index], true)
@@ -1164,7 +1073,7 @@ fn scan_with_workers(
 }
 
 fn scan_with_workers_for(product: Product, root: &Path, m: &Manifest, mode: Mode, op: &Operation, workers: usize, installed: Option<&str>) -> Result<(Report, Vec<Planned>), String> {
-    let signatures = scan_signatures(root, m, op, workers, "Check")?;
+    let signatures = scan_signatures(root, &m.files.iter().collect::<Vec<_>>(), op, workers, Stage::Check)?;
     // A PlayOnline Viewer without an installed version is a fresh install: its installer's
     // files are not in the retained patch history (and there is no installer baseline for
     // them), so they read as modified though nobody changed them. They are replaced like
@@ -1246,7 +1155,7 @@ fn plan_from_signatures(product: Product, m: &Manifest, mode: Mode, op: &Operati
         report.kept += usize::from(keep);
     }
     op.progress(
-        "Check",
+        Stage::Check,
         m.files.len() as u64,
         m.files.len() as u64,
         t("File verification complete"),
@@ -1259,25 +1168,25 @@ fn plan_from_signatures(product: Product, m: &Manifest, mode: Mode, op: &Operati
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LocalFile { sig: FileSig, md5: [u8; 16] }
 
-/// `stage` is "Check" for planning or "Verify" for Repair's final verification, which
+/// `stage` is Check for planning or Verify for Repair's final verification, which
 /// also credits each file's verify work to the whole-update estimate.
 fn scan_signatures(
     root: &Path,
-    m: &Manifest,
+    files: &[&FileHistory],
     op: &Operation,
     workers: usize,
-    stage: &str,
+    stage: Stage,
 ) -> Result<Vec<Option<LocalFile>>, String> {
     op.check_cancelled()?;
-    op.progress(stage, 0, m.files.len() as u64, if stage == "Verify" { t("Verifying downloaded files") } else { t("Checking game files") });
-    if m.files.is_empty() { return Ok(Vec::new()); }
+    op.progress(stage, 0, files.len() as u64, if stage == Stage::Verify { t("Verifying downloaded files") } else { t("Checking game files") });
+    if files.is_empty() { return Ok(Vec::new()); }
     // Opt-in timing tests can compare larger pools without increasing the
     // production limit selected by scan.
     #[cfg(test)]
     let limit = MAX_BENCHMARK_CHECK_WORKERS;
     #[cfg(not(test))]
     let limit = MAX_CHECK_WORKERS;
-    let workers = workers.clamp(1, limit).min(m.files.len());
+    let workers = workers.clamp(1, limit).min(files.len());
     let next = AtomicUsize::new(0);
     let stopped = AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -1293,13 +1202,14 @@ fn scan_signatures(
                     let mut buffer = vec![0u8; SIGNATURE_BUFFER_LEN];
                     while !stopped.load(Ordering::Acquire) {
                         let index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(history) = m.files.get(index) else { break; };
+                        let Some(history) = files.get(index) else { break; };
                         let result = (|| {
                             op.check_cancelled()?;
                             let path = confined(root, &history.path)?;
                             match fs::metadata(&path) {
                                 Ok(metadata) if metadata.is_file() =>
-                                    local_file_with_buffer(&path, op, &mut buffer).map(Some),
+                                    local_file_with_buffer(&path, op, &mut buffer)
+                                        .map(|file| Some(without_local_laa(&path, history, file, op, &mut buffer))),
                                 Ok(_) => Err(tf("{path} is not a regular file", &[("path", &path.display())])),
                                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                                 Err(e) => Err(format!("{}: {e}", path.display())),
@@ -1319,7 +1229,7 @@ fn scan_signatures(
             }
         }
         drop(sender);
-        let mut signatures = vec![None; m.files.len()];
+        let mut signatures = vec![None; files.len()];
         let mut done = 0;
         let mut last_progress = Instant::now();
         // Drain even after a failure so a worker in send cannot block a scoped join.
@@ -1328,11 +1238,11 @@ fn scan_signatures(
                 Ok(signature) => {
                     signatures[index] = Some(signature);
                     done += 1;
-                    if stage == "Verify" {
-                        op.complete_update_work(UpdateWork::Verify, io_work(m.files[index].current().sig), None);
+                    if stage == Stage::Verify {
+                        op.complete_update_work(UpdateWork::Verify, io_work(files[index].current().sig), None);
                     }
                     if last_progress.elapsed() >= Duration::from_millis(100) {
-                        op.progress(stage, done, m.files.len() as u64, m.files[index].path.clone());
+                        op.progress(stage, done, files.len() as u64, files[index].path.clone());
                         last_progress = Instant::now();
                     }
                 }
@@ -1351,6 +1261,35 @@ fn scan_signatures(
     })
 }
 
+/// The PlayOnline Viewer's `pol.exe` with IMAGE_FILE_LARGE_ADDRESS_AWARE set
+/// locally (the community 4 GB patch) and nothing else changed is the current
+/// official file: no Check reports it and no Repair or Update replaces it.
+/// Recognised only when clearing that one flag gives exactly the current
+/// official identity (length, byte sum, MD5 word); any other difference stays
+/// a modification. Crystal never sets the flag on Square Enix's files; its own
+/// game host is built large-address-aware instead.
+fn without_local_laa(path: &Path, history: &FileHistory, file: LocalFile, op: &Operation, buffer: &mut [u8]) -> LocalFile {
+    let official = history.current().sig;
+    if !history.path.eq_ignore_ascii_case("pol.exe") || file.sig == official || file.sig.len != official.len {
+        return file;
+    }
+    let Ok(mut bytes) = fs::read(path) else { return file };
+    let Some(at) = laa_flag_byte(&bytes) else { return file };
+    bytes[at] &= !0x20;
+    match read_local_file(&bytes[..], op, buffer) {
+        Ok(cleared) if cleared.sig == official => cleared,
+        _ => file,
+    }
+}
+
+/// The offset of the low byte of a PE file's Characteristics when it has
+/// IMAGE_FILE_LARGE_ADDRESS_AWARE (0x20) set.
+fn laa_flag_byte(bytes: &[u8]) -> Option<usize> {
+    let nt = u32::from_le_bytes(bytes.get(0x3c..0x40)?.try_into().ok()?) as usize;
+    let at = nt.checked_add(22)?;
+    (bytes.get(..2)? == b"MZ" && bytes.get(nt..nt.checked_add(4)?)? == b"PE\0\0" && bytes.get(at)? & 0x20 != 0).then_some(at)
+}
+
 fn signature(path: &Path, op: &Operation) -> Result<FileSig, String> {
     let mut buffer = vec![0u8; SIGNATURE_BUFFER_LEN];
     signature_with_buffer(path, op, &mut buffer)
@@ -1360,9 +1299,9 @@ fn signature_with_buffer(path: &Path, op: &Operation, buffer: &mut [u8]) -> Resu
     local_file_with_buffer(path, op, buffer).map(|file| file.sig)
 }
 
+/// `path` is one every caller already checked (`confined`, or `ensure_plain` for a cache file).
 fn local_file_with_buffer(path: &Path, op: &Operation, buffer: &mut [u8]) -> Result<LocalFile, String> {
     let started = Instant::now();
-    ensure_plain(path)?;
     let file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let signature = read_local_file(file, op, buffer)?;
     // Keep per-file durations: later Apply and Verify still execute serially.
@@ -1403,8 +1342,10 @@ fn read_local_file(mut file: impl Read, op: &Operation, buffer: &mut [u8]) -> Re
 /// One patch-server connection on a stock-shaped socket (`stock_socket`: bound, 64 KB
 /// SO_RCVBUF/SO_SNDBUF before connect, Nagle and delayed ACK left alone). One request
 /// is in flight at a time: `exchange` writes a request and reads its whole reply.
+/// Every end closes like stock (`close`, or the same close on its own thread on `Drop`).
 struct Session {
-    stream: tokio::net::TcpStream,
+    /// `None` once closed.
+    stream: Option<tokio::net::TcpStream>,
     product: Product,
     server: Arc<str>,
     /// When the last reply on this connection ended: paces the next file
@@ -1412,6 +1353,9 @@ struct Session {
     replied: Option<Instant>,
     /// The last file fetched on this connection, for `next_file_pause`.
     previous: Option<Transfer>,
+    /// An exchange stopped partway (I/O error, timeout or cancel): the stream may still carry
+    /// that reply, so nothing is sent on it again, and its close reads the rest first.
+    broken: bool,
 }
 /// One file a fetch asks for: a direct (full) file of its transfer size, or a delta.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1443,6 +1387,20 @@ fn note_closed(server: &str, at: Instant) {
     closes.push((server.to_owned(), at));
 }
 
+/// A connection to `product`'s patch server Crystal closed elsewhere (`at`: its FIN), such as a
+/// Play's W20 (patch.rs), so the next connection here keeps `NEXT_CONNECTION_GAP` from it too.
+/// A later close already known wins.
+pub(crate) fn note_patch_closed(product: Product, at: Instant) {
+    note_server_closed(product.server(), at);
+}
+
+fn note_server_closed(server: &str, at: Instant) {
+    let mut closes = LAST_CLOSE.lock().unwrap_or_else(|e| e.into_inner());
+    if closes.iter().any(|(known, when)| known == server && *when >= at) { return; }
+    closes.retain(|(known, _)| known != server);
+    closes.push((server.to_owned(), at));
+}
+
 /// How long a new connection to `server` still waits for `NEXT_CONNECTION_GAP` after
 /// Crystal's last FIN to it.
 fn connect_gap(server: &str) -> Duration {
@@ -1450,32 +1408,114 @@ fn connect_gap(server: &str) -> Duration {
         .map_or(Duration::ZERO, |(_, at)| crate::stock_socket::uniform(NEXT_CONNECTION_GAP).saturating_sub(at.elapsed()))
 }
 
-impl Session {
-    #[cfg(test)]
-    async fn connect(op: &Operation) -> Result<Self, String> {
-        Self::connect_to(Product::Ffxi, Product::Ffxi.server(), op).await
+/// After an exchange stopped partway: read what is left of its reply (at most `DRAIN_LIMIT`
+/// bytes, until the peer goes quiet for `DRAIN_IDLE`) so closesocket sends a FIN, not a reset
+/// for unread data. Returns when the last byte arrived, if any did.
+fn drain(stream: &std::net::TcpStream) -> Option<Instant> {
+    const DRAIN_LIMIT: usize = 256 * 1024;
+    const DRAIN_IDLE: Duration = Duration::from_millis(200);
+    if stream.set_nonblocking(false).and_then(|_| stream.set_read_timeout(Some(DRAIN_IDLE))).is_err() { return None; }
+    let (mut buffer, mut read, mut last) = (vec![0u8; 64 * 1024], 0, None);
+    while read < DRAIN_LIMIT {
+        match (&*stream).read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => { read += n; last = Some(Instant::now()); }
+        }
     }
+    last
+}
+
+/// The stock close of one patch connection, on the calling (blocking) thread: drain a broken
+/// exchange's leftover reply, then FIN 100-115 ms after the last byte received. Returns when
+/// the socket closed.
+fn close_stream(stream: std::net::TcpStream, replied: Option<Instant>, broken: bool) -> Instant {
+    let drained = if broken { drain(&stream) } else { None };
+    match drained.or(replied) {
+        Some(last) => crate::stock_socket::close_after_reply(stream, last),
+        None => drop(stream),
+    }
+    Instant::now()
+}
+
+impl Drop for Session {
+    /// An early return (error or cancel) still closes like stock, on its own thread; a next
+    /// connection to the server waits for that FIN, then `NEXT_CONNECTION_GAP` from it.
+    fn drop(&mut self) {
+        let Some(stream) = self.stream.take() else { return };
+        let server = self.server.clone();
+        let Ok(stream) = stream.into_std() else { note_closed(&server, Instant::now()); return };
+        let (replied, broken) = (self.replied, self.broken);
+        // A next connection to this server waits for this FIN (`wait_closing`).
+        closing(&server, 1);
+        let thread_server = server.clone();
+        let spawned = std::thread::Builder::new().name("patch-close".into()).spawn(move || {
+            let closed = close_stream(stream, replied, broken);
+            note_closed(&thread_server, closed);
+            closing(&thread_server, -1);
+        });
+        if spawned.is_err() {
+            // The stream was dropped with the closure: closed now.
+            note_closed(&server, Instant::now());
+            closing(&server, -1);
+        }
+    }
+}
+
+/// Closes still in flight on a `patch-close` thread, per server (`Session::drop`).
+static CLOSING: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+static CLOSED: std::sync::Condvar = std::sync::Condvar::new();
+
+fn closing(server: &str, delta: isize) {
+    let mut pending = CLOSING.lock().unwrap_or_else(|e| e.into_inner());
+    match pending.iter_mut().find(|(known, _)| known == server) {
+        Some((_, count)) => *count = count.saturating_add_signed(delta),
+        None if delta > 0 => pending.push((server.to_owned(), delta as usize)),
+        None => {}
+    }
+    pending.retain(|(_, count)| *count > 0);
+    if delta < 0 { CLOSED.notify_all(); }
+}
+
+/// Block until no close to `server` is in flight (bounded by `limit`), so the next SYN is
+/// spaced from its FIN, not from when the session was dropped.
+fn wait_closing(server: &str, limit: Duration) {
+    let pending = CLOSING.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = CLOSED.wait_timeout_while(pending, limit, |pending| pending.iter().any(|(known, _)| known == server));
+}
+
+impl Session {
     async fn connect_to(product: Product, server: &str, op: &Operation) -> Result<Self, String> {
         let stream = cancel_io(stock_connect(server.to_owned()), op).await?;
-        Ok(Self { stream, product, server: server.into(), replied: None, previous: None })
+        Ok(Self { stream: Some(stream), product, server: server.into(), replied: None, previous: None, broken: false })
+    }
+    /// The open stream (a closed session has none).
+    fn stream(&mut self) -> Result<&mut tokio::net::TcpStream, String> {
+        self.stream.as_mut().ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotConnected).to_string())
     }
     /// Close like stock: FIN 100-115 ms after the last reply byte, never in its millisecond,
     /// timed and sent on one blocking thread (`stock_socket::close_after_reply`). Returns
     /// after the FIN, which a next connection to this server spaces itself from.
-    async fn close(self) {
-        let server = self.server.clone();
-        let replied = self.replied;
-        let closed = match self.stream.into_std() {
-            Ok(stream) => tokio::task::spawn_blocking(move || {
-                match replied {
-                    Some(replied) => crate::stock_socket::close_after_reply(stream, replied),
-                    None => drop(stream),
-                }
-                Instant::now()
-            }).await.unwrap_or_else(|_| Instant::now()),
+    async fn close(mut self) {
+        self.shut().await;
+    }
+    async fn shut(&mut self) {
+        let Some(stream) = self.stream.take() else { return };
+        let (replied, broken) = (self.replied, self.broken);
+        let closed = match stream.into_std() {
+            Ok(stream) => tokio::task::spawn_blocking(move || close_stream(stream, replied, broken))
+                .await.unwrap_or_else(|_| Instant::now()),
             Err(_) => Instant::now(),
         };
-        note_closed(&server, closed);
+        note_closed(&self.server, closed);
+    }
+    /// Close this connection like stock, then open a new one to the same server (after
+    /// `NEXT_CONNECTION_GAP` from that FIN). A failed connect leaves the session closed.
+    async fn reconnect(&mut self, op: &Operation) -> Result<(), String> {
+        self.shut().await;
+        let mut fresh = Self::connect_to(self.product, &self.server.clone(), op).await?;
+        self.stream = fresh.stream.take();
+        (self.replied, self.broken) = (None, false);
+        Ok(())
     }
     async fn exchange(
         &mut self,
@@ -1483,11 +1523,15 @@ impl Session {
         expected: u32,
         op: &Operation,
     ) -> Result<Vec<u8>, String> {
-        cancel_io(self.stream.write_all(request), op).await?;
+        if self.broken { return Err(std::io::Error::from(std::io::ErrorKind::NotConnected).to_string()); }
+        // Until the whole reply is read, an early return leaves it on the wire.
+        self.broken = true;
+        let stream = self.stream()?;
+        cancel_io(stream.write_all(request), op).await?;
         let mut head = [0u8; 4];
-        cancel_io(self.stream.read_exact(&mut head), op).await?;
+        cancel_io(stream.read_exact(&mut head), op).await?;
         let len = polp::declared_len(&head);
-        let cap = if expected == 2 {
+        let cap = if expected == polp::kind::MANIFEST_REPLY {
             16 * 1024 * 1024
         } else {
             128 * 1024
@@ -1497,12 +1541,13 @@ impl Session {
         }
         let mut data = vec![0u8; len];
         data[..4].copy_from_slice(&head);
-        if expected == polp::kind::MANIFEST {
-            read_manifest_body(&mut self.stream, &mut data, op, Duration::from_secs(30)).await?;
+        if expected == polp::kind::MANIFEST_REPLY {
+            read_manifest_body(stream, &mut data, op, Duration::from_secs(30)).await?;
         } else {
-            cancel_io(self.stream.read_exact(&mut data[4..]), op).await?;
+            cancel_io(stream.read_exact(&mut data[4..]), op).await?;
         }
         self.replied = Some(Instant::now());
+        self.broken = false;
         let p = polp::parse(&data)?;
         if p.kind != expected {
             return Err(tf(
@@ -1512,12 +1557,10 @@ impl Session {
         }
         Ok(data)
     }
-    /// A direct (full) file; `fetch_delta` for a delta.
+    /// A direct (full) file.
+    #[cfg(test)]
     async fn fetch(&mut self, path: &str, len: u64, op: &Operation) -> Result<Vec<u8>, String> {
         self.fetch_tracked(path, len, Transfer::Direct(len), op, None).await
-    }
-    async fn fetch_delta(&mut self, path: &str, len: u64, op: &Operation) -> Result<Vec<u8>, String> {
-        self.fetch_tracked(path, len, Transfer::Delta, op, None).await
     }
     async fn fetch_tracked(&mut self, path: &str, len: u64, kind: Transfer, op: &Operation, progress: Option<&FileProgress>) -> Result<Vec<u8>, String> {
         if len > MAX_FILE {
@@ -1534,24 +1577,21 @@ impl Session {
             let offset = data.len() as u32;
             let want = (len - data.len() as u64).min(polp::CHUNK_LEN as u64) as u32;
             let request = polp::file_request(&self.product.tags(), path, offset, want);
-            let mut last = String::new();
-            let mut received = None;
-            for attempt in 0..3 {
-                match self.exchange(&request, 4, op).await {
-                    Ok(frame) => {
-                        received = Some(frame);
-                        break;
-                    }
-                    Err(e) => {
-                        last = e;
+            // Up to 3 attempts per chunk. After a failed exchange the old connection closes
+            // like stock (its leftover reply read first) before the next SYN, and the new
+            // connection asks for the same chunk at the same offset.
+            let mut attempt = 0;
+            let frame = loop {
+                match self.exchange(&request, polp::kind::FILE_REPLY, op).await {
+                    Ok(frame) => break frame,
+                    Err(_) if attempt < 2 => {
                         op.check_cancelled()?;
-                        if attempt < 2 {
-                            *self = Self::connect_to(self.product, &self.server.clone(), op).await?;
-                        }
+                        attempt += 1;
+                        self.reconnect(op).await?;
                     }
+                    Err(error) => return Err(tf("{path}: {error}", &[("path", &path), ("error", &error)])),
                 }
-            }
-            let frame = received.ok_or_else(|| tf("{path}: {error}", &[("path", &path), ("error", &last)]))?;
+            };
             let body = &frame[16..];
             let (got, chunk) = polp::file_chunk(body)?;
             let name_len = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
@@ -1569,7 +1609,7 @@ impl Session {
             if let Some(progress) = progress {
                 progress.advance(chunk.len() as u64, path.to_owned(), false);
             } else {
-                op.progress_bytes("Download", data.len() as u64, len, path.to_owned());
+                op.progress_bytes(Stage::Download, data.len() as u64, len, path.to_owned());
             }
         }
         self.previous = Some(kind);
@@ -1582,6 +1622,8 @@ impl Session {
 async fn stock_connect(server: String) -> std::io::Result<tokio::net::TcpStream> {
     let stream = tokio::task::spawn_blocking(move || {
         let addresses = crate::dns::resolve_server(&server)?;
+        // A drained close takes at most ~1 s (`drain` idle reads plus the stock close delay).
+        wait_closing(&server, Duration::from_secs(2));
         std::thread::sleep(connect_gap(&server));
         let started = Instant::now();
         let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, t("no address"));
@@ -1609,7 +1651,7 @@ async fn read_manifest_body<R: tokio::io::AsyncRead + Unpin>(
 ) -> Result<(), String> {
     let mut received = 4;
     let detail = t("Downloading the official file manifest");
-    op.progress_bytes("Manifest", received as u64, data.len() as u64, detail);
+    op.progress_bytes(Stage::Manifest, received as u64, data.len() as u64, detail);
     while received < data.len() {
         op.check_cancelled()?;
         let end = (received + 64 * 1024).min(data.len());
@@ -1618,7 +1660,7 @@ async fn read_manifest_body<R: tokio::io::AsyncRead + Unpin>(
             return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).to_string());
         }
         received += count;
-        op.progress_bytes("Manifest", received as u64, data.len() as u64, detail);
+        op.progress_bytes(Stage::Manifest, received as u64, data.len() as u64, detail);
     }
     Ok(())
 }
@@ -1634,11 +1676,10 @@ async fn cancel_io_with_timeout<F, T>(future: F, op: &Operation, timeout: Durati
 where
     F: std::future::Future<Output = std::io::Result<T>>,
 {
-    tokio::pin!(future);
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
-    loop {
-        tokio::select! {result=&mut future=>return result.map_err(|e|e.to_string()),_=&mut deadline=>return Err(t("Patch server timed out").into()),_=tokio::time::sleep(Duration::from_millis(100))=>op.check_cancelled()?,}
+    tokio::select! {
+        result = future => result.map_err(|e| e.to_string()),
+        _ = tokio::time::sleep(timeout) => Err(t("Patch server timed out").into()),
+        cancelled = op.cancelled_wait() => Err(cancelled),
     }
 }
 
@@ -1754,40 +1795,41 @@ pub(crate) fn ensure_plain(path: &Path) -> Result<(), String> {
         if matches!(part, Component::Prefix(_)) {
             continue;
         }
-        match fs::symlink_metadata(&at) {
-            Ok(m) => {
-                if m.file_type().is_symlink() {
-                    return Err(tf("Symlink path {path}", &[("path", &at.display())]));
-                }
-                #[cfg(windows)]
-                {
-                    use std::os::windows::fs::MetadataExt;
-                    if m.file_attributes() & 0x400 != 0 {
-                        return Err(tf("Reparse path {path}", &[("path", &at.display())]));
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("{}: {e}", at.display())),
-        }
+        plain_component(&at)?;
     }
     Ok(())
 }
+/// `at`, if it exists, is neither a symlink nor another reparse point.
+fn plain_component(at: &Path) -> Result<(), String> {
+    use std::os::windows::fs::MetadataExt;
+    match fs::symlink_metadata(at) {
+        Ok(m) if m.file_type().is_symlink() => Err(tf("Symlink path {path}", &[("path", &at.display())])),
+        Ok(m) if m.file_attributes() & 0x400 != 0 => Err(tf("Reparse path {path}", &[("path", &at.display())])),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", at.display())),
+    }
+}
+/// `root\rel`, with each component below `root` checked (`plain_component`). The root itself was
+/// checked in full where it was accepted (`prepare_with`, `recover_interrupted`), so it is not
+/// stat'ed again for every file.
 fn confined(root: &Path, rel: &str) -> Result<PathBuf, String> {
     validate_relative(rel)?;
-    let p = root.join(rel);
-    ensure_plain(&p)?;
-    Ok(p)
+    let mut at = root.to_path_buf();
+    for part in rel.split('/') {
+        at.push(part);
+        plain_component(&at)?;
+    }
+    Ok(root.join(rel))
 }
 fn save(path: &Path, data: &[u8]) -> Result<(), String> {
-    ensure_plain(path)?;
+    // The temporary file shares `path`'s parents; `publish` checks both leaves.
     let tmp = path.with_extension("xi-part");
     ensure_plain(&tmp)?;
     let mut f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
     f.write_all(data).map_err(|e| e.to_string())?;
     f.sync_all().map_err(|e| e.to_string())?;
     drop(f);
-    ensure_plain(path)?;
     publish(&tmp, path)
 }
 
@@ -1796,40 +1838,8 @@ fn save(path: &Path, data: &[u8]) -> Result<(), String> {
 fn publish(from: &Path, to: &Path) -> Result<(), String> {
     ensure_plain(from)?;
     ensure_plain(to)?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-        };
-        let source: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
-        let target: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
-        // SAFETY: both NUL-terminated path buffers remain live for this call.
-        if unsafe {
-            MoveFileExW(
-                source.as_ptr(),
-                target.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        } == 0
-        {
-            return Err(tf(
-                "Publish {path}: {error}",
-                &[("path", &to.display()), ("error", &std::io::Error::last_os_error())],
-            ));
-        }
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        fs::rename(from, to).map_err(|e| e.to_string())?;
-        if let Some(parent) = to.parent() {
-            fs::File::open(parent)
-                .and_then(|f| f.sync_all())
-                .map_err(|e| e.to_string())?;
-        }
-        Ok(())
-    }
+    crate::fsutil::replace(from, to)
+        .map_err(|error| tf("Publish {path}: {error}", &[("path", &to.display()), ("error", &error)]))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1935,10 +1945,13 @@ where
         format: RECORDS_FORMAT,
     };
     write_journal(root, &j)?;
+    // The final verification failed: a file is not what the plan expected, even with nothing
+    // replaced (a Repair whose scan said current), so the next update checks every file.
+    let mut verify_failed = false;
     let result = (|| {
         for (i, (path, cache, sig, original)) in ready.iter().enumerate() {
             let file_started = Instant::now();
-            op.progress("Apply", i as u64, ready.len() as u64, path.clone());
+            op.progress(Stage::Apply, i as u64, ready.len() as u64, path.clone());
             op.check_cancelled()?;
             guard(root)?;
             let dest = confined(root, path)?;
@@ -1950,11 +1963,11 @@ where
             if now != *original {
                 return Err(tf("{path} changed since the check; retry", &[("path", path)]));
             }
-            replace(root, &mut j, path, cache, *sig, op)?;
+            replace(root, &mut j, path, cache, *sig, now, op)?;
             op.complete_update_work(UpdateWork::Apply, applying_work(*sig, *original), Some(file_started.elapsed()));
         }
-        op.progress("Apply", ready.len() as u64, ready.len() as u64, t("Applying files"));
-        let metadata = verify()?;
+        op.progress(Stage::Apply, ready.len() as u64, ready.len() as u64, t("Applying files"));
+        let metadata = verify().inspect_err(|_| verify_failed = true)?;
         // The user's copies go to KEPT_DIR before anything can commit. A copy written
         // before a later failure duplicates a file the rollback then restores; an older
         // kept copy is never replaced, so a rollback cannot lose one.
@@ -1974,7 +1987,7 @@ where
                 if dest.is_file() && fs::read(&dest).is_ok_and(|now| now == *data) { continue; }
                 let tmp = confined(root, &format!("{STATE_DIR}/staged/{name}"))?;
                 save(&tmp, data)?;
-                replace(root, &mut j, name, &tmp, FileSig::of(data), op)?;
+                replace(root, &mut j, name, &tmp, FileSig::of(data), None, op)?;
             }
         }
         op.check_cancelled()?;
@@ -1990,8 +2003,14 @@ where
         Ok(metadata.is_some())
     })();
     if let Err(e) = result {
+        // A file was replaced, the final verification failed, or recovery fails below: the
+        // next update checks every file. Any other failure before the first replacement
+        // changed nothing and keeps the version plan.
+        let touched = !j.entries.is_empty();
         // Rollback ignores user cancellation but preserves the recorded backups.
-        return match recover_with_guard(root, &guard) {
+        let recovered = recover_with_guard(root, &guard);
+        if touched || verify_failed || recovered.is_err() { mark_full_check(root); }
+        return match recovered {
             Ok(_) => Err(tf(
                 "{error}. Transaction recovered; verified downloads retained.",
                 &[("error", &e)],
@@ -2004,12 +2023,16 @@ where
     }
     result
 }
+/// `known`: the signature the caller just read from the file being replaced (`None` reads it
+/// here). The backup is still checked against it, and the file read again after copying.
+#[allow(clippy::too_many_arguments)]
 fn replace(
     root: &Path,
     j: &mut Journal,
     path: &str,
     cache: &Path,
     sig: FileSig,
+    known: Option<FileSig>,
     op: &Operation,
 ) -> Result<(), String> {
     let dest = confined(root, path)?;
@@ -2020,7 +2043,7 @@ fn replace(
     let (backup, original) = if dest.exists() {
         let rel = format!("{STATE_DIR}/backups/{}/{}.bin", j.id, j.entries.len());
         let p = confined(root, &rel)?;
-        let original = signature(&dest, op)?;
+        let original = match known { Some(known) => known, None => signature(&dest, op)? };
         fs::copy(&dest, &p).map_err(|e| e.to_string())?;
         let f = fs::OpenOptions::new()
             .write(true)
@@ -2060,7 +2083,6 @@ fn replace(
     f.sync_all().map_err(|e| e.to_string())?;
     drop(f);
     op.check_cancelled()?;
-    ensure_plain(&dest)?;
     publish(&tmp, &dest)?;
     if signature(&dest, op)? != sig {
         return Err(tf("{path}: replacement did not verify", &[("path", &path)]));
@@ -2177,13 +2199,7 @@ pub(crate) fn recover_interrupted(install: &Path) -> Result<bool, String> {
     let root = fs::canonicalize(install).map_err(|e| tf("Install directory: {error}", &[("error", &e)]))?;
     ensure_plain(&root)?;
     if !confined(&root, &format!("{STATE_DIR}/transaction.json"))?.exists() { return Ok(false); }
-    let mut options = fs::OpenOptions::new();
-    options.create(true).truncate(false).read(true).write(true);
-    #[cfg(windows)] {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(0);
-    }
-    let _lock = options.open(confined(&root, &format!("{STATE_DIR}/lock"))?)
+    let _lock = open_update_lock(&confined(&root, &format!("{STATE_DIR}/lock"))?)
         .map_err(|e| tf("Another updater may be using this install: {error}", &[("error", &e)]))?;
     let recovered = recover(&root)?;
     if recovered { mark_full_check(&root); }
@@ -2268,41 +2284,30 @@ fn recover_with_guard(root: &Path, guard: impl Fn(&Path) -> Result<(), String>) 
     Ok(true)
 }
 
-#[cfg(windows)]
+/// Nothing runs from `root` or has a module loaded from it (`folder_users`).
 pub(crate) fn ensure_idle(root: &Path) -> Result<(), String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, Process32FirstW, Process32NextW,
-        MODULEENTRY32W, PROCESSENTRY32W, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32,
-        TH32CS_SNAPPROCESS,
-    };
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+    if folder_users(root)?.is_empty() { Ok(()) } else { Err(t("Close the game using this install before updating files").into()) }
+}
+
+/// The processes that use `root`: a game, POL host or loader whose image or a loaded module is
+/// in that folder, or one of those that cannot be inspected (it may be). Only processes that
+/// actually use the folder count: a signed-in host at the PlayOnline main menu maps polcore from
+/// the PlayOnline folder and nothing from FINAL FANTASY XI's until GameStart loads FFXi.dll and
+/// FFXiMain.dll (crystal-loader game.rs `run_game`), so it does not hold a game update back.
+/// Earlier builds counted every `host32-`/`host64-` process as busy whatever its folder.
+/// A process that is starting (created suspended) or exiting while it is inspected is retried
+/// (`module_snapshot`), and one that exited meanwhile is not a user.
+pub(crate) fn folder_users(root: &Path) -> Result<Vec<u32>, String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_NO_MORE_FILES};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{Module32FirstW, Module32NextW, MODULEENTRY32W};
+    let processes = crate::win::process::processes().ok_or_else(|| t("Cannot verify that the game is stopped"))?;
     unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == INVALID_HANDLE_VALUE {
-            return Err(t("Cannot verify that the game is stopped").into());
-        }
-        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        let mut more = Process32FirstW(snapshot, &mut entry);
-        if more == 0 {
-            CloseHandle(snapshot);
-            return Err(t("Cannot verify that the game is stopped").into());
-        }
-        let mut busy = false;
+        let mut users = Vec::new();
         let mut incomplete = false;
-        while more != 0 {
-            let end = entry
-                .szExeFile
-                .iter()
-                .position(|b| *b == 0)
-                .unwrap_or(entry.szExeFile.len());
-            let name = String::from_utf16_lossy(&entry.szExeFile[..end]).to_ascii_lowercase();
-            if name.starts_with("host64-") || name.starts_with("host32-") {
-                busy = true;
-            }
+        for entry in processes {
+            let name = entry.name.to_ascii_lowercase();
+            let pid = entry.pid;
+            let mut busy = false;
             if name == "pol.exe"
                 || name == "startpol.exe"
                 || name == "crystal-loader.exe"
@@ -2310,67 +2315,101 @@ pub(crate) fn ensure_idle(root: &Path) -> Result<(), String> {
                 || name.starts_with("xi_recomp")
                 || name.starts_with("xi-client")
             {
-                let process =
-                    OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID);
-                if process.is_null() {
-                    busy = true;
-                } else {
-                    let mut buf = [0u16; 32768];
-                    let mut n = buf.len() as u32;
-                    if QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut n) == 0 {
-                        busy = true;
-                    } else {
-                        let exe = PathBuf::from(String::from_utf16_lossy(&buf[..n as usize]));
-                        busy |= under_root(&exe, root);
-                    }
-                    CloseHandle(process);
+                match process_image(pid) {
+                    Image::Path(exe) => busy |= under_root(&exe, root),
+                    Image::Gone => {}
+                    Image::Unknown => busy = true,
                 }
-                let modules = CreateToolhelp32Snapshot(
-                    TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
-                    entry.th32ProcessID,
-                );
-                if modules == INVALID_HANDLE_VALUE {
-                    busy = true;
-                } else {
-                    let mut module: MODULEENTRY32W = std::mem::zeroed();
-                    module.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
-                    let mut found = Module32FirstW(modules, &mut module);
-                    if found == 0 { incomplete = true; }
-                    while found != 0 {
-                        let end = module
-                            .szExePath
-                            .iter()
-                            .position(|c| *c == 0)
-                            .unwrap_or(module.szExePath.len());
-                        let path =
-                            PathBuf::from(String::from_utf16_lossy(&module.szExePath[..end]));
-                        if under_root(&path, root) {
-                            busy = true;
-                            break;
-                        }
-                        found = Module32NextW(modules, &mut module);
+                match module_snapshot(pid) {
+                    ModuleSnapshot::Handle(modules) => {
+                        let mut module: MODULEENTRY32W = std::mem::zeroed();
+                        module.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+                        let mut found = Module32FirstW(modules, &mut module);
+                        // No module at all (a process just starting or ending) is an empty list.
                         if found == 0 && GetLastError() != ERROR_NO_MORE_FILES { incomplete = true; }
+                        while found != 0 {
+                            let end = module
+                                .szExePath
+                                .iter()
+                                .position(|c| *c == 0)
+                                .unwrap_or(module.szExePath.len());
+                            let path =
+                                PathBuf::from(String::from_utf16_lossy(&module.szExePath[..end]));
+                            if under_root(&path, root) {
+                                busy = true;
+                                break;
+                            }
+                            found = Module32NextW(modules, &mut module);
+                            if found == 0 && GetLastError() != ERROR_NO_MORE_FILES { incomplete = true; }
+                        }
+                        CloseHandle(modules);
                     }
-                    CloseHandle(modules);
+                    ModuleSnapshot::Gone => busy = false,
+                    ModuleSnapshot::Failed => busy = true,
                 }
             }
-            if busy || incomplete {
+            if busy { users.push(pid); }
+            if incomplete {
                 break;
             }
-            more = Process32NextW(snapshot, &mut entry);
-            if more == 0 && GetLastError() != ERROR_NO_MORE_FILES { incomplete = true; }
         }
-        CloseHandle(snapshot);
         if incomplete {
             return Err(t("Cannot verify that the game is stopped").into());
         }
-        if busy {
-            return Err(t("Close the game using this install before updating files").into());
+        Ok(users)
+    }
+}
+
+/// How often, and how far apart, a process caught starting or exiting is inspected again.
+const INSPECT_RETRIES: u32 = 10;
+const INSPECT_RETRY_PAUSE: Duration = Duration::from_millis(25);
+
+enum Image { Path(PathBuf), Gone, Unknown }
+
+/// `pid`'s image path; `Gone` when the process no longer exists.
+fn process_image(pid: u32) -> Image {
+    use crate::win::process::{image_path_of, open, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+    for attempt in 0..INSPECT_RETRIES {
+        if attempt > 0 { std::thread::sleep(INSPECT_RETRY_PAUSE); }
+        let process = match open(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+            Ok(process) => process,
+            Err(error) => match error.raw_os_error().map(|code| code as u32) {
+                // No such process (any more): it exited after the process list was taken.
+                Some(ERROR_INVALID_PARAMETER) => return Image::Gone,
+                // Not transient: it stays uninspectable.
+                Some(ERROR_ACCESS_DENIED) => return Image::Unknown,
+                _ => continue,
+            },
+        };
+        if let Ok(path) = image_path_of(&process) { return Image::Path(path); }
+    }
+    Image::Unknown
+}
+
+enum ModuleSnapshot { Handle(windows_sys::Win32::Foundation::HANDLE), Gone, Failed }
+
+/// A module snapshot of `pid`. ERROR_BAD_LENGTH and ERROR_PARTIAL_COPY (a process being created
+/// or ending) are retried, as CreateToolhelp32Snapshot's documentation asks; `Gone` when the
+/// process exited meanwhile.
+fn module_snapshot(pid: u32) -> ModuleSnapshot {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_BAD_LENGTH, ERROR_INVALID_PARAMETER, ERROR_PARTIAL_COPY, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32};
+    for attempt in 0..INSPECT_RETRIES {
+        if attempt > 0 { std::thread::sleep(INSPECT_RETRY_PAUSE); }
+        let modules = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
+        if modules != INVALID_HANDLE_VALUE { return ModuleSnapshot::Handle(modules); }
+        match unsafe { GetLastError() } {
+            ERROR_BAD_LENGTH | ERROR_PARTIAL_COPY => {
+                if matches!(process_image(pid), Image::Gone) { return ModuleSnapshot::Gone; }
+            }
+            ERROR_INVALID_PARAMETER => return ModuleSnapshot::Gone,
+            _ => return ModuleSnapshot::Failed,
         }
     }
-    Ok(())
+    ModuleSnapshot::Failed
 }
-#[cfg(windows)]
+
 fn under_root(path: &Path, root: &Path) -> bool {
     let normalized = |p: &Path| {
         p.to_string_lossy()
@@ -2381,55 +2420,10 @@ fn under_root(path: &Path, root: &Path) -> bool {
     let path = normalized(path);
     path == root || path.starts_with(&(root + "\\"))
 }
-#[cfg(not(windows))]
-pub(crate) fn ensure_idle(_root: &Path) -> Result<(), String> {
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn download_budget_covers_delta_peaks_and_full_file_fallback() {
-        let mib = 1 << 20;
-        let version = |decoded: u64, encoded: u64, delta: Option<u64>| manifest::Version {
-            stamp: "30260904_1".into(),
-            sig: FileSig { len: decoded, byte_sum: 0, md5_word: 0 },
-            direct: "30260904_1/Direct/test.DAT.slc".into(), direct_len: encoded,
-            indirect: delta.map(|len| manifest::Delta { path: "30260904_1/Indirect/test.DAT.olc".into(), len }),
-        };
-        let mut history = FileHistory { path: "test.DAT".into(), optional: false, versions: vec![version(32 * mib, mib, None)] };
-        assert_eq!(download_memory_mib(&history, &Action::Direct), 68);
-        history.versions = vec![version(128 * mib, mib, None), version(8 * mib, 5 * mib, Some(mib))];
-        assert_eq!(download_memory_mib(&history, &Action::Direct), 24);
-        assert_eq!(download_memory_mib(&history, &Action::Deltas(1)), 276);
-        // A tiny delta can need a larger direct fallback under the same permit.
-        history.versions = vec![version(mib, mib, None), version(2 * mib, 80 * mib, Some(100))];
-        assert_eq!(download_memory_mib(&history, &Action::Deltas(1)), 87);
-        // The largest intermediate version must survive later smaller outputs.
-        history.versions = vec![version(8 * mib, mib, None), version(64 * mib, mib, Some(2 * mib)), version(2 * mib, mib, Some(mib))];
-        assert_eq!(download_memory_mib(&history, &Action::Deltas(1)), 149);
-        history.versions = vec![version(MAX_FILE, MAX_FILE, None)];
-        assert_eq!(download_memory_mib(&history, &Action::Direct), DOWNLOAD_BUDGET_MIB as u32);
-    }
-
-    #[tokio::test]
-    async fn cancellation_interrupts_a_pending_download_memory_reservation() {
-        let budget = Arc::new(tokio::sync::Semaphore::new(1));
-        let held = budget.clone().acquire_owned().await.unwrap();
-        let op = Operation::new();
-        let waiting_op = op.clone();
-        let waiting_budget = budget.clone();
-        let waiting = tokio::spawn(async move { reserve_download_memory(waiting_budget, 1, &waiting_op).await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        op.cancel();
-        let error = tokio::time::timeout(Duration::from_secs(1), waiting).await.unwrap().unwrap().unwrap_err();
-        assert!(error.contains("Cancelled"));
-        assert_eq!(budget.available_permits(), 0);
-        drop(held);
-        assert_eq!(budget.available_permits(), 1);
-    }
 
     #[test]
     fn delta_base_reads_require_the_exact_previous_signature() {
@@ -2541,7 +2535,7 @@ mod tests {
 
     #[tokio::test]
     async fn manifest_body_accepts_progress_beyond_one_io_timeout() {
-        let expected = polp::seal(polp::kind::MANIFEST, &[1; 252]);
+        let expected = polp::seal(polp::kind::MANIFEST_REPLY, &[1; 252]);
         let mut data = vec![0; expected.len()];
         data[..4].copy_from_slice(&expected[..4]);
         let (mut reader, mut writer) = tokio::io::duplex(64);
@@ -2559,7 +2553,7 @@ mod tests {
                     tokio::task::yield_now().await;
                 }
                 let progress = op.snapshot();
-                assert_eq!(progress.stage, "Manifest");
+                assert_eq!(progress.stage, Stage::Manifest);
                 assert_eq!(progress.total, expected.len() as u64);
             }
         };
@@ -2570,7 +2564,7 @@ mod tests {
         result.unwrap();
         assert!(started.elapsed() > idle_limit);
         assert_eq!(data, expected);
-        assert_eq!(polp::parse(&data).unwrap().kind, polp::kind::MANIFEST);
+        assert_eq!(polp::parse(&data).unwrap().kind, polp::kind::MANIFEST_REPLY);
     }
 
     #[tokio::test]
@@ -3119,7 +3113,7 @@ mod tests {
         assert_eq!((report.modified, report.kept, report.outdated, planned.len()), (2, 1, 1, 2));
         report.version = "30261006_0".into();
         let ready = stage_fixture(&root, &m, &planned, &official);
-        let seed = crate::patch::applied_seed_for(&root, "0001").unwrap();
+        let seed = crate::patch::applied_seed_for(&root, crate::updater::Product::Ffxi).unwrap();
         let prepared = PreparedUpdate { product: Product::Ffxi, root: root.clone(), _lock: None, mode: Mode::Update,
             report, manifest: m.clone(), text: b"list 30261006_0".to_vec(), planned, seed: Some(seed),
             server: SERVER.into(), full_scan: true };
@@ -3149,7 +3143,7 @@ mod tests {
         let (mut report, planned) = scan_for(Product::Ffxi, &root, &m, Mode::Update, &op, Some("30261006_0")).unwrap();
         assert!(planned.is_empty());
         report.version = "30261006_0".into();
-        let seed = crate::patch::applied_seed_for(&root, "0001").unwrap();
+        let seed = crate::patch::applied_seed_for(&root, crate::updater::Product::Ffxi).unwrap();
         let again = PreparedUpdate { product: Product::Ffxi, root: root.clone(), _lock: None, mode: Mode::Update,
             report, manifest: m, text: b"list 30261006_0".to_vec(), planned, seed: Some(seed),
             server: SERVER.into(), full_scan: false };
@@ -3264,20 +3258,78 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A minimal PE file standing in for Square Enix's signed pol.exe.
+    fn pe_file(characteristics: u16, tail: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x100];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+        bytes[0x84..0x86].copy_from_slice(&0x14cu16.to_le_bytes());
+        bytes[0x96..0x98].copy_from_slice(&characteristics.to_le_bytes());
+        bytes.extend_from_slice(tail);
+        bytes
+    }
+
     #[test]
-    fn a_failed_commit_leaves_a_full_check_for_the_next_update() {
+    fn a_pol_exe_differing_only_by_the_local_4gb_flag_is_current_and_never_repaired() {
+        let root = fixture("pol-laa");
+        let official = pe_file(0x0102, b"signed official body");
+        let m = Manifest { files: vec![FileHistory { path: "pol.exe".into(), optional: false, versions: vec![manifest::Version {
+            stamp: "20261022_0".into(), sig: FileSig::of(&official), direct: "20261022_0/Direct/pol.exe.slc".into(),
+            direct_len: official.len() as u64, indirect: None }] }] };
+        let op = Operation::new();
+        let scan = |mode| scan_with_workers_for(Product::Viewer, &root, &m, mode, &op, 1, Some("20261022_0")).unwrap();
+        // Official bytes, and the same bytes with only IMAGE_FILE_LARGE_ADDRESS_AWARE set: current.
+        for bytes in [official.clone(), pe_file(0x0122, b"signed official body")] {
+            fs::write(root.join("pol.exe"), &bytes).unwrap();
+            for mode in [Mode::Check, Mode::Repair, Mode::Update] {
+                let (report, plan) = scan(mode);
+                assert_eq!((report.current, report.modified, plan.len()), (1, 0, 0), "{mode:?}");
+            }
+        }
+        // Any other difference, with or without the flag, is a modification Repair replaces.
+        for bytes in [pe_file(0x0122, b"signed officiaL body"), pe_file(0x0103, b"signed official body"), pe_file(0x0122, b"signed official body!")] {
+            fs::write(root.join("pol.exe"), &bytes).unwrap();
+            let (report, plan) = scan(Mode::Repair);
+            assert_eq!((report.current, report.modified, plan.len()), (0, 1, 1));
+        }
+        // Only pol.exe gets this: the same flag edit on another file is a modification.
+        let other = Manifest { files: vec![FileHistory { path: "polhook.dll".into(), ..m.files[0].clone() }] };
+        fs::write(root.join("polhook.dll"), pe_file(0x0122, b"signed official body")).unwrap();
+        let (report, _) = scan_with_workers_for(Product::Viewer, &root, &other, Mode::Check, &op, 1, Some("20261022_0")).unwrap();
+        assert_eq!(report.modified, 1);
+        assert_eq!(laa_flag_byte(&pe_file(0x0122, b"")), Some(0x96));
+        assert_eq!(laa_flag_byte(&pe_file(0x0102, b"")), None);
+        assert_eq!(laa_flag_byte(b"MZ"), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_commit_leaves_a_full_check_only_when_it_touched_the_install() {
         let root = fixture("failed-commit");
-        let m = Manifest { files: vec![FileHistory { path: "a.DAT".into(), optional: false, versions: vec![manifest::Version {
-            stamp: "30261006_0".into(), sig: FileSig::of(b"official"), direct: "30261006_0/Direct/a.DAT.slc".into(),
-            direct_len: 9, indirect: None }] }] };
-        let planned = vec![Planned { index: 0, action: Action::Direct, original: None, keep: false }];
-        // The staged bytes are not the official ones: the transaction must roll back.
+        let file = |path: &str| FileHistory { path: path.into(), optional: false, versions: vec![manifest::Version {
+            stamp: "30261006_0".into(), sig: FileSig::of(format!("official {path}").as_bytes()),
+            direct: format!("30261006_0/Direct/{path}.slc"), direct_len: 9, indirect: None }] };
+        let m = Manifest { files: vec![file("a.DAT"), file("b.DAT")] };
+        let planned: Vec<Planned> = (0..2).map(|index| Planned { index, action: Action::Direct, original: None, keep: false }).collect();
+        let prepared = |planned: Vec<Planned>| {
+            let report = Report { version: "30261006_0".into(), total: 2, ..Default::default() };
+            PreparedUpdate { product: Product::Ffxi, root: root.clone(), _lock: None, mode: Mode::Update,
+                report, manifest: m.clone(), text: Vec::new(), planned, seed: Some(1), server: SERVER.into(), full_scan: false }
+        };
+        // The staged bytes are not the official ones: refused before any file is replaced, so
+        // the next update keeps its version plan.
         let ready = stage_fixture(&root, &m, &planned, &|_| b"damaged".to_vec());
-        let mut report = Report { version: "30261006_0".into(), ..Default::default() };
-        report.total = 1;
-        let prepared = PreparedUpdate { product: Product::Ffxi, root: root.clone(), _lock: None, mode: Mode::Update,
-            report, manifest: m, text: Vec::new(), planned, seed: Some(1), server: SERVER.into(), full_scan: false };
-        assert!(commit_with_guard(prepared, ready, &Operation::new(), |_| Ok(())).is_err());
+        assert!(commit_with_guard(prepared(planned.clone()), ready, &Operation::new(), |_| Ok(())).is_err());
+        assert!(!full_check_due(&root), "nothing in the install changed");
+        // A failure after the first replacement rolls back and leaves the full check.
+        let ready = stage_fixture(&root, &m, &planned, &|path| format!("official {path}").into_bytes());
+        let calls = std::cell::Cell::new(0);
+        // Calls: the commit's own guard, file a, then file b (fails); recovery passes.
+        let guard = |_: &Path| { calls.set(calls.get() + 1);
+            if calls.get() == 3 { Err("fixture game started".to_owned()) } else { Ok(()) } };
+        let error = commit_with_guard(prepared(planned), ready, &Operation::new(), guard).unwrap_err();
+        assert!(error.contains("Transaction recovered"), "{error}");
         assert!(full_check_due(&root));
         assert!(!root.join("a.DAT").exists() && !root.join("patch.ver").exists());
         fs::remove_dir_all(root).unwrap();

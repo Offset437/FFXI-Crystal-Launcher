@@ -38,10 +38,7 @@ pub(super) struct Snapshot {
 
 impl Snapshot {
     pub(super) fn refresh() -> Self {
-        #[cfg(windows)]
-        return win::refresh();
-        #[cfg(not(windows))]
-        Self::default()
+        win::refresh()
     }
 
     pub(super) fn metadata(
@@ -204,7 +201,6 @@ fn power(
     result
 }
 
-#[cfg(windows)]
 mod win {
     use super::*;
     use std::mem::size_of;
@@ -220,12 +216,15 @@ mod win {
         DEVPKEY_Device_InLocalMachineContainer, DEVPROP_TYPE_BOOLEAN,
     };
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_NO_MORE_ITEMS};
-    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
 
     pub(super) fn refresh() -> Snapshot {
-        let host = registry_string("SystemManufacturer")
-            .zip(registry_string("SystemProductName"))
-            .and_then(|(maker, model)| host_family(&maker, &model));
+        // The host model cannot change while the process runs: read it once.
+        static HOST: std::sync::OnceLock<Option<Family>> = std::sync::OnceLock::new();
+        let host = *HOST.get_or_init(|| {
+            registry_string("SystemManufacturer")
+                .zip(registry_string("SystemProductName"))
+                .and_then(|(maker, model)| host_family(&maker, &model))
+        });
         let controllers = controllers().unwrap_or_default();
         // USB metadata is relevant only on one of the known Ally host models.
         let usb = if host.is_some() {
@@ -319,28 +318,9 @@ mod win {
     }
 
     fn registry_string(value: &str) -> Option<String> {
-        let key: Vec<u16> = "HARDWARE\\DESCRIPTION\\System\\BIOS\0"
-            .encode_utf16()
-            .collect();
-        let value: Vec<u16> = value.encode_utf16().chain([0]).collect();
-        let mut buffer = [0u16; 512];
-        let mut bytes = size_of::<[u16; 512]>() as u32;
-        let result = unsafe {
-            RegGetValueW(
-                HKEY_LOCAL_MACHINE,
-                key.as_ptr(),
-                value.as_ptr(),
-                RRF_RT_REG_SZ,
-                std::ptr::null_mut(),
-                buffer.as_mut_ptr().cast(),
-                &mut bytes,
-            )
-        };
-        if result != 0 || bytes % 2 != 0 {
-            return None;
-        }
-        let length = buffer.iter().position(|c| *c == 0)?;
-        Some(String::from_utf16_lossy(&buffer[..length]))
+        use crate::win::reg::{self, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+        let units = reg::string(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\BIOS", value, RRF_RT_REG_SZ, 512)?;
+        Some(String::from_utf16_lossy(&units))
     }
 
     struct Devices(HDEVINFO);

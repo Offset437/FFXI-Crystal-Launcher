@@ -35,16 +35,79 @@ fn embed_loader() {
     } else {
         Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect()
     };
-    std::fs::write(out.join("embedded-pol.exe"), &bytes).unwrap();
+    // Installer builds ship the host as crystal\pol.exe beside the launcher: they keep only its
+    // hash (to check that installed file) and carry no second executable inside this one.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_INSTALLED_HOST");
+    let carried: &[u8] = if std::env::var_os("CARGO_FEATURE_INSTALLED_HOST").is_some() { &[] } else { &bytes };
+    std::fs::write(out.join("embedded-pol.exe"), carried).unwrap();
     std::fs::write(out.join("embedded-pol.sha256"), hash).unwrap();
+}
+
+/// crystal.rc (the icon) plus version information naming the product and publisher, written
+/// to OUT_DIR with the icon's path made absolute.
+fn resource_script() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let icon = root.join("assets").join("crystal.ico").display().to_string().replace('\\', "\\\\");
+    let base = std::fs::read_to_string(root.join("crystal.rc")).unwrap().replace("\"assets/crystal.ico\"", &format!("\"{icon}\""));
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap();
+    let mut parts: Vec<u16> = version.split(['.', '-', '+']).filter_map(|p| p.parse().ok()).take(3).collect();
+    parts.resize(4, 0);
+    let numbers = format!("{},{},{},{}", parts[0], parts[1], parts[2], parts[3]);
+    let rc = format!(
+        r#"#pragma code_page(65001)
+{base}
+1 VERSIONINFO
+FILEVERSION {numbers}
+PRODUCTVERSION {numbers}
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Crystal Launcher project"
+            VALUE "FileDescription", "Crystal Launcher"
+            VALUE "FileVersion", "{version}"
+            VALUE "InternalName", "Crystal-Launcher"
+            VALUE "LegalCopyright", "GPL-3.0-only. FINAL FANTASY XI and PlayOnline are trademarks of Square Enix."
+            VALUE "OriginalFilename", "Crystal-Launcher.exe"
+            VALUE "ProductName", "Crystal Launcher"
+            VALUE "ProductVersion", "{version}"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+"#
+    );
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("crystal.rc");
+    std::fs::write(&out, rc).unwrap();
+    out
+}
+
+/// The Slint front end's markup (`ui/`), compiled into the exe with its fonts and pictures.
+fn compile_slint() {
+    let config = slint_build::CompilerConfiguration::new()
+        .with_style("fluent".into())
+        .embed_resources(slint_build::EmbedResourcesKind::EmbedFiles);
+    slint_build::compile_with_config("ui/crystal.slint", config).unwrap();
 }
 
 fn main() {
     embed_loader();
+    compile_slint();
     println!("cargo:rerun-if-changed=launcher.manifest");
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         println!("cargo:rerun-if-changed=assets/crystal.ico");
-        embed_resource::compile("crystal.rc", embed_resource::NONE).manifest_required().unwrap();
+        println!("cargo:rerun-if-changed=crystal.rc");
+        embed_resource::compile(resource_script(), embed_resource::NONE).manifest_required().unwrap();
         let template = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap())
             .join("launcher.manifest");
         // Unit tests and hidden smoke checks must run without elevation. The

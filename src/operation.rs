@@ -1,13 +1,52 @@
-//! Shared progress and cancellation for disk/network work outside the iced UI thread.
+//! Shared progress and cancellation for disk/network work outside the UI thread.
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+/// A step of a file operation. Never shown as is: the Downloads page names each
+/// stage in the current language; `as_str` is its id for logs and benches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage {
+    /// No step named yet: the page names the operation.
+    #[default]
+    None,
+    Manifest,
+    SignOut,
+    Waiting,
+    Check,
+    Download,
+    Verify,
+    Apply,
+    Finish,
+    InstallerMetadata,
+    InstallerDownload,
+}
+impl Stage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Manifest => "Manifest",
+            Self::SignOut => "SignOut",
+            Self::Waiting => "Waiting",
+            Self::Check => "Check",
+            Self::Download => "Download",
+            Self::Verify => "Verify",
+            Self::Apply => "Apply",
+            Self::Finish => "Finish",
+            Self::InstallerMetadata => "installer-metadata",
+            Self::InstallerDownload => "installer-download",
+        }
+    }
+}
+impl std::fmt::Display for Stage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Progress {
-    /// A stage id (`"Check"`, `"installer-download"`, …), never shown as is:
-    /// the Downloads page names each stage in the current language.
-    pub stage: String,
+    pub stage: Stage,
     pub done: u64,
     pub total: u64,
     pub detail: String,
@@ -91,12 +130,12 @@ impl WholeUpdate {
         Self { started: now, stage: UpdateStage::Preparing, network: 0, pending: [0; 3],
             disk: Rate::default(), apply: Rate::default(), fraction: None, revision: 1, displayed_revision: 0, last_activity: now }
     }
-    fn observe(&mut self, stage: &str, advanced: bool, now: Instant) {
+    fn observe(&mut self, stage: Stage, advanced: bool, now: Instant) {
         let next = match stage {
-            "Download" if self.stage != UpdateStage::Preparing => UpdateStage::Download,
-            "Apply" => UpdateStage::Apply,
-            "Verify" => UpdateStage::Verify,
-            "Finish" => UpdateStage::Finish,
+            Stage::Download if self.stage != UpdateStage::Preparing => UpdateStage::Download,
+            Stage::Apply => UpdateStage::Apply,
+            Stage::Verify => UpdateStage::Verify,
+            Stage::Finish => UpdateStage::Finish,
             _ => self.stage,
         };
         if advanced || next != self.stage { self.revision += 1; self.last_activity = now; }
@@ -132,7 +171,7 @@ impl WholeUpdate {
                     self.disk.duration(self.pending[0])?
                 } else { Duration::ZERO };
                 let network = if self.stage == UpdateStage::Download && self.network > 0 {
-                    if progress.stage != "Download" || !progress.bytes { return None; }
+                    if progress.stage != Stage::Download || !progress.bytes { return None; }
                     step_eta?
                 } else { Duration::ZERO };
                 // Staging and six network workers overlap; applying and the
@@ -188,7 +227,7 @@ impl State {
             }
         }
         if let Some(update) = &mut self.update {
-            update.observe(&progress.stage, progress.done > self.progress.done, now);
+            update.observe(progress.stage, progress.done > self.progress.done, now);
         }
         self.progress = progress;
         // A bounded recent window adapts to changing network/disk speed. Keep
@@ -254,6 +293,8 @@ impl Part {
 #[derive(Clone, Default)]
 pub struct Operation {
     cancelled: Arc<AtomicBool>,
+    /// Wakes `cancelled_wait` at `cancel` (every clone shares it).
+    cancel_wake: Arc<tokio::sync::Notify>,
     state: Arc<Mutex<State>>,
     component: Option<&'static str>,
 }
@@ -261,10 +302,24 @@ pub struct Operation {
 impl Operation {
     pub fn new() -> Self { Self::default() }
     pub fn component(&self, name: &'static str) -> Self { Self { component: Some(name), ..self.clone() } }
-    pub fn cancel(&self) { self.cancelled.store(true, Ordering::Release); }
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.cancel_wake.notify_waiters();
+    }
     pub fn cancelled(&self) -> bool { self.cancelled.load(Ordering::Acquire) }
     pub fn check_cancelled(&self) -> Result<(), String> {
-        if self.cancelled() { Err(crate::i18n::t("Cancelled. Verified downloads are kept for resuming.").into()) } else { Ok(()) }
+        if self.cancelled() { Err(Self::cancel_message()) } else { Ok(()) }
+    }
+    fn cancel_message() -> String { crate::i18n::t("Cancelled. Verified downloads are kept for resuming.").into() }
+    /// Resolves once the operation is cancelled (at once if it already is), with
+    /// `check_cancelled`'s error, so a wait can race it instead of polling.
+    pub async fn cancelled_wait(&self) -> String {
+        let woken = self.cancel_wake.notified();
+        tokio::pin!(woken);
+        // Registered before the flag is read, so a cancel in between still wakes it.
+        woken.as_mut().enable();
+        if !self.cancelled() { woken.await; }
+        Self::cancel_message()
     }
     pub fn snapshot(&self) -> Progress {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -300,31 +355,31 @@ impl Operation {
             update.revision += 1;
         }
     }
-    pub fn progress(&self, stage: &str, done: u64, total: u64, detail: impl Into<String>) {
+    pub fn progress(&self, stage: Stage, done: u64, total: u64, detail: impl Into<String>) {
         self.publish(Progress {
-            stage: stage.to_owned(), done, total, detail: detail.into(), part: None,
+            stage, done, total, detail: detail.into(), part: None,
             ..Progress::default()
         }, false);
     }
-    pub fn progress_bytes(&self, stage: &str, done: u64, total: u64, detail: impl Into<String>) {
+    pub fn progress_bytes(&self, stage: Stage, done: u64, total: u64, detail: impl Into<String>) {
         self.publish(Progress {
-            stage: stage.to_owned(), done, total, detail: detail.into(), bytes: true,
+            stage, done, total, detail: detail.into(), bytes: true,
             ..Progress::default()
         }, false);
     }
     /// Reused files advance the fraction without pretending their bytes were
     /// transferred at network speed.
-    pub fn progress_bytes_rebased(&self, stage: &str, done: u64, total: u64, detail: impl Into<String>) {
+    pub fn progress_bytes_rebased(&self, stage: Stage, done: u64, total: u64, detail: impl Into<String>) {
         self.publish(Progress {
-            stage: stage.to_owned(), done, total, detail: detail.into(), bytes: true,
+            stage, done, total, detail: detail.into(), bytes: true,
             ..Progress::default()
         }, true);
     }
     /// `progress` for one installer volume; the detail is its English line.
-    pub fn progress_part(&self, stage: &str, done: u64, total: u64, part: Part) {
+    pub fn progress_part(&self, stage: Stage, done: u64, total: u64, part: Part) {
         self.publish(Progress {
-            stage: stage.to_owned(), done, total, detail: part.english(), part: Some(part),
-            bytes: stage == "installer-download",
+            stage, done, total, detail: part.english(), part: Some(part),
+            bytes: stage == Stage::InstallerDownload,
             ..Progress::default()
         }, matches!(part.state, PartState::AlreadyComplete));
     }
@@ -338,30 +393,47 @@ impl Operation {
 mod tests {
     use super::*;
 
-    fn progress(stage: &str, done: u64, total: u64) -> Progress {
-        Progress { stage: stage.into(), done, total, ..Progress::default() }
+    fn progress(stage: Stage, done: u64, total: u64) -> Progress {
+        Progress { stage, done, total, ..Progress::default() }
+    }
+
+    /// A wait raced against `cancelled_wait` ends at the cancel (from any clone, even one made
+    /// for a component), not on a poll, and a cancel before the wait starts is not missed.
+    #[tokio::test]
+    async fn cancelled_wait_wakes_at_the_cancel_and_never_misses_an_earlier_one() {
+        let op = Operation::new();
+        let canceller = op.component("PlayOnline");
+        let started = Instant::now();
+        let waiting = tokio::spawn(async move { op.cancelled_wait().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        canceller.cancel();
+        let message = tokio::time::timeout(Duration::from_secs(1), waiting).await.unwrap().unwrap();
+        assert!(message.contains("Cancelled") && started.elapsed() < Duration::from_millis(500));
+        let already = Operation::new();
+        already.cancel();
+        assert!(tokio::time::timeout(Duration::from_millis(50), already.cancelled_wait()).await.is_ok());
     }
 
     #[test]
     fn percentage_waits_for_a_total_and_does_not_round_to_zero_early() {
-        assert_eq!(progress("Download", 0, 0).remaining_percent(), None);
-        assert_eq!(progress("Download", 1, 3).remaining_percent(), Some(67));
-        assert_eq!(progress("Download", 999, 1000).remaining_percent(), Some(1));
-        assert_eq!(progress("Download", u64::MAX - 1, u64::MAX).remaining_percent(), Some(1));
-        assert_eq!(progress("Download", 1001, 1000).remaining_percent(), Some(0));
+        assert_eq!(progress(Stage::Download, 0, 0).remaining_percent(), None);
+        assert_eq!(progress(Stage::Download, 1, 3).remaining_percent(), Some(67));
+        assert_eq!(progress(Stage::Download, 999, 1000).remaining_percent(), Some(1));
+        assert_eq!(progress(Stage::Download, u64::MAX - 1, u64::MAX).remaining_percent(), Some(1));
+        assert_eq!(progress(Stage::Download, 1001, 1000).remaining_percent(), Some(0));
     }
 
     #[test]
     fn estimates_observed_progress_and_withdraws_the_estimate_when_stalled() {
         let start = Instant::now();
         let mut state = State::default();
-        state.publish(progress("Check", 0, 100), start, false);
-        state.publish(progress("Check", 10, 100), start + Duration::from_secs(1), false);
+        state.publish(progress(Stage::Check, 0, 100), start, false);
+        state.publish(progress(Stage::Check, 10, 100), start + Duration::from_secs(1), false);
         assert_eq!(state.estimate(start + Duration::from_secs(1)), None);
-        state.publish(progress("Check", 40, 100), start + Duration::from_secs(4), false);
+        state.publish(progress(Stage::Check, 40, 100), start + Duration::from_secs(4), false);
         assert_eq!(state.estimate(start + Duration::from_secs(4)), Some(Duration::from_secs(6)));
         assert_eq!(state.estimate(start + Duration::from_secs(15)), None);
-        state.publish(progress("Check", 100, 100), start + Duration::from_secs(16), false);
+        state.publish(progress(Stage::Check, 100, 100), start + Duration::from_secs(16), false);
         assert_eq!(state.estimate(start + Duration::from_secs(16)), Some(Duration::ZERO));
     }
 
@@ -369,16 +441,16 @@ mod tests {
     fn changing_steps_totals_or_reusing_bytes_restarts_the_estimate() {
         let start = Instant::now();
         let mut state = State::default();
-        state.publish(progress("Check", 0, 100), start, false);
-        state.publish(progress("Check", 40, 100), start + Duration::from_secs(4), false);
+        state.publish(progress(Stage::Check, 0, 100), start, false);
+        state.publish(progress(Stage::Check, 40, 100), start + Duration::from_secs(4), false);
         assert!(state.estimate(start + Duration::from_secs(4)).is_some());
-        state.publish(progress("Download", 0, 100), start + Duration::from_secs(4), false);
+        state.publish(progress(Stage::Download, 0, 100), start + Duration::from_secs(4), false);
         assert_eq!(state.estimate(start + Duration::from_secs(4)), None);
-        state.publish(progress("Download", 50, 100), start + Duration::from_secs(8), true);
+        state.publish(progress(Stage::Download, 50, 100), start + Duration::from_secs(8), true);
         assert_eq!(state.estimate(start + Duration::from_secs(8)), None);
-        state.publish(progress("Download", 70, 100), start + Duration::from_secs(10), false);
+        state.publish(progress(Stage::Download, 70, 100), start + Duration::from_secs(10), false);
         assert_eq!(state.estimate(start + Duration::from_secs(10)), Some(Duration::from_secs(3)));
-        state.publish(progress("Download", 70, 200), start + Duration::from_secs(11), false);
+        state.publish(progress(Stage::Download, 70, 200), start + Duration::from_secs(11), false);
         assert_eq!(state.estimate(start + Duration::from_secs(11)), None);
     }
 
@@ -386,7 +458,7 @@ mod tests {
     fn resumed_installer_bytes_are_not_measured_as_network_throughput() {
         let start = Instant::now();
         let volume = |number, done, total_done| Progress {
-            stage: "installer-download".into(), done: total_done, total: 200, bytes: true,
+            stage: Stage::InstallerDownload, done: total_done, total: 200, bytes: true,
             part: Some(Part { number, name: "volume", state: PartState::Downloading { done, expected: 100 } }),
             ..Progress::default()
         };
@@ -407,22 +479,22 @@ mod tests {
         let mut update = WholeUpdate::new(start);
         update.disk.record(100, Duration::from_secs(10));
         update.plan(100, 20, 40, 100, start);
-        let downloaded = Progress { stage: "Download".into(), done: 100, total: 100, bytes: true, ..Progress::default() };
-        update.observe("Download", true, start + Duration::from_secs(5));
+        let downloaded = Progress { stage: Stage::Download, done: 100, total: 100, bytes: true, ..Progress::default() };
+        update.observe(Stage::Download, true, start + Duration::from_secs(5));
         let overall = update.snapshot(start + Duration::from_secs(5), &downloaded, Some(Duration::ZERO));
         assert_eq!(overall.remaining, Some(Duration::from_secs(16)));
         assert!(!overall.complete && overall.remaining_percent().unwrap() > 0);
         let downloaded_fraction = overall.fraction.unwrap();
         update.credit(UpdateWork::Staging, 20, None, start + Duration::from_secs(6));
-        update.observe("Apply", false, start + Duration::from_secs(6));
+        update.observe(Stage::Apply, false, start + Duration::from_secs(6));
         let applying = update.snapshot(start + Duration::from_secs(6), &downloaded, None);
         assert_eq!(applying.remaining, Some(Duration::from_secs(14)));
         assert!(applying.fraction.unwrap() >= downloaded_fraction);
         update.credit(UpdateWork::Apply, 40, Some(Duration::from_secs(8)), start + Duration::from_secs(14));
-        update.observe("Verify", false, start + Duration::from_secs(14));
+        update.observe(Stage::Verify, false, start + Duration::from_secs(14));
         assert_eq!(update.snapshot(start + Duration::from_secs(14), &downloaded, None).remaining, Some(Duration::from_secs(10)));
         update.credit(UpdateWork::Verify, 100, None, start + Duration::from_secs(24));
-        update.observe("Finish", false, start + Duration::from_secs(24));
+        update.observe(Stage::Finish, false, start + Duration::from_secs(24));
         let finishing = update.snapshot(start + Duration::from_secs(24), &downloaded, None);
         assert_eq!(finishing.remaining_percent(), Some(1));
         assert!(!finishing.complete);
@@ -440,12 +512,12 @@ mod tests {
         update.plan(0, 0, 60, 200, start);
         update.credit(UpdateWork::Apply, 20, Some(Duration::from_secs(4)), start);
         update.credit(UpdateWork::Verify, 50, None, start);
-        update.observe("Verify", true, start);
-        let progress = progress("Verify", 50, 100);
+        update.observe(Stage::Verify, true, start);
+        let progress = progress(Stage::Verify, 50, 100);
         let first = update.snapshot(start, &progress, None);
         assert_eq!(first.remaining, Some(Duration::from_secs(23))); // 8 apply + 15 verify
         assert!(!first.complete);
-        update.observe("Apply", true, start);
+        update.observe(Stage::Apply, true, start);
         assert_eq!(update.snapshot(start, &progress, None).remaining, first.remaining);
     }
 
@@ -455,8 +527,8 @@ mod tests {
         let mut update = WholeUpdate::new(start);
         update.disk.record(100, Duration::from_secs(10));
         update.plan(0, 0, 0, 1000, start);
-        update.observe("Verify", false, start + Duration::from_secs(5));
-        let progress = progress("Verify", 0, 100);
+        update.observe(Stage::Verify, false, start + Duration::from_secs(5));
+        let progress = progress(Stage::Verify, 0, 100);
         let before = update.snapshot(start + Duration::from_secs(5), &progress, None);
         let waiting = update.snapshot(start + Duration::from_secs(9), &progress, None);
         assert_eq!(waiting.fraction, before.fraction);
@@ -476,7 +548,7 @@ mod tests {
             let mut update = WholeUpdate::new(start);
             update.disk.record(100, Duration::from_secs(1));
             update.plan(network, 0, 0, 100, start);
-            let progress = Progress { stage: "Download".into(), done: network, total: network, bytes: true, ..Progress::default() };
+            let progress = Progress { stage: Stage::Download, done: network, total: network, bytes: true, ..Progress::default() };
             let overall = update.snapshot(start + Duration::from_secs(2), &progress, Some(Duration::ZERO));
             assert_eq!(overall.remaining, Some(Duration::from_secs(1)));
             assert!(!overall.complete);
@@ -489,8 +561,8 @@ mod tests {
         let mut update = WholeUpdate::new(start);
         update.disk.record(100, Duration::from_secs(10));
         update.plan(100, 0, 0, 100, start);
-        let mut progress = Progress { stage: "Download".into(), done: 50, total: 100, bytes: true, ..Progress::default() };
-        update.observe("Download", true, start + Duration::from_secs(5));
+        let mut progress = Progress { stage: Stage::Download, done: 50, total: 100, bytes: true, ..Progress::default() };
+        update.observe(Stage::Download, true, start + Duration::from_secs(5));
         let before = update.snapshot(start + Duration::from_secs(5), &progress, Some(Duration::from_secs(10)));
         progress.total = 600;
         let fallback = update.snapshot(start + Duration::from_secs(5), &progress, Some(Duration::from_secs(110)));
@@ -502,7 +574,7 @@ mod tests {
     fn overall_estimate_waits_for_real_disk_and_network_measurements() {
         let start = Instant::now();
         let mut update = WholeUpdate::new(start);
-        let progress = Progress { stage: "Download".into(), done: 50, total: 100, bytes: true, ..Progress::default() };
+        let progress = Progress { stage: Stage::Download, done: 50, total: 100, bytes: true, ..Progress::default() };
         assert_eq!(update.snapshot(start, &progress, None).remaining, None);
         update.plan(100, 20, 40, 100, start);
         assert_eq!(update.snapshot(start, &progress, Some(Duration::from_secs(5))).remaining, None);

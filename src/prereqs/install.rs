@@ -3,7 +3,7 @@
 //! Only ever started by an explicit click on the System tab.
 use super::detect::Component;
 use crate::i18n::{t, tf};
-use iced::futures::{SinkExt, Stream};
+use futures_util::{SinkExt, Stream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -131,13 +131,8 @@ pub(crate) fn extract_outcome(code: u32) -> Result<(), String> {
     }
 }
 
-#[cfg(windows)]
 pub(crate) fn system32() -> PathBuf {
     super::detect::sys::system32()
-}
-#[cfg(not(windows))]
-pub(crate) fn system32() -> PathBuf {
-    PathBuf::from("/")
 }
 
 /// Whether a download's final (post-redirect) host is Microsoft's.
@@ -164,9 +159,120 @@ impl Scratch {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("CrystalLauncher-components-{}-{nanos}", std::process::id()));
-        std::fs::create_dir(&dir).map_err(|e| tf("Couldn't create a temporary folder: {error}", &[("error", &e)]))?;
+        let name = format!("CrystalLauncher-components-{}-{nanos}", std::process::id());
+        let failed = |e: std::io::Error| tf("Couldn't create a temporary folder: {error}", &[("error", &e)]);
+        if crate::win::process::is_elevated() {
+            // The installers then run elevated from here, and DXSETUP loads DLLs beside itself:
+            // a folder in the user's %TEMP% could be changed by any program the user runs.
+            // The root comes from the system, not %ProgramData%: an elevated process inherits
+            // the user's environment, which that same user-level code could point anywhere.
+            let root = program_data().map_err(failed)?;
+            if !owned_by_admins(&root) {
+                return Err(failed(std::io::Error::other(format!("{} isn't owned by Administrators or SYSTEM", root.display()))));
+            }
+            let dir = root.join(name);
+            create_admin_only_dir(&dir).map_err(failed)?;
+            return Ok(Self(dir));
+        }
+        // Known gap, left as is: a launcher built without `elevated-ui` (release builds always
+        // have it) runs the installers through "runas" from this user-writable %TEMP% folder,
+        // where user-level code could plant DLLs beside DXSETUP before it starts elevated.
+        let dir = std::env::temp_dir().join(name);
+        std::fs::create_dir(&dir).map_err(failed)?;
         Ok(Self(dir))
+    }
+}
+
+/// The machine's ProgramData folder as the system records it (FOLDERID_ProgramData, read from
+/// HKLM), never from the environment.
+fn program_data() -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath, KF_FLAG_DONT_VERIFY};
+    let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: `raw` is an out-pointer; on return it is a NUL-terminated CoTaskMem string (or
+    // null), read before being freed exactly once.
+    unsafe {
+        let hr = SHGetKnownFolderPath(&FOLDERID_ProgramData, KF_FLAG_DONT_VERIFY as u32, std::ptr::null_mut(), &mut raw);
+        let path = (hr >= 0 && !raw.is_null()).then(|| {
+            let len = (0..).take_while(|&i| *raw.add(i) != 0).count();
+            PathBuf::from(std::ffi::OsString::from_wide(std::slice::from_raw_parts(raw, len)))
+        });
+        CoTaskMemFree(raw as _);
+        path.filter(|p| p.is_absolute()).ok_or_else(|| std::io::Error::other(format!("no ProgramData folder (0x{hr:08X})")))
+    }
+}
+
+/// Whether `dir` is owned by Administrators or SYSTEM, so no standard user can swap what is
+/// created inside it.
+fn owned_by_admins(dir: &Path) -> bool {
+    use crate::win::wide_os;
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid, OWNER_SECURITY_INFORMATION, PSID,
+    };
+    let path = wide_os(dir.as_os_str());
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: NUL-terminated path; `owner` points into `descriptor`, which is LocalAlloc'd by
+    // the call and freed after the last use of `owner`.
+    unsafe {
+        let status = GetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        let ok = status == ERROR_SUCCESS
+            && !owner.is_null()
+            && (IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0 || IsWellKnownSid(owner, WinLocalSystemSid) != 0);
+        if !descriptor.is_null() {
+            LocalFree(descriptor as _);
+        }
+        ok
+    }
+}
+
+/// A new folder (never an existing one) that only Administrators and SYSTEM can change; what
+/// is created inside inherits that. The DACL is protected, so nothing from the parent applies.
+fn create_admin_only_dir(dir: &Path) -> std::io::Result<()> {
+    create_dir_with_dacl(dir, ADMIN_ONLY)
+}
+
+/// Full control for Administrators and SYSTEM, inherited by everything inside; nothing else.
+const ADMIN_ONLY: &str = "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)";
+
+fn create_dir_with_dacl(dir: &Path, sddl: &str) -> std::io::Result<()> {
+    use crate::win::{wide, wide_os};
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+    let sddl = wide(sddl);
+    let path = wide_os(dir.as_os_str());
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: NUL-terminated strings and out-pointers live through the calls; the descriptor
+    // LocalAlloc'd by the conversion is freed once CreateDirectoryW has copied it.
+    unsafe {
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut descriptor, std::ptr::null_mut()) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let created = CreateDirectoryW(path.as_ptr(), &attributes);
+        let error = std::io::Error::last_os_error();
+        LocalFree(descriptor as _);
+        if created == 0 { Err(error) } else { Ok(()) }
     }
 }
 impl Drop for Scratch {
@@ -175,12 +281,12 @@ impl Drop for Scratch {
     }
 }
 
-type Out = iced::futures::channel::mpsc::Sender<Event>;
+type Out = futures_channel::mpsc::Sender<Event>;
 
 /// The event stream for one fix. Dropping it (Cancel) stops a download and
 /// removes the partial file; an installer that has started is left to finish.
 pub(crate) fn job(component: Component) -> impl Stream<Item = Event> {
-    iced::stream::channel(8, async move |mut out: Out| {
+    crate::runtime::channel(8, async move |mut out: Out| {
         let result = run(component, &mut out).await;
         let _ = out.send(Event::Finished(result)).await;
     })
@@ -198,36 +304,20 @@ async fn run(component: Component, out: &mut Out) -> Result<Outcome, String> {
             .await
         }
         Component::VcRedist => {
-            let scratch = Scratch::new()?;
-            let exe = scratch.0.join("vc_redist.x86.exe");
-            download(VC_URL, &exe, out).await?;
-            let _ = out.send(Event::Phase(Phase::Verifying)).await;
-            let (scratch, lock) = blocking(move || {
-                let lock = verified(&exe)?;
-                Ok((scratch, (exe, lock)))
-            })
-            .await?;
+            let (scratch, exe, lock) = fetch_verified(VC_URL, "vc_redist.x86.exe", out).await?;
             let _ = out.send(Event::Phase(Phase::Installing)).await;
             blocking(move || {
-                let _scratch = scratch;
-                let (exe, _lock) = lock;
+                // The folder and the write-deny handle stay until the installer has run.
+                let (_scratch, _lock) = (scratch, lock);
                 run_hidden(&exe, "/install /quiet /norestart", None).and_then(vc_outcome)
             })
             .await
         }
         Component::DirectX9 => {
-            let scratch = Scratch::new()?;
-            let exe = scratch.0.join("directx_Jun2010_redist.exe");
-            download(DIRECTX_URL, &exe, out).await?;
-            let _ = out.send(Event::Phase(Phase::Verifying)).await;
-            let (scratch, lock) = blocking(move || {
-                let lock = verified(&exe)?;
-                Ok((scratch, (exe, lock)))
-            })
-            .await?;
+            let (scratch, exe, lock) = fetch_verified(DIRECTX_URL, "directx_Jun2010_redist.exe", out).await?;
             let _ = out.send(Event::Phase(Phase::Extracting)).await;
             let (scratch, setup) = blocking(move || {
-                let (exe, _lock) = lock;
+                let _lock = lock;
                 let target = scratch.0.join("dx");
                 std::fs::create_dir(&target).map_err(|e| tf("Couldn't create a temporary folder: {error}", &[("error", &e)]))?;
                 run_hidden(&exe, &format!("/Q /T:\"{}\"", target.display()), None).and_then(extract_outcome)?;
@@ -247,6 +337,20 @@ async fn run(component: Component, out: &mut Out) -> Result<Outcome, String> {
     }
 }
 
+/// Download `url` into a new scratch folder as `name`, then open it write-denied and check
+/// its Microsoft signature. Keep all three alive until the file has run.
+async fn fetch_verified(url: &str, name: &str, out: &mut Out) -> Result<(Scratch, PathBuf, std::fs::File), String> {
+    let scratch = Scratch::new()?;
+    let exe = scratch.0.join(name);
+    download(url, &exe, out).await?;
+    let _ = out.send(Event::Phase(Phase::Verifying)).await;
+    blocking(move || {
+        let lock = verified(&exe)?;
+        Ok((scratch, exe, lock))
+    })
+    .await
+}
+
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
     tokio::task::spawn_blocking(f)
         .await
@@ -261,7 +365,6 @@ fn verified(path: &Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
-#[cfg(windows)]
 fn open_locked(path: &Path) -> Result<std::fs::File, String> {
     use std::os::windows::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
@@ -269,10 +372,6 @@ fn open_locked(path: &Path) -> Result<std::fs::File, String> {
         .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
         .open(path)
         .map_err(|e| tf("Couldn't open {path}: {error}", &[("path", &path.display()), ("error", &e)]))
-}
-#[cfg(not(windows))]
-fn open_locked(path: &Path) -> Result<std::fs::File, String> {
-    std::fs::File::open(path).map_err(|e| tf("Couldn't open {path}: {error}", &[("path", &path.display()), ("error", &e)]))
 }
 
 async fn download(url: &str, dest: &Path, out: &mut Out) -> Result<(), String> {
@@ -338,12 +437,24 @@ async fn download(url: &str, dest: &Path, out: &mut Out) -> Result<(), String> {
     Ok(())
 }
 
+/// Wait for `process` to end and return its exit code; `None` when it could not be tracked.
+pub(crate) fn wait_exit_code(process: std::os::windows::io::OwnedHandle) -> Option<u32> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+    let handle = process.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let mut code = 0u32;
+    // SAFETY: a live process handle owned by `process` for both calls.
+    let (waited, ok) = unsafe { (WaitForSingleObject(handle, INFINITE), GetExitCodeProcess(handle, &mut code)) };
+    (waited == WAIT_OBJECT_0 && ok != 0).then_some(code)
+}
+
 /// Runs `exe args` without a console window and returns its exit code. An
 /// elevated launcher starts it directly; otherwise Windows asks for
 /// permission (the "runas" verb) first.
-#[cfg(windows)]
 pub(crate) fn run_hidden(exe: &Path, args: &str, dir: Option<&Path>) -> Result<u32, String> {
-    if super::detect::sys::is_elevated() {
+    use crate::win::{shell_execute, ShellError};
+    if crate::win::process::is_elevated() {
         use std::os::windows::process::CommandExt;
         let mut command = std::process::Command::new(exe);
         command.raw_arg(args).creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
@@ -355,53 +466,15 @@ pub(crate) fn run_hidden(exe: &Path, args: &str, dir: Option<&Path>) -> Result<u
             .map_err(|e| tf("Couldn't start {path}: {error}", &[("path", &exe.display()), ("error", &e)]))?;
         return Ok(status.code().unwrap_or(-1) as u32);
     }
-    use super::detect::sys::{wide, wide_os};
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
-    use windows_sys::Win32::UI::Shell::{
-        ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    let process = match shell_execute("runas", exe, Some(args), dir, windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE, true) {
+        Ok(process) => process,
+        Err(ShellError::Failed(ERROR_CANCELLED)) => return Ok(ERROR_CANCELLED),
+        Err(ShellError::Failed(error)) => {
+            return Err(tf("Couldn't start {path} (error {error}).", &[("path", &exe.display()), ("error", &error)]))
+        }
+        Err(ShellError::NoProcess) => return Err(tf("Couldn't track {path}.", &[("path", &exe.display())])),
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
-    let verb = wide("runas");
-    let file = wide_os(exe.as_os_str());
-    let params = wide(args);
-    let directory = dir.map(|d| wide_os(d.as_os_str()));
-    unsafe {
-        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
-        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-        info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
-        info.lpVerb = verb.as_ptr();
-        info.lpFile = file.as_ptr();
-        info.lpParameters = params.as_ptr();
-        info.lpDirectory = directory.as_ref().map_or(std::ptr::null(), |d| d.as_ptr());
-        info.nShow = SW_HIDE;
-        if ShellExecuteExW(&mut info) == 0 {
-            let error = GetLastError();
-            return if error == ERROR_CANCELLED {
-                Ok(ERROR_CANCELLED)
-            } else {
-                Err(tf(
-                    "Couldn't start {path} (error {error}).",
-                    &[("path", &exe.display()), ("error", &error)],
-                ))
-            };
-        }
-        if info.hProcess.is_null() {
-            return Err(tf("Couldn't track {path}.", &[("path", &exe.display())]));
-        }
-        let waited = WaitForSingleObject(info.hProcess, INFINITE);
-        let mut code = 0u32;
-        let ok = GetExitCodeProcess(info.hProcess, &mut code);
-        CloseHandle(info.hProcess);
-        if waited != WAIT_OBJECT_0 || ok == 0 {
-            return Err(tf("Lost track of {path}.", &[("path", &exe.display())]));
-        }
-        Ok(code)
-    }
-}
-#[cfg(not(windows))]
-pub(crate) fn run_hidden(_exe: &Path, _args: &str, _dir: Option<&Path>) -> Result<u32, String> {
-    Err(t("Installing Windows components needs Windows.").into())
+    wait_exit_code(process).ok_or_else(|| tf("Lost track of {path}.", &[("path", &exe.display())]))
 }
 
 #[cfg(test)]
@@ -464,6 +537,24 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// Elevated installers run from this folder: an unelevated process (the test runner here)
+    /// must not be able to add or replace anything in it.
+    #[test]
+    fn admin_only_folder_refuses_unelevated_writes() {
+        let dir = std::env::temp_dir().join(format!("crystal-admin-only-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        // The production DACL plus, on the folder itself only, what this test needs to remove it
+        // again (DELETE, SYNCHRONIZE, FILE_READ_ATTRIBUTES): nothing that adds a file.
+        create_dir_with_dacl(&dir, &format!("{ADMIN_ONLY}(A;;0x110080;;;WD)")).unwrap();
+        assert!(create_admin_only_dir(&dir).is_err(), "an existing folder is never reused");
+        let written = std::fs::write(dir.join("DSETUP.dll"), b"planted");
+        if !crate::win::process::is_elevated() {
+            assert_eq!(written.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        }
+        let _ = std::fs::remove_file(dir.join("DSETUP.dll"));
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
     /// Downloads both real installers to a temp folder and verifies their
     /// signatures. Never runs them. `cargo test prereqs -- --ignored`.
     #[test]
@@ -474,7 +565,7 @@ mod tests {
             for (url, name) in [(VC_URL, "vc_redist.x86.exe"), (DIRECTX_URL, "directx_Jun2010_redist.exe")] {
                 let scratch = Scratch::new().unwrap();
                 let exe = scratch.0.join(name);
-                let (mut tx, _rx) = iced::futures::channel::mpsc::channel(1024);
+                let (mut tx, _rx) = futures_channel::mpsc::channel(1024);
                 download(url, &exe, &mut tx).await.unwrap();
                 let size = std::fs::metadata(&exe).unwrap().len();
                 let lock = verified(&exe);

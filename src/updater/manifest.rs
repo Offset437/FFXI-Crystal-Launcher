@@ -110,20 +110,6 @@ pub struct Manifest {
     pub files: Vec<FileHistory>,
 }
 
-impl Manifest {
-    pub fn latest_stamp(&self) -> Option<&str> {
-        fn order(stamp: &str) -> Option<(u64, u64)> {
-            let (date, revision) = stamp.split_once('_')?;
-            Some((date.parse().unwrap_or(0), revision.parse().unwrap_or(0)))
-        }
-        self.files
-            .iter()
-            .flat_map(|file| &file.versions)
-            .map(|version| version.stamp.as_str())
-            .max_by_key(|stamp| order(stamp))
-    }
-}
-
 struct Words<'a>(&'a str);
 
 impl<'a> Words<'a> {
@@ -346,7 +332,7 @@ mod tests {
         text.push_str("file unused-empty-record {\n}\nend\nunfinished bytes after committed end");
         let manifest = parse(&text.replace('\n', "\r\n")).unwrap();
         assert_eq!(manifest.files, expected);
-        assert_eq!(manifest.latest_stamp(), Some("30270102_108"));
+        assert_eq!(crate::updater::Product::Ffxi.latest_stamp(&manifest), Some("30270102_108"));
         for file in manifest.files {
             assert_eq!(file.current().stamp, "30270102_108");
         }
@@ -367,12 +353,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             [true, false, false]
         );
-        assert_eq!(manifest.latest_stamp(), Some("30270103_1"));
         assert!(parse(&text).is_err());
         assert!(parse_viewer(&text.replace("}\nReset2", "Reset2")).is_err());
         assert!(parse_viewer(&text.replace("Option {", "Option {\nReset2 {")).is_err());
         assert!(parse_viewer("Option {\nend\n").is_err());
-        assert_eq!(parse("end\n").unwrap().latest_stamp(), None);
+        assert_eq!(crate::updater::Product::Ffxi.latest_stamp(&parse("end\n").unwrap()), None);
     }
 
     #[test]

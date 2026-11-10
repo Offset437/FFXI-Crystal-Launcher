@@ -1,0 +1,307 @@
+// The account sheet: a 464 px panel on the right over
+// the dimmed page, for a saved account (Account, Launch, Status) or a new one (Account, Launch,
+// After adding). A click on the dimmed page or Escape closes it, like Cancel. Its controls are
+// modal (Nav.modal holds Tab and the controller inside it while it is open).
+import { Theme } from "theme.slint";
+import { View } from "state.slint";
+import { Features } from "features.slint";
+import { Glyph, Icon, Dot, SmallButton, Control, Tone, IconButton, Field, Select, Segmented } from "widgets.slint";
+import { FormLabel, Note, Fieldset, Labelled, CheckNote, Card, CardRow, SideSheet, SheetBody, SheetFooter } from "form.slint";
+
+/// A labelled text field.
+component LabelledField inherits Labelled {
+    in property <string> placeholder;
+    in-out property <string> text;
+    in property <bool> password;
+    in property <bool> enabled: true;
+    callback edited(string);
+    Field {
+        modal: true;
+        label: root.caption;
+        placeholder: root.placeholder;
+        text <=> root.text;
+        password: root.password;
+        enabled: root.enabled;
+        edited(value) => { root.edited(value); }
+    }
+}
+
+/// A labelled field with a button beside its input (Show, Change).
+component FieldWithButton inherits Labelled {
+    in property <string> placeholder;
+    in-out property <string> text;
+    in property <bool> password;
+    in property <bool> enabled: true;
+    in property <string> button;
+    callback edited(string);
+    callback pressed();
+    HorizontalLayout {
+        spacing: Theme.sp-s;
+        Field {
+            modal: true;
+            label: root.caption;
+            placeholder: root.placeholder;
+            text <=> root.text;
+            password: root.password;
+            enabled: root.enabled;
+            edited(value) => { root.edited(value); }
+        }
+        Control { modal: true; width: 92px; text: root.button; clicked => { root.pressed(); } }
+    }
+}
+
+export component AccountSheet inherits SideSheet {
+    modal: true;
+    caption: View.sheet.caption;
+    title: View.sheet.title;
+    close-label: View.sheet-strings.close;
+    close => { View.close-sheet(); }
+    SheetBody {
+        scroll-to: Features.sheet-scroll;
+        Fieldset {
+            legend: View.sheet-strings.account;
+            LabelledField {
+                caption: View.sheet-strings.display-name;
+                placeholder: View.sheet-strings.display-placeholder;
+                text <=> View.sheet-label;
+                password: View.sheet.label-masked;
+                edited(value) => { View.sheet-edited(0, value); }
+            }
+            if !View.sheet.retail: Note { text: View.sheet-strings.private-note; }
+            if !View.sheet.retail: LabelledField {
+                caption: View.sheet-strings.server;
+                placeholder: View.sheet-strings.server-placeholder;
+                text <=> View.sheet-server;
+                enabled: !View.sheet.active;
+                edited(value) => { View.sheet-edited(1, value); }
+            }
+            if View.sheet.editing: FieldWithButton {
+                caption: View.sheet.id-label;
+                placeholder: View.sheet.id-placeholder;
+                text <=> View.sheet-pol-id;
+                password: View.sheet.id-masked;
+                enabled: !View.sheet.active;
+                button: View.sheet.id-button;
+                edited(value) => { View.sheet-edited(2, value); }
+                pressed => { View.sheet-flag(2, true); }
+            }
+            if !View.sheet.editing: LabelledField {
+                caption: View.sheet.id-label;
+                placeholder: View.sheet.id-placeholder;
+                text <=> View.sheet-pol-id;
+                password: View.sheet.id-masked;
+                enabled: !View.sheet.active;
+                edited(value) => { View.sheet-edited(2, value); }
+            }
+            FieldWithButton {
+                caption: View.sheet.password-label;
+                placeholder: View.sheet-strings.pol-password-placeholder;
+                text <=> View.sheet-pol-password;
+                password: View.sheet.password-masked;
+                enabled: View.sheet.password-enabled;
+                button: View.sheet.password-button;
+                edited(value) => { View.sheet-edited(3, value); }
+                pressed => { View.sheet-flag(View.sheet.password-enabled ? 3 : 4, true); }
+            }
+            if View.sheet.retail: HorizontalLayout {
+                spacing: Theme.sp-m;
+                LabelledField {
+                    caption: View.sheet-strings.se-id;
+                    placeholder: View.sheet-strings.se-id-placeholder;
+                    text <=> View.sheet-se-id;
+                    password: View.sheet.se-id-masked;
+                    edited(value) => { View.sheet-edited(4, value); }
+                }
+                LabelledField {
+                    caption: View.sheet-strings.se-password;
+                    placeholder: View.sheet-strings.password-placeholder;
+                    text <=> View.sheet-se-password;
+                    password: true;
+                    edited(value) => { View.sheet-edited(5, value); }
+                }
+            }
+            Labelled {
+                caption: View.sheet-strings.region;
+                Segmented {
+                    modal: true;
+                    items: View.regions;
+                    current: View.sheet.region;
+                    picked(index) => { View.sheet-region(index); }
+                }
+                Note { text: View.sheet-strings.region-note; }
+            }
+            if View.sheet.retail: CheckNote {
+                modal: true;
+                text: View.sheet-strings.uses-otp;
+                checked: View.sheet.uses-otp;
+                toggled(on) => { View.sheet-flag(0, on); }
+            }
+            if View.sheet.retail: VerticalLayout {
+                spacing: Theme.label-gap;
+                LabelledField {
+                    caption: View.sheet-strings.handles;
+                    placeholder: View.sheet-strings.handles-placeholder;
+                    text <=> View.sheet-handles;
+                    password: View.sheet.handles-masked;
+                    edited(value) => { View.sheet-edited(6, value); }
+                }
+                Note { text: View.sheet-strings.handles-note; }
+            }
+            if !View.sheet.editing: HorizontalLayout {
+                spacing: 10px;
+                Icon { glyph: Glyph.check-circle; size: 16px; tint: Theme.sub; }
+                Note { text: View.sheet-strings.saved-note; vertical-alignment: center; }
+            }
+        }
+        Fieldset {
+            legend: View.sheet-strings.launch;
+            if View.sheet.retail: Labelled {
+                caption: View.sheet-strings.launch-with;
+                Segmented {
+                    modal: true;
+                    items: View.launch-choices;
+                    current: View.sheet.launch-index;
+                    picked(index) => { View.sheet-launch(index); }
+                }
+                Note { text: View.sheet.launch-hint; }
+            }
+            if View.sheet.retail && View.sheet.tool != 0: Labelled {
+                caption: View.sheet.tool-label;
+                Select {
+                    modal: true;
+                    label: View.sheet.tool-label;
+                    items: View.tool-items;
+                    current: View.sheet.tool-current;
+                    picked(index) => { View.sheet-tool(index); }
+                }
+                if View.sheet.tool-note != "": Note { text: View.sheet.tool-note; }
+                if Features.sheet-gamepad != "": Note { text: Features.sheet-gamepad; }
+                if View.sheet.tool == 2: HorizontalLayout {
+                    alignment: start;
+                    SmallButton {
+                        modal: true;
+                        scale: 1;
+                        text: View.sheet-strings.edit-profiles;
+                        glyph: Glyph.edit;
+                        enabled: View.sheet.edit-profiles-enabled;
+                        clicked => { View.edit-profiles(); }
+                    }
+                }
+            }
+            if View.sheet.retail: VerticalLayout {
+                spacing: 10px;
+                CheckNote {
+                    modal: true;
+                    text: View.sheet-strings.auto-login;
+                    checked: View.sheet.auto-login;
+                    toggled(on) => { View.sheet-auto-login(on); }
+                }
+                if View.sheet.auto-login: Labelled {
+                    padding-left: 26px;
+                    caption: View.sheet-strings.slot;
+                    Select {
+                        modal: true;
+                        label: View.sheet-strings.slot;
+                        items: View.slot-items;
+                        current: View.sheet.slot;
+                        picked(index) => { View.sheet-slot(index); }
+                    }
+                    Note { text: View.sheet-strings.slot-note; }
+                }
+            }
+            Labelled {
+                caption: View.sheet-strings.folder;
+                HorizontalLayout {
+                    spacing: Theme.sp-s;
+                    Field {
+                        modal: true;
+                        label: View.sheet-strings.folder;
+                        placeholder: View.sheet-strings.folder-placeholder;
+                        text <=> View.sheet-folder;
+                        password: View.sheet.folder-masked;
+                        enabled: View.sheet.folder-enabled;
+                        edited(value) => { View.sheet-folder-edited(value); }
+                    }
+                    IconButton {
+                        modal: true;
+                        label: View.sheet-strings.folder;
+                        glyph: Glyph.folder;
+                        bordered: true;
+                        enabled: View.sheet.browse-enabled;
+                        clicked => { View.browse-folder(); }
+                    }
+                }
+                Note { text: View.sheet-strings.folder-note; }
+            }
+            if View.sheet.active: Note { text: View.sheet-strings.active-note; }
+        }
+        if View.sheet.has-status: Fieldset {
+            legend: View.sheet-strings.status;
+            Card {
+                CardRow {
+                    Dot { cross-axis-self-alignment: center; tint: View.tone(View.sheet.status-ink); }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        alignment: center;
+                        spacing: 2px;
+                        Text { text: View.sheet.status-label; font-size: Theme.type-body; font-weight: 600; color: Theme.ink; wrap: word-wrap; }
+                        if View.sheet.status-detail != "": Note { text: View.sheet.status-detail; }
+                    }
+                    SmallButton {
+                        modal: true;
+                        cross-axis-self-alignment: center;
+                        scale: 1;
+                        text: View.sheet-strings.sign-out;
+                        enabled: View.sheet.sign-out-enabled;
+                        clicked => { View.sign-out(); }
+                    }
+                }
+            }
+            if View.sheet.timing != "": HorizontalLayout {
+                spacing: Theme.label-gap;
+                alignment: start;
+                Text { text: View.sheet-strings.last-play; font-size: Theme.type-caption; color: Theme.sub; }
+                Text { text: View.sheet.timing; font-family: Theme.mono; font-size: Theme.type-caption; color: Theme.ink2; }
+            }
+            if View.sheet.has-log: HorizontalLayout {
+                spacing: Theme.sp-s;
+                alignment: start;
+                SmallButton { modal: true; scale: 1; text: View.sheet-strings.view-log; enabled: View.sheet.log-enabled; clicked => { View.view-log(); } }
+                SmallButton { modal: true; scale: 1; text: View.sheet-strings.open-logs; glyph: Glyph.folder; clicked => { View.open-logs(); } }
+            }
+        }
+        if View.sheet.after-adding: Fieldset {
+            legend: View.sheet-strings.after-adding;
+            CheckNote {
+                modal: true;
+                text: View.sheet-strings.sign-in-now;
+                note: View.sheet.sign-in-note;
+                checked: View.sheet.sign-in-now;
+                enabled: View.sheet.sign-in-now-enabled;
+                toggled(on) => { View.sheet-flag(1, on); }
+            }
+        }
+        if View.sheet.app-status != "": Note { text: View.sheet.app-status; }
+    }
+    // A footer starts with a quiet text button (Delete account): its label, not its hover box,
+    // lines up with the fields.
+    SheetFooter {
+        lead: Theme.sheet-pad-x - 10px;
+        if View.sheet.editing: Control {
+            modal: true;
+            tone: Tone.danger-link;
+            text: View.sheet-strings.delete;
+            enabled: View.sheet.delete-enabled;
+            clicked => { View.delete-account(); }
+        }
+        Rectangle { horizontal-stretch: 1; }
+        Control { modal: true; text: View.sheet-strings.cancel; clicked => { View.close-sheet(); } }
+        Control {
+            modal: true;
+            tone: Tone.primary;
+            text: View.sheet.save-label;
+            enabled: View.sheet.save-enabled;
+            clicked => { View.save-sheet(); }
+        }
+    }
+}

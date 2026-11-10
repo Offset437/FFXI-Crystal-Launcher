@@ -77,16 +77,29 @@ impl Drop for CapturePauses {
     fn drop(&mut self) { PAUSES.with(|p| *p.borrow_mut() = None); }
 }
 
+/// How many arguments each fake records (traces show these). `Api` itself
+/// checks every real call against `pol_core::SERVICES`.
 fn arity(slot: usize) -> usize {
     match slot {
         376 | 195 => 6,
         1502 => 4,
         824 => 3,
-        825 | 826 | 854 | 856 | 852 | 858 | 868 | 892 | 1149 | 814 | 1072 | 1302 | 167 | 169 => 2,
+        825 | 826 | 854 | 856 | 852 | 858 | 868 | 892 | 1149 | 814 | 1072 | 1302 | 167 | 169 | 173 => 2,
         870 | 851 | 886 | 853 | 965 | 1527 | 1309 | 871 | 846 | 849 | 1032 | 1140 | 1175 | 969 | 288 | 331 | 375
         | 164 | 172 | 176 | 384 | 377 | 405 | 404 | 819 | 125 | 367 | 1075 | 1107 | 337 | 199 | 816 | 1305 | 330 | 1528 => 1,
         329 => 2,
         _ => 0,
+    }
+}
+
+#[test]
+fn every_recorded_arity_agrees_with_the_core_check_registry() {
+    for slot in 0..crate::pol_core::TABLE_LEN {
+        let recorded = arity(slot);
+        if recorded == 0 { continue; }
+        if let Some(service) = crate::pol_core::service(slot) {
+            assert_eq!(service.args.map(usize::from), Some(recorded), "slot {slot}");
+        }
     }
 }
 
@@ -104,6 +117,11 @@ fn dispatch(slot: usize, a: [usize; 6]) -> usize {
             return value;
         }
         match slot {
+            173 => unsafe {
+                std::ptr::write_bytes(a[1] as *mut u8, 0, 0x28);
+                if a[0] == 0 { *(a[1] as *mut u8) = 1; }
+                0
+            },
             814 => {
                 f.mode = a[0];
                 f.states = if a[0] == 0 { f.open0.clone() } else { f.open3.clone() }.into();
@@ -162,7 +180,7 @@ macro_rules! fake_table {
         }
     };
 }
-fake_table!(125 126 163 164 165 166 167 169 171 172 175 176 190 195 196 199 206 207 288 322 323 326 327 328
+fake_table!(125 126 163 164 165 166 167 169 171 172 173 175 176 190 195 196 199 206 207 288 322 323 326 327 328
     329 330 331 333 334 337 367 374 375 376 377 383 384 385 401 404 405 434 463 705 807 809 814 815 816
     817 818 819 823 824 825 826 828 835 836 838 845 846 849 851 852 853 854 856 858 868 870 871 872 884
     886 891 892 914 915 920 932 933 965 969 1032 1072 1074 1075 1103 1107 1140 1149 1175 1302 1304 1305 1309 1502 1527 1528);
@@ -179,7 +197,9 @@ fn show(v: usize) -> String {
 }
 /// The recorded calls as `slot(args)`, pointers shown as `*`.
 fn trace(skip: &[usize]) -> Vec<String> {
-    raw_calls().iter().filter(|(s, _)| !skip.contains(s))
+    // The handle inventory is read-only; its record-copy calls are covered by
+    // native_handles and do not participate in the authentication request order.
+    raw_calls().iter().filter(|(s, _)| *s != 173 && !skip.contains(s))
         .map(|(s, a)| format!("{s}({})", a.iter().map(|v| show(*v)).collect::<Vec<_>>().join(",")))
         .collect()
 }
@@ -228,6 +248,7 @@ fn credentials() -> NativeCredentials {
         se_secret: [0x51; 20],
         otp: Some(*b"123456"),
         profile_key: "a".repeat(40),
+        handle_names: String::new(),
     }
 }
 
@@ -245,15 +266,13 @@ static CONTROL_TEST: Mutex<()> = Mutex::new(());
 
 // --- Sign-in --------------------------------------------------------------
 
-// The comparison pilot (native-fast-login-poll) is the only build with 1 ms
-// startup polls; the shipped default steps everything at the Viewer frame.
-#[cfg(not(feature = "native-fast-login-poll"))]
+// Startup polls step at the Viewer frame like everything else.
 #[test]
 fn default_build_steps_sign_in_mail_presence_return_and_idle_at_the_viewer_frame() {
     let viewer = fixture();
     let mut s = session(&viewer);
-    let root = CStr::from_bytes_with_nul(b"C:\\PlayOnlineViewer\\\0").unwrap();
-    let key = CStr::from_bytes_with_nul(b"SOFTWARE\\PlayOnlineUS\0").unwrap();
+    let root = c"C:\\PlayOnlineViewer\\";
+    let key = c"SOFTWARE\\PlayOnlineUS";
     s.bootstrap_core(root, key).unwrap();
     script(891, &[native_profile::PROFILE_NOT_FOUND]);
     viewer_check_current();
@@ -284,17 +303,19 @@ fn default_build_steps_sign_in_mail_presence_return_and_idle_at_the_viewer_frame
     let ordinary = pauses.take();
     assert!(ordinary.len() >= 4);
     assert!(ordinary.iter().all(|(d, _)| *d == Duration::from_millis(20)));
-    assert_eq!(FRAME * native_jobs::MAIL_FRAMES, Duration::from_millis(112_500));
+    assert_eq!(FRAME * native_jobs::mail_frames(), Duration::from_millis(112_500));
     forget(s);
     fs::remove_dir_all(viewer).unwrap();
 }
 
 #[test]
 fn sign_in_drives_the_core_in_the_stock_viewer_order() {
+    // The 815 count below counts owner frames: keep the floor frame-bound.
+    let _pauses = CapturePauses::start();
     let viewer = fixture();
     let mut s = session(&viewer);
-    let root = CStr::from_bytes_with_nul(b"C:\\PlayOnlineViewer\\\0").unwrap();
-    let key = CStr::from_bytes_with_nul(b"SOFTWARE\\PlayOnlineUS\0").unwrap();
+    let root = c"C:\\PlayOnlineViewer\\";
+    let key = c"SOFTWARE\\PlayOnlineUS";
     s.bootstrap_core(root, key).unwrap();
     script(891, &[native_profile::PROFILE_NOT_FOUND]);
     viewer_check_current();
@@ -342,7 +363,7 @@ fn sign_in_drives_the_core_in_the_stock_viewer_order() {
 fn sign_in_failure_is_a_negative_state_after_transitional_ones() {
     let viewer = fixture();
     let mut s = session(&viewer);
-    let root = CStr::from_bytes_with_nul(b"C:\\v\\\0").unwrap();
+    let root = c"C:\\v\\";
     s.bootstrap_core(root, root).unwrap();
     FAKE.with(|f| f.borrow_mut().open3 = vec![18, 31, 32, 33, 39, -1036]);
     script(823, &[-1036]);
@@ -362,7 +383,7 @@ fn sign_in_failure_is_a_negative_state_after_transitional_ones() {
 fn network_open_failure_does_not_issue_member_sign_out() {
     let viewer = fixture();
     let mut s = session(&viewer);
-    let root = CStr::from_bytes_with_nul(b"C:\\v\\\0").unwrap();
+    let root = c"C:\\v\\";
     s.bootstrap_core(root, root).unwrap();
     FAKE.with(|f| f.borrow_mut().open0 = vec![17, 31, 32, 39, -1025]);
     assert!(s.sign_in_core(50, &credentials()).is_err());
@@ -375,7 +396,7 @@ fn network_open_failure_does_not_issue_member_sign_out() {
 
 fn bootstrapped(viewer: &Path) -> NativeSession {
     let mut s = session(viewer);
-    let root = CStr::from_bytes_with_nul(b"C:\\v\\\0").unwrap();
+    let root = c"C:\\v\\";
     s.bootstrap_core(root, root).unwrap();
     script(891, &[native_profile::PROFILE_NOT_FOUND]);
     s
@@ -391,9 +412,10 @@ fn startup_sign_out_before_login_sends_no_credentials() {
     assert!(replies.iter().any(|reply| reply.contains("\"action\":\"sign_out\",\"code\":0")));
     assert!(s.sign_in_core(50, &credentials()).unwrap_err().contains("cancelled"));
     assert!(raw_calls().is_empty());
-    drop(s);
+    // Nothing was opened, so nothing closes; the requested sign-out still completes.
+    assert_eq!(events::capture(|| drop(s)), ["{\"type\":\"native_sign_out_complete\",\"code\":0}\n"]);
     assert!(!startup_cancelled());
-    assert!(!raw_calls().iter().any(|(slot, _)| [814, 1502].contains(slot)));
+    assert!(!raw_calls().iter().any(|(slot, _)| [814, 1502, 816].contains(slot)));
     fs::remove_dir_all(viewer).unwrap();
 }
 
@@ -601,7 +623,10 @@ fn request_play() { TEST_PLAY.with(|p| p.set(true)); }
 /// has none. Nothing else changes: the same requests in the same order.
 #[test]
 fn a_queued_or_requested_play_ends_the_viewer_gaps_at_the_next_frame() {
-    // The owner frames before member login are the same in every run.
+    // The owner frames before member login are the same in every run. Frames
+    // take no real sleep here, so a loaded machine cannot let the wall clock
+    // end the Viewer-check floor a frame early in one run but not another.
+    let _pauses = CapturePauses::start();
     let viewer = fixture();
     let mut s = bootstrapped(&viewer);
     viewer_check_current();
@@ -691,8 +716,11 @@ fn every_sign_in_request_logs_its_start_end_polls_and_attempts() {
 /// sequence (bootstrap, then the sign-in `sign_in_drives_the_core_in_the_stock_viewer_order` pins).
 #[test]
 fn a_parked_host_calls_nothing_until_its_credentials_then_signs_in_exactly_like_a_cold_host() {
-    let root = CStr::from_bytes_with_nul(b"C:\\PlayOnlineViewer\\\0").unwrap();
-    let key = CStr::from_bytes_with_nul(b"SOFTWARE\\PlayOnlineUS\0").unwrap();
+    // The cold and parked traces include every owner frame: no real sleep, so
+    // the wall clock cannot end the Viewer-check floor a frame later in one run.
+    let _pauses = CapturePauses::start();
+    let root = c"C:\\PlayOnlineViewer\\";
+    let key = c"SOFTWARE\\PlayOnlineUS";
     let sign_in = |viewer: &Path| {
         let mut s = session(viewer);
         s.bootstrap_core(root, key).unwrap();
@@ -778,6 +806,28 @@ fn a_launcher_gone_during_a_viewer_gap_starts_neither_the_next_request_nor_a_can
     }
 }
 
+/// Without Viewer gaps (a cold or batch-prepared sign-in) a stopping owner
+/// still starts no status load (374) or presence (376) only to cancel it.
+#[test]
+fn a_launcher_gone_without_viewer_gaps_starts_neither_the_next_request_nor_a_cancel() {
+    for (close_on, next) in [(1032, 374), (330, 376)] {
+        let viewer = fixture();
+        let mut s = bootstrapped(&viewer);
+        viewer_check_current();
+        script(190, &[0]); // presence would publish
+        FAKE.with(|f| f.borrow_mut().close_on = Some(close_on));
+        let error = s.sign_in_core(50, &credentials()).unwrap_err();
+        events::set_closed_for_test(false);
+        assert!(error.contains("closed the session"), "{close_on}: {error}");
+        let calls = raw_calls();
+        assert!(position(&calls, next, None).is_none(), "{next} never starts");
+        assert!(!calls.iter().any(|(slot, _)| [337, 328, 199].contains(slot)), "nothing to cancel: {:?}", trace(&[]));
+        assert!(s.signed_in, "the signed-in teardown follows");
+        forget(s);
+        fs::remove_dir_all(viewer).unwrap();
+    }
+}
+
 #[test]
 fn main_menu_follows_the_publish_with_its_code_on_sign_in_and_on_return() {
     let viewer = fixture();
@@ -790,9 +840,9 @@ fn main_menu_follows_the_publish_with_its_code_on_sign_in_and_on_return() {
     // Return: published again (a character was selected) → the 377 code.
     script(190, &[0]);
     script(377, &[-5000]);
-    assert_eq!(events::capture(|| s.return_from_game().unwrap()), ["{\"type\":\"native_main_menu\",\"code\":-5000,\"returned\":true}\n"]);
+    assert_eq!(events::capture(|| assert!(s.return_from_game().unwrap())), ["{\"type\":\"native_main_menu\",\"code\":-5000,\"returned\":true}\n"]);
     // Already the Viewer: nothing published, still the main menu.
-    assert_eq!(events::capture(|| s.return_from_game().unwrap()), ["{\"type\":\"native_main_menu\",\"code\":0,\"returned\":true}\n"]);
+    assert_eq!(events::capture(|| assert!(s.return_from_game().unwrap())), ["{\"type\":\"native_main_menu\",\"code\":0,\"returned\":true}\n"]);
     forget(s);
     fs::remove_dir_all(viewer).unwrap();
 }
@@ -947,19 +997,19 @@ fn status_changes_push_to_groups_only_when_asked_and_in_a_group() {
     set_linked(3);
     script(385, &[1]);
     NativeSession::user_status(&api, 0, true, &mut s.viewer_status, &mut frame);
-    assert_eq!(trace(&[838]), ["385()", "376(-2,-2,1,0,0,-2)", "404(0)", "377(5)", "405(6)"]);
+    assert_eq!(trace(&[838, 1103]), ["385()", "376(-2,-2,1,0,0,-2)", "404(0)", "377(5)", "405(6)"]);
     clear_calls();
     NativeSession::user_status(&api, 4, false, &mut s.viewer_status, &mut frame);
-    assert_eq!(trace(&[838]), ["376(-2,-2,1,4,0,-2)", "377(5)"]);
+    assert_eq!(trace(&[838, 1103]), ["376(-2,-2,1,4,0,-2)", "377(5)"]);
     clear_calls();
     NativeSession::user_status(&api, 1, true, &mut s.viewer_status, &mut frame); // 385() == 0: no group active
-    assert_eq!(trace(&[838]), ["385()", "376(-2,-2,1,1,0,-2)", "377(5)"]);
+    assert_eq!(trace(&[838, 1103]), ["385()", "376(-2,-2,1,1,0,-2)", "377(5)"]);
     clear_calls();
     // 10040f39 starts both jobs on apply: a failed status change is still pushed.
     script(377, &[-5000]);
     script(385, &[1]);
     NativeSession::user_status(&api, 0, true, &mut s.viewer_status, &mut frame);
-    assert_eq!(trace(&[838, 1107]), ["385()", "376(-2,-2,1,0,0,-2)", "404(0)", "377(5)", "405(6)"]);
+    assert_eq!(trace(&[838, 1103, 1107]), ["385()", "376(-2,-2,1,0,0,-2)", "404(0)", "377(5)", "405(6)"]);
     forget(s);
     fs::remove_dir_all(viewer).unwrap();
 }
@@ -980,7 +1030,7 @@ fn stopped_status_owner_cancels_both_tickets_without_another_frame() {
     });
     assert_eq!(frames, 1);
     assert!(s.viewer_status.pending.is_none());
-    assert_eq!(trace(&[838]), ["385()", "376(-2,-2,1,0,0,-2)", "404(0)", "377(5)", "337(6)", "337(5)"]);
+    assert_eq!(trace(&[838, 1103]), ["385()", "376(-2,-2,1,0,0,-2)", "404(0)", "377(5)", "337(6)", "337(5)"]);
     clear_calls();
     script(385, &[1]);
     script(405, &[native_jobs::ABORTED]);
@@ -1001,9 +1051,9 @@ fn stopped_status_owner_cancels_both_tickets_without_another_frame() {
 #[test]
 fn auto_away_counts_gated_frames_and_checks_idle_at_the_stock_cold_period() {
     // The Viewer checks after 3600 cold frames, 112.5 s: 5625 frames of 20 ms, not 3600 (72 s).
-    assert_eq!(AUTO_AWAY_FRAMES, 5625);
-    assert_eq!(FRAME * AUTO_AWAY_FRAMES, Duration::from_millis(112_500));
-    let n = AUTO_AWAY_FRAMES;
+    assert_eq!(auto_away_frames(), 5625);
+    assert_eq!(FRAME * auto_away_frames(), Duration::from_millis(112_500));
+    let n = auto_away_frames();
     let idle = Duration::from_secs(10 * 60 + 1);
     let mut away = AutoAway::new(10);
     for _ in 0..3600 { assert!(!away.frame(true, idle)); }
@@ -1030,15 +1080,15 @@ fn auto_away_sends_the_viewer_away_status_only_while_visible() {
     let viewer = fixture();
     let mut s = session(&viewer);
     set_linked(3);
-    s.auto_away.frames = AUTO_AWAY_FRAMES;
+    s.auto_away.frames = auto_away_frames();
     script(206, &[1]); // Away already: not gated, counter unchanged
     NativeSession::auto_away_tick(&s.api, &mut s.auto_away, &mut s.viewer_status, Duration::from_secs(3600));
     assert!(s.viewer_status.pending.is_none());
-    assert_eq!(s.auto_away.frames, AUTO_AWAY_FRAMES);
+    assert_eq!(s.auto_away.frames, auto_away_frames());
     NativeSession::auto_away_tick(&s.api, &mut s.auto_away, &mut s.viewer_status, Duration::from_secs(3600));
     s.viewer_status.step(&s.api);
     s.viewer_status.step(&s.api);
-    assert_eq!(trace(&[838]), ["206()", "206()", "376(-2,-2,1,1,0,-2)", "377(5)"]);
+    assert_eq!(trace(&[838, 1103]), ["206()", "206()", "376(-2,-2,1,1,0,-2)", "377(5)"]);
     assert_eq!(s.auto_away.frames, 0);
     forget(s);
     fs::remove_dir_all(viewer).unwrap();
@@ -1051,7 +1101,7 @@ fn auto_away_progresses_during_another_native_request_wait() {
     let mut s = session(&viewer);
     let api = s.api.clone();
     set_linked(3);
-    s.auto_away.frames = AUTO_AWAY_FRAMES;
+    s.auto_away.frames = auto_away_frames();
     script(172, &[0, 0, 1]);
     script(377, &[0, 1]);
     let result = native_jobs::run(&api, Request { name: "handles", start: &mut || api.zero(171), poll: 172, policy: Policy::Normal },
@@ -1079,7 +1129,7 @@ fn newer_status_replaces_only_its_pending_ticket_and_handoff_waits_for_it_withou
     s.viewer_status.queue(&s.api, 0, false); // the Viewer's own replacement cancel
     s.viewer_status.queue(&s.api, 4, false); // queued replacement has no ticket
     s.viewer_status.step(&s.api);
-    assert_eq!(trace(&[838]), ["337(5)", "376(-2,-2,1,4,0,-2)"]);
+    assert_eq!(trace(&[838, 1103]), ["337(5)", "376(-2,-2,1,4,0,-2)"]);
     clear_calls();
     // Play: launch states 3/6/7 poll the in-flight ticket to its end, one
     // idle frame (818) each, then hand off with no 337/328/199.
@@ -1176,11 +1226,11 @@ fn after_play_no_auto_away_and_no_mail_retry_start() {
     let mut s = session(&viewer);
     set_linked(3);
     let _play = TestPlay::requested();
-    s.auto_away.frames = AUTO_AWAY_FRAMES;
+    s.auto_away.frames = auto_away_frames();
     assert!(idle_owner_frame(&s.api, &mut s.pushes, &mut s.auto_away, &mut s.viewer_status, Duration::from_secs(86_400)));
     assert_eq!(trace(&[838, 1103]), ["818()"], "no Visible check and no Away request");
     assert!(s.viewer_status.pending.is_none());
-    assert_eq!(s.auto_away.frames, AUTO_AWAY_FRAMES);
+    assert_eq!(s.auto_away.frames, auto_away_frames());
     clear_calls();
     s.social.retry_mail_now();
     s.social.idle_frame(&s.api, &mut || true);
@@ -1206,7 +1256,7 @@ fn a_real_start_game_or_latched_play_starts_no_auto_away_and_no_mail_retry() {
         } else {
             CONTROL.store(START_GAME, Ordering::Release);
         }
-        s.auto_away.frames = AUTO_AWAY_FRAMES;
+        s.auto_away.frames = auto_away_frames();
         assert!(idle_owner_frame(&s.api, &mut s.pushes, &mut s.auto_away, &mut s.viewer_status, Duration::from_secs(86_400)));
         assert_eq!(trace(&[838, 1103]), ["818()"], "latched={latched}: no Away request");
         assert!(s.viewer_status.pending.is_none());
@@ -1300,7 +1350,7 @@ fn replacing_retrying_or_completed_status_never_cancels_a_released_ticket() {
     s.viewer_status.step(&s.api);
     s.viewer_status.step(&s.api);
     s.viewer_status.cancel(&s.api);
-    assert_eq!(trace(&[838]), ["376(-2,-2,1,4,0,-2)", "377(5)"]);
+    assert_eq!(trace(&[838, 1103]), ["376(-2,-2,1,4,0,-2)", "377(5)"]);
     assert!(s.viewer_status.pending.is_none());
     forget(s);
     fs::remove_dir_all(viewer).unwrap();
@@ -1350,7 +1400,7 @@ fn sign_out_closes_like_the_viewer_without_pumping() {
     assert_eq!(events, ["{\"type\":\"native_sign_out_complete\",\"code\":0}\n"]);
     assert!(started.elapsed() >= Duration::from_millis(200), "817 polls are >= 100 ms apart");
     // 838 only decides whether final pushes can still be answered.
-    assert_eq!(trace(&[838]), [
+    assert_eq!(trace(&[838, 1103]), [
         "816(1)", "817()", "817()", "817()", "463()", "434()", "1502(0,0,0,0)",
         "828()", "824(0,0,0)", "819(0)", "872()", "1149(0,0)", "920()", "915()",
     ]);
@@ -1367,7 +1417,7 @@ fn sign_out_failure_is_reported_after_teardown_and_never_as_success() {
     script(817, &[-1038]);
     let events = events::capture(|| drop(s));
     assert_eq!(events, ["{\"type\":\"native_sign_out_complete\",\"code\":-1038}\n"]);
-    assert_eq!(trace(&[838]), ["816(1)", "817()", "463()", "434()", "1502(0,0,0,0)", "920()", "915()"]);
+    assert_eq!(trace(&[838, 1103]), ["816(1)", "817()", "463()", "434()", "1502(0,0,0,0)", "920()", "915()"]);
     fs::remove_dir_all(viewer).unwrap();
 }
 
@@ -1381,18 +1431,18 @@ fn concurrent_loads_retry_a_full_table_and_cancel_only_their_own_tickets() {
     let mut frames = 0;
     let results = run_concurrent(&s.api, &LISTS[..2], &mut || { frames += 1; true });
     assert_eq!(results, [1, 1]);
-    assert_eq!(trace(&[838]), ["163()", "171()", "164(1)", "171()", "164(1)", "172(2)", "164(1)"]);
+    assert_eq!(trace(&[838, 1103]), ["163()", "171()", "164(1)", "171()", "164(1)", "172(2)", "164(1)"]);
     assert_eq!(frames, 3);
     clear_calls();
     script(164, &[SLOTS_FULL]);
     script(1107, &[1]);
     assert_eq!(run_concurrent(&s.api, &LISTS[..1], &mut || true), [SLOTS_FULL]);
-    assert_eq!(trace(&[838]), ["163()", "164(1)", "1107(-256)"],
+    assert_eq!(trace(&[838, 1103]), ["163()", "164(1)", "1107(-256)"],
         "a failed poll is not a new allocation attempt under the Login policy");
     clear_calls();
     let results = run_concurrent(&s.api, &LISTS[..2], &mut || false);
     assert_eq!(results, [native_jobs::ABORTED, native_jobs::ABORTED]);
-    assert_eq!(trace(&[838]), ["163()", "171()", "337(1)", "337(2)"]);
+    assert_eq!(trace(&[838, 1103]), ["163()", "171()", "337(1)", "337(2)"]);
     forget(s);
     fs::remove_dir_all(viewer).unwrap();
 }
@@ -1410,7 +1460,6 @@ fn friend_observer_only_reads_locked_getters() {
         let _ = done.send(raw_calls());
     });
     std::thread::sleep(Duration::from_millis(700));
-    refuse_friends_refresh();
     stop.send(()).unwrap();
     thread.join().unwrap();
     let calls = calls.recv().unwrap();
@@ -1549,22 +1598,6 @@ fn a_failed_open_names_its_stage() {
 fn notification_texts_lose_carriage_returns_like_the_viewer() {
     assert_eq!(viewer_text(1302, b"a\r\nb\r".to_vec()), b"a\nb");
     assert_eq!(viewer_text(1072, b"a\r\nb".to_vec()), b"a\r\nb");
-}
-
-#[test]
-fn table_rejects_foreign_entries_before_any_function_call() {
-    let mut table = vec![0; 1560];
-    let base = 0x10000000;
-    for &(slot, rva) in ENTRY_RVAS.iter().chain(crate::native_social::ENTRY_RVAS).chain(crate::native_jobs::ENTRY_RVAS) {
-        table[slot] = base + rva;
-    }
-    assert!(validate_entries(&table, base).is_ok());
-    for slot in [1502, 163, 164, 199, 1074, 1075, 824, 871, 891, 1103, 376, 404, 816] {
-        table[slot] += 1;
-        assert!(validate_entries(&table, base).is_err());
-        table[slot] -= 1;
-    }
-    assert!(validate_entries(&table, usize::MAX).is_err());
 }
 
 #[test]
