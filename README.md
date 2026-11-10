@@ -79,7 +79,7 @@ Crystal remembers a window for every account, puts it back at launch, and **Arra
 See who is online, keep a conversation going with unread badges, and read your PlayOnline mailbox from the same window you launch from. Privacy mode (shown here) masks names and messages for streams and screenshots.
 
 <p align="center">
-  <img src="docs/screenshots/friends.png" alt="PlayOnline Friends in privacy mode: names and messages masked" width="900">
+  <img src="docs/screenshots/friends-private.png" alt="PlayOnline Friends in privacy mode: names and messages masked" width="900">
 </p>
 
 ## Updates you can trust
