@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/home.jpg" alt="Crystal Launcher Home at dusk: the account rail with five sample accounts in different states, a hero sky, live PlayOnline news and a Play button" width="900"><br>
+  <img src="docs/screenshots/home-v12.jpg" alt="Crystal Launcher Home at dusk: the account rail with five sample accounts in different states, a hero sky, live PlayOnline news and a Play button" width="900"><br>
   <sub>Every screenshot in this README uses sample accounts and friends.</sub>
 </p>
 
@@ -83,8 +83,8 @@ Crystal remembers a window for every account, puts it back at launch, and **Arra
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/hotkeys.png" alt="Features, Hotkeys: Next window Ctrl+Tab and Previous window Ctrl+Shift+Tab, with per-account keys Ctrl+Alt+1 and Ctrl+Alt+2"></td>
-    <td width="50%"><img src="docs/screenshots/features.png" alt="Features, Windows: Grid and Main large layouts, Arrange all, and the remembered window size for each account"></td>
+    <td width="50%"><img src="docs/screenshots/hotkeys-v12.png" alt="Features, Hotkeys: Next window Ctrl+Tab and Previous window Ctrl+Shift+Tab, with per-account keys Ctrl+Alt+1 and Ctrl+Alt+2"></td>
+    <td width="50%"><img src="docs/screenshots/features-v12.png" alt="Features, Windows: Grid and Main large layouts, Arrange all, and the remembered window size for each account"></td>
   </tr>
   <tr>
     <td align="center"><sub><b>Ctrl+Tab / Ctrl+Shift+Tab</b> cycle characters in Home order</sub></td>
@@ -107,7 +107,7 @@ Crystal remembers a window for every account, puts it back at launch, and **Arra
 See who is online, keep a conversation going with unread badges, and read your PlayOnline mailbox from the same window you launch from. Friends and your own accounts show their PlayOnline profile pictures, read from your own PlayOnline Viewer install; Crystal bundles none. Privacy mode (shown here) masks names and messages for streams and screenshots, and swaps the pictures for the default silhouette.
 
 <p align="center">
-  <img src="docs/screenshots/friends-private.png" alt="PlayOnline Friends in privacy mode: names and messages masked" width="900">
+  <img src="docs/screenshots/friends-private-v12.png" alt="PlayOnline Friends in privacy mode: names and messages masked" width="900">
 </p>
 
 ## Updates you can trust
@@ -115,7 +115,7 @@ See who is online, keep a conversation going with unread badges, and read your P
 File check, repair, resumable downloads and backups for FFXI and PlayOnline, with support for POL 1.18.15f. An interrupted download picks up where it stopped. A crystal on the Downloads page fills as the update runs, and the card above shows the percentage, time left and current file.
 
 <p align="center">
-  <img src="docs/screenshots/updates.png" alt="Downloads page mid-update: the crystal gauge filled to 28 percent, with overall progress, time left and installed versus latest version" width="900">
+  <img src="docs/screenshots/updates-v12.png" alt="Downloads page mid-update: the crystal gauge filled to 28 percent, with overall progress, time left and installed versus latest version" width="900">
 </p>
 
 ## Pick up a controller
@@ -123,15 +123,15 @@ File check, repair, resumable downloads and backups for FFXI and PlayOnline, wit
 Set up Xbox, PlayStation (DualSense) and ROG Xbox Ally controllers with a live input test and bindings. Crystal itself can be driven with a controller too.
 
 <p align="center">
-  <img src="docs/screenshots/controller-ps5.png" alt="Settings, Controller: a DualSense controller with a live input test and button bindings" width="900">
+  <img src="docs/screenshots/controller-ps5-v12.png" alt="Settings, Controller: a DualSense controller with a live input test and button bindings" width="900">
 </p>
 
 ## Your launcher, your way
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/home-light.jpg" alt="Home in the light theme, with a pale dusk sky"></td>
-    <td width="50%"><img src="docs/screenshots/home-ja.jpg" alt="Home in Japanese, with the rail, sky and Japanese news cards"></td>
+    <td width="50%"><img src="docs/screenshots/home-light-v12.jpg" alt="Home in the light theme, with a pale dusk sky"></td>
+    <td width="50%"><img src="docs/screenshots/home-ja-v12.jpg" alt="Home in Japanese, with the rail, sky and Japanese news cards"></td>
   </tr>
   <tr>
     <td align="center"><sub><b>Dark and light</b> themes</sub></td>
