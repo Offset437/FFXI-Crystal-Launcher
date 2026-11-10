@@ -7,19 +7,40 @@
 //! Hooks are out-of-context, so nothing is loaded into the game. The per-game hooks are scoped
 //! to that game's processes; the one global hook is the foreground change, which only fires when
 //! the user switches windows. That hook also arms the in-game hotkeys (the cycle keys): they are
-//! registered while a tracked game's window is in front and released on any other change.
+//! registered while a tracked game's window is in front and released on any other change, and
+//! for the same span the low-level keyboard hook (`keyhook`) takes exactly those chords, since a
+//! game reading the keyboard through DirectInput keeps registered hotkeys from arriving.
 
 use super::hotkeys::{Gate, Hotkey, Registrar};
+use super::keyhook::{Fired, KeyHook, WM_HOOK_HOTKEY, WM_HOOK_RELEASE};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 
+/// How a hotkey press arrived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Via {
+    /// WM_HOTKEY (RegisterHotKey): this thread received the input.
+    Hotkey,
+    /// The low-level keyboard hook took the chord over a game (`keyhook`).
+    Hook,
+}
+
+impl Via {
+    pub(crate) fn name(self) -> &'static str {
+        match self { Self::Hotkey => "WM_HOTKEY", Self::Hook => "hook" }
+    }
+}
+
 /// What the desktop thread reports, on the desktop thread itself (so a hotkey's handler may set
 /// the foreground window: the hotkey's input belongs to this thread).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Event {
-    Hotkey(i32),
+    /// `key`: the key event that fired it, when the hook took it.
+    Hotkey { id: i32, via: Via, key: Option<Fired> },
+    /// A line for the launch history (`hotkeys: ...`).
+    Log(String),
     /// The hotkeys after a `Command::Hotkeys`: each id with Ok, or the Windows error.
     Registered(Vec<(i32, Result<(), u32>)>),
     Foreground { hwnd: isize, pid: u32 },
@@ -76,7 +97,31 @@ struct State {
     gate: Gate,
     /// Per tracked process: its scoped hooks.
     tracked: BTreeMap<u32, Vec<HWINEVENTHOOK>>,
+    /// The tracked processes, shared with the keyboard hook's thread.
+    pids: Arc<Mutex<Vec<u32>>>,
     foreground_hook: Option<HWINEVENTHOOK>,
+    /// A tracked game's window is in front (as last seen by the foreground hook).
+    in_game: bool,
+    /// The keyboard hook's thread, started the first time the in-game keys are armed.
+    keyhook: Option<KeyHook>,
+    /// Work waiting for its timer (`later`), by timer id.
+    timers: Vec<(usize, Box<dyn FnOnce() + Send>)>,
+    next_timer: usize,
+}
+
+/// Run `work` on the desktop thread `ms` from now (one timer on its window: nothing polls).
+/// Only the desktop thread may ask, from one of its handlers; false anywhere else.
+pub(crate) fn later(ms: u32, work: Box<dyn FnOnce() + Send>) -> bool {
+    STATE.with(|s| {
+        let Ok(mut state) = s.try_borrow_mut() else { return false };
+        let Some(state) = state.as_mut() else { return false };
+        state.next_timer += 1;
+        let id = state.next_timer;
+        // SAFETY: a timer on this thread's own window, killed when it fires or with the window.
+        if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SetTimer(state.window, id, ms, None) } == 0 { return false; }
+        state.timers.push((id, work));
+        true
+    })
 }
 
 thread_local! { static STATE: std::cell::RefCell<Option<State>> = const { std::cell::RefCell::new(None) }; }
@@ -139,7 +184,8 @@ fn run(sink: Sink, queue: Arc<Mutex<VecDeque<Command>>>, ready: std::sync::mpsc:
         if hwnd.is_null() { let _ = ready.send(None); return; }
         STATE.with(|s| *s.borrow_mut() = Some(State {
             sink, queue, window: hwnd, hotkeys: Vec::new(), results: Vec::new(), gate: Gate::default(),
-            tracked: BTreeMap::new(), foreground_hook: None,
+            tracked: BTreeMap::new(), pids: Arc::new(Mutex::new(Vec::new())), foreground_hook: None, in_game: false, keyhook: None,
+            timers: Vec::new(), next_timer: 0,
         }));
         let _ = ready.send(Some(hwnd as isize));
         let mut msg: MSG = std::mem::zeroed();
@@ -155,8 +201,25 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
     match message {
         WM_HOTKEY => { hotkey(wparam as i32, (lparam >> 16) as u16); 0 }
+        WM_HOOK_HOTKEY => { emit(Event::Hotkey { id: wparam as i32, via: Via::Hook, key: Some(Fired::unpack(lparam)) }); 0 }
+        WM_HOOK_RELEASE => {
+            emit(Event::Log(format!("hotkeys: chord key released after {} ms, {} repeats swallowed", lparam as u32, wparam as u32)));
+            0
+        }
+        WM_TIMER => {
+            // SAFETY: a timer `later` set on this window.
+            unsafe { KillTimer(hwnd, wparam) };
+            let work = STATE.with(|s| s.borrow_mut().as_mut().and_then(|state| {
+                let at = state.timers.iter().position(|(id, _)| *id == wparam)?;
+                Some(state.timers.swap_remove(at).1)
+            }));
+            if let Some(work) = work { work(); } // outside the state: it may call back in
+            0
+        }
         WM_COMMANDS => { drain(hwnd); 0 }
         WM_DESTROY => {
+            let keyhook = STATE.with(|s| s.borrow_mut().as_mut().and_then(|state| state.keyhook.take()));
+            drop(keyhook); // its thread ends; joined outside the state
             STATE.with(|s| {
                 if let Some(state) = s.borrow_mut().as_mut() {
                     state.gate.disarm(&mut Windows(hwnd));
@@ -211,13 +274,60 @@ fn foreground_pid() -> Option<u32> { super::game_window::foreground().map(|(_, p
 
 /// Arm or disarm the in-game hotkeys for the process now in front. Whether to report.
 fn gate_focus(pid: Option<u32>) -> bool {
-    STATE.with(|s| {
+    let (report, line) = STATE.with(|s| {
         let mut state = s.borrow_mut();
-        let Some(state) = state.as_mut() else { return false };
+        let Some(state) = state.as_mut() else { return (false, None) };
         let game = is_game(state, pid);
         let window = state.window;
-        state.gate.focus(game, &mut Windows(window))
-    })
+        let report = state.gate.focus(game, &mut Windows(window));
+        (report, set_in_game(state, game))
+    });
+    if let Some(line) = line { emit(Event::Log(line)); }
+    report
+}
+
+/// Whether a game is in front changed to `game`: arm or disarm the keyboard hook to match the
+/// registered keys, and describe the change for the history (nothing while no in-game key is set).
+fn set_in_game(state: &mut State, game: bool) -> Option<String> {
+    if game && state.in_game {
+        // Game to game: that game takes the keyboard (and DirectInput's own hook) as it comes in
+        // front, so the hook is installed again to stay ahead of it. The key that made the switch
+        // is usually still down: the hook keeps its press (`keyhook::Matcher`), so its repeats
+        // switch nothing. Quietly: only a failure is told.
+        let keys = state.gate.keys().to_vec();
+        let result = state.keyhook.as_ref().filter(|_| !keys.is_empty()).map(|hook| hook.arm(keys));
+        return match result {
+            Some(Err(code)) => Some(format!("hotkeys: game to game: hook failed (error {code})")),
+            _ => None,
+        };
+    }
+    if game == state.in_game { return None; }
+    state.in_game = game;
+    if !game {
+        if let Some(hook) = &state.keyhook { hook.disarm(); }
+        return (!state.gate.keys().is_empty()).then(|| "hotkeys: game left: cycle keys unregistered, hook off".to_owned());
+    }
+    let keys = state.gate.keys().to_vec();
+    if keys.is_empty() { return None; }
+    let registered: Vec<String> = keys.iter().map(|(id, hotkey)| {
+        match state.gate.results().iter().find(|(i, _)| i == id).map(|(_, r)| *r) {
+            Some(Ok(())) => format!("{hotkey} registered"),
+            Some(Err(code)) => format!("{hotkey} not registered (error {code})"),
+            None => format!("{hotkey} not tried"),
+        }
+    }).collect();
+    if state.keyhook.is_none() {
+        match KeyHook::start(state.window as isize, state.pids.clone()) {
+            Ok(hook) => state.keyhook = Some(hook),
+            Err(error) => return Some(format!("hotkeys: game in front: {}; hook unavailable ({error})", registered.join(", "))),
+        }
+    }
+    let hook = match state.keyhook.as_ref().map(|hook| hook.arm(keys)) {
+        Some(Ok(())) => "hook on".to_owned(),
+        Some(Err(code)) => format!("hook failed (error {code})"),
+        None => "hook unavailable".to_owned(),
+    };
+    Some(format!("hotkeys: game in front: {}; {hook}", registered.join(", ")))
 }
 
 /// A hotkey was pressed. An in-game one that arrives after the foreground left the games (its
@@ -227,12 +337,16 @@ fn hotkey(id: i32, key: u16) {
     let stale = STATE.with(|s| {
         let mut state = s.borrow_mut();
         let Some(state) = state.as_mut() else { return false };
-        if !state.gate.is_key(id) || is_game(state, foreground_pid()) { return false; }
+        // No window in front at all is not "left": the game that had the foreground is between
+        // windows of its own, and is still what the user sees.
+        let front = super::game_window::foreground();
+        if !state.gate.is_key(id) || front.is_none_or(|(_, pid)| is_game(state, Some(pid))) { return false; }
         let window = state.window;
         state.gate.disarm(&mut Windows(window));
         true
     });
-    if !stale { emit(Event::Hotkey(id)); return; }
+    if !stale { emit(Event::Hotkey { id, via: Via::Hotkey, key: None }); return; }
+    emit(Event::Log(format!("hotkeys: WM_HOTKEY id {id} after the game left the front: unregistered, key passed on")));
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP};
     // The modifiers are still held: only the key itself is sent again.
     let input = |flags| INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: key, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } } };
@@ -249,7 +363,16 @@ fn drain(hwnd: HWND) {
             Command::Hotkeys(list) => { register(hwnd, &list); changed = true; }
             Command::GameHotkeys(list) => {
                 let game = is_game_now();
-                STATE.with(|s| if let Some(state) = s.borrow_mut().as_mut() { state.gate.set_keys(list, game, &mut Windows(hwnd)); });
+                let line = STATE.with(|s| {
+                    let mut state = s.borrow_mut();
+                    let state = state.as_mut()?;
+                    state.gate.set_keys(list, game, &mut Windows(hwnd));
+                    // New keys: the hook follows them (re-armed now when a game is in front).
+                    if let Some(hook) = &state.keyhook { hook.disarm(); }
+                    state.in_game = false;
+                    set_in_game(state, game)
+                });
+                if let Some(line) = line { emit(Event::Log(line)); }
                 changed = true;
             }
             Command::Track(pids) => {
@@ -295,6 +418,7 @@ fn track(pids: &[u32]) {
                 .filter(|h| !h.is_null()).collect();
             state.tracked.insert(pid, hooks);
         }
+        *state.pids.lock().unwrap_or_else(|e| e.into_inner()) = state.tracked.keys().copied().collect();
         match (state.tracked.is_empty(), state.foreground_hook) {
             (true, Some(hook)) => { unsafe { UnhookWinEvent(hook) }; state.foreground_hook = None; }
             (false, None) => {
@@ -356,6 +480,26 @@ mod tests {
         let (done, finished) = mpsc::channel();
         desktop.send(Command::Run(Box::new(move || { let _ = done.send(STATE.with(|s| s.borrow().as_ref().map(|st| (st.tracked.len(), st.foreground_hook.is_some())))); })));
         assert_eq!(finished.recv_timeout(wait).unwrap(), Some((0, false)));
+        drop(desktop);
+    }
+
+    #[test]
+    fn work_asked_for_later_runs_once_on_the_desktop_thread() {
+        let desktop = Desktop::start(Arc::new(|_| {})).unwrap();
+        let wait = std::time::Duration::from_secs(5);
+        let (done, finished) = mpsc::channel();
+        let asked = std::time::Instant::now();
+        desktop.send(Command::Run(Box::new(move || {
+            let thread = std::thread::current().id();
+            let ran = done.clone();
+            let set = later(40, Box::new(move || { let _ = ran.send((std::thread::current().id() == thread, asked.elapsed())); }));
+            if !set { let _ = done.send((false, asked.elapsed())); }
+        })));
+        let (same_thread, after) = finished.recv_timeout(wait).unwrap();
+        assert!(same_thread, "set, and run on the desktop thread");
+        assert!(after >= std::time::Duration::from_millis(30), "not before its time: {after:?}");
+        assert!(finished.recv_timeout(std::time::Duration::from_millis(150)).is_err(), "once");
+        assert!(!later(1, Box::new(|| {})), "only the desktop thread may ask");
         drop(desktop);
     }
 

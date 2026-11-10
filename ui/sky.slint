@@ -1,0 +1,347 @@
+// Home's sky (Skyline): Vana'diel's sky over the party, picked by the Vana'diel clock that
+// src/slint_host/sky.rs works out from the PC clock (no network, no game). Four still pictures
+// (night with the moon's real phase, dawn, day, dusk) drawn from baked, dithered skies, the star
+// field and the party's silhouette. A change of sky crossfades over a few seconds; otherwise
+// nothing animates, and the clock wakes only at the next shown change.
+import { Theme } from "theme.slint";
+
+/// The Vana'diel clock, set by sky.rs.
+export global Sky {
+    /// 0 night (20:00 to 04:00), 1 dawn (04:00 to 07:00), 2 day (07:00 to 17:00), 3 dusk.
+    in property <int> phase;
+    /// While the sky changes: the one fading out (-1 for none) and how far the new one has come
+    /// in (0 to 1, eased).
+    in property <int> under: -1;
+    in property <float> fade: 1;
+    /// The weekday, Firesday 0 to Darksday 7 (the element dot's colour), and its name.
+    in property <int> weekday;
+    in property <string> day;
+    /// Vana'diel time to ten minutes ("21:40").
+    in property <string> time;
+    /// The moon's phase in words with its percentage ("Waxing gibbous 62%").
+    in property <string> moon;
+    /// The lit part of a 28-unit moon disc (SVG path).
+    in property <string> moon-path: "M14 0A14 14 0 0 1 14 28A14 14 0 0 1 14 0Z";
+
+    /// The weekday's element colour.
+    public pure function element(day: int) -> color {
+        Theme.light
+            ? (day == 0 ? #C7553A : day == 1 ? #9A7428 : day == 2 ? #2F6FB8 : day == 3 ? #2E8A55
+                : day == 4 ? #58B8E0 : day == 5 ? #7C52C8 : day == 6 ? #A08A2E : #5E5378)
+            : (day == 0 ? #F2846B : day == 1 ? #D9B26A : day == 2 ? #6FA8F2 : day == 3 ? #7AD19A
+                : day == 4 ? #9DD6F0 : day == 5 ? #B892F2 : day == 6 ? #EDE6C8 : #A699C4);
+    }
+}
+
+/// The moon: its disc, faint, and the lit part (Sky.moon-path).
+component Moon inherits Rectangle {
+    width: 28px;
+    height: 28px;
+    border-radius: 14px;
+    background: Theme.light ? #FFFFFF59 : #DCE9F71A;
+    Path {
+        width: 28px;
+        height: 28px;
+        viewbox-width: 28;
+        viewbox-height: 28;
+        commands: Sky.moon-path;
+        fill: Theme.light ? #FFFFFFE6 : #DCE9F7;
+        stroke: transparent;
+        stroke-width: 0px;
+    }
+}
+/// The sky band behind Home's top, layer by layer as a.css draws `.sky` (crystal-design-v12b):
+/// the phase's gradient, the star field, the glow, the moon, the party's silhouette (the portal
+/// art's alpha mask, tinted) and the fade into the window colour. The dark theme has four skies
+/// (a-sky.html); the light theme has one, the day sky with its pale moon (home-light).
+///
+/// Night and the light sky have a render at the hero's size (home-dark, home-light) and follow
+/// `.sky` as written. Dawn, day and dusk have only their sky-times tile (`.sp`: a 326 x 214
+/// frame with the party 420 px wide), so they follow the tile, scaled until its party is the
+/// hero's and laid where the party is: the gradient runs the tile's height, the glow keeps the
+/// tile's size and place behind the party, and the fade is the tile's.
+///
+/// The gradient, the glow, the light's falloff and the foot's fade are pictures baked by assets/sky/bake.py, smoothed
+/// and dithered: the renderer's own gradients and alpha blends step in 8-bit bands. The
+/// renderer samples a scaled picture at its nearest pixel, which keeps their grain, so one of
+/// each serves every display scale. The party, the stars and the wordmark have sharp edges and
+/// come at 1x, 1.5x and 2x.
+///
+/// The party is two masks. Night and the light sky take the art's own alpha, as their renders
+/// draw it. Dawn, day and dusk take the solid silhouette: the art's alpha is open line work,
+/// and on a bright sky at this size it reads as a lit, see-through drawing, where the tile (the
+/// same art at half the size) reads as a dark shape.
+///
+/// A change of sky crossfades (Sky.under, Sky.fade). The renderer has no group opacity, so the
+/// two skies cross part by part: the outgoing gradient and glow whole under the incoming
+/// gradient (which fades them out exactly), the incoming glow and the stars and moon each by
+/// their own weight, and the outgoing party fading only late, so the silhouette stays solid
+/// through the change. The foot's length eases between the two.
+///
+/// The band has no edge of its own: one elliptical falloff around the party (soft-<phase>.png)
+/// melts it into the bar, the rail, the window's edge and the page alike. The moon sits over
+/// the falloff, a little nearer the party.
+export component SkyBackdrop inherits Rectangle {
+    private property <int> to: Theme.light ? 4 : Sky.phase;
+    private property <bool> fading: Sky.under >= 0 && !Theme.light;
+    private property <int> from: root.fading ? Sky.under : root.to;
+    private property <float> mix: root.fading ? Sky.fade : 1;
+    // How much of the night sky (its stars) and of a moon sky shows.
+    private property <float> night: (root.to == 0 ? root.mix : 0) + (root.fading && root.from == 0 ? 1 - root.mix : 0);
+    private property <float> moon: root.night + (root.to == 4 ? 1 : 0);
+    // The party's width and how far it hangs past the band's right edge and foot.
+    private property <length> crowd-w: Theme.small ? 640px : 860px;
+    private property <length> crowd-h: Theme.small ? 249px : 334px;
+    private property <length> crowd-right: Theme.small ? 34px : 30px;
+    private property <length> crowd-foot: Theme.small ? 30px : 36px;
+    // The light's width: 1180 px at the hero's size, in step with the party.
+    private property <length> soft-w: 1180px * (root.crowd-w / 860px);
+    // A tile pixel at the hero's size.
+    private property <float> tile: root.crowd-w / 420px;
+    private property <length> foot: root.foot-of(root.from) * (1 - root.mix) + root.foot-of(root.to) * root.mix;
+    private property <length> fade: root.fade-of(root.from) * (1 - root.mix) + root.fade-of(root.to) * root.mix;
+    // The pictures' scale: 0 for 1x, 1 for 1.5x, 2 for 2x (and above).
+    private property <float> dpr: 1px / 1phx;
+    private property <int> at: root.dpr < 1.2 ? 0 : root.dpr < 1.75 ? 1 : 2;
+
+    /// Dawn, day and dusk follow the sky-times tile.
+    pure function solid(p: int) -> bool { p >= 1 && p <= 3 }
+    /// How far the tile's foot (the party hangs 20 tile pixels past it) stands above the band's.
+    pure function foot-of(p: int) -> length { root.solid(p) ? max(0px, 20px * root.tile - root.crowd-foot) : 0px }
+    pure function fade-of(p: int) -> length { root.solid(p) ? 40px * root.tile : 80px }
+    /// The glow: a square, of which the picture holds the top 5/8 (the band never shows the
+    /// rest). The tile's glow is centred 152 tile pixels left of the party's right edge and 34
+    /// above the foot; `.sky`'s sits in the band's top right corner.
+    pure function glow-side(p: int) -> length { root.solid(p) ? 380px * root.tile : Theme.small ? 540px : 700px }
+    pure function glow-x(p: int) -> length {
+        root.solid(p) ? root.width + root.crowd-right - 152px * root.tile - root.glow-side(p) / 2
+            : root.width - root.glow-side(p) + (Theme.small ? 40px : 10px)
+    }
+    pure function glow-y(p: int) -> length {
+        root.solid(p) ? root.height - root.foot-of(p) - 34px * root.tile - root.glow-side(p) / 2 : Theme.small ? -30px : -20px
+    }
+    pure function strip(p: int) -> image {
+        p == 0 ? @image-url("../assets/sky/sky-night.png") : p == 1 ? @image-url("../assets/sky/sky-dawn.png")
+            : p == 2 ? @image-url("../assets/sky/sky-day.png") : p == 3 ? @image-url("../assets/sky/sky-dusk.png")
+            : @image-url("../assets/sky/sky-light.png")
+    }
+    pure function glow(p: int) -> image {
+        p == 0 ? @image-url("../assets/sky/glow-night.png") : p == 1 ? @image-url("../assets/sky/glow-dawn.png")
+            : p == 2 ? @image-url("../assets/sky/glow-day.png") : p == 3 ? @image-url("../assets/sky/glow-dusk.png")
+            : @image-url("../assets/sky/glow-light.png")
+    }
+    /// The party's mask at the display scale (the small window at 2x takes the hero's 1.5x
+    /// mask: 1290 for 1280, within 1 %).
+    pure function crowd(p: int) -> image {
+        root.solid(p)
+            ? (Theme.small
+                ? (root.at == 0 ? @image-url("../assets/sky/crowd-solid-640.png") : root.at == 1 ? @image-url("../assets/sky/crowd-solid-960.png")
+                    : @image-url("../assets/sky/crowd-solid-1290.png"))
+                : (root.at == 0 ? @image-url("../assets/sky/crowd-solid-860.png") : root.at == 1 ? @image-url("../assets/sky/crowd-solid-1290.png")
+                    : @image-url("../assets/sky/crowd-solid-1720.png")))
+            : (Theme.small
+                ? (root.at == 0 ? @image-url("../assets/sky/crowd-640.png") : root.at == 1 ? @image-url("../assets/sky/crowd-960.png")
+                    : @image-url("../assets/sky/crowd-1290.png"))
+                : (root.at == 0 ? @image-url("../assets/sky/crowd-860.png") : root.at == 1 ? @image-url("../assets/sky/crowd-1290.png")
+                    : @image-url("../assets/sky/crowd-1720.png")))
+    }
+    pure function crowd-tint(p: int) -> color {
+        p == 0 ? #04070D : p == 1 ? #0B0A16 : p == 2 ? #06101F : p == 3 ? #0A0A1C : #234B69
+    }
+
+    clip: true;
+    background: Theme.bg;
+    if root.fading: Image {
+        width: parent.width;
+        height: parent.height;
+        source: root.strip(root.from);
+        image-fit: fill;
+        accessible-role: none;
+    }
+    // The outgoing glow whole: the incoming gradient over it fades it out exactly.
+    if root.fading: Image {
+        x: root.glow-x(root.from);
+        y: root.glow-y(root.from);
+        width: root.glow-side(root.from);
+        height: self.width * 0.625;
+        source: root.glow(root.from);
+        image-fit: fill;
+        accessible-role: none;
+    }
+    Image {
+        width: parent.width;
+        height: parent.height;
+        source: root.strip(root.to);
+        image-fit: fill;
+        opacity: root.mix;
+        accessible-role: none;
+    }
+    // Stars at night only (sky-times).
+    if root.night > 0: Image {
+        x: 0;
+        y: 50px;
+        width: 1200px;
+        height: 300px;
+        source: root.at == 0 ? @image-url("../assets/sky/stars.png") : root.at == 1 ? @image-url("../assets/sky/stars-1800.png")
+            : @image-url("../assets/sky/stars-2400.png");
+        image-fit: fill;
+        opacity: 0.9 * root.night;
+        accessible-role: none;
+    }
+    Image {
+        x: root.glow-x(root.to);
+        y: root.glow-y(root.to);
+        width: root.glow-side(root.to);
+        height: self.width * 0.625;
+        source: root.glow(root.to);
+        image-fit: fill;
+        opacity: root.mix;
+        accessible-role: none;
+    }
+    // The outgoing party leaves late (1 - mix³), so where both are solid the silhouette never
+    // thins; the incoming one comes in with its sky.
+    if root.fading: Image {
+        x: parent.width - self.width + root.crowd-right;
+        y: parent.height - self.height + root.crowd-foot;
+        width: root.crowd-w;
+        height: root.crowd-h;
+        source: root.crowd(root.from);
+        image-fit: fill;
+        colorize: root.crowd-tint(root.from);
+        opacity: 1 - root.mix * root.mix * root.mix;
+        accessible-role: none;
+    }
+    Image {
+        x: parent.width - self.width + root.crowd-right;
+        y: parent.height - self.height + root.crowd-foot;
+        width: root.crowd-w;
+        height: root.crowd-h;
+        source: root.crowd(root.to);
+        image-fit: fill;
+        colorize: root.crowd-tint(root.to);
+        opacity: (Theme.light ? 0.62 : 1) * root.mix;
+        accessible-role: none;
+    }
+    // The light's falloff: the window colour over everything outside an ellipse around the
+    // party, so the sky meets the bar, the rail, the band's right edge and the page with the same
+    // soft edge. The picture keeps the party's scale and stands on the band's right edge; left of
+    // it the page is whole (a pixel under the picture's edge, so no seam). It lies under the
+    // foot's fade. The incoming sky's grain serves both during a change.
+    if root.width > root.soft-w: Rectangle {
+        x: 0;
+        width: root.width - root.soft-w + 1px;
+        height: parent.height;
+        background: Theme.bg;
+    }
+    Image {
+        x: parent.width - self.width;
+        width: root.soft-w;
+        height: parent.height;
+        source: root.to == 0 ? @image-url("../assets/sky/soft-night.png") : root.to == 1 ? @image-url("../assets/sky/soft-dawn.png")
+            : root.to == 2 ? @image-url("../assets/sky/soft-day.png") : root.to == 3 ? @image-url("../assets/sky/soft-dusk.png")
+            : @image-url("../assets/sky/soft-light.png");
+        image-fit: fill;
+        colorize: Theme.bg;
+        accessible-role: none;
+    }
+    // The moon is its own light: over the falloff, a little nearer the party.
+    if root.moon > 0: Moon {
+        x: parent.width - (Theme.small ? 176px : 204px) - 28px - (Theme.small ? 22px : 30px);
+        y: (Theme.small ? 62px : 70px) + (Theme.small ? 18px : 26px);
+        opacity: min(1, root.moon);
+    }
+    // The foot melts into the page (a smoothstep), solid for the last `foot`.
+    Image {
+        y: parent.height - root.foot - self.height;
+        width: parent.width;
+        height: root.fade;
+        source: root.to == 0 ? @image-url("../assets/sky/fade-night.png") : root.to == 1 ? @image-url("../assets/sky/fade-dawn.png")
+            : root.to == 2 ? @image-url("../assets/sky/fade-day.png") : root.to == 3 ? @image-url("../assets/sky/fade-dusk.png")
+            : @image-url("../assets/sky/fade-light.png");
+        image-fit: fill;
+        colorize: Theme.bg;
+        accessible-role: none;
+    }
+    if root.foot > 0: Rectangle {
+        y: parent.height - root.foot;
+        height: root.foot;
+        background: Theme.bg;
+    }
+    // Square Enix's notice for the art, in the band's corner.
+    Text {
+        x: parent.width - self.width - Theme.page-x;
+        y: parent.height - self.height - 12px;
+        text: "FINAL FANTASY XI © SQUARE ENIX";
+        font-size: Theme.type-micro;
+        color: Theme.faint;
+    }
+}
+
+/// The Vana'diel line under the greeting: the weekday's element dot, its name, the time and the
+/// moon.
+export component VanaLine inherits HorizontalLayout {
+    height: 20px;
+    spacing: 0px;
+    alignment: start;
+    Rectangle {
+        cross-axis-self-alignment: center;
+        width: 8px;
+        height: 8px;
+        border-radius: 4px;
+        background: Sky.element(Sky.weekday);
+    }
+    Rectangle { width: 9px; }
+    Text { text: Sky.day; font-size: Theme.type-small; font-weight: 600; color: Theme.ink2; vertical-alignment: center; }
+    Rectangle { width: 10px; }
+    Text { text: Sky.time; font-family: Theme.mono; font-size: Theme.type-caption; font-weight: 500; color: Theme.ink2; vertical-alignment: center; }
+    Rectangle { width: 14px; }
+    // A step brighter than sub on the dark skies, where dawn's and day's glow lifts the ground it sits on.
+    Text { text: Sky.moon; font-size: Theme.type-small; color: Theme.light ? Theme.sub : #B4C2D2; vertical-alignment: center; }
+}
+
+/// The hero's words over the sky (`.hello`): the FFXI wordmark, the greeting and the Vana'diel
+/// line. `serif` sets the greeting in Source Serif italic (Japanese keeps the interface face).
+export component SkyHero inherits VerticalLayout {
+    in property <string> greeting;
+    in property <bool> serif: true;
+    // The wordmark comes at 1x, 1.5x and 2x, as the silhouette does (nearest-pixel sampling).
+    private property <float> dpr: 1px / 1phx;
+    private property <int> at: root.dpr < 1.2 ? 0 : root.dpr < 1.75 ? 1 : 2;
+    alignment: start;
+    spacing: 0px;
+    HorizontalLayout {
+        alignment: start;
+        Image {
+            width: Theme.small ? 204px : 252px;
+            height: Theme.small ? 42px : 52px;
+            source: Theme.light
+                ? (Theme.small
+                    ? (root.at == 0 ? @image-url("../assets/sky/wordmark-light-204.png") : root.at == 1 ? @image-url("../assets/sky/wordmark-light-306.png")
+                        : @image-url("../assets/sky/wordmark-light-408.png"))
+                    : (root.at == 0 ? @image-url("../assets/sky/wordmark-light-252.png") : root.at == 1 ? @image-url("../assets/sky/wordmark-light-378.png")
+                        : @image-url("../assets/sky/wordmark-light-504.png")))
+                : (Theme.small
+                    ? (root.at == 0 ? @image-url("../assets/sky/wordmark-dark-204.png") : root.at == 1 ? @image-url("../assets/sky/wordmark-dark-306.png")
+                        : @image-url("../assets/sky/wordmark-dark-408.png"))
+                    : (root.at == 0 ? @image-url("../assets/sky/wordmark-dark-252.png") : root.at == 1 ? @image-url("../assets/sky/wordmark-dark-378.png")
+                        : @image-url("../assets/sky/wordmark-dark-504.png")));
+            image-fit: fill;
+            accessible-role: image;
+            accessible-label: "FINAL FANTASY XI";
+        }
+    }
+    Rectangle { height: Theme.small ? 14px : 20px; }
+    Text {
+        height: Theme.small ? 30px : 34px;
+        text: root.greeting;
+        font-family: root.serif ? Theme.serif : Theme.sans;
+        font-italic: root.serif;
+        font-weight: root.serif ? 400 : 600;
+        font-size: root.serif ? Theme.type-greeting : Theme.type-greeting - 4px;
+        letter-spacing: self.font-size * (root.serif ? 0.003 : 0.01);
+        color: Theme.ink;
+        vertical-alignment: center;
+    }
+    Rectangle { height: Theme.small ? 6px : 10px; }
+    VanaLine { }
+}

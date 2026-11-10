@@ -32,6 +32,8 @@ const TINTS: u32 = 6;
 struct Actions {
     sign_out: Option<Message>,
     play: Option<Message>,
+    /// Your avatar: the portrait picker for the signed-in account.
+    portrait: Option<Message>,
     connect: Option<Message>,
     otp_key: Option<String>,
     account_keys: Vec<String>,
@@ -102,7 +104,8 @@ fn keep_at<T, V: ?Sized>(list: &mut Vec<T>, i: usize, value: &V, same: impl Fn(&
 #[derive(Clone, PartialEq, Debug)]
 enum Block {
     Divider { label: String, accent: bool },
-    Group { mine: bool, who: String, time: String, initial: String, tint: i32, items: Vec<Item> },
+    /// `portrait`: the portrait ID drawn (portraits::shown), so privacy mode changes the block.
+    Group { mine: bool, who: String, time: String, initial: String, tint: i32, portrait: Option<u16>, items: Vec<Item> },
 }
 
 #[derive(Clone, PartialEq, Debug, Default)]
@@ -229,6 +232,7 @@ pub(super) fn wire(ui: &MainWindow) {
 
     view.on_sign_out(|| act(|a| a.sign_out.clone()));
     view.on_play(|| act(|a| a.play.clone()));
+    view.on_choose_portrait(|| act(|a| a.portrait.clone()));
     view.on_connect(|| act(|a| a.connect.clone()));
     view.on_otp_edited(|value| act(|a| a.otp_key.clone().map(|key| Message::OtpChanged(key, value.into()))));
     view.on_account_picked(|i| act(|a| a.account_keys.get(index(i)?).cloned().map(Message::FriendsAccount)));
@@ -304,6 +308,15 @@ fn face(name: &str) -> (String, i32) {
     (name.chars().next().map(|ch| ch.to_uppercase().to_string()).unwrap_or_default(), (hash % TINTS) as i32)
 }
 
+/// An avatar's portrait (crate::portraits::image: the silhouette in privacy mode) and whether it
+/// has one; without one the initial shows.
+fn portrait_picture(portrait: Option<u16>) -> (slint::Image, bool) {
+    match crate::portraits::image(portrait) {
+        Some(image) => (image, true),
+        None => (slint::Image::default(), false),
+    }
+}
+
 fn display_name(friend: &Friend) -> String {
     if friend.name.is_empty() { t("Unnamed handle").to_owned() } else { friend.name.clone() }
 }
@@ -353,6 +366,7 @@ impl<'a> Ctx<'a> {
 /// Push `app.friends` into the window. Called after every batch of messages; only what changed
 /// is set. Nothing is worked out while another page shows.
 pub(super) fn sync(ui: &MainWindow, app: &App) {
+    badge(ui, app);
     if app.page != crate::Page::Friends {
         return;
     }
@@ -392,6 +406,17 @@ pub(super) fn sync(ui: &MainWindow, app: &App) {
     });
 }
 
+/// The top bar's Friends count: the unread PlayOnline mail while a friend list is shown.
+fn badge(ui: &MainWindow, app: &App) {
+    let friends = &app.friends;
+    let unread = friends.snapshot.as_ref().filter(|s| s.fetched_at != 0 && friends.connected).and_then(|s| s.social.inbox_unread).unwrap_or(0);
+    let text: SharedString = if unread > 0 { unread.to_string().into() } else { SharedString::new() };
+    let view = ui.global::<super::View>();
+    if view.get_friends_badge() != text {
+        view.set_friends_badge(text);
+    }
+}
+
 fn strings() -> FriendsStrings {
     FriendsStrings {
         title: t("PlayOnline friends").into(),
@@ -402,7 +427,7 @@ fn strings() -> FriendsStrings {
         choose_account: t("Choose the account to sign in").into(),
         status_options: t("Status options").into(),
         groups: t("Also set for my groups").into(),
-        auto_away_note: t("Set Away when Crystal sees no input while FFXI is closed. Applies at the next sign-in.").into(),
+        auto_away_note: t("Applies at the next sign-in.").into(),
         find: t("Find a friend…").into(),
         mailbox: t("Mailbox").into(),
         mailbox_desc: t("All your stored PlayOnline mail, from friends and others.").into(),
@@ -535,6 +560,13 @@ fn sidebar(view: &FriendsView, x: &Ctx, snapshot: &Snapshot, state: &mut State, 
         _ => 3,
     };
     put!(view, get_own_presence, set_own_presence, presence);
+    let (own, has_own) = portrait_picture(snapshot.own_portrait);
+    put!(view, get_has_own_picture, set_has_own_picture, has_own);
+    put!(view, get_own_picture, set_own_picture, own);
+    // Your avatar opens the portrait picker (browsable; changing waits for the field's confirmation).
+    actions.portrait = x.account.filter(|a| a.account.mode == crate::AccountMode::Retail).map(|a| Message::PortraitPicker(Some(a.key.clone())));
+    put!(view, get_portrait_enabled, set_portrait_enabled, actions.portrait.is_some());
+    put!(view, get_portrait_label, set_portrait_label, t("Portrait").into());
     actions.status = x.idle && !x.busy;
     put!(view, get_status_editable, set_status_editable, actions.status);
     let status_text = if actions.status {
@@ -597,7 +629,7 @@ fn sidebar(view: &FriendsView, x: &Ctx, snapshot: &Snapshot, state: &mut State, 
         }
         let folded = friends.collapsed[index];
         section(targets, rows.len(), index);
-        rows.push(FriendLine { folded, ..line(0, format!("{} · {}", label.to_uppercase(), group.len())) });
+        rows.push(FriendLine { folded, secondary: group.len().to_string().into(), ..line(0, label.to_owned()) });
         if folded {
             continue;
         }
@@ -605,10 +637,13 @@ fn sidebar(view: &FriendsView, x: &Ctx, snapshot: &Snapshot, state: &mut State, 
             let selected = open.is_some_and(|f| f.slot == friend.slot && f.name == friend.name);
             let unread = friends.unread_from(friend);
             let (initial, tint) = face(&friend.name);
+            let (picture, has_picture) = portrait_picture(friend.portrait);
             person(targets, rows.len(), friend);
             rows.push(
                 FriendLine {
                     kind: 1,
+                    picture,
+                    has_picture,
                     text: hidden(&display_name(friend)).into(),
                     folded: false,
                     secondary: secondary(friend).into(),
@@ -619,6 +654,7 @@ fn sidebar(view: &FriendsView, x: &Ctx, snapshot: &Snapshot, state: &mut State, 
                     unread: if unread > 0 { unread.to_string().into() } else { SharedString::new() },
                     bold: unread > 0,
                     strong: unread > 0 || selected,
+                    ..FriendLine::default()
                 },
             );
         }
@@ -714,6 +750,9 @@ fn conversation(view: &FriendsView, x: &Ctx, friend: &Friend, state: &mut State,
     put!(view, get_friend_secondary, set_friend_secondary, secondary(friend).into());
     put!(view, get_friend_initial, set_friend_initial, initial.into());
     put!(view, get_friend_tint, set_friend_tint, tint);
+    let (picture, has_picture) = portrait_picture(friend.portrait);
+    put!(view, get_has_friend_picture, set_has_friend_picture, has_picture);
+    put!(view, get_friend_picture, set_friend_picture, picture);
     put!(view, get_friend_presence, set_friend_presence, presence_of(friend));
     actions.remove = x.ready && friend.uid.is_some();
     keep_friend(&mut state.remove_to, friend);
@@ -761,27 +800,32 @@ fn set_blocks(state: &mut State, blocks: Vec<Block>) {
 fn to_row(block: &Block) -> ChatBlock {
     match block {
         Block::Divider { label, accent } => ChatBlock { kind: 0, label: label.into(), accent: *accent, ..ChatBlock::default() },
-        Block::Group { mine, who, time, initial, tint, items } => ChatBlock {
-            kind: 1,
-            mine: *mine,
-            who: who.into(),
-            time: time.into(),
-            initial: initial.into(),
-            tint: *tint,
-            items: ModelRc::new(VecModel::from(
-                items
-                    .iter()
-                    .map(|item| ChatItem {
-                        subject: item.subject.as_str().into(),
-                        text: item.text.as_str().into(),
-                        italic: item.italic,
-                        skeleton: item.skeleton,
-                        pending: item.pending,
-                    })
-                    .collect::<Vec<_>>(),
-            )),
-            ..ChatBlock::default()
-        },
+        Block::Group { mine, who, time, initial, tint, portrait, items } => {
+            let picture = portrait.and_then(crate::portraits::stock_image);
+            ChatBlock {
+                kind: 1,
+                mine: *mine,
+                who: who.into(),
+                time: time.into(),
+                initial: initial.into(),
+                tint: *tint,
+                has_picture: picture.is_some(),
+                picture: picture.unwrap_or_default(),
+                items: ModelRc::new(VecModel::from(
+                    items
+                        .iter()
+                        .map(|item| ChatItem {
+                            subject: item.subject.as_str().into(),
+                            text: item.text.as_str().into(),
+                            italic: item.italic,
+                            skeleton: item.skeleton,
+                            pending: item.pending,
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+                ..ChatBlock::default()
+            }
+        }
     }
 }
 
@@ -856,12 +900,14 @@ fn messages(x: &Ctx, friend: &Friend) -> Chat {
     let newest = state.mail.listed.iter().flatten().any(|page| page.len() >= 32);
     let shown = hidden(&display_name(friend));
     let (friend_initial, friend_tint) = face(&friend.name);
+    let own_portrait = state.snapshot.as_ref().and_then(|s| s.own_portrait);
     let group = |mine: bool, time: Option<chrono::DateTime<chrono::Local>>| Block::Group {
         mine,
         who: if mine { t("You").to_owned() } else { shown.clone() },
         time: time.map(|time| time.format("%H:%M").to_string()).unwrap_or_default(),
         initial: if mine { String::new() } else { friend_initial.clone() },
         tint: if mine { -1 } else { friend_tint },
+        portrait: crate::portraits::shown(if mine { own_portrait } else { friend.portrait }),
         items: Vec::new(),
     };
     let push = |blocks: &mut Vec<Block>, item: Item| {
@@ -928,7 +974,8 @@ fn composer_view(view: &FriendsView, x: &Ctx, composer: &crate::friends::Compose
     put!(view, get_subject, set_subject, privacy::mask(&composer.subject).into());
     // Privacy mode: no editor for the real content, only the fixed mask.
     actions.draft = editable && !hide;
-    put!(view, get_draft_masked, set_draft_masked, hide);
+    // An empty draft keeps its placeholder: the mask would read as typed text.
+    put!(view, get_draft_masked, set_draft_masked, hide && !composer.text.is_empty());
     put!(view, get_draft_enabled, set_draft_enabled, actions.draft);
     let draft = composer.text.clone();
     let core = draft.trim_end_matches('\n');
@@ -975,7 +1022,13 @@ fn mailbox(view: &FriendsView, x: &Ctx, snapshot: &Snapshot, state: &mut State, 
     actions.folders = FOLDERS.map(|folder| enabled.then_some(Message::FriendsSocial(Request::Inbox { folder, page: 0 })));
     let page = social.page;
     let pages = social.total.div_ceil(32).max(1);
-    put!(view, get_mail_count, set_mail_count, tf("{total} messages · Page {page} of {pages}", &[("total", &social.total), ("page", &(page + 1)), ("pages", &pages)]).into());
+    // The page only when there is more than one.
+    let count = if pages > 1 {
+        tf("{total} messages · Page {page} of {pages}", &[("total", &social.total), ("page", &(page + 1)), ("pages", &pages)])
+    } else {
+        tf("{total} messages", &[("total", &social.total)])
+    };
+    put!(view, get_mail_count, set_mail_count, count.into());
     // Paging only when there is more than one page.
     put!(view, get_paging, set_paging, pages > 1);
     actions.previous = (pages > 1 && enabled && page > 0).then(|| Message::FriendsSocial(Request::Inbox { folder: social.folder, page: page - 1 }));
@@ -1009,7 +1062,12 @@ fn mailbox(view: &FriendsView, x: &Ctx, snapshot: &Snapshot, state: &mut State, 
         keep_at(&mut state.mail_to, i, header.raw.as_str(), |old, raw| old == raw, str::to_owned);
         let mine = social.folder == 2;
         let (initial, tint) = if mine { (String::new(), -1) } else { face(&header.sender) };
+        // Your own portrait on sent mail; a friend's on theirs.
+        let portrait = if mine { snapshot.own_portrait } else { snapshot.entries.iter().find(|f| !f.alternate && f.name == header.sender).and_then(|f| f.portrait) };
+        let (picture, has_picture) = portrait_picture(portrait);
         lines.push(MailLine {
+            picture,
+            has_picture,
             unread: header.unread,
             mine,
             initial: initial.into(),
@@ -1017,6 +1075,7 @@ fn mailbox(view: &FriendsView, x: &Ctx, snapshot: &Snapshot, state: &mut State, 
             correspondent: correspondent(&header.sender, header.recipient).into(),
             subject: (if header.subject.is_empty() { t("No subject").to_owned() } else { hidden(&header.subject) }).into(),
             enabled,
+            ..MailLine::default()
         });
     }
     state.mail_to.truncate(social.headers.len());
@@ -1033,7 +1092,8 @@ fn blocked(x: &Ctx, snapshot: &Snapshot, state: &mut State, actions: &mut Action
             state.blocked_to.push(None);
         }
         keep_friend(&mut state.blocked_to[i], friend);
-        lines.push(BlockedLine { name: hidden(&display_name(friend)).into(), initial: initial.into(), tint, enabled });
+        let (picture, has_picture) = portrait_picture(friend.portrait);
+        lines.push(BlockedLine { name: hidden(&display_name(friend)).into(), initial: initial.into(), tint, enabled, picture, has_picture, ..BlockedLine::default() });
         actions.unblocks.push(enabled);
     }
     state.blocked_to.truncate(lines.len());
@@ -1097,8 +1157,8 @@ mod tests {
         assert_eq!(view.get_friend_secondary(), "Lyrielle · Port Jeuno");
         let rows: Vec<FriendLine> = view.get_rows().iter().collect();
         assert_eq!(rows[0].kind, 0);
-        assert_eq!(rows[0].text, "ONLINE · 3");
-        assert!(rows.iter().any(|r| r.kind == 0 && r.text == "WAITING · 1"), "the Waiting section shows when it has friends");
+        assert_eq!((rows[0].text.as_str(), rows[0].secondary.as_str()), ("Online", "3"));
+        assert!(rows.iter().any(|r| r.kind == 0 && r.text == "Waiting" && r.secondary == "1"), "the Waiting section shows when it has friends");
         let alyria = rows.iter().find(|r| r.text == "Alyria").unwrap();
         assert!(alyria.selected && alyria.strong && alyria.presence == 0);
         assert_eq!(view.get_mailbox_count(), "1");
@@ -1138,6 +1198,23 @@ mod tests {
         assert!(matches!(messages[4], Message::FriendsAddSubject(true)));
         assert!(matches!(messages[5], Message::FriendsStatus(NativeControl::Away)));
         assert_eq!(messages.len(), 6, "Send is disabled: it sends nothing");
+
+        // Portraits show where the Viewer install has them (Nocturne has none: the initial);
+        // your avatar opens the portrait picker for the signed-in account.
+        assert_eq!(alyria.has_picture, crate::portraits::rgba(249).is_some());
+        assert_eq!(view.get_has_own_picture(), crate::portraits::rgba(256).is_some());
+        assert!(!rows.iter().find(|r| r.text == "Nocturne").unwrap().has_picture);
+        assert!(view.get_portrait_enabled());
+        // Privacy mode: the silhouette for everyone, never the real portrait.
+        privacy::set(true);
+        render(&ui, &app);
+        let rows: Vec<FriendLine> = view.get_rows().iter().collect();
+        privacy::set(false);
+        let silhouette = crate::portraits::stock_image(crate::portraits::SILHOUETTE);
+        assert!(rows.iter().filter(|r| r.kind == 1).all(|r| r.has_picture == silhouette.is_some() && silhouette.as_ref().is_none_or(|s| r.picture == *s)));
+        render(&ui, &app);
+        view.invoke_choose_portrait();
+        assert!(matches!(sent().as_slice(), [Message::PortraitPicker(Some(key))] if Some(key) == app.friends.account.as_ref()));
 
         // Typing goes through the editor's own actions, and the core's text comes back.
         view.invoke_draft_edited("Hi there".into());
@@ -1291,7 +1368,7 @@ mod tests {
             }
         }
         assert!(!view.get_query_enabled());
-        assert!(view.get_draft_masked());
+        assert!(!view.get_draft_masked(), "an empty draft keeps its placeholder");
         assert!(!view.get_draft_enabled());
         assert!(!view.get_subject_toggle_enabled());
         assert_eq!(view.get_note(), t("Privacy mode"));
@@ -1387,7 +1464,7 @@ mod tests {
         render(&ui, &app);
         let seen = reachable(&ui);
         for name in [
-            "Sign out", "Start FFXI", "Main account", "Visible", "Status options", "Find a friend…", "ONLINE · 3", "Alyria", "Nocturne",
+            "Sign out", "Start FFXI", "Main account", "Visible", "Status options", "Find a friend…", "Online 3", "Alyria", "Nocturne",
             "Mailbox", "Blocked", "Check for new messages", "Remove from friends", "Write a PlayOnline message…", "Add subject",
         ] {
             assert!(seen.contains(name), "{name} is reachable: {seen:?}");

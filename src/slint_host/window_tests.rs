@@ -328,11 +328,11 @@ fn updating(app: &mut App, progress: operation::Progress) {
 fn update_activity_shows_remaining_time_and_clears_it_when_cancelled() {
     crate::privacy::set(false);
     let (ui, window) = main_window();
-    for (language, remaining, estimate, estimating) in [
-        (Lang::En, "65% remaining in this step", "About 2 min remaining", "Estimating time remaining…"),
-        (Lang::Ja, "このステップの残り：65%", "残り約2分", "残り時間を計算しています…"),
-    ] {
+    for (language, estimating) in [(Lang::En, "Estimating time remaining…"), (Lang::Ja, "残り時間を計算しています…")] {
         crate::i18n::set(language);
+        // Time left only: the share is the panel's header figure.
+        let estimate = tf("{time} left", &[("time", &crate::play_update::remaining_time(Duration::from_secs(115)))]);
+        let estimate = estimate.as_str();
         let mut app = crate::tests::app();
         updating(&mut app, operation::Progress {
             stage: operation::Stage::Download, done: 42_000_000, total: 120_000_000,
@@ -340,14 +340,14 @@ fn update_activity_shows_remaining_time_and_clears_it_when_cancelled() {
             ..operation::Progress::default()
         });
         let shown = render(&ui, &window, &app);
-        assert!(shown.iter().any(|text| text.contains(remaining) && text.contains(estimate)), "{shown:?}");
+        assert!(shown.iter().any(|text| text == estimate), "{shown:?}");
+        assert!(!shown.iter().any(|text| text.contains("65%")), "no share repeated under the header: {shown:?}");
         assert!(shown.iter().any(|text| text.contains("42 MB")), "byte progress keeps its units: {shown:?}");
         app.maintenance_progress.remaining = None;
         let shown = render(&ui, &window, &app);
         assert!(shown.iter().any(|text| text.contains(estimating)), "{shown:?}");
         app.maintenance_cancelled = true;
         let shown = render(&ui, &window, &app);
-        assert!(shown.iter().any(|text| text.contains(remaining)), "{shown:?}");
         assert!(!shown.iter().any(|text| text.contains(estimating) || text.contains(estimate)), "{shown:?}");
         app.maintenance_cancelled = false;
         app.maintenance = Some(MaintenanceKind::Setup);
@@ -362,13 +362,14 @@ fn update_activity_shows_remaining_time_and_clears_it_when_cancelled() {
 fn update_activity_uses_the_whole_update_estimate_above_current_step() {
     crate::privacy::set(false);
     let (ui, window) = main_window();
-    for (language, title, percent, estimate, calculating, estimating, finalizing) in [
-        (Lang::En, "Overall update", "72% remaining overall", "About 5 min remaining for the whole update",
-         "Calculating total update size…", "Estimating total time remaining…", "Finalizing update…"),
-        (Lang::Ja, "アップデート全体", "全体の残り：72%", "アップデート全体の残り時間：約5分",
-         "アップデート全体のサイズを計算しています…", "アップデート全体の残り時間を計算しています…", "アップデートの最終処理を行っています…"),
+    for (language, title, calculating, estimating, finalizing) in [
+        (Lang::En, "Overall update", "Calculating total update size…", "Estimating total time remaining…", "Finalizing update…"),
+        (Lang::Ja, "アップデート全体", "アップデート全体のサイズを計算しています…", "アップデート全体の残り時間を計算しています…", "アップデートの最終処理を行っています…"),
     ] {
         crate::i18n::set(language);
+        // The header carries the share (28%); under it, the whole update's time left.
+        let estimate = tf("{time} left", &[("time", &crate::play_update::remaining_time(Duration::from_secs(265)))]);
+        let estimate = estimate.as_str();
         let mut app = crate::tests::app();
         updating(&mut app, operation::Progress {
             stage: operation::Stage::Download, done: 120_000_000, total: 120_000_000, bytes: true,
@@ -381,7 +382,8 @@ fn update_activity_uses_the_whole_update_estimate_above_current_step() {
         let step = tf("Current step: {step}", &[("step", &t("Downloading official files"))]);
         let step_index = shown.iter().position(|text| *text == step).unwrap_or_else(|| panic!("{shown:?}"));
         assert!(title_index < step_index, "overall progress leads the current step");
-        assert!(shown.iter().any(|text| text == percent), "{shown:?}");
+        assert!(shown.iter().any(|text| text == "28%"), "{shown:?}");
+        assert!(!shown.iter().any(|text| text.contains("72%")), "no second share: {shown:?}");
         assert!(shown.iter().any(|text| text == estimate), "{shown:?}");
         let step_remaining = tf("{percent}% remaining in this step", &[("percent", &0)]);
         assert!(!shown.iter().any(|text| text.contains(&step_remaining)), "{shown:?}");
@@ -398,7 +400,346 @@ fn update_activity_uses_the_whole_update_estimate_above_current_step() {
         app.maintenance_progress.overall = Some(operation::OverallProgress { fraction: Some(0.99), remaining: Some(Duration::ZERO), complete: false });
         let shown = render(&ui, &window, &app);
         assert!(shown.iter().any(|text| text == finalizing), "{shown:?}");
-        assert!(shown.iter().any(|text| *text == tf("{percent}% remaining overall", &[("percent", &1)])), "{shown:?}");
+        assert!(shown.iter().any(|text| text == "99%"), "{shown:?}");
     }
     crate::i18n::set(Lang::En);
+}
+
+/// The rail keeps every message Home's rows and footer sent, plus the v1.2 shortcuts: number keys
+/// pick accounts on Home (not under a dialog, not on other pages), Return presses Play, a code row
+/// takes digits only and its sixth digit signs in, and the More menu sends what its entries name.
+#[test]
+fn the_rail_sends_the_row_footer_and_shortcut_messages() {
+    crate::privacy::set(false);
+    crate::i18n::set(Lang::En);
+    let (ui, window) = main_window();
+    let mut app = app(Page::Home, None, false, false);
+    let keys: Vec<String> = app.accounts.iter().map(|row| row.key.clone()).collect();
+    let picked = app.accounts[1].selected;
+    render(&ui, &window, &app);
+    let _ = super::take_sent();
+    // Number keys toggle that row's pick on Home only.
+    assert!(ui.invoke_number_key(2));
+    assert!(matches!(super::take_sent().as_slice(), [Message::ToggleAccount(key, on)] if *key == keys[1] && *on == !picked));
+    assert!(!ui.invoke_number_key(9), "no ninth account");
+    app.page = Page::Settings;
+    render(&ui, &window, &app);
+    assert!(!ui.invoke_number_key(1), "number keys are Home's");
+    app.page = Page::Home;
+    render(&ui, &window, &app);
+    let _ = super::take_sent();
+    // Return presses Play when Play can.
+    let view = ui.global::<super::View>();
+    assert_eq!(ui.invoke_enter_key(), view.get_footer().play_enabled);
+    if view.get_footer().play_enabled {
+        assert!(matches!(super::take_sent().as_slice(), [Message::MainAction]));
+    }
+    // A code row: digits only, six at most, and the sixth signs in.
+    app.settings.account_otp.insert(keys[1].clone());
+    app.accounts[1].otp = "12345".into();
+    render(&ui, &window, &app);
+    let _ = super::take_sent();
+    view.invoke_otp_edited(1, "12a3456789".into());
+    let sent = super::take_sent();
+    assert!(matches!(sent.first(), Some(Message::OtpChanged(key, code)) if *key == keys[1] && code == "123456"), "{sent:?}");
+    assert!(matches!(sent.get(1), Some(Message::SignIn(key)) if *key == keys[1]), "the sixth digit signs in: {sent:?}");
+    view.invoke_otp_edited(1, "12".into());
+    assert_eq!(super::take_sent().len(), 1, "a partial code only updates the row");
+    // The More menu: Import, then Install & repair and Help & support at its end.
+    let menu: Vec<String> = slint::Model::iter(&view.get_rail_menu()).map(|s| s.to_string()).collect();
+    assert_eq!(menu.first().map(String::as_str), Some(t("Import")), "{menu:?}");
+    assert_eq!(menu[menu.len() - 2..], [t("Install & repair").to_owned(), t("Help & support").to_owned()]);
+    view.invoke_rail_menu_picked(0);
+    assert!(matches!(super::take_sent().as_slice(), [Message::AccountImport(_)]));
+    view.invoke_rail_menu_picked(menu.len() as i32 - 2);
+    assert!(matches!(super::take_sent().as_slice(), [Message::Navigate(Page::Maintenance)]));
+    // Character select names its choice and switches it.
+    let at = menu.iter().position(|entry| entry.starts_with(t("Character select"))).expect("character select in the menu");
+    view.invoke_rail_menu_picked(at as i32);
+    assert!(matches!(super::take_sent().as_slice(), [Message::SetCharacterSelect(_)]));
+}
+
+/// Home's news: three cards and four older lines (Latest takes the maintenance notices in, newest
+/// first), two and two in the small window, the lines opening after the cards; first run shows
+/// the cards alone and its three checks, whose actions are the import, Downloads and Settings →
+/// System (never a second Add account), with the game folder masked in privacy mode.
+#[test]
+fn home_news_and_first_run_checks() {
+    crate::privacy::set(false);
+    crate::i18n::set(Lang::En);
+    let (ui, window) = main_window();
+    let view = ui.global::<super::View>();
+    let size = |app: &mut App, width: u32, height: u32| {
+        window.set_size(slint::PhysicalSize::new(width, height));
+        app.viewport = crate::effect::Size::new(width as f32, height as f32);
+        ui.global::<super::Theme>().set_small(super::small(app));
+    };
+    let mut app = app(Page::Home, None, false, false);
+    size(&mut app, 1440, 900);
+    render(&ui, &window, &app);
+    let older = |view: &super::View| slint::Model::iter(&view.get_news_older()).map(|line| line.date.to_string()).collect::<Vec<_>>();
+    assert_eq!(slint::Model::row_count(&view.get_news()), 3);
+    assert_eq!(older(&view), ["Sep 26", "Sep 7", "Sep 3"], "the notices, newest first");
+    assert!(!view.get_first_run());
+    let _ = super::take_sent();
+    view.invoke_open_news(3);
+    let notice = app.services.as_ref().unwrap().notices[0].url.clone();
+    assert!(matches!(super::take_sent().as_slice(), [Message::OpenUrl(url)] if *url == notice), "a line opens its post");
+
+    size(&mut app, 1000, 700);
+    // The feeds' own date form (the sample's "Sep 18" has no year and would sort last).
+    app.services.as_mut().unwrap().news[2].date = "Fri, 18 Sep 2026 10:00:00 +0900".into();
+    render(&ui, &window, &app);
+    assert_eq!(slint::Model::row_count(&view.get_news()), 2);
+    assert_eq!(older(&view), ["Sep 26", "Sep 18"], "the third post joins the lines by date");
+
+    // The look-up bar shows the chosen site's field.
+    view.set_look_scope(0);
+    let shown = render(&ui, &window, &app);
+    assert!(shown.iter().any(|text| text == t("Search BG Wiki")), "{shown:?}");
+    view.set_look_scope(1);
+
+    size(&mut app, 1440, 900);
+    app.replace_accounts(Vec::new());
+    app.settings.install_path = r"C:\Users\Jane\Games\FFXI".into();
+    crate::privacy::set(true);
+    let shown = render(&ui, &window, &app);
+    crate::privacy::set(false);
+    assert!(view.get_first_run());
+    assert!(!shown.iter().any(|text| text.contains("Jane")), "{shown:?}");
+    assert!(older(&view).is_empty() && slint::Model::iter(&view.get_news()).all(|card| card.teaser.is_empty()));
+    let steps: Vec<_> = slint::Model::iter(&view.get_setup()).collect();
+    assert_eq!(steps.len(), 3);
+    assert!(steps.iter().all(|step| step.action != t("Add account")), "Add account is the rail's alone");
+    let _ = super::take_sent();
+    view.invoke_setup_action(0);
+    assert!(matches!(super::take_sent().as_slice(), [Message::AccountImport(_)]));
+    view.invoke_setup_action(1);
+    assert!(matches!(super::take_sent().first(), Some(Message::Navigate(Page::Maintenance))));
+    view.invoke_setup_action(2);
+    assert!(matches!(super::take_sent().as_slice(), [Message::OpenSettingsTab(crate::settings_page::Tab::System)]));
+}
+
+/// The account lamps follow the row state.
+#[test]
+fn rail_lamps_follow_the_row_state() {
+    crate::privacy::set(false);
+    crate::i18n::set(Lang::En);
+    let (ui, window) = main_window();
+    let mut app = app(Page::Home, None, false, false);
+    app.accounts[0].pid = Some(7);
+    app.accounts[0].game_running = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let key = app.accounts[1].key.clone();
+    app.settings.account_otp.insert(key);
+    render(&ui, &window, &app);
+    let rows = ui.global::<super::View>().get_accounts();
+    let lamp = |i: usize| slint::Model::row_data(&rows, i).unwrap().lamp;
+    assert_eq!(lamp(0), super::LampState::Ready, "signed in, not in game");
+    assert_eq!(lamp(1), super::LampState::Code, "needs a one-time code");
+    assert_eq!(lamp(2), super::LampState::Off, "signed out");
+    app.accounts[0].game_running = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)));
+    render(&ui, &window, &app);
+    let rows = ui.global::<super::View>().get_accounts();
+    assert_eq!(slint::Model::row_data(&rows, 0).unwrap().lamp, super::LampState::Game);
+}
+
+/// CRYSTAL_SHOTS=<dir>: the Skyline shell as PNGs (Home dark and light, first run, the small
+/// window, an inner page, the four skies) for review against crystal-design-v12b.
+#[test]
+fn skyline_screenshots() {
+    let Some(dir) = std::env::var_os("CRYSTAL_SHOTS").map(std::path::PathBuf::from) else { return };
+    crate::privacy::set(false);
+    crate::i18n::set(Lang::En);
+    let (ui, window) = main_window();
+    super::sky::update(&ui);
+    let shot = |name: &str, app: &mut App, width: u32, height: u32, light: bool| {
+        window.set_size(slint::PhysicalSize::new(width, height));
+        app.viewport = crate::effect::Size::new(width as f32, height as f32);
+        let theme = ui.global::<super::Theme>();
+        theme.set_light(light);
+        theme.set_scale(super::scale(app));
+        theme.set_small(super::small(app));
+        render(&ui, &window, app);
+        save_png(&window, width, height, &dir.join(format!("{name}.png")));
+    };
+    let mut home = app(Page::Home, None, false, false);
+    home.accounts[0].pid = Some(7);
+    home.accounts[0].game_running = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)));
+    let key = home.accounts[1].key.clone();
+    home.settings.account_otp.insert(key);
+    home.accounts[1].otp = "41".into();
+    shot("home-dark", &mut home, 1440, 900, false);
+    shot("home-light", &mut home, 1440, 900, true);
+    shot("home-small-dark", &mut home, 1000, 700, false);
+    for (phase, name) in [(0, "night"), (1, "dawn"), (2, "day"), (3, "dusk")] {
+        ui.global::<super::Sky>().set_phase(phase);
+        shot(&format!("sky-{name}"), &mut home, 1440, 900, false);
+    }
+    let mut first = app(Page::Home, None, false, false);
+    first.replace_accounts(Vec::new());
+    shot("first-run-dark", &mut first, 1440, 900, false);
+    let mut settings = app(Page::Settings, None, false, false);
+    shot("settings-dark", &mut settings, 1440, 900, false);
+    let mut downloads = app(Page::Maintenance, None, false, false);
+    shot("downloads-light", &mut downloads, 1440, 900, true);
+}
+
+/// CRYSTAL_GAUGE_SHOTS=<dir>: the crystal wherever it shows, dark and light, at 1x and 150 %:
+/// the rail's lamps in every state (unlit, rising, ready, in game, code, error), the first-run
+/// rail, the brand mark, and the Downloads gauge idle, half lit and full.
+#[test]
+fn crystal_screenshots() {
+    let Some(dir) = std::env::var_os("CRYSTAL_GAUGE_SHOTS").map(std::path::PathBuf::from) else { return };
+    crate::privacy::set(false);
+    crate::i18n::set(Lang::En);
+    let (ui, window) = main_window();
+    let shot = |name: &str, app: &mut App, scale: f32, light: bool, setup: &dyn Fn(&MainWindow)| {
+        let (width, height) = (1440u32, 900u32);
+        window.dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged { scale_factor: scale });
+        let (pw, ph) = ((width as f32 * scale) as u32, (height as f32 * scale) as u32);
+        window.set_size(slint::PhysicalSize::new(pw, ph));
+        app.viewport = crate::effect::Size::new(width as f32, height as f32);
+        let theme = ui.global::<super::Theme>();
+        theme.set_light(light);
+        theme.set_scale(super::scale(app));
+        theme.set_small(super::small(app));
+        render(&ui, &window, app);
+        setup(&ui);
+        save_png(&window, pw, ph, &dir.join(format!("{name}.png")));
+    };
+    // Six rows, one per lamp state.
+    let mut home = app(Page::Home, None, false, false);
+    let mut values: Vec<_> = home.accounts.iter().map(|row| row.account.clone()).collect();
+    for i in values.len()..6 {
+        let mut extra = values[0].clone();
+        extra.label = format!("Extra {i}");
+        extra.pol_id = format!("XYZ{i:05}");
+        values.push(extra);
+    }
+    home.replace_accounts(values);
+    let lamps = |ui: &MainWindow| {
+        use slint::Model;
+        let rows = ui.global::<super::View>().get_accounts();
+        let states = [super::LampState::Off, super::LampState::Rising, super::LampState::Ready, super::LampState::Game, super::LampState::Code, super::LampState::Error];
+        for (i, lamp) in states.into_iter().enumerate() {
+            if let Some(mut line) = rows.row_data(i) {
+                line.lamp = lamp;
+                line.fill = 0.55;
+                rows.set_row_data(i, line);
+            }
+        }
+    };
+    let gauge = |fraction: f32| {
+        move |ui: &MainWindow| {
+            let dl = ui.global::<super::Downloads>();
+            let mut activity = dl.get_activity();
+            activity.gauge = fraction;
+            activity.gauge_label = if fraction < 0.0 { "".into() } else { format!("{}%", (fraction * 100.0).round() as u32).into() };
+            dl.set_activity(activity);
+        }
+    };
+    let mut first = app(Page::Home, None, false, false);
+    first.replace_accounts(Vec::new());
+    let mut downloads = app(Page::Maintenance, None, false, false);
+    for (suffix, scale) in [("", 1.0), ("@1.5x", 1.5)] {
+        for (theme, light) in [("dark", false), ("light", true)] {
+            shot(&format!("rail-{theme}{suffix}"), &mut home, scale, light, &lamps);
+            shot(&format!("first-run-{theme}{suffix}"), &mut first, scale, light, &|_| {});
+            for (name, fraction) in [("idle", -1.0), ("50", 0.5), ("100", 1.0)] {
+                shot(&format!("downloads-{name}-{theme}{suffix}"), &mut downloads, scale, light, &gauge(fraction));
+            }
+        }
+    }
+}
+
+/// CRYSTAL_SHOTS=<dir>: the Friends page in Skyline (dark, light, Japanese, privacy, the
+/// Mailbox, the block list, the in-game notice and the sign-in card), into <dir>.
+#[test]
+fn friends_screenshots() {
+    let Some(dir) = std::env::var_os("CRYSTAL_SHOTS").map(std::path::PathBuf::from) else { return };
+    let (ui, window) = main_window();
+    super::sky::update(&ui);
+    let shot = |name: &str, app: &mut App, light: bool| {
+        let (width, height) = (1440, 900);
+        window.set_size(slint::PhysicalSize::new(width, height));
+        app.viewport = crate::effect::Size::new(width as f32, height as f32);
+        let theme = ui.global::<super::Theme>();
+        theme.set_light(light);
+        theme.set_scale(super::scale(app));
+        theme.set_small(super::small(app));
+        render(&ui, &window, app);
+        save_png(&window, width, height, &dir.join(format!("{name}.png")));
+    };
+    crate::privacy::set(false);
+    crate::i18n::set(Lang::En);
+    shot("friends-dark", &mut app(Page::Friends, None, false, false), false);
+    shot("friends-light", &mut app(Page::Friends, None, false, false), true);
+    shot("mailbox-dark", &mut app(Page::Friends, Some(Pane::Mailbox), true, false), false);
+    shot("blocked-dark", &mut app(Page::Friends, Some(Pane::Blocked), false, false), false);
+    shot("ingame-dark", &mut app(Page::Friends, None, false, true), false);
+    let mut signin = app(Page::Friends, None, false, false);
+    signin.friends.connected = false;
+    if let Some(snapshot) = &mut signin.friends.snapshot { snapshot.entries.clear(); }
+    signin.friends.snapshot = None;
+    shot("signin-dark", &mut signin, false);
+    crate::i18n::set(Lang::Ja);
+    shot("friends-ja", &mut app(Page::Friends, None, false, false), false);
+    crate::i18n::set(Lang::En);
+    crate::privacy::set(true);
+    shot("friends-privacy", &mut app(Page::Friends, None, false, false), false);
+    crate::privacy::set(false);
+}
+
+/// CRYSTAL_SHOTS=<dir>: the Settings and Features pages as PNGs (dark, light, Japanese, privacy)
+/// for review against crystal-design-v12b\a-skyline\features-dark.png.
+#[test]
+fn settings_and_features_screenshots() {
+    use crate::features::ui::Section;
+    use crate::settings_page::Tab;
+    let Some(dir) = std::env::var_os("CRYSTAL_SHOTS").map(std::path::PathBuf::from) else { return };
+    let (ui, window) = main_window();
+    let shot = |name: &str, app: &mut App, width: u32, height: u32, light: bool| {
+        window.set_size(slint::PhysicalSize::new(width, height));
+        app.viewport = crate::effect::Size::new(width as f32, height as f32);
+        let theme = ui.global::<super::Theme>();
+        theme.set_light(light);
+        theme.set_scale(super::scale(app));
+        theme.set_small(super::small(app));
+        render(&ui, &window, app);
+        save_png(&window, width, height, &dir.join(format!("{name}.png")));
+    };
+    let features = |section: Section| {
+        let mut app = app(Page::Home, None, false, false);
+        app.accounts[0].pid = Some(7);
+        app.accounts[0].game_running = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        for row in app.accounts.iter_mut().skip(1) { row.pid = Some(8); }
+        app.load_features_sample(section, false);
+        app
+    };
+    crate::privacy::set(false);
+    crate::i18n::set(Lang::En);
+    for (name, section) in [("windows", Section::Windows), ("hotkeys", Section::Hotkeys), ("recovery", Section::Recovery), ("backups", Section::Backups), ("clients", Section::Clients), ("activity", Section::Activity)] {
+        shot(&format!("features-{name}-dark"), &mut features(section), 1440, 900, false);
+    }
+    shot("features-windows-light", &mut features(Section::Windows), 1440, 900, true);
+    shot("features-windows-small-dark", &mut features(Section::Windows), 1000, 700, false);
+    shot("features-clients-light", &mut features(Section::Clients), 1440, 900, true);
+    for (name, tab) in [("graphics", Tab::Graphics), ("sound", Tab::Sound), ("controller", Tab::Controller), ("system", Tab::System)] {
+        let mut settings = app(Page::Settings, None, false, false);
+        settings.settings_tab = tab;
+        shot(&format!("settings-{name}-dark"), &mut settings, 1440, 900, false);
+        if name == "graphics" || name == "system" { shot(&format!("settings-{name}-light"), &mut settings, 1440, 900, true); }
+    }
+    crate::i18n::set(Lang::Ja);
+    shot("features-windows-ja", &mut features(Section::Windows), 1440, 900, false);
+    shot("features-activity-ja", &mut features(Section::Activity), 1440, 900, false);
+    let mut settings = app(Page::Settings, None, false, false);
+    shot("settings-graphics-ja", &mut settings, 1440, 900, false);
+    crate::i18n::set(Lang::En);
+    crate::privacy::set(true);
+    shot("features-windows-privacy", &mut features(Section::Windows), 1440, 900, false);
+    shot("features-hotkeys-privacy", &mut features(Section::Hotkeys), 1440, 900, false);
+    let mut settings = app(Page::Settings, None, false, false);
+    shot("settings-graphics-privacy", &mut settings, 1440, 900, false);
+    crate::privacy::set(false);
 }

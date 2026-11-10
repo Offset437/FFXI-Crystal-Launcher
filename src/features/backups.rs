@@ -119,8 +119,16 @@ pub(crate) struct RestoreReport {
 
 const FORMAT: u32 = 1;
 const MANIFEST: &str = "manifest.json";
-const MAX_FILE: u64 = 64 * 1024 * 1024;
-const MAX_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
+/// Settings files are small; anything bigger in the USER, Windower or Ashita data is a log,
+/// cache or mod payload and is left out.
+const MAX_FILE: u64 = 16 * 1024 * 1024;
+const MAX_TOTAL: u64 = 512 * 1024 * 1024;
+/// Folders that hold output or bulk content rather than settings (compared case-insensitively).
+const SKIP_DIRS: [&str; 14] = [
+    "logs", "log", "chatlogs", "crashes", "crash", "dumps", "screenshots", "cache", "temp", "tmp",
+    "dats", "updates", "backup", "backups",
+];
+const SKIP_EXTENSIONS: [&str; 5] = ["log", "dmp", "tmp", "etl", "mdmp"];
 const MAX_MANIFEST: u64 = 64 * 1024 * 1024;
 /// Programs whose files a restore would pull out from under (compared case-insensitively).
 const BUSY: [&str; 5] = ["pol.exe", "ffxi-boot.exe", "windower.exe", "ashita-cli.exe", "ashita.exe"];
@@ -162,8 +170,17 @@ fn add_file(path: &Path, name: String, out: &mut Vec<Item>) {
     }
 }
 
-/// Every regular file under `dir`, named `rel/...`; `skip` drops names. Links are not followed.
-fn walk(dir: &Path, rel: &str, skip: &dyn Fn(&str) -> bool, out: &mut Vec<Item>) -> Result<(), String> {
+/// True for a folder or file that is output or bulk content, not settings: logs, crash dumps,
+/// screenshots, caches, mod DAT payloads (by the last part of `name`).
+fn is_noise(name: &str, is_dir: bool) -> bool {
+    let last = name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
+    if is_dir { return SKIP_DIRS.contains(&last.as_str()); }
+    last.rsplit_once('.').is_some_and(|(_, ext)| SKIP_EXTENSIONS.contains(&ext))
+}
+
+/// Every regular file under `dir`, named `rel/...`; `skip(name, is_dir)` drops files, or whole
+/// folders. Links are not followed.
+fn walk(dir: &Path, rel: &str, skip: &dyn Fn(&str, bool) -> bool, out: &mut Vec<Item>) -> Result<(), String> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -173,10 +190,10 @@ fn walk(dir: &Path, rel: &str, skip: &dyn Fn(&str) -> bool, out: &mut Vec<Item>)
         let Some(file) = entry.file_name().to_str().map(str::to_owned) else { continue };
         let name = format!("{rel}/{file}");
         let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
-        if is_link(&meta) { continue; }
+        if is_link(&meta) || skip(&name, meta.is_dir()) { continue; }
         if meta.is_dir() {
             walk(&entry.path(), &name, skip, out)?;
-        } else if !skip(&name) {
+        } else {
             add_file(&entry.path(), name, out);
         }
     }
@@ -185,7 +202,7 @@ fn walk(dir: &Path, rel: &str, skip: &dyn Fn(&str) -> bool, out: &mut Vec<Item>)
 
 fn collect(sources: &Sources) -> Result<(Vec<Item>, BTreeMap<String, String>), String> {
     let (mut items, mut roots) = (Vec::new(), BTreeMap::new());
-    let keep_all = |_: &str| false;
+    let keep_all = is_noise;
     for (i, install) in sources.ffxi.iter().enumerate() {
         if !install.is_dir() { continue; }
         roots.insert(format!("ffxi/{i}"), install.display().to_string());
@@ -194,6 +211,7 @@ fn collect(sources: &Sources) -> Result<(Vec<Item>, BTreeMap<String, String>), S
     if let Some(root) = sources.windower.as_ref().filter(|p| p.is_dir()) {
         roots.insert("windower".into(), root.display().to_string());
         add_file(&root.join("settings.xml"), "windower/settings.xml".into(), &mut items);
+        add_file(&root.join("init.txt"), "windower/init.txt".into(), &mut items);
         walk(&root.join("scripts"), "windower/scripts", &keep_all, &mut items)?;
         walk(&root.join("plugins").join("settings"), "windower/plugins/settings", &keep_all, &mut items)?;
         if let Ok(addons) = std::fs::read_dir(root.join("addons")) {
@@ -208,9 +226,9 @@ fn collect(sources: &Sources) -> Result<(Vec<Item>, BTreeMap<String, String>), S
     if let Some(root) = sources.ashita.as_ref().filter(|p| p.is_dir()) {
         roots.insert("ashita".into(), root.display().to_string());
         // Crystal generates these boot files itself; restoring old ones would be wrong.
-        let generated = |name: &str| {
+        let generated = |name: &str, is_dir: bool| {
             let lower = name.to_ascii_lowercase();
-            lower.starts_with("ashita/config/boot/crystal-") && lower.ends_with(".ini")
+            is_noise(name, is_dir) || (lower.starts_with("ashita/config/boot/crystal-") && lower.ends_with(".ini"))
         };
         walk(&root.join("config"), "ashita/config", &generated, &mut items)?;
         walk(&root.join("scripts"), "ashita/scripts", &keep_all, &mut items)?;
@@ -289,12 +307,12 @@ fn info_of(path: &Path) -> Result<BackupInfo, String> {
 // ---------------------------------------------------------------- create / list / prune
 
 /// Writes a new archive of everything in `sources` into `dir`. `Err` when there is nothing to
-/// back up, the total would pass 2 GiB, or a file cannot be read; no partial archive is left.
+/// back up, the total would pass 512 MiB, or a file cannot be read; no partial archive is left.
 pub(crate) fn create(dir: &Path, sources: &Sources, reason: Reason) -> Result<BackupInfo, String> {
     let (items, roots) = collect(sources)?;
     if items.is_empty() { return Err(t("There is no game data to back up.").into()); }
     if items.iter().map(|i| i.size).sum::<u64>() > MAX_TOTAL {
-        return Err(t("The game data is over 2 GiB; nothing was backed up.").into());
+        return Err(too_big(&items));
     }
     std::fs::create_dir_all(dir).map_err(|_| t("Could not create the backups folder."))?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -311,6 +329,20 @@ pub(crate) fn create(dir: &Path, sources: &Sources, reason: Reason) -> Result<Ba
         return Err(error);
     }
     info_of(&target)
+}
+
+/// The over-the-limit message, naming the largest folder (first three name parts, e.g.
+/// `windower/addons/XIPivot`) and its size.
+fn too_big(items: &[Item]) -> String {
+    let mut by_folder: HashMap<String, u64> = HashMap::new();
+    for item in items {
+        let parts: Vec<&str> = item.name.split('/').collect();
+        let depth = parts.len().saturating_sub(1).min(3).max(1);
+        *by_folder.entry(parts[..depth].join("/")).or_default() += item.size;
+    }
+    let (name, size) = by_folder.into_iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0))).unwrap_or_default();
+    tf("{name} is {size} MB, over the {limit} MB backup limit; nothing was backed up.",
+        &[("name", &name), ("size", &(size / (1024 * 1024))), ("limit", &(MAX_TOTAL / (1024 * 1024)))])
 }
 
 fn write_archive(temp: &Path, items: &[Item], roots: BTreeMap<String, String>, reason: Reason, created: u64) -> Result<(), String> {
@@ -559,6 +591,58 @@ mod tests {
         assert_eq!(report.checked, 9);
         // No temp file is left behind.
         assert!(std::fs::read_dir(t.dir()).unwrap().all(|e| e.unwrap().path().extension().unwrap() == "zip"));
+    }
+
+    #[test]
+    fn logs_dats_dumps_and_oversize_files_are_left_out() {
+        let t = Tree::new();
+        for (path, body) in [
+            ("ffxi/USER/log/x.dat", "l"), ("ffxi/USER/crash.dmp", "d"), ("win/init.txt", "init"),
+            ("win/addons/XIPivot/data/DATs/big/0001.DAT", "mod"), ("win/addons/XIPivot/data/settings.xml", "s"),
+            ("win/addons/fa/data/logs/a.txt", "log"), ("win/addons/fa/data/run.LOG", "log"),
+            ("win/scripts/screenshots/a.png", "png"), ("ash/config/addons/ml/logs/1.txt", "log"),
+            ("ash/config/addons/ml/settings.lua", "set"), ("ash/config/plugins/gigacs/crashes/c.txt", "c"),
+        ] {
+            let p = t.root.join(path);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        let big = File::create(t.root.join("win/addons/fa/data/huge.bin")).unwrap();
+        big.set_len(MAX_FILE + 1).unwrap();
+        let info = create(&t.dir(), &t.sources, Reason::Manual).unwrap();
+        let all = names(&info.path);
+        for kept in ["windower/init.txt", "windower/addons/XIPivot/data/settings.xml", "ashita/config/addons/ml/settings.lua", "ffxi/0/USER/macro.dat"] {
+            assert!(all.contains(&kept.to_owned()), "{kept} missing from {all:?}");
+        }
+        for dropped in ["log/", "crash.dmp", "DATs", "logs", "run.LOG", "screenshots", "crashes", "huge.bin"] {
+            assert!(!all.iter().any(|n| n.contains(dropped)), "{dropped} in {all:?}");
+        }
+        assert!(verify(&info.path).unwrap().ok());
+    }
+
+    #[test]
+    fn the_size_error_names_the_largest_folder() {
+        let item = |name: &str, size: u64| Item { name: name.into(), path: PathBuf::new(), size };
+        let mb = 1024 * 1024;
+        let msg = too_big(&[
+            item("windower/addons/XIPivot/data/a.xml", 600 * mb), item("windower/addons/XIPivot/data/b.xml", 500 * mb),
+            item("ffxi/0/USER/macro.dat", 10 * mb), item("windower/settings.xml", 5 * mb),
+        ]);
+        assert!(msg.contains("windower/addons/XIPivot") && msg.contains("1100") && msg.contains("512"), "{msg}");
+    }
+
+    #[test]
+    fn an_old_layout_backup_still_restores() {
+        // Older archives (format 1) hold the same entry names; they restore by name, whatever the
+        // include rules were when they were made.
+        let t = Tree::new();
+        std::fs::create_dir_all(t.dir()).unwrap();
+        let old = t.dir().join("old.zip");
+        craft(&old, &[("windower/addons/fa/data/s.xml", b"old"), ("windower/plugins/settings/p.xml", b"p"), ("ffxi/0/USER/macro.dat", b"om")]);
+        let r = restore_with(&old, &t.sources, Parts::ALL, false, &idle).unwrap();
+        assert_eq!(r.restored, 3);
+        assert_eq!(t.read("win/addons/fa/data/s.xml"), "old");
+        assert_eq!(t.read("ffxi/USER/macro.dat"), "om");
     }
 
     #[test]

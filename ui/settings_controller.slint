@@ -146,15 +146,16 @@ component LiveCard inherits PadCard {
     HorizontalLayout {
         PadHeading { text: SettingsView.strings.pad-live; vertical-alignment: center; }
         Rectangle { horizontal-stretch: 1; }
-        Text { text: SettingsView.pad.caption; font-size: Theme.type-caption * root.s; color: Theme.sub; vertical-alignment: center; }
+        if SettingsView.pad.connected: Text { text: SettingsView.pad.caption; font-size: Theme.type-caption * root.s; color: Theme.sub; vertical-alignment: center; }
     }
-    Image {
+    // With no controller, the one line saying so under the heading: no idle drawing or readouts.
+    if !SettingsView.pad.connected: Text { text: SettingsView.pad.caption; font-size: Theme.type-caption * root.s; color: Theme.sub; wrap: word-wrap; }
+    if SettingsView.pad.connected: Image {
         height: 318px * root.s;
         source: SettingsView.pad.picture;
         image-fit: contain;
-        opacity: SettingsView.pad.connected ? 1 : 0.35;
     }
-    HorizontalLayout {
+    if SettingsView.pad.connected: HorizontalLayout {
         spacing: 18px * root.s;
         Meter { label: SettingsView.pad.lt-label; value: SettingsView.pad.lt; }
         Meter { label: SettingsView.pad.rt-label; value: SettingsView.pad.rt; }
@@ -170,7 +171,7 @@ component LiveCard inherits PadCard {
             clicked => { SettingsView.pad-rumble(); }
         }
     }
-    if SettingsView.pad-keys.length > 0: HorizontalLayout {
+    if SettingsView.pad.connected && SettingsView.pad-keys.length > 0: HorizontalLayout {
         spacing: 10px * root.s;
         alignment: start;
         for key in SettingsView.pad-keys: Keycap { text: key.label; lit: key.lit; }
@@ -288,11 +289,11 @@ component BindingsCard inherits PadCard {
 component OptionsCard inherits PadCard {
     private property <float> s: Theme.scale;
     PadHeading { text: SettingsView.strings.pad-options; }
-    HorizontalLayout {
-        spacing: 28px * root.s;
-        alignment: start;
+    GridLayout {
+        spacing: 12px * root.s;
         for switch[i] in SettingsView.pad-switches: Toggle {
-            horizontal-stretch: 0;
+            row: floor(i / 2);
+            col: mod(i, 2);
             font-size: Theme.type-small * root.s;
             text: switch.label;
             on: switch.on;
@@ -312,14 +313,21 @@ component OptionsCard inherits PadCard {
 }
 
 export component ControllerTab inherits VerticalLayout {
+    /// The detail pane's width: the live test and the bindings sit side by side only when both fit.
+    in property <length> width-hint;
     private property <float> s: Theme.scale;
     spacing: 14px * root.s;
     padding-bottom: 8px * root.s;
     DeviceBar { }
-    HorizontalLayout {
+    if root.width-hint >= 880px * root.s: HorizontalLayout {
         spacing: 14px * root.s;
         LiveCard { horizontal-stretch: 11; min-width: 0px; preferred-width: 0px; }
         BindingsCard { horizontal-stretch: 12; min-width: 0px; preferred-width: 0px; }
+    }
+    if root.width-hint < 880px * root.s: VerticalLayout {
+        spacing: 14px * root.s;
+        LiveCard { }
+        BindingsCard { }
     }
     OptionsCard { }
 }

@@ -194,6 +194,42 @@ mod tests {
         let list: String = missing.iter().map(|(key, at)| format!("\n  {at}: {key:?}")).collect();
         assert!(missing.is_empty(), "{} t()/tf() strings have no Japanese entry:{list}", missing.len());
     }
+    /// UTF-8 text decoded as Windows-1252 and saved again (a middle dot turns into A-circumflex
+    /// and a middle dot, a dash into a-circumflex, euro and a quote): what a merge resolved through
+    /// a non-UTF-8 editor or shell did to main.rs twice. No source, markup or build script
+    /// carries such a pair; the failure lists each with `file:line`.
+    #[test]
+    fn no_source_file_holds_doubly_encoded_text() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        for dir in ["src", "ui", "crystal-loader/src", "crates", "tools", "assets"] {
+            text_files(&root.join(dir), &mut files);
+        }
+        let mut found = String::new();
+        for file in &files {
+            let Ok(text) = std::fs::read_to_string(file) else { continue };
+            for (number, line) in text.lines().enumerate() {
+                let chars: Vec<char> = line.chars().collect();
+                if chars.windows(2).any(|pair| matches!(pair, ['Â', '\u{a0}'..='\u{bf}'] | ['Ã', '\u{80}'..='\u{bf}'] | ['â', '€'])) {
+                    found.push_str(&format!("\n  {}:{}", file.strip_prefix(root).unwrap().display(), number + 1));
+                }
+            }
+        }
+        assert!(found.is_empty(), "doubly encoded text:{found}");
+    }
+
+    fn text_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if !path.ends_with("target") { text_files(&path, out); }
+            } else if path.extension().is_some_and(|e| ["rs", "slint", "py", "ps1", "nsi", "rc", "toml", "md"].iter().any(|x| e == *x)) {
+                out.push(path);
+            }
+        }
+    }
+
     #[test]
     fn scanner_reads_keys_and_skips_comments_and_raw_strings() {
         let source = r####"

@@ -36,7 +36,9 @@ export component CardTitle inherits Text {
 }
 
 /// A labelled switch with its notes under the label, indented so they start where the label
-/// starts.
+/// starts. A layout measures a wrapped text's height at the text's preferred width (its one
+/// line), so each note's preferred width is the width it really gets: otherwise the card comes
+/// up a line short per note.
 export component SwitchNotes inherits VerticalLayout {
     in property <bool> on;
     in property <string> text;
@@ -52,12 +54,12 @@ export component SwitchNotes inherits VerticalLayout {
         toggled(on) => { root.toggled(on); }
     }
     if root.note-1 != "": HorizontalLayout {
-        padding-left: switch.label-x;
-        Text { text: root.note-1; font-size: Theme.type-caption * Theme.scale; color: Theme.sub; wrap: word-wrap; }
+        Rectangle { width: switch.label-x; }
+        VerticalLayout { horizontal-stretch: 1; min-width: 0px; preferred-width: max(0px, root.width - switch.label-x); Text { text: root.note-1; font-size: Theme.type-caption * Theme.scale; color: Theme.sub; wrap: word-wrap; } }
     }
     if root.note-2 != "": HorizontalLayout {
-        padding-left: switch.label-x;
-        Text { text: root.note-2; font-size: Theme.type-caption * Theme.scale; color: Theme.sub; wrap: word-wrap; }
+        Rectangle { width: switch.label-x; }
+        VerticalLayout { horizontal-stretch: 1; min-width: 0px; preferred-width: max(0px, root.width - switch.label-x); Text { text: root.note-2; font-size: Theme.type-caption * Theme.scale; color: Theme.sub; wrap: word-wrap; } }
     }
 }
 

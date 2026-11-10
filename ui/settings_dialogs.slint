@@ -222,7 +222,28 @@ export component ImportDialog inherits DialogFrame {
                             browse => { SettingsView.import-browse(true); }
                         }
                     }
-                    if SettingsView.import.error != "": SubText { text: SettingsView.import.error; }
+                    // A failed read: the danger tone and its glyph, on a tinted strip.
+                    if SettingsView.import.error != "": Rectangle {
+                        border-radius: Theme.radius-inner;
+                        border-width: 1px;
+                        border-color: Theme.danger.with-alpha(0.45);
+                        background: Theme.danger.with-alpha(0.10);
+                        HorizontalLayout {
+                            padding: 12px * root.s;
+                            spacing: 10px * root.s;
+                            VerticalLayout {
+                                alignment: start;
+                                Icon { glyph: Glyph.alert-circle; size: 16px * root.s; tint: Theme.danger; }
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: SettingsView.import.error;
+                                font-size: Theme.type-small * root.s;
+                                color: Theme.ink;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
                     for warning in SettingsView.import-warnings: SubText { text: warning; font-size: Theme.type-caption * root.s; }
                     if SettingsView.import.no-drafts: SubText { text: SettingsView.strings.import-empty; }
                     for draft[i] in SettingsView.import-drafts: HorizontalLayout {

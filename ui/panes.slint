@@ -1,0 +1,167 @@
+// The two-pane page frame Features and Settings share (a-skyline\features-dark.png): a page
+// title, a rail of section tiles (icon, title, one line of state), and a detail pane that scrolls.
+// Flat fills and hairlines only: nothing here needs a shadow.
+import { Theme } from "theme.slint";
+import { Pressable, Icon, Glyph, Toggle, Rule, ScrollThumb } from "widgets.slint";
+
+/// A section tile (`.sec a`): 60 px, the chosen one on `fill`, its icon in ice.
+export component SectionTile inherits Pressable {
+    in property <Glyph> glyph;
+    in property <string> title;
+    in property <string> note;
+    in property <bool> active;
+    label: root.title;
+    accessible-role: tab;
+    accessible-checked: root.active;
+    height: 60px;
+    horizontal-stretch: 1;
+    border-radius: Theme.radius;
+    background: root.active ? Theme.fill : root.hot ? Theme.fill.with-alpha(0.55) : transparent;
+    // The light page's fill is close to the tile's: a hairline marks the chosen one there.
+    border-width: root.active && Theme.light ? 1px : 0px;
+    border-color: Theme.line;
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        spacing: 14px;
+        Icon {
+            cross-axis-self-alignment: center;
+            glyph: root.glyph;
+            size: 18px;
+            tint: root.active ? Theme.ice : Theme.sub;
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            Text {
+                height: 20px;
+                text: root.title;
+                font-size: 14.5px;
+                font-weight: 600;
+                color: Theme.ink;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            if root.note != "": Text {
+                height: 18px;
+                text: root.note;
+                font-size: Theme.type-note;
+                color: Theme.sub;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+    }
+}
+
+/// The page title (`.ph1`).
+export component PageTitle inherits Text {
+    height: 32px;
+    font-size: Theme.type-display;
+    font-weight: 600;
+    color: Theme.ink;
+    vertical-alignment: center;
+}
+
+/// A detail pane's heading (`.det h2`).
+export component DetailTitle inherits Text {
+    height: 28px;
+    font-size: Theme.type-section;
+    font-weight: 600;
+    color: Theme.ink;
+    vertical-alignment: center;
+}
+
+/// A group's label (`.gl`).
+export component GroupLabel inherits Text {
+    height: 20px;
+    font-size: Theme.type-small;
+    font-weight: 600;
+    color: Theme.sub;
+    vertical-alignment: center;
+}
+
+/// A setting row (`.tg`): its name and an optional note, the switch at the right, a hairline on
+/// top (and under, with `closing`). `inset` indents a row that depends on the one above it.
+export component ToggleRow inherits Rectangle {
+    in property <string> name;
+    in property <string> note;
+    in property <bool> on;
+    in property <bool> enabled: true;
+    in property <bool> closing;
+    in property <length> inset: 0px;
+    callback toggled(bool);
+    // 52 px, taller when a narrow pane wraps the name or note (they wrap, never elide).
+    min-height: 52px;
+    Rule { y: 0px; width: parent.width; }
+    HorizontalLayout {
+        padding-top: 7px;
+        padding-bottom: 7px;
+        padding-left: root.inset;
+        spacing: 16px;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            // A layout measures wrapped text at its preferred width: the width it really gets
+            // (beside the 36 px switch), so a wrapped name or note makes the row taller.
+            min-width: 0px;
+            preferred-width: max(0px, root.width - root.inset - 16px - 36px);
+            alignment: center;
+            Text {
+                min-height: 20px;
+                text: root.name;
+                font-size: Theme.type-body;
+                font-weight: 500;
+                color: root.enabled ? Theme.ink : Theme.faint;
+                vertical-alignment: center;
+                wrap: word-wrap;
+            }
+            if root.note != "": Text {
+                min-height: 18px;
+                text: root.note;
+                font-size: Theme.type-note;
+                color: Theme.sub;
+                vertical-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+        Toggle {
+            cross-axis-self-alignment: center;
+            size: 20px;
+            label: root.name;
+            on: root.on;
+            enabled: root.enabled;
+            toggled(on) => { root.toggled(on); }
+        }
+    }
+    if root.closing: Rule { y: parent.height - 1px; width: parent.width; }
+}
+
+/// A detail pane's scroller: the content's own width, a thin thumb in the lane at the right.
+export component PaneScroll inherits Rectangle {
+    in property <length> scroll-to: 0px;
+    page := Flickable {
+        // Its width comes from the pane alone: its content (which reflows by that width) must
+        // not feed back into it.
+        min-width: 0px;
+        preferred-width: 0px;
+        max-width: 100000px;
+        content-width: self.width;
+        content-height: body.preferred-height;
+        content-y: -min(root.scroll-to, max(0px, body.preferred-height - self.height));
+        body := VerticalLayout {
+            width: page.width;
+            height: self.preferred-height;
+            padding-right: 12px;
+            padding-bottom: Theme.sp-2xl;
+            alignment: start;
+            @children
+        }
+    }
+    ScrollThumb {
+        x: parent.width - 4px;
+        height: parent.height;
+        content-y: page.content-y;
+        content-height: page.content-height;
+        visible-height: page.height;
+    }
+}

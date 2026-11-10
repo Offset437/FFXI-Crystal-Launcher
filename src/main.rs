@@ -48,6 +48,7 @@ mod patch_watch;
 mod play_flag;
 mod play_update;
 mod pol_less;
+mod portraits;
 mod preview;
 mod privacy;
 mod services;
@@ -867,6 +868,12 @@ pub(crate) enum Message {
     SearchAh,
     AhResults(u64, Result<ffxiah::Results, String>),
     CloseAh,
+    /// Open the portrait picker for this account (its key), or close it.
+    PortraitPicker(Option<String>),
+    /// The installed portraits, listed off the UI thread.
+    PortraitsListed(std::sync::Arc<[u16]>),
+    PortraitPage(usize),
+    PortraitPick(u16),
     AhServerChanged(&'static str),
     NewsFilter(crate::services::NewsTab),
     InstallPathChanged(String),
@@ -979,6 +986,8 @@ pub(crate) struct App {
     pub show_settings: bool,
     pub status: String,
     pub vault_ready: bool,
+    /// Why the saved accounts could not be read (the rail says so in place of its first-run state).
+    vault_error: Option<String>,
     startup_signin_pending: bool,
     /// Startup sign-ins whose row was still busy with a previous session, and since when
     /// (07d §5.5): each starts once its row is free, or is skipped after STARTUP_WAIT_LIMIT.
@@ -1025,6 +1034,10 @@ pub(crate) struct App {
     pub wiki_query: String,
     pub ah_query: String,
     pub ah_lookup: ffxiah::Lookup,
+    /// The portrait picker, while open.
+    pub portrait_picker: Option<portraits::Picker>,
+    /// Each account's own portrait as its PlayOnline session last reported it (this run only).
+    pub own_portraits: HashMap<String, u16>,
     pub ah_server: &'static str,
     pub news_filter: crate::services::NewsTab,
     pub maintenance: Option<MaintenanceKind>,
@@ -1147,6 +1160,7 @@ impl App {
             show_settings: false,
             status: String::new(),
             vault_ready: true,
+            vault_error: None,
             startup_signin_pending: false,
             startup_waiting: Vec::new(),
             startup_issued: None,
@@ -1173,6 +1187,8 @@ impl App {
             wiki_query: String::new(),
             ah_query: String::new(),
             ah_lookup: ffxiah::Lookup::default(),
+            portrait_picker: None,
+            own_portraits: HashMap::new(),
             ah_server: crate::ffxiah::DEFAULT_AH_SERVER,
             news_filter: crate::services::NewsTab::Latest,
             maintenance: None,
@@ -2987,8 +3003,8 @@ impl App {
         let mut tools: Vec<&'static str> = Vec::new();
         let mut all_native = true;
         // One worker per account: every sign-in starts now and runs in parallel; only the
-        // Ashita/Windower start inside each worker waits its turn (pol_less::TurnGate; for
-        // Windower, session_worker::windower_turn_at's machine-wide windower.lock).
+        // Ashita/Windower start inside each worker waits its turn (pol_less::TurnGate: the
+        // machine-wide windower.lock and ashita.lock in session_worker).
         for key in keys {
             let Some(row) = self
                 .accounts
@@ -4039,6 +4055,9 @@ impl App {
                 self.friends_expired = None;
             }
         }
+        if let (Some(key), Some(portrait)) = (&self.friends.account, snapshot.as_ref().and_then(|s| s.own_portrait)) {
+            if self.own_portraits.get(key) != Some(&portrait) { self.own_portraits.insert(key.clone(), portrait); }
+        }
         self.friends.snapshot = snapshot;
         if let Some(done) = finished {
             self.friends.completed(&done);
@@ -4442,11 +4461,11 @@ impl App {
     /// A dialog is over the page (the account sheet counts separately: `controller_modal`).
     fn dialog_open(&self) -> bool {
         self.confirm_close || self.pending_delete.is_some() || self.account_import.open
-            || self.show_settings || self.show_details || self.ah_lookup.open
+            || self.show_settings || self.show_details || self.ah_lookup.open || self.portrait_picker.is_some()
     }
 
     pub(crate) fn controller_modal(&self) -> bool {
-        self.dialog_open() || self.editor.is_some() || self.features_view.open
+        self.dialog_open() || self.editor.is_some()
     }
 
     /// The open account sheet, unless the vault is being saved (edits wait for that).
@@ -4540,10 +4559,15 @@ impl App {
             }
             Message::ControllerPage(step) => {
                 if !self.controller_modal() {
-                    let pages = [Page::Home, Page::Friends, Page::Maintenance, Page::Settings];
-                    let index = pages.iter().position(|p| *p == self.page).unwrap_or(0);
+                    // The top bar's order; Features (None) is a page over the one underneath.
+                    let stops = [Some(Page::Home), Some(Page::Friends), Some(Page::Maintenance), None, Some(Page::Settings)];
+                    let current = if self.features_view.open { None } else { Some(self.page) };
+                    let index = stops.iter().position(|p| *p == current).unwrap_or(0);
                     self.controller_nav.clear();
-                    return self.update(Message::Navigate(pages[(index as i32 + step as i32).rem_euclid(pages.len() as i32) as usize]));
+                    return match stops[(index as i32 + step as i32).rem_euclid(stops.len() as i32) as usize] {
+                        Some(page) => self.update(Message::Navigate(page)),
+                        None => self.update(Message::Feature(features::ui::Msg::Open(true))),
+                    };
                 }
             }
             Message::ControllerBack => {
@@ -4551,6 +4575,7 @@ impl App {
                 if self.gamepad.capturing() { return self.update(Message::Gamepad(gamepad::Msg::CancelCapture)); }
                 if self.confirm_close { return self.update(Message::CancelClose); }
                 if self.pending_delete.is_some() { return self.update(Message::CancelDeleteAccount); }
+                if self.portrait_picker.is_some() { return self.update(Message::PortraitPicker(None)); }
                 if self.features_view.open { return self.update(Message::Feature(features::ui::Msg::Open(false))); }
                 if self.editor.is_some() { return self.update(Message::CloseEditor); }
                 if self.account_import.open { return self.import_update(account_import_ui::Msg::Close); }
@@ -4867,7 +4892,9 @@ impl App {
                 }
             }
             Message::AccountDragStart(key) => {
-                if self.page == Page::Home && self.vault_ready && !self.vault_saving
+                // The rail shows on every page, so a reorder starts from any of them; a dialog
+                // over the rail blocks it.
+                if self.vault_ready && !self.vault_saving && !self.show_settings && self.portrait_picker.is_none()
                     && self.editor.is_none() && !self.account_import.open && !self.confirm_close && self.pending_delete.is_none()
                     && self.accounts.iter().any(|row| row.key == key) {
                     self.cancel_account_drag();
@@ -4928,6 +4955,8 @@ impl App {
             Message::Navigate(page) => {
                 self.cancel_account_drag();
                 self.page = page;
+                // Features is a page of its own: going anywhere leaves it.
+                if self.features_view.open { self.features_view.open = false; self.features_view.touch(); }
                 self.show_settings = false;
                 self.show_details = false;
                 if page == Page::Friends { self.load_friends(); }
@@ -5173,6 +5202,40 @@ impl App {
             }
             Message::AhResults(generation, result) => self.ah_lookup.finish(generation, result),
             Message::CloseAh => self.ah_lookup.open = false,
+            Message::PortraitPicker(None) => self.portrait_picker = None,
+            Message::PortraitPicker(Some(key)) => {
+                if !self.accounts.iter().any(|row| row.key == key && row.account.mode == AccountMode::Retail) { return Effect::none(); }
+                self.portrait_picker = Some(portraits::Picker { account: key, ..Default::default() });
+                // Every sheet is read once (a few hundred ms), off the UI thread; later opens reuse it.
+                return Effect::perform(
+                    async { tokio::task::spawn_blocking(portraits::available).await.unwrap_or_else(|_| std::sync::Arc::from([])) },
+                    Message::PortraitsListed,
+                );
+            }
+            Message::PortraitsListed(ids) => {
+                if let Some(picker) = &mut self.portrait_picker {
+                    // Privacy mode does not open on the page that would point at your own.
+                    let current = if privacy::on() { None } else { self.own_portraits.get(&picker.account).copied() };
+                    picker.listed(ids, current);
+                }
+            }
+            Message::PortraitPage(page) => {
+                if let Some(picker) = &mut self.portrait_picker {
+                    if page < picker.pages() { picker.page = page; }
+                }
+            }
+            Message::PortraitPick(id) => {
+                // Nothing is written to PlayOnline until the portrait field is confirmed.
+                if !portraits::PICKER_ENABLED || self.preview { return Effect::none(); }
+                let Some(picker) = &mut self.portrait_picker else { return Effect::none() };
+                if !picker.ids.as_ref().is_some_and(|ids| ids.contains(&id)) { return Effect::none(); }
+                let Some(row) = self.accounts.iter().find(|row| row.key == picker.account) else { return Effect::none() };
+                let config = self.settings.config_for(&self.config, &row.account);
+                match session_worker::request_native_portrait(&config, &row.account, id) {
+                    Ok(()) => self.portrait_picker = None,
+                    Err(error) => picker.error = Some(error),
+                }
+            }
             Message::NewsFilter(value) => self.news_filter = value,
             Message::SearchAh => return self.search_ah(),
             Message::SearchWiki => {
@@ -5370,6 +5433,7 @@ impl App {
                     Ok(values) => {
                         self.replace_accounts(values);
                         self.vault_ready = true;
+                        self.vault_error = None;
                         self.status = t("Ready. Select accounts or use Launch all. Games continue when you close Crystal.").into();
                         self.log_launcher_start();
                         self.start_ready_startup_signins();
@@ -5377,6 +5441,7 @@ impl App {
                     Err(error) => {
                         self.vault_ready = false;
                         self.status = tf("Saved accounts could not be loaded: {error} The existing vault was kept.", &[("error", &error)]);
+                        self.vault_error = Some(self.status.clone());
                     }
                 }
                 if let Some(warning) = self.startup_warning.take() {
@@ -6689,7 +6754,7 @@ mod tests {
         let mut app = app();
         app.preview = false;
         app.friends.pending = Some(("sync-1".into(), Instant::now()));
-        let friend = friends::Friend { name: "Ayame".into(), alternate: false, slot: 1, uid: Some(9), online: None, location: None, character: None };
+        let friend = friends::Friend { name: "Ayame".into(), alternate: false, slot: 1, uid: Some(9), online: None, location: None, character: None, portrait: None };
         let _ = app.update(Message::FriendsRemove(friend));
         let _ = app.update(Message::FriendsRemoveConfirm);
         assert!(app.friends.remove.is_some());
@@ -10438,6 +10503,31 @@ mod tests {
         assert_eq!(reopened.accounts.iter().map(|row| row.key.clone()).collect::<Vec<_>>(), expected);
         assert_eq!(std::fs::read(vault).unwrap(), ciphertext);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn account_drags_start_from_the_rail_on_every_page() {
+        for page in [Page::Home, Page::Friends, Page::Maintenance, Page::Settings] {
+            let mut app = app();
+            app.page = page;
+            let key = app.accounts[0].key.clone();
+            let _ = app.update(Message::AccountDragStart(key.clone()));
+            assert_eq!(app.account_drag.source.as_deref(), Some(key.as_str()));
+        }
+    }
+
+    #[test]
+    fn controller_shoulders_follow_the_top_bar_through_features() {
+        let mut app = app();
+        app.page = Page::Maintenance;
+        let _ = app.update(Message::ControllerPage(1));
+        assert!(app.features_view.open && app.page == Page::Maintenance);
+        let _ = app.update(Message::ControllerPage(1));
+        assert!(!app.features_view.open && app.page == Page::Settings);
+        let _ = app.update(Message::ControllerPage(-1));
+        assert!(app.features_view.open);
+        let _ = app.update(Message::ControllerPage(-1));
+        assert!(!app.features_view.open && app.page == Page::Maintenance);
     }
 
     #[test]

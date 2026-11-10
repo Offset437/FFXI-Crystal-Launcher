@@ -26,6 +26,7 @@ pub mod lobby;
 pub mod native_auth;
 mod native_jobs;
 mod native_handles;
+mod native_portrait;
 mod native_profile;
 mod native_social;
 mod park;

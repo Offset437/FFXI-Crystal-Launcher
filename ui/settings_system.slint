@@ -310,7 +310,17 @@ export component SystemTab inherits VerticalLayout {
             Text { text: SettingsView.strings.updates-title; font-size: Theme.type-heading * root.s; font-weight: 600; color: Theme.ink; horizontal-stretch: 1; }
             Text { text: SettingsView.version; font-size: Theme.type-small * root.s; color: Theme.sub; }
         }
-        HorizontalLayout {
+        // The small window puts the button under the status rather than squeezing the words.
+        if Theme.small: Text { text: SettingsView.system.updates-status; font-size: Theme.type-small * root.s; color: Theme.sub; wrap: word-wrap; }
+        if Theme.small && SettingsView.system.updates-action != "": HorizontalLayout {
+            alignment: start;
+            Control {
+                scale: root.s;
+                text: SettingsView.system.updates-action;
+                clicked => { SettingsView.update-action(); }
+            }
+        }
+        if !Theme.small: HorizontalLayout {
             spacing: 16px * root.s;
             Text { text: SettingsView.system.updates-status; font-size: Theme.type-small * root.s; color: Theme.sub; wrap: word-wrap; vertical-alignment: center; horizontal-stretch: 1; }
             if SettingsView.system.updates-action != "": Control {

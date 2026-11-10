@@ -1,6 +1,6 @@
 //! The machine-wide PlayOnline connection profile list (`usr\all\inet_w.bin`)
 //! and the Viewer's member/connection selection, driven through the installed
-//! core exactly as app.dll does (pol-spec/02-member-settings.md Â§2.1, Â§5).
+//! core exactly as app.dll does (pol-spec/02-member-settings.md §2.1, §5).
 //! The file is read only; the Viewer's default-save (app 101a09e6) is omitted.
 
 use crate::native_auth::Api;
@@ -18,7 +18,7 @@ const MAX_RECORDS: usize = 64;
 pub(crate) const PROFILE_NOT_FOUND: i32 = -11267;
 
 /// Bounded, read-only copy of the Viewer's profile file; `None` when absent.
-/// Holds no credentials for a LAN profile (02 Â§2.1).
+/// Holds no credentials for a LAN profile (02 §2.1).
 pub(crate) fn read_file(viewer: &Path) -> Option<Vec<u8>> {
     let path = viewer.join("usr").join("all").join("inet_w.bin");
     let limit = HEADER_LEN + MAX_RECORDS * RECORD_LEN;

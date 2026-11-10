@@ -42,7 +42,7 @@ impl Region {
 
 pub use crate::wire::{FRIENDS_LEN, FRIEND_RECORD_LEN, FRIEND_SLOTS};
 
-pub enum ServiceEvent { NativeStartGame, NativeBatchGame(String), NativeSignOut, NativeStatus { mode: i32, groups: bool }, NativeActivity, NativeSocial(NativeSocialRequest), ViewerCheck(ViewerCheckResult), NativePlayPending, ControllerSettings { id: u64, settings: FfxiSettings, deadline_ms: u64 }, GameShutdown { id: u64, game: u64, deadline_ms: u64 } }
+pub enum ServiceEvent { NativeStartGame, NativeBatchGame(String), NativeSignOut, NativeStatus { mode: i32, groups: bool }, NativePortrait(u16), NativeActivity, NativeSocial(NativeSocialRequest), ViewerCheck(ViewerCheckResult), NativePlayPending, ControllerSettings { id: u64, settings: FfxiSettings, deadline_ms: u64 }, GameShutdown { id: u64, game: u64, deadline_ms: u64 } }
 
 /// The launcher's answer to `native_viewer_check`: the Viewer's own W2U
 /// (:54000) verdict for this Connect (pol-spec 07a w2u-at-connect, 07c §1).
@@ -188,6 +188,11 @@ pub fn parse_service_event(line: &[u8]) -> Result<Option<ServiceEvent>, ProtoErr
     if t.eq_str("native_sign_out") { return Ok(Some(ServiceEvent::NativeSignOut)); }
     if t.eq_str("native_viewer_check_result") { return viewer_check_result(&root).map(|r| Some(ServiceEvent::ViewerCheck(r))); }
     if t.eq_str("native_activity") { return Ok(Some(ServiceEvent::NativeActivity)); }
+    if t.eq_str("native_portrait") {
+        let portrait = root.get("portrait").and_then(Value::as_i64).filter(|p| (0..=i64::from(crate::wire::PORTRAIT_MASK)).contains(p))
+            .ok_or(ProtoError::Field("portrait", "must be a 13-bit portrait ID"))?;
+        return Ok(Some(ServiceEvent::NativePortrait(portrait as u16)));
+    }
     if t.eq_str("native_play_pending") { return Ok(Some(ServiceEvent::NativePlayPending)); }
     for (name, mode) in [("native_visible", 0), ("native_away", 1), ("native_invisible", 4)] {
         if t.eq_str(name) {
@@ -856,6 +861,10 @@ mod tests {
         assert_eq!(status(br#"{"type":"native_invisible","groups":true}"#), Ok((4, true)));
         assert!(parse_service_event(br#"{"type":"native_visible","groups":1}"#).is_err());
         assert!(matches!(parse_service_event(br#"{"type":"native_activity"}"#), Ok(Some(ServiceEvent::NativeActivity))));
+        assert!(matches!(parse_service_event(br#"{"type":"native_portrait","portrait":8191}"#), Ok(Some(ServiceEvent::NativePortrait(8191)))));
+        for bad in [&br#"{"type":"native_portrait","portrait":8192}"#[..], br#"{"type":"native_portrait","portrait":-1}"#, br#"{"type":"native_portrait"}"#] {
+            assert!(parse_service_event(bad).is_err());
+        }
         let native = native_fields();
         assert_eq!(parse_session(line(&native).as_bytes()).unwrap().auto_away_minutes, 10, "Viewer default");
         for (value, minutes) in [("0", 0), ("10", 10), ("35", 35), ("60", 60)] {

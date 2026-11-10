@@ -14,9 +14,10 @@
 //! profile picker shows profile names unmasked in both builds, and the others name no one.
 //! Nothing here animates or polls: a relaunch's time is shown as a clock time, so no countdown
 //! ticks.
-use super::{send, BackupLine, ClientLine, FeatureStrings, Features, HotkeyLine, LayoutLine, MainWindow, PlayLine, RelaunchLine};
+use super::{send, BackupLine, ClientLine, FeatureStrings, Features, HotkeyLine, LayoutLine, MainWindow, MapTile, PlayLine, RelaunchLine};
 use crate::features::hotkeys::{Action, Status};
-use crate::features::layouts::Preset;
+use crate::features::game_window::Rect;
+use crate::features::layouts::{self, Preset};
 use crate::features::perf::Priority;
 use crate::features::profiles::{self, GamepadSource, Tool};
 use crate::features::recovery::{Decision, EndKind, Held};
@@ -54,10 +55,15 @@ struct State {
     backup_paths: Vec<PathBuf>,
     keep_values: Vec<u32>,
     monitor_devices: Vec<Option<String>>,
+    /// What the monitor map draws from, as of the last sync.
+    map: MapInputs,
     /// The relaunch banner's rows: (account, scheduled).
     relaunches: Vec<(String, bool)>,
     sections: Rc<VecModel<SharedString>>,
+    section_notes: Rc<VecModel<SharedString>>,
     monitors: Rc<VecModel<SharedString>>,
+    monitor_names: Rc<VecModel<SharedString>>,
+    map_tiles: Rc<VecModel<MapTile>>,
     keep_items: Rc<VecModel<SharedString>>,
     priorities: Rc<VecModel<SharedString>>,
     layouts: Rc<VecModel<LayoutLine>>,
@@ -67,6 +73,16 @@ struct State {
     clients: Rc<VecModel<ClientLine>>,
     playtime: Rc<VecModel<PlayLine>>,
     relaunch_lines: Rc<VecModel<RelaunchLine>>,
+}
+
+/// The game windows and monitor work areas the map is drawn from.
+#[derive(Default)]
+struct MapInputs {
+    /// Every monitor: (device, work area), in the order Arrange all uses.
+    areas: Vec<(String, Rect)>,
+    /// The running games in account order: (account label, in game).
+    windows: Vec<(String, bool)>,
+    aspect: f32,
 }
 
 impl State {
@@ -81,9 +97,13 @@ impl State {
             backup_paths: Vec::new(),
             keep_values: Vec::new(),
             monitor_devices: Vec::new(),
+            map: MapInputs::default(),
             relaunches: Vec::new(),
             sections: Rc::default(),
+            section_notes: Rc::default(),
             monitors: Rc::default(),
+            monitor_names: Rc::default(),
+            map_tiles: Rc::default(),
             keep_items: Rc::default(),
             priorities: Rc::default(),
             layouts: Rc::default(),
@@ -151,7 +171,10 @@ pub(super) fn wire(ui: &MainWindow) {
     let state = State::new();
     let g = ui.global::<Features>();
     g.set_sections(ModelRc::from(state.sections.clone()));
+    g.set_section_notes(ModelRc::from(state.section_notes.clone()));
     g.set_monitors(ModelRc::from(state.monitors.clone()));
+    g.set_monitor_names(ModelRc::from(state.monitor_names.clone()));
+    g.set_map_tiles(ModelRc::from(state.map_tiles.clone()));
     g.set_keep_items(ModelRc::from(state.keep_items.clone()));
     g.set_priorities(ModelRc::from(state.priorities.clone()));
     g.set_layouts(ModelRc::from(state.layouts.clone()));
@@ -172,6 +195,12 @@ pub(super) fn wire(ui: &MainWindow) {
         let picked = weak.upgrade().map_or(0, |ui| ui.global::<Features>().get_monitor());
         let device = read(|s| s.monitor_devices.get(index(picked)?).cloned()).flatten();
         feature(Msg::Arrange(preset, device));
+    });
+    g.on_restore_windows(|| feature(Msg::RestoreWindows));
+    let weak = ui.as_weak();
+    g.on_map_changed(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        STATE.with(|cell| { if let Some(state) = cell.borrow().as_ref() { map_tiles(&ui.global::<Features>(), state); } });
     });
     g.on_forget(|i| { if let Some(id) = read(|s| s.layout_ids.get(index(i)?).cloned()) { feature(Msg::Forget(id)); } });
     g.on_hotkey_entered(|i, text| {
@@ -255,7 +284,7 @@ pub(super) fn sync(ui: &MainWindow, app: &App) {
         if state.lang != Some(lang) {
             state.lang = Some(lang);
             put!(g, get_strings, set_strings, strings());
-            strings_model(&state.sections, Section::ALL.iter().map(|s| s.label().to_owned()));
+            strings_model(&state.sections, Section::ALL.iter().map(|s| section_title(*s).to_owned()));
             strings_model(&state.priorities, std::iter::once(t("Windows default").to_owned()).chain(Priority::ALL.iter().map(|p| p.label().to_owned())));
         }
         let print = accounts_print(app);
@@ -295,8 +324,11 @@ pub(super) fn sync(ui: &MainWindow, app: &App) {
         let notice = app.features.as_ref().and_then(|r| r.load_error()).filter(|_| notice.is_empty()).map_or((error, notice), |e| (true, e));
         put!(g, get_notice, set_notice, notice.1.into());
         put!(g, get_notice_error, set_notice_error, notice.0);
+        strings_model(&state.section_notes, section_notes(app, &settings));
+        // The map and the Windows tile name the layout and monitor whichever section is open.
+        windows(&g, app, &settings, state);
         match view.section {
-            Section::Windows => windows(&g, app, &settings, state),
+            Section::Windows => {}
             Section::Hotkeys => hotkeys(app, &settings, state),
             Section::Recovery => recovery(&g, &settings),
             Section::Backups => backups(&g, app, &settings, state),
@@ -321,36 +353,41 @@ fn strings() -> FeatureStrings {
         launch_saved_note: t("The game opens at the remembered resolution.").into(),
         order_windows: t("Order game windows").into(),
         order_windows_note: t("Taskbar and Alt+Tab follow the Home order.").into(),
-        arrange: t("Arrange all").to_uppercase().into(),
+        arrange: t("Arrange all").into(),
+        restore_windows: t("Restore windows").into(),
         monitor: t("Monitor").into(),
+        layout: t("Layout").into(),
         grid: t("Grid").into(),
         main_large: t("Main large").into(),
-        arrange_note: t("Follows the account order. Fullscreen games are left alone.").into(),
-        remembered: t("Remembered windows").to_uppercase().into(),
+        list_sep: t(", ").into(),
+        arrange_note: t("Fullscreen games are left alone.").into(),
+        in_game: t("In game").into(),
+        no_windows: t("No game windows open").into(),
+        remembered: t("Remembered windows").into(),
         no_layouts: t("No windows remembered yet.").into(),
         forget: t("Forget").into(),
-        switch_windows: t("Switch windows").to_uppercase().into(),
-        per_account: t("Per account").to_uppercase().into(),
+        switch_windows: t("Switch windows").into(),
+        per_account: t("Per account").into(),
         hotkey_placeholder: t("e.g. Ctrl+Alt+1").into(),
         hotkey_note: t("Press Return to apply. Leave blank for none.").into(),
         no_accounts: t("No accounts yet").into(),
-        recovery: t("Crash recovery").to_uppercase().into(),
+        recovery: t("Crash recovery").into(),
         offer: t("Offer Relaunch after a crash or disconnect").into(),
         offer_note: t("Shown above the play bar.").into(),
         auto_relaunch: t("Relaunch automatically").into(),
         auto_note: SharedString::new(),
-        pending: t("Waiting").to_uppercase().into(),
+        pending: t("Waiting").into(),
         no_pending: t("Nothing waiting to relaunch.").into(),
-        backups: t("USER data").to_uppercase().into(),
+        backups: t("USER data").into(),
         back_up_now: t("Back up now").into(),
         before_update: t("Back up before Update and Repair").into(),
         keep: t("Keep").into(),
-        saved_backups: t("Saved backups").to_uppercase().into(),
+        saved_backups: t("Saved backups").into(),
         no_backups: t("No backups yet.").into(),
         restore_action: t("Restore files").into(),
         restore_question: t("Replace the current files with this backup? They are backed up first.").into(),
         cancel: t("Cancel").into(),
-        background: t("Background clients").to_uppercase().into(),
+        background: t("Background clients").into(),
         background_priority: t("Lower their priority").into(),
         background_priority_note: t("Below normal until brought forward.").into(),
         mute_background: t("Mute them").into(),
@@ -361,13 +398,13 @@ fn strings() -> FeatureStrings {
         mute_client: t("Mute in background").into(),
         edit_account: t("Edit account").into(),
         running: t("Running").into(),
-        notifications: t("Notifications").to_uppercase().into(),
+        notifications: t("Notifications").into(),
         notify: t("Show desktop notifications").into(),
         notify_mail: t("New mail").into(),
         notify_friends: t("Friends coming online").into(),
-        discord: "Discord".to_uppercase().into(),
+        discord: "Discord".into(),
         discord_switch: t("Show play status in Discord").into(),
-        playtime: t("Play time").to_uppercase().into(),
+        playtime: t("Play time").into(),
         record: t("Record play time").into(),
         no_playtime: t("No play time recorded yet.").into(),
         relaunch: t("Relaunch").into(),
@@ -471,8 +508,10 @@ fn windows(g: &Features, app: &App, settings: &FeatureSettings, state: &mut Stat
     put!(g, get_restore, set_restore, layouts.restore);
     put!(g, get_launch_saved, set_launch_saved, layouts.launch_at_saved_size);
     put!(g, get_order_windows, set_order_windows, layouts.order_windows);
+    put!(g, get_can_restore, set_can_restore, app.features.as_ref().is_some_and(|r| r.can_restore_windows()));
     let monitors = &app.features_view.monitors;
     let mut labels = vec![t("All monitors").to_owned()];
+    let mut names = labels.clone();
     let mut devices = vec![None];
     for (i, monitor) in monitors.iter().enumerate() {
         let number = monitor.device.trim_start_matches(r"\\.\DISPLAY").parse::<u32>().unwrap_or(i as u32 + 1);
@@ -480,24 +519,99 @@ fn windows(g: &Features, app: &App, settings: &FeatureSettings, state: &mut Stat
         let mut label = tf("Display {number} · {width}×{height}", &[("number", &number), ("width", &w), ("height", &h)]);
         if monitor.primary { label = tf("{display} · primary", &[("display", &label)]); }
         labels.push(label);
+        names.push(format!("{} {number}", t("Display")));
         devices.push(Some(monitor.device.clone()));
     }
     if state.monitor_devices != devices { put!(g, get_monitor, set_monitor, 0); }
     state.monitor_devices = devices;
     strings_model(&state.monitors, labels);
+    strings_model(&state.monitor_names, names);
     let mut ids = Vec::new();
     let mut lines = Vec::new();
     for (id, saved) in &layouts.saved {
         let Some(key) = ClientKey::parse(id) else { continue };
         let display = saved.monitor.device.trim_start_matches(r"\\.\");
+        let size = format!("{} × {}", saved.client.0, saved.client.1);
         lines.push(LayoutLine {
             name: app.feature_client_label(&key).into(),
-            detail: format!("{} × {} · {display}", saved.client.0, saved.client.1).into(),
+            detail: format!("{size} · {display}").into(),
+            size: size.into(),
+            display: display.to_uppercase().into(),
         });
         ids.push(id.clone());
     }
     state.layout_ids = ids;
     sync_model(&state.layouts, lines);
+    state.map = MapInputs {
+        areas: monitors.iter().map(|m| (m.device.clone(), m.work)).collect(),
+        windows: app.accounts.iter()
+            .filter(|row| row.pid.is_some())
+            .map(|row| (crate::privacy::mask(&row.account.label), crate::account_row::row_state(app, row) == crate::account_row::RowState::Playing))
+            .collect(),
+        aspect: layouts.aspect,
+    };
+    map_tiles(g, state);
+}
+
+/// The monitor map: where Arrange all would put the running games with the layout and monitor
+/// chosen, as fractions of the area they share.
+fn map_tiles(g: &Features, state: &State) {
+    let preset = if g.get_preset() == 1 { Preset::MainLarge } else { Preset::Grid };
+    let picked = index(g.get_monitor()).and_then(|i| state.monitor_devices.get(i).cloned()).flatten();
+    let areas: Vec<Rect> = state.map.areas.iter().filter(|(device, _)| picked.as_ref().is_none_or(|p| p == device)).map(|(_, work)| *work).collect();
+    let areas = if areas.is_empty() { state.map.areas.iter().map(|(_, work)| *work).take(1).collect() } else { areas };
+    let Some(first) = areas.first().copied() else {
+        sync_model(&state.map_tiles, Vec::new());
+        return;
+    };
+    let (left, top) = areas.iter().fold((first.x, first.y), |(x, y), a| (x.min(a.x), y.min(a.y)));
+    let (right, bottom) = areas.iter().fold((first.right(), first.bottom()), |(x, y), a| (x.max(a.right()), y.max(a.bottom())));
+    let (width, height) = (((right - left).max(1)) as f32, ((bottom - top).max(1)) as f32);
+    put!(g, get_map_aspect, set_map_aspect, width / height);
+    let rects = layouts::arrange(preset, state.map.windows.len(), &areas, state.map.aspect);
+    let tiles = state.map.windows.iter().zip(rects).enumerate().map(|(i, ((name, live), r))| MapTile {
+        index: (i + 1).to_string().into(),
+        name: name.as_str().into(),
+        size: format!("{} × {}", r.w, r.h).into(),
+        x: (r.x - left) as f32 / width,
+        y: (r.y - top) as f32 / height,
+        w: r.w as f32 / width,
+        h: r.h as f32 / height,
+        live: *live,
+    }).collect();
+    sync_model(&state.map_tiles, tiles);
+}
+
+fn section_title(section: Section) -> &'static str {
+    match section {
+        Section::Windows => t("Windows"),
+        Section::Hotkeys => t("Hotkeys"),
+        Section::Recovery => t("Crash recovery"),
+        Section::Backups => t("Backups"),
+        Section::Clients => t("Clients"),
+        Section::Activity => t("Activity"),
+    }
+}
+
+/// Each section tile's state in a few words, in `Section::ALL` order (Windows' is worded by the
+/// page from the layout and monitor chosen).
+fn section_notes(app: &App, settings: &FeatureSettings) -> Vec<String> {
+    let hotkeys = &settings.hotkeys;
+    let set = usize::from(hotkeys.cycle.is_some()) + usize::from(hotkeys.cycle_back.is_some()) + hotkeys.accounts.len();
+    let recovery = &settings.recovery;
+    let on_off = |on: bool| if on { t("on") } else { t("off") };
+    Section::ALL.iter().map(|section| match section {
+        Section::Windows => String::new(),
+        Section::Hotkeys if set == 0 => t("Not set").to_owned(),
+        Section::Hotkeys => tf("{count} set", &[("count", &set)]),
+        Section::Recovery => if recovery.auto_relaunch { t("Relaunches automatically") } else if recovery.offer { t("Offers a relaunch") } else { t("Off") }.to_owned(),
+        Section::Backups => match app.features_view.backups.iter().map(|b| b.created).max() {
+            Some(created) => tf("Last {date}", &[("date", &date(created))]),
+            None => t("No backups yet").to_owned(),
+        },
+        Section::Clients => if settings.perf.background { t("Background at low priority") } else { t("Background at normal priority") }.to_owned(),
+        Section::Activity => tf("Play time {playtime}, Discord {discord}", &[("playtime", &on_off(settings.playtime.record)), ("discord", &on_off(settings.playtime.discord))]),
+    }).collect()
 }
 
 fn hotkey_line(name: String, hotkey: Option<crate::features::hotkeys::Hotkey>, action: &Action, statuses: &[Status], error: Option<&String>) -> HotkeyLine {
@@ -596,7 +710,8 @@ fn clients(g: &Features, app: &App, settings: &FeatureSettings, state: &mut Stat
         let profile = match view.tool {
             Tool::Native => t("Stock client: no launch profile").to_owned(),
             tool => {
-                let name = if view.effective.is_empty() { t("Windower's default profile").to_owned() } else { view.effective.clone() };
+                // A profile's own name is user-authored: masked in privacy mode.
+                let name = if view.effective.is_empty() { t("Windower's default profile").to_owned() } else { crate::privacy::mask(&view.effective) };
                 let name = if view.missing { tf("{name} (missing)", &[("name", &name)]) } else { name };
                 let tool = if tool == Tool::Windower { "Windower" } else { "Ashita" };
                 let line = tf("{tool} · {profile}", &[("tool", &tool), ("profile", &name)]);
@@ -754,12 +869,12 @@ mod tests {
         assert_eq!(priority_choice(-1), None);
     }
 
-    /// The sheet shows the runtime's settings and read-outs, and while it is open the
-    /// controller walker reaches its controls and nothing under the dimmed page.
+    /// The page shows the runtime's settings and read-outs, and the controller walker reaches
+    /// each section's controls (it is a page, not a modal: the rail and top bar stay reachable).
     #[test]
-    fn the_sheet_draws_the_runtime_and_the_walker_reaches_only_its_controls() {
+    fn the_page_draws_the_runtime_and_the_walker_reaches_its_controls() {
         let mut app = crate::tests::app();
-        // Closed: Home's stops, the Features entry among them; no sheet.
+        // Closed: Home's stops, the Features entry among them; no modal.
         let ui = window(&app);
         assert!(!pad::stop_origins(ui.window()).is_empty());
         assert!(pad::modal_rect(ui.window()).is_none());
@@ -772,12 +887,12 @@ mod tests {
         assert_eq!(g.get_backups().row_count(), 2);
         assert!(g.get_backups().row_data(0).unwrap().confirming, "the sample asks to restore the newest");
         assert!(!g.get_backups_loading());
-        let (x, _, w, _) = pad::modal_rect(ui.window()).expect("the sheet's panel");
-        assert_eq!(w, 600.0, "Theme.sheet-wide-w at 1440 px");
-        // The header's close button, six tabs and the footer's Close, plus each section's own
-        // controls; every stop lies in the panel.
+        assert!(pad::modal_rect(ui.window()).is_none(), "the page is not modal");
+        // The six section tiles, plus each section's own controls (the layout's two segments and
+        // the monitor, Arrange all, the four switches, two Forget buttons); the page lies right of
+        // the rail and under the top bar.
         let own = [
-            (Section::Windows, 4 + 1 + 2 + 2),
+            (Section::Windows, 2 + 1 + 1 + 4 + 2),
             (Section::Hotkeys, 2 + app.accounts.len()),
             (Section::Recovery, 2),
             (Section::Backups, 3 + 1 + 2),
@@ -787,9 +902,8 @@ mod tests {
         for (i, (section, controls)) in own.into_iter().enumerate() {
             open(&mut app, &ui, section);
             assert_eq!(g.get_section(), i as i32);
-            let stops = pad::stop_origins(ui.window());
-            assert!(stops.iter().all(|(sx, _)| *sx >= x), "{section:?}: {stops:?}");
-            assert_eq!(stops.len(), 8 + controls, "{section:?}");
+            let stops: Vec<_> = pad::stop_origins(ui.window()).into_iter().filter(|(sx, sy)| *sx >= 356.0 && *sy > 100.0).collect();
+            assert_eq!(stops.len(), 6 + controls, "{section:?}: {stops:?}");
             match section {
                 Section::Windows => assert_eq!(g.get_layouts().row_count(), 2),
                 Section::Hotkeys => {
@@ -808,11 +922,9 @@ mod tests {
                 Section::Backups => {}
             }
         }
-        // Escape closes it from the keyboard; the controller's Back does in the core.
-        key(&ui, Key::Escape);
-        assert!(take_sent().iter().any(|m| matches!(m, Message::Feature(Msg::Open(false)))));
-        assert!(app.controller_modal());
-        // Closing hides the sheet; the banner stays for an offered relaunch.
+        // Back (Escape, the controller's B) closes it in the core; going to another page does too.
+        assert!(!app.controller_modal());
+        // Closing hides the page; the banner stays for an offered relaunch.
         app.features_view.offers.insert(app.accounts[0].key.clone(), Decision::Offer { kind: EndKind::Disconnect, held: Held::Off });
         drop(app.update(Message::ControllerBack));
         sync(&ui, &app);
@@ -833,6 +945,55 @@ mod tests {
         render();
         assert!(pad::modal_rect(ui.window()).is_some_and(|(_, _, w, _)| w == 464.0));
         assert!(pad::stop_origins(ui.window()).iter().all(|(sx, _)| *sx >= 1440.0 - 464.0));
+    }
+
+    /// The monitor map draws one tile per running game, and follows the layout chosen; going to
+    /// another page leaves the Features page.
+    #[test]
+    fn the_map_follows_the_layout_and_navigating_leaves_the_page() {
+        let mut app = crate::tests::app();
+        for row in app.accounts.iter_mut() { row.pid = Some(1); }
+        let ui = window(&app);
+        app.load_features_sample(Section::Windows, false);
+        sync(&ui, &app);
+        render();
+        let g = ui.global::<Features>();
+        if app.features_view.monitors.is_empty() { return; }
+        assert_eq!(g.get_map_tiles().row_count(), app.accounts.len(), "a tile per running game");
+        g.set_preset(1);
+        g.invoke_map_changed();
+        let main_large = g.get_map_tiles().row_data(0).unwrap();
+        g.set_preset(0);
+        g.invoke_map_changed();
+        let grid = g.get_map_tiles().row_data(0).unwrap();
+        assert!(main_large.w > grid.w, "the main window is the large one: {} against {}", main_large.w, grid.w);
+        assert!(g.get_map_tiles().iter().all(|t| t.x >= 0.0 && t.y >= 0.0 && t.x + t.w <= 1.001 && t.y + t.h <= 1.001));
+        assert!(app.features_view.open);
+        drop(app.update(Message::Navigate(crate::Page::Settings)));
+        assert!(!app.features_view.open, "Features is a page: going elsewhere leaves it");
+    }
+    /// Restore windows shows beside Arrange all only while the last Arrange all can be undone.
+    #[test]
+    fn restore_windows_shows_only_with_something_to_restore() {
+        let mut app = crate::tests::app();
+        let ui = window(&app);
+        app.load_features_sample(Section::Windows, false);
+        sync(&ui, &app);
+        render();
+        let g = ui.global::<Features>();
+        let stops = || pad::stop_origins(ui.window()).len();
+        assert!(!g.get_can_restore(), "no Arrange all yet: no Restore windows");
+        let without = stops();
+        g.set_can_restore(true);
+        render();
+        assert_eq!(stops(), without + 1, "the button is there and reachable");
+        // The next rebuild follows the runtime, which has nothing to restore.
+        drop(app.feature_update(Msg::RestoreWindows));
+        sync(&ui, &app);
+        render();
+        assert!(!g.get_can_restore());
+        assert_eq!(stops(), without);
+        assert!(app.features_view.notice.as_ref().is_some_and(|(error, _)| *error), "nothing to restore is said");
     }
 
     /// Each callback sends the message its control is for.
@@ -875,6 +1036,7 @@ mod tests {
         assert!(matches!(one(&|| g.invoke_forget(0)), Message::Feature(Msg::Forget(ref id)) if *id == layout));
         g.set_monitor(0);
         assert!(matches!(one(&|| g.invoke_arrange(1)), Message::Feature(Msg::Arrange(Preset::MainLarge, None))));
+        assert!(matches!(one(&|| g.invoke_restore_windows()), Message::Feature(Msg::RestoreWindows)));
         assert!(matches!(one(&|| g.invoke_relaunch_now(0)), Message::Launch(ref k) if *k == keys[1]));
         assert!(matches!(one(&|| g.invoke_relaunch_dismiss(0)), Message::Feature(Msg::DismissRecovery(ref k)) if *k == keys[1]));
         assert!(matches!(one(&|| g.invoke_relaunch_cancel(0)), Message::Feature(Msg::CancelRelaunch(ref k)) if *k == keys[1]));

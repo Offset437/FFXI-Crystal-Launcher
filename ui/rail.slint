@@ -1,0 +1,761 @@
+// The account rail (Skyline): on every page, left of the top bar. The brand row (it drags the
+// window), the accounts with their crystal lamps, picks, inline one-time codes and row actions,
+// drag-to-reorder by the index grip, and the status block with Play and the launch pickers.
+// Every row message is the one Home's former rows sent (src/slint_host/view.rs).
+import { Theme } from "theme.slint";
+import { View, Ink, AccountLine, RailNote } from "state.slint";
+import { Downloads } from "downloads_state.slint";
+import { Nav, Glyph, Icon, Spinner, Pressable, SmallButton, Control, Tone, IconButton, Check, Select, ScrollThumb, KeyCap, Lamp, LampState, Face, CornerMask, Menu, QuietButton, TipBody } from "widgets.slint";
+
+/// The brand row: the crystal mark and the name. Its empty part is the title bar.
+component Brand inherits Rectangle {
+    callback title-pressed();
+    callback title-moved();
+    callback title-released();
+    height: Theme.bar-h;
+    TouchArea {
+        pointer-event(event) => {
+            if event.button == PointerEventButton.left {
+                if event.kind == PointerEventKind.down { root.title-pressed(); }
+                if event.kind == PointerEventKind.up { root.title-released(); }
+            }
+        }
+        moved => { if self.pressed { root.title-moved(); } }
+    }
+    HorizontalLayout {
+        padding-left: 20px;
+        padding-right: 12px;
+        spacing: 10px;
+        // The lit crystal at 1x, 1.5x and 2x (assets/crystal/bake.py): dark over light. Its
+        // slot keeps the mark's width, so the name doesn't move.
+        Rectangle {
+            width: 8.5px;
+            Image {
+                private property <float> dpr: 1px / 1phx;
+                private property <int> cell-h: self.source.height / 2;
+                x: round((parent.width - self.width) / 2 / 1phx) * 1phx;
+                y: round((parent.height - self.height) / 2 / 1phx) * 1phx;
+                width: 24px * self.source.width / self.cell-h;
+                height: 24px;
+                source: self.dpr < 1.2 ? @image-url("../assets/crystal/mark-24.png") : self.dpr < 1.75 ? @image-url("../assets/crystal/mark-36.png")
+                    : @image-url("../assets/crystal/mark-48.png");
+                source-clip-y: Theme.light ? self.cell-h : 0;
+                source-clip-height: self.cell-h;
+                image-fit: fill;
+                accessible-role: none;
+            }
+        }
+        Text {
+            text: "Crystal Launcher";
+            font-size: Theme.type-body;
+            font-weight: 600;
+            color: Theme.ink;
+            vertical-alignment: center;
+        }
+        Rectangle { horizontal-stretch: 1; }
+        // A launcher update (self_update::model::pill): found, downloading, ready or restarting.
+        // Its button, when it has one, is the pill itself.
+        if Downloads.update-banner && Downloads.update-strip.pill != "": pill := Pressable {
+            cross-axis-self-alignment: center;
+            height: 24px;
+            width: pill-row.preferred-width + 20px;
+            label: Downloads.update-strip.text;
+            enabled: Downloads.update-strip.action != "";
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.ice.with-alpha(0.45);
+            background: Theme.ice.with-alpha(self.hot ? 0.22 : 0.12);
+            clicked => { Downloads.update-strip-clicked(); }
+            pill-row := HorizontalLayout {
+                x: 10px;
+                width: self.preferred-width;
+                spacing: 6px;
+                if Downloads.update-strip.busy: Spinner { cross-axis-self-alignment: center; size: 12px; tint: Theme.ice; }
+                if !Downloads.update-strip.busy: Icon { cross-axis-self-alignment: center; glyph: Glyph.download; size: 12px; tint: Theme.ice; }
+                Text { text: Downloads.update-strip.pill; font-size: Theme.type-note; font-weight: 600; color: pill.hot ? Theme.ice-hi : Theme.ice; vertical-alignment: center; }
+            }
+            Tooltip { TipBody { text: Downloads.update-strip.text; } }
+        }
+    }
+}
+
+/// Six code boxes over one hidden input: the digits sit in the boxes (a mono face spaced to their
+/// pitch), the next box shows the caret in amber. `shown` is the code as drawn (bullets in
+/// privacy mode); `length` its digits.
+component CodeBoxes inherits Rectangle {
+    in property <string> code;
+    in property <string> shown;
+    in property <int> length;
+    in property <string> label;
+    callback edited(string);
+    callback accepted();
+    // The edited handler below writes the input, which drops its `text` binding: this keeps it
+    // following the row's code when the core changes it (a cleared code, a reused row instance
+    // after a reorder or delete), so a stale digit is never typed onto.
+    changed code => { input.text = root.code; }
+    /// Narrower boxes, to leave the row's button its room.
+    in property <bool> compact;
+    private property <length> box-w: Theme.small || root.compact ? 19px : 21px;
+    private property <length> pitch: root.box-w + 3px;
+    width: 6 * root.pitch - 3px;
+    height: Theme.small ? 24px : 26px;
+    horizontal-stretch: 0;
+    for i in 6: Rectangle {
+        x: i * root.pitch;
+        width: root.box-w;
+        height: root.height;
+        border-radius: Theme.radius-sm;
+        border-width: 1px;
+        border-color: input.has-focus && i == min(root.length, 5) ? Theme.warn : Theme.line;
+        background: Theme.field;
+        if input.has-focus && i == root.length: Rectangle {
+            width: 1.5px;
+            height: 14px;
+            background: Theme.warn;
+        }
+    }
+    // JetBrains Mono advances 0.6 em: 7.8 px at 13 px, so each digit centres in its box.
+    Text {
+        x: (root.box-w - 7.8px) / 2;
+        width: parent.width;
+        text: root.shown;
+        font-family: Theme.mono;
+        font-size: 13px;
+        font-weight: 500;
+        letter-spacing: root.pitch - 7.8px;
+        color: Theme.ink;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+    input := TextInput {
+        width: parent.width;
+        height: parent.height;
+        text: root.code;
+        single-line: true;
+        enabled: !Nav.modal;
+        color: transparent;
+        selection-background-color: transparent;
+        selection-foreground-color: transparent;
+        font-size: 13px;
+        vertical-alignment: center;
+        accessible-label: root.label;
+        edited => {
+            root.edited(self.text);
+            // The view keeps digits only, up to six: show what it kept.
+            self.text = root.code;
+        }
+        accepted => { root.accepted(); }
+    }
+}
+
+/// One account (`.acct`): the index (the drag grip under the pointer), the crystal lamp, the name
+/// (opens its settings) with the session clock and the Play pick, then the state with its detail
+/// and one of: the code boxes, the progress bar, the row's action.
+component RailRow inherits Rectangle {
+    in property <AccountLine> line;
+    in property <int> index;
+    height: Theme.rail-row-h;
+    border-radius: Theme.radius;
+    // The dragged pointer is over this row (or the gap under it): it takes the dragged row's place.
+    private property <bool> under: View.dragging && View.drag-y >= self.absolute-position.y
+        && View.drag-y < self.absolute-position.y + self.height + Theme.rail-row-gap;
+    changed under => { if self.under { View.drag-over(root.index); } }
+    private property <bool> off: root.line.lamp == LampState.off;
+    // A code row with its button beside the boxes.
+    private property <bool> otp-button: root.line.otp && root.line.action != "" && !root.line.action-soft;
+    background: root.line.dragging ? Theme.fill2 : hover.has-hover || root.line.editing ? Theme.fill : transparent;
+    // What the portrait's corners are cut out of.
+    private property <color> surface: root.line.dragging ? Theme.fill2 : hover.has-hover || root.line.editing ? Theme.fill : Theme.rail;
+    border-width: root.line.dragging ? 1px : 0px;
+    border-color: Theme.ice;
+    hover := TouchArea {
+        HorizontalLayout {
+            padding-left: Theme.small ? 10px : 12px;
+            padding-right: Theme.small ? 10px : 12px;
+            spacing: 0px;
+            // The index; under the pointer, the grip. Pressing it starts the drag; the release
+            // anywhere ends it (the host's window listener).
+            Rectangle {
+                width: 10px;
+                if hover.has-hover || root.line.dragging: Icon {
+                    glyph: Glyph.grip;
+                    size: 12px;
+                    tint: root.line.dragging ? Theme.ice : Theme.sub;
+                }
+                if !hover.has-hover && !root.line.dragging: Text {
+                    text: root.index + 1;
+                    font-family: Theme.mono;
+                    font-size: Theme.type-micro;
+                    font-weight: 500;
+                    color: Theme.faint;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                TouchArea {
+                    x: -10px;
+                    width: 26px;
+                    mouse-cursor: root.line.dragging ? grabbing : grab;
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                            View.drag-y = self.absolute-position.y + self.mouse-y;
+                            View.drag-start(root.index);
+                        }
+                    }
+                    moved => { if View.dragging { View.drag-y = self.absolute-position.y + self.mouse-y; } }
+                }
+            }
+            Rectangle { width: Theme.small ? 8px : 10px; }
+            Lamp {
+                cross-axis-self-alignment: center;
+                state: root.line.lamp;
+                fill: root.line.fill;
+            }
+            Rectangle { width: Theme.small ? 12px : 14px; }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                spacing: Theme.small ? 0px : 2px;
+                HorizontalLayout {
+                    height: Theme.small ? 22px : 24px;
+                    spacing: 10px;
+                    name := Pressable {
+                        horizontal-stretch: 1;
+                        min-width: 24px;
+                        label: root.line.name;
+                        enabled: root.line.name-enabled;
+                        clicked => { View.edit-account(root.index); }
+                        Text {
+                            width: min(parent.width, self.preferred-width);
+                            x: 0;
+                            text: root.line.name;
+                            font-size: Theme.small ? 15px : Theme.type-heading;
+                            font-weight: 600;
+                            color: root.line.editing || parent.hot ? Theme.ice-hi : root.off ? Theme.ink2 : Theme.ink;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                    // Your PlayOnline portrait, once a session has reported it: after the name, so the name and the state under it share one edge on every row.
+                    if root.line.has-picture: Face {
+                        cross-axis-self-alignment: center;
+                        size: Theme.small ? 18px : 20px;
+                        source: root.line.picture;
+                        ring: root.surface;
+                    }
+                    if root.line.clock != "": Text {
+                        horizontal-stretch: 0;
+                        text: root.line.clock;
+                        font-family: Theme.mono;
+                        font-size: Theme.type-fine;
+                        font-weight: 500;
+                        color: Theme.sub;
+                        vertical-alignment: center;
+                    }
+                    Check {
+                        cross-axis-self-alignment: center;
+                        box: 18px;
+                        width: 18px;
+                        height: 18px;
+                        label: root.line.name;
+                        checked: root.line.checked;
+                        toggled(on) => { View.toggle-account(root.index, on); }
+                    }
+                }
+                HorizontalLayout {
+                    height: 28px;
+                    spacing: 8px;
+                    Text {
+                        horizontal-stretch: 0;
+                        max-width: 200px;
+                        // A code row keeps its whole label: the short one beside a row button.
+                        min-width: root.line.otp ? self.preferred-width : 0px;
+                        text: root.line.otp ? (Theme.small || root.otp-button ? View.strings.code : View.strings.one-time-code) : root.line.label;
+                        font-size: Theme.type-state;
+                        font-weight: root.line.lamp == LampState.game ? 600 : 400;
+                        color: root.line.lamp == LampState.game ? Theme.lamp-game
+                            : root.line.lamp == LampState.code || root.line.otp ? Theme.lamp-code
+                            : root.line.lamp == LampState.error ? Theme.lamp-error
+                            : root.off ? Theme.lamp-off : Theme.lamp-ready;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    if !root.line.otp: Text {
+                        horizontal-stretch: 1;
+                        min-width: 0px;
+                        text: root.line.detail;
+                        font-size: Theme.type-note;
+                        color: Theme.faint;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    if root.line.otp: Rectangle { horizontal-stretch: 1; }
+                    if root.line.otp: CodeBoxes {
+                        cross-axis-self-alignment: center;
+                        compact: root.otp-button;
+                        code: root.line.otp-text;
+                        shown: root.line.otp-shown;
+                        length: root.line.otp-len;
+                        label: View.strings.one-time-code;
+                        edited(value) => { View.otp-edited(root.index, value); }
+                        accepted => { if root.line.action-enabled { View.row-action(root.index); } }
+                    }
+                    // The row's progress; work without a fraction (signing in, starting) runs a
+                    // segment along the track.
+                    if !root.line.otp && (root.line.progress >= 0 || root.line.working): Rectangle {
+                        width: 96px;
+                        accessible-role: progress-indicator;
+                        accessible-value: root.line.percent;
+                        Rectangle {
+                            y: (parent.height - 3px) / 2;
+                            height: 3px;
+                            border-radius: 1.5px;
+                            background: Theme.line;
+                            clip: true;
+                            if root.line.progress >= 0: Rectangle {
+                                x: 0;
+                                width: parent.width * clamp(root.line.progress, 0, 1);
+                                border-radius: 1.5px;
+                                background: Theme.ice;
+                            }
+                            if root.line.progress < 0: Rectangle {
+                                // Still while unfocused (no frames asked for), as the Spinner.
+                                x: Theme.animate
+                                    ? -self.width + (parent.width + self.width) * mod(animation-tick() / 1ms, 1400) / 1400
+                                    : (parent.width - self.width) / 2;
+                                width: 32px;
+                                border-radius: 1.5px;
+                                background: Theme.ice;
+                            }
+                        }
+                    }
+                    // The soft Sign in of a code row is the boxes' own (Return, or the sixth digit).
+                    if root.line.action != "" && !(root.line.otp && root.line.action-soft): SmallButton {
+                        cross-axis-self-alignment: center;
+                        slim: true;
+                        scale: 1;
+                        text: root.line.action;
+                        enabled: root.line.action-enabled;
+                        clicked => { View.row-action(root.index); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The empty rail before any account is added (first run).
+component EmptyRail inherits VerticalLayout {
+    padding-left: 28px;
+    padding-right: 28px;
+    padding-top: 64px;
+    alignment: start;
+    spacing: 0px;
+    HorizontalLayout {
+        alignment: center;
+        // The unlit crystal at 1x, 1.5x and 2x (assets/crystal/bake.py): dark, then light.
+        Image {
+            private property <float> dpr: 1px / 1phx;
+            private property <int> cell-w: self.source.width / 2;
+            width: 120px * self.cell-w / self.source.height;
+            height: 120px;
+            source: self.dpr < 1.2 ? @image-url("../assets/crystal/empty-120.png") : self.dpr < 1.75 ? @image-url("../assets/crystal/empty-180.png")
+                : @image-url("../assets/crystal/empty-240.png");
+            source-clip-x: Theme.light ? self.cell-w : 0;
+            source-clip-width: self.cell-w;
+            image-fit: fill;
+            opacity: 0.9;
+            accessible-role: none;
+        }
+    }
+    Rectangle { height: 24px; }
+    Text { text: View.strings.no-accounts; font-size: 17px; font-weight: 600; color: Theme.ink; horizontal-alignment: center; }
+    Rectangle { height: 6px; }
+    Text { text: View.strings.no-accounts-body; font-size: Theme.type-state; color: Theme.sub; horizontal-alignment: center; wrap: word-wrap; }
+    Rectangle { height: 22px; }
+    Control {
+        height: 40px;
+        horizontal-stretch: 1;
+        tone: Tone.primary;
+        text: View.strings.add-account;
+        glyph: Glyph.plus;
+        enabled: View.can-add;
+        clicked => { View.add-account(); }
+    }
+    Rectangle { height: 8px; }
+    HorizontalLayout {
+        alignment: center;
+        QuietButton {
+            text: View.strings.import-from-pol;
+            glyph: Glyph.download;
+            weight: 600;
+            font-size: Theme.type-small;
+            enabled: View.can-add;
+            clicked => { View.import-accounts(); }
+        }
+    }
+}
+
+/// The Play button: the two-tone ice fill when Play is ready (amber when it needs attention), a
+/// raised tint while waiting or working, faint when there is nothing to play. Return starts it
+/// when nothing else has the focus (the Enter cap says so).
+component PlayButton inherits Pressable {
+    private property <int> tone: View.footer.play-fill;
+    private property <bool> bright: root.enabled && (root.tone == 0 || root.tone == 1);
+    private property <color> ink: !root.enabled ? Theme.faint
+        : root.tone == 0 ? Theme.ice-ink
+        : root.tone == 1 ? Theme.att-ink
+        : root.tone == 3 ? Theme.ok
+        : Theme.ink;
+    // The two tones (`.play`: 112deg, stops 0, 34, 34, 100%). The software renderer leaves a seam
+    // between gradient stops at an angle, so each tone is its own two-stop gradient: the dark
+    // tone fills the button, the light one a rectangle to the split's top end, and a triangle in
+    // the dark tone's colour there cuts the split's slant (CSS's 34% line: 22 deg off vertical).
+    private property <color> c0: root.tone == 1 ? Theme.att-0 : Theme.play-0;
+    private property <color> c1: root.tone == 1 ? Theme.att-1 : Theme.play-1;
+    private property <color> c2: root.tone == 1 ? Theme.att-2 : Theme.play-2;
+    private property <color> c3: root.tone == 1 ? Theme.att-3 : Theme.play-3;
+    private property <float> w: root.width / 1px;
+    private property <float> h: root.height / 1px;
+    private property <float> split: root.w / 2 - 0.16 * (0.927 * root.w + 0.375 * root.h) / 0.927;
+    private property <float> lean: 0.4045 * root.h / 2;
+    label: View.footer.play-label;
+    enabled: View.footer.play-enabled;
+    height: Theme.play-h;
+    border-radius: Theme.radius-lg;
+    background: !root.enabled ? Theme.fill : root.bright ? transparent : root.hot ? Theme.fill2.mix(Theme.line, 0.8) : Theme.fill2;
+    clicked => { View.main-action(); }
+    if root.bright: Rectangle { background: @linear-gradient(112deg, root.c2 0%, root.c3 100%); }
+    if root.bright: Rectangle {
+        x: 0;
+        width: (root.split + root.lean) * 1px;
+        background: @linear-gradient(112deg, root.c0 0%, root.c1 100%);
+    }
+    if root.bright: Path {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        viewbox-width: root.w;
+        viewbox-height: root.h;
+        fill: root.c2;
+        stroke: transparent;
+        stroke-width: 0px;
+        MoveTo { x: root.split + root.lean; y: 0; }
+        LineTo { x: root.split + root.lean; y: root.h; }
+        LineTo { x: root.split - root.lean; y: root.h; }
+        Close { }
+    }
+    if root.bright && (root.hot || root.down): Rectangle { background: root.down ? #0000001A : #FFFFFF1F; }
+    HorizontalLayout {
+        padding-left: 20px;
+        padding-right: 16px;
+        spacing: 12px;
+        if View.footer.play-glyph == 0: Path {
+            cross-axis-self-alignment: center;
+            width: 14px;
+            height: 16px;
+            viewbox-width: 14;
+            viewbox-height: 16;
+            commands: "M1 1.2C1 0.4 1.8 0 2.5 0.4L13.2 7.2C13.8 7.6 13.8 8.4 13.2 8.8L2.5 15.6C1.8 16 1 15.6 1 14.8Z";
+            fill: root.ink;
+            stroke: transparent;
+            stroke-width: 0px;
+        }
+        if View.footer.play-glyph == 1: Icon { cross-axis-self-alignment: center; glyph: Glyph.check; size: 18px; tint: root.ink; }
+        if View.footer.play-glyph == 2: Spinner { cross-axis-self-alignment: center; size: 18px; tint: Theme.ice; }
+        if View.footer.play-glyph == 3: Icon { cross-axis-self-alignment: center; glyph: Glyph.download; size: 18px; tint: root.ink; }
+        if View.footer.play-glyph == 4: Icon { cross-axis-self-alignment: center; glyph: Glyph.wrench; size: 18px; tint: root.ink; }
+        if View.footer.play-glyph == 5: Icon { cross-axis-self-alignment: center; glyph: Glyph.alert-circle; size: 18px; tint: root.ink; }
+        Text {
+            horizontal-stretch: 1;
+            text: View.footer.play-label;
+            font-size: Theme.type-play;
+            font-weight: 700;
+            color: root.ink;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        if root.enabled: KeyCap {
+            cross-axis-self-alignment: center;
+            text: View.strings.enter;
+            cap-h: 22px;
+            pad-x: 7px;
+            ink: root.bright ? root.ink.with-alpha(0.82) : Theme.sub;
+            edge: root.tone == 0 && root.enabled ? Theme.play-key : root.tone == 1 && root.enabled ? #2B1A005C : Theme.line;
+        }
+    }
+    // The software renderer fills a gradient square: the rail's colour rounds its corners.
+    if root.bright: CornerMask { r: Theme.radius-lg; surface: Theme.rail; target-width: parent.width; target-height: parent.height; }
+    Rectangle {
+        border-radius: Theme.radius-lg;
+        border-width: 1px;
+        border-color: root.bright ? Theme.play-edge : root.enabled ? Theme.line : Theme.hairline;
+    }
+}
+
+/// One line of the status block: a glyph (or the state dot) and the words.
+component NoteLine inherits HorizontalLayout {
+    in property <Glyph> glyph;
+    in property <string> text;
+    in property <color> ink: Theme.ink2;
+    spacing: 10px;
+    // The glyph sits on the first line; a long line wraps under itself rather than losing its end.
+    VerticalLayout {
+        alignment: start;
+        Rectangle { width: 16px; height: 24px; Icon { glyph: root.glyph; size: 16px; tint: Theme.sub; } }
+    }
+    VerticalLayout {
+        horizontal-stretch: 1;
+        padding-top: 2px;
+        padding-bottom: 2px;
+        Text { min-height: 20px; text: root.text; font-size: Theme.type-small; color: root.ink; vertical-alignment: center; wrap: word-wrap; }
+    }
+}
+
+/// The bottom of the rail (`.go`): the Play state (it opens Connection & activity) and what
+/// Crystal knows besides, Shut down for running picks, Play, and the picked names with the
+/// launcher picker (character select is in the More menu).
+component PlayBlock inherits Rectangle {
+    background: Theme.rail;
+    Rectangle { height: 1px; y: 0; background: Theme.hairline; }
+    // The launcher picker's words, measured: the picker hugs them (`.dd`: 4 px to the chevron).
+    launcher := Text {
+        visible: false;
+        text: View.footer.launch-current >= 0 && View.footer.launch-current < View.launch-items.length
+            ? View.launch-items[View.footer.launch-current] : View.mixed;
+        font-size: Theme.type-note;
+        font-weight: 600;
+    }
+    VerticalLayout {
+        padding-left: Theme.small ? 16px : 20px;
+        padding-right: Theme.small ? 16px : 20px;
+        padding-top: Theme.small ? 10px : 14px;
+        padding-bottom: Theme.small ? 12px : 16px;
+        spacing: 0px;
+        HorizontalLayout {
+            spacing: 8px;
+            status := Pressable {
+                horizontal-stretch: 1;
+                label: View.footer.status;
+                border-radius: Theme.radius-inner;
+                clicked => { View.toggle-details(); }
+                VerticalLayout {
+                    spacing: 0px;
+                    HorizontalLayout {
+                        height: 24px;
+                        spacing: 0px;
+                        if View.footer.badge == 4: Icon { cross-axis-self-alignment: center; glyph: Glyph.info; size: 16px; tint: Theme.sub; }
+                        if View.footer.badge == 4: Rectangle { width: 10px; }
+                        // The same 16 px slot as the note glyphs under it, so the words share one edge.
+                        if View.footer.badge == 2: Rectangle { width: 16px; Spinner { size: 14px; tint: Theme.sub; } }
+                        if View.footer.badge == 2: Rectangle { width: 10px; }
+                        if View.footer.badge != 4 && View.footer.badge != 2: Rectangle { width: 4px; }
+                        if View.footer.badge != 4 && View.footer.badge != 2: Rectangle {
+                            cross-axis-self-alignment: center;
+                            width: 8px;
+                            height: 8px;
+                            border-radius: 4px;
+                            background: View.footer.badge == 0 ? Theme.ok : View.footer.badge == 1 ? Theme.warn : Theme.faint;
+                        }
+                        if View.footer.badge != 4 && View.footer.badge != 2: Rectangle { width: 14px; }
+                        Text {
+                            horizontal-stretch: 1;
+                            text: View.footer.status;
+                            font-size: Theme.type-small;
+                            font-weight: View.footer.badge == 4 ? 400 : 600;
+                            color: View.footer.badge == 4 ? Theme.ink2 : status.hot ? Theme.ice-hi : Theme.ink;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                    for note in View.notes: NoteLine {
+                        glyph: note.glyph;
+                        text: note.text;
+                        ink: View.tone(note.ink);
+                    }
+                }
+            }
+            if View.footer.shutdown: SmallButton {
+                y: 0;
+                slim: true;
+                scale: 1;
+                text: View.footer.shutdown-label;
+                glyph: Glyph.power;
+                busy: View.footer.shutdown-busy;
+                enabled: View.footer.shutdown-enabled;
+                clicked => { View.shut-down-selected(); }
+            }
+        }
+        // The Windows components check: its fix is on Settings > System, as the banner's is.
+        if View.banner: Pressable {
+            label: View.banner-action;
+            border-radius: Theme.radius-inner;
+            clicked => { View.banner-clicked(); }
+            NoteLine {
+                glyph: View.banner-restart ? Glyph.refresh : Glyph.alert-circle;
+                text: View.banner-lead + View.banner-rest;
+                ink: View.tone(Ink.warn-tone);
+            }
+        }
+        Rectangle { height: Theme.small ? 10px : 12px; }
+        PlayButton { }
+        Rectangle { height: Theme.small ? 6px : 8px; }
+        HorizontalLayout {
+            height: 24px;
+            spacing: 12px;
+            Text {
+                horizontal-stretch: 1;
+                text: View.footer.names != "" ? View.footer.names : View.strings.nothing-picked;
+                font-size: Theme.type-note;
+                color: Theme.faint;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            // Select keeps 11 px before its words and 30 px after them for the chevron; its right
+            // inset hangs past the rail's margin, so the chevron ends at the Play button's edge.
+            Rectangle {
+                width: launcher.preferred-width + 30px;
+                Select {
+                    x: 0;
+                    width: parent.width + 11px;
+                    height: 24px;
+                    framed: false;
+                    up: true;
+                    font-size: Theme.type-note;
+                    weight: 600;
+                    ink: Theme.sub;
+                    placeholder-ink: Theme.sub;
+                    glyph-ink: Theme.faint;
+                    hot-fill: Theme.fill;
+                    menu-width: 180px;
+                    label: View.strings.launch-with;
+                    items: View.launch-items;
+                    current: View.footer.launch-current;
+                    placeholder: View.mixed;
+                    picked(index) => { View.launch-picked(index); }
+                }
+            }
+        }
+    }
+}
+
+/// The rail: brand, the Accounts header with Add and More, the rows (they scroll; the wheel
+/// scrolls them and a mouse drag stays a row drag) or the first-run empty state, and the status
+/// block with Play.
+export component AccountRail inherits Rectangle {
+    callback title-pressed();
+    callback title-moved();
+    callback title-released();
+    background: Theme.rail;
+    private property <length> gap: Theme.rail-row-gap;
+    private property <length> rows-h: View.accounts.length * (Theme.rail-row-h + root.gap) + (Theme.small ? 38px : 44px);
+    VerticalLayout {
+        Brand {
+            title-pressed => { root.title-pressed(); }
+            title-moved => { root.title-moved(); }
+            title-released => { root.title-released(); }
+        }
+        // The header: Accounts, "3 of 5 picked", Add and More.
+        header := Rectangle {
+            height: 42px;
+            HorizontalLayout {
+                padding-top: 10px;
+                padding-left: 20px;
+                padding-right: 12px;
+                spacing: 10px;
+                Text { text: View.strings.accounts; font-size: Theme.type-small; font-weight: 600; color: Theme.ink2; vertical-alignment: center; }
+                if View.accounts.length > 0: Text { text: View.accounts-note; font-size: Theme.type-note; color: Theme.faint; vertical-alignment: center; }
+                Rectangle { horizontal-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 0px;
+                    IconButton {
+                        cross-axis-self-alignment: center;
+                        side: 28px;
+                        glyph: Glyph.plus;
+                        glyph-size: 16px;
+                        hint: View.strings.add-account;
+                        enabled: View.can-add;
+                        clicked => { View.add-account(); }
+                    }
+                    IconButton {
+                        cross-axis-self-alignment: center;
+                        side: 28px;
+                        glyph: Glyph.more;
+                        glyph-size: 16px;
+                        hint: View.strings.more;
+                        clicked => { more.show(); }
+                    }
+                }
+            }
+            more := Menu {
+                x: parent.width - self.width - 12px;
+                y: parent.height + 2px;
+                width: 220px;
+                items: View.rail-menu;
+                picked(index) => { View.rail-menu-picked(index); }
+            }
+        }
+        // First run only once the vault is read and empty: nothing while it loads, the reason
+        // when it could not be read.
+        if View.accounts.length == 0 && View.first-run: EmptyRail { vertical-stretch: 1; }
+        if View.accounts.length == 0 && !View.first-run: VerticalLayout {
+            vertical-stretch: 1;
+            alignment: start;
+            padding-left: 20px;
+            padding-right: 20px;
+            padding-top: 24px;
+            if View.vault-error != "": NoteLine {
+                glyph: Glyph.alert-circle;
+                text: View.vault-error;
+                ink: View.tone(Ink.warn-tone);
+            }
+        }
+        if View.accounts.length > 0: Rectangle {
+            vertical-stretch: 1;
+            flick := Flickable {
+                // The wheel scrolls; a mouse drag is a row drag, not a pan (a pan steals the grip's press).
+                mouse-drag-pan-enabled: false;
+                content-width: self.width;
+                content-height: root.rows-h;
+                VerticalLayout {
+                    width: flick.width;
+                    padding-top: 2px;
+                    padding-left: Theme.small ? 6px : 8px;
+                    padding-right: Theme.small ? 6px : 8px;
+                    spacing: root.gap;
+                    alignment: start;
+                    for line[index] in View.accounts: RailRow {
+                        line: line;
+                        index: index;
+                    }
+                    // Add account (`.add`).
+                    add := Pressable {
+                        height: Theme.small ? 36px : 40px;
+                        label: View.strings.add-account;
+                        enabled: View.can-add;
+                        border-radius: Theme.radius;
+                        background: self.hot ? Theme.fill : transparent;
+                        clicked => { View.add-account(); }
+                        HorizontalLayout {
+                            padding-left: Theme.small ? 29px : 35px;
+                            spacing: Theme.small ? 15px : 17px;
+                            alignment: start;
+                            Icon { cross-axis-self-alignment: center; glyph: Glyph.plus; size: 16px; tint: add.hot ? Theme.ink2 : Theme.sub; }
+                            Text { text: View.strings.add-account; font-size: Theme.type-small; font-weight: 600; color: add.hot ? Theme.ink2 : Theme.sub; vertical-alignment: center; }
+                        }
+                    }
+                }
+            }
+            ScrollThumb {
+                x: parent.width - 5px;
+                height: parent.height;
+                content-y: flick.content-y;
+                content-height: flick.content-height;
+                visible-height: flick.height;
+            }
+        }
+        PlayBlock { }
+    }
+    // The rail's right edge.
+    Rectangle { x: parent.width - 1px; width: 1px; background: Theme.hairline; }
+}

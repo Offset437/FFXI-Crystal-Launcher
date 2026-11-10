@@ -12,21 +12,23 @@ import { Theme } from "theme.slint";
 import { ChromeBar, ResizeEdges } from "chrome.slint";
 import { View } from "state.slint";
 import { TitleContent } from "titlebar.slint";
-import { HomePage, PlayBar } from "home.slint";
+import { HomePage, HomeScroll } from "home.slint";
+import { AccountRail } from "rail.slint";
+import { Sky, SkyBackdrop } from "sky.slint";
 import { AccountSheet } from "sheet.slint";
 import { FriendsPage, FriendsView } from "friends.slint";
-import { Downloads, DownloadsPage, SettingsDialog, UpdateStrip } from "downloads.slint";
+import { Downloads, DownloadsPage, SettingsDialog } from "downloads.slint";
 import { LauncherUpdatesCard, WindowsComponents } from "downloads_system.slint";
 import { SettingsPage, SettingsView } from "settings.slint";
 import { CloseDialog, ImportDialog } from "settings_dialogs.slint";
-import { Features, FeaturesSheet, RelaunchBanner } from "features.slint";
+import { Features, FeaturesPage, RelaunchBanner } from "features.slint";
 import { Nav } from "widgets.slint";
-import { Dialogs, DeleteDialog, DetailsDialog, AhDialog } from "dialogs.slint";
+import { Dialogs, DeleteDialog, DetailsDialog, AhDialog, PortraitDialog } from "dialogs.slint";
 
 // Nav.modal is set with the account sheet and the launcher settings dialog
 // (src/slint_host/downloads.rs): while either is open, the title bar, the page and the play bar
 // are out of Tab's and the controller's reach.
-export { Theme, View, FriendsView, Downloads, SettingsView, Features, Nav, Dialogs }
+export { Theme, View, FriendsView, Downloads, SettingsView, Features, Nav, Dialogs, Sky }
 
 export component MainWindow inherits Window {
     // ---- the host's contract (src/slint_host/mod.rs) ----
@@ -65,8 +67,29 @@ export component MainWindow inherits Window {
     changed width => { root.resized(self.width, self.height); }
     changed height => { root.resized(self.width, self.height); }
 
-    // Every key a control rejects ends here: Escape goes back. It never
-    // takes the focus itself (not a Tab or controller stop).
+    /// A dialog or sheet is over the window: the shortcuts below stand down.
+    private property <bool> overlay: View.sheet-open || Downloads.settings-open
+        || SettingsView.import-open || SettingsView.close-open || Dialogs.delete-open
+        || Dialogs.details-open || Dialogs.ah-open || Dialogs.portrait-open || Nav.modal;
+
+    /// A number key 1 to 9 on Home toggles that account's Play pick (no text field has the key:
+    /// a field takes digits itself). Returns whether it was taken.
+    public function number-key(n: int) -> bool {
+        if root.overlay || Features.open || View.page != 0 || n < 1 || n > 9 || n > View.accounts.length { return false; }
+        View.toggle-account(n - 1, !View.accounts[n - 1].checked);
+        return true;
+    }
+
+    /// Return with nothing focused presses Play (its Enter cap). Returns whether it was taken.
+    public function enter-key() -> bool {
+        if root.overlay || !View.footer.play-enabled { return false; }
+        View.main-action();
+        return true;
+    }
+
+    // Every key a control rejects ends here: Escape goes back, a number key picks an account on
+    // Home. It never takes the focus itself (not a Tab or controller stop); with nothing focused
+    // the host's window listener does the same (src/slint_host/mod.rs).
     FocusScope {
         focus-on-click: false;
         focus-on-tab-navigation: false;
@@ -75,39 +98,64 @@ export component MainWindow inherits Window {
                 root.escape();
                 return accept;
             }
+            if !event.modifiers.control && !event.modifiers.alt && !event.modifiers.meta {
+                let n = event.text == "1" ? 1 : event.text == "2" ? 2 : event.text == "3" ? 3
+                    : event.text == "4" ? 4 : event.text == "5" ? 5 : event.text == "6" ? 6
+                    : event.text == "7" ? 7 : event.text == "8" ? 8 : event.text == "9" ? 9 : 0;
+                if n > 0 && root.number-key(n) { return accept; }
+            }
             return reject;
         }
-    VerticalLayout {
-        ChromeBar {
-            maximized: root.window-maximized;
-            minimize-label: root.minimize-label;
-            maximize-label: root.maximize-label;
-            restore-label: root.restore-label;
-            close-label: root.close-label;
-            minimize-clicked => { root.minimize-clicked(); }
-            maximize-clicked => { root.maximize-clicked(); }
-            close-clicked => { root.close-clicked(); }
+    // The main column is declared before the rail it sits beside, so Tab goes top bar, page,
+    // then the rail with Play last (the former footer's place).
+    Rectangle {
+        Rectangle {
+            x: Theme.rail-w;
+            width: parent.width - Theme.rail-w;
+            // Home's sky reaches up under the clear top bar and scrolls with the page.
+            if View.page == 0 && !Features.open: SkyBackdrop { y: -min(HomeScroll.offset, Theme.sky-h); height: Theme.sky-h; }
+            VerticalLayout {
+                ChromeBar {
+                    // Clear over the sky; the window colour once Home has scrolled past it.
+                    flat: View.page != 0 || Features.open || HomeScroll.offset >= Theme.sky-h - Theme.bar-h;
+                    maximized: root.window-maximized;
+                    minimize-label: root.minimize-label;
+                    maximize-label: root.maximize-label;
+                    restore-label: root.restore-label;
+                    close-label: root.close-label;
+                    minimize-clicked => { root.minimize-clicked(); }
+                    maximize-clicked => { root.maximize-clicked(); }
+                    close-clicked => { root.close-clicked(); }
+                    title-pressed => { root.title-pressed(); }
+                    title-moved => { root.title-moved(); }
+                    title-released => { root.title-released(); }
+                    TitleContent { }
+                }
+                if View.page == 0 && !Features.open: HomePage { vertical-stretch: 1; }
+                if Features.open: FeaturesPage { vertical-stretch: 1; }
+                if View.page == 1 && !Features.open: FriendsPage { vertical-stretch: 1; }
+                if View.page == 2 && !Features.open: DownloadsPage { vertical-stretch: 1; }
+                if View.page == 3 && !Features.open: SettingsPage { vertical-stretch: 1; }
+                // Crash recovery lists the same relaunches itself.
+                if Features.relaunches.length > 0 && !(Features.open && Features.section == 2): RelaunchBanner { }
+            }
+        }
+        AccountRail {
+            x: 0;
+            width: Theme.rail-w;
             title-pressed => { root.title-pressed(); }
             title-moved => { root.title-moved(); }
             title-released => { root.title-released(); }
-            TitleContent { }
         }
-        if Downloads.update-banner: UpdateStrip { }
-        if View.page == 0: HomePage { vertical-stretch: 1; }
-        if View.page == 1: FriendsPage { vertical-stretch: 1; }
-        if View.page == 2: DownloadsPage { vertical-stretch: 1; }
-        if View.page == 3: SettingsPage { vertical-stretch: 1; }
-        if Features.relaunches.length > 0: RelaunchBanner { }
-        PlayBar { }
     }
     if View.sheet-open: AccountSheet { }
-    if Features.open: FeaturesSheet { }
     if Downloads.settings-open: SettingsDialog { }
     if SettingsView.import-open: ImportDialog { }
     if SettingsView.close-open: CloseDialog { }
     if Dialogs.delete-open: DeleteDialog { }
     if Dialogs.details-open: DetailsDialog { }
     if Dialogs.ah-open: AhDialog { }
+    if Dialogs.portrait-open: PortraitDialog { }
     if !root.window-maximized: ResizeEdges {
         resize-pressed(edge) => { root.resize-pressed(edge); }
     }

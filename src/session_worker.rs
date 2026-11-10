@@ -175,12 +175,26 @@ fn exclusive(path: &Path) -> io::Result<File> {
 /// the same lock gives up after this too (crystal-loader windower_start.rs).
 pub(crate) const WINDOWER_TURN_LIMIT: Duration = Duration::from_secs(90);
 
-/// The machine-wide Windower launch lock file (`windower_turn_at`).
-pub(crate) fn windower_lock_path() -> Result<PathBuf, String> {
+/// How long an Ashita start waits for the previous one: past the previous start's own
+/// connect and hello limits, so a turn only ends early when a holder is stuck.
+pub(crate) const ASHITA_TURN_LIMIT: Duration = Duration::from_secs(90);
+
+fn locks_directory() -> Result<PathBuf, String> {
     let root = std::env::var_os("CRYSTAL_DATA_ROOT")
         .or_else(|| std::env::var_os("LOCALAPPDATA"))
         .ok_or(t("Could not locate the Windower launch lock directory."))?;
-    Ok(PathBuf::from(root).join("Crystal Launcher/locks/windower.lock"))
+    Ok(PathBuf::from(root).join("Crystal Launcher/locks"))
+}
+
+/// The machine-wide Windower launch lock file (`windower_turn_at`).
+pub(crate) fn windower_lock_path() -> Result<PathBuf, String> {
+    Ok(locks_directory()?.join("windower.lock"))
+}
+
+/// The machine-wide Ashita launch lock file (`ashita_turn_at`), shared by every Crystal
+/// build on the machine.
+pub(crate) fn ashita_lock_path() -> Result<PathBuf, String> {
+    Ok(locks_directory()?.join("ashita.lock"))
 }
 
 /// Windower uses fixed named IPC objects: keep spawn-to-hello serialized across workers.
@@ -188,6 +202,21 @@ pub(crate) fn windower_lock_path() -> Result<PathBuf, String> {
 /// previous holder keeps the lock past `limit`. The lock is never forced or broken.
 pub(crate) fn windower_turn_at(path: &Path, progress: &mut dyn FnMut(&str), abort: &dyn Fn() -> Option<String>,
     limit: Duration) -> Result<File, String> {
+    launch_turn_at(path, t("Waiting for the previous Windower start to reach the game..."),
+        t("Could not acquire the Windower launch lock."), progress, abort, limit)
+}
+
+/// Ashita's POL plugins share files in Ashita's folder (pivot rewrites `config\pivot\pivot.ini`
+/// as it loads, inside each game host's start-up): two hosts starting together can make a
+/// plugin throw, and that host ends before crystal-loader runs. Serialized like Windower's.
+pub(crate) fn ashita_turn_at(path: &Path, progress: &mut dyn FnMut(&str), abort: &dyn Fn() -> Option<String>,
+    limit: Duration) -> Result<File, String> {
+    launch_turn_at(path, t("Waiting for the previous Ashita start to reach the game..."),
+        t("Could not acquire the Ashita launch lock."), progress, abort, limit)
+}
+
+fn launch_turn_at(path: &Path, waiting: &str, failed: &str, progress: &mut dyn FnMut(&str),
+    abort: &dyn Fn() -> Option<String>, limit: Duration) -> Result<File, String> {
     let deadline = Instant::now() + limit;
     let mut announced = false;
     loop {
@@ -196,12 +225,12 @@ pub(crate) fn windower_turn_at(path: &Path, progress: &mut dyn FnMut(&str), abor
             Ok(lock) => return Ok(lock),
             Err(error) if error.raw_os_error() == Some(32) && Instant::now() < deadline => {
                 if !announced {
-                    progress(t("Waiting for the previous Windower start to reach the game..."));
+                    progress(waiting);
                     announced = true;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(_) => return Err(t("Could not acquire the Windower launch lock.").into()),
+            Err(_) => return Err(failed.into()),
         }
     }
 }
@@ -327,10 +356,14 @@ struct FriendCache { worker: Identity, snapshot: crate::friends::Snapshot }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum NativeControl { StartGame, SignOut, Visible, Away, Invisible }
+pub(crate) enum NativeControl {
+    StartGame, SignOut, Visible, Away, Invisible,
+    /// Change the selected handle's portrait (`wire::PORTRAIT_FIELD_CONFIRMED` only).
+    Portrait(u16),
+}
 impl NativeControl {
     pub(crate) fn name(self) -> &'static str {
-        match self { Self::StartGame => "start_game", Self::SignOut => "sign_out", Self::Visible => "visible", Self::Away => "away", Self::Invisible => "invisible" }
+        match self { Self::StartGame => "start_game", Self::SignOut => "sign_out", Self::Visible => "visible", Self::Away => "away", Self::Invisible => "invisible", Self::Portrait(_) => "portrait" }
     }
 }
 /// `groups`: a status change also goes to my groups (Viewer 10040f39, 404
@@ -655,6 +688,14 @@ pub(crate) fn request_native_control(config: &Config, account: &Account, action:
 pub(crate) fn request_native_status(config: &Config, account: &Account, action: NativeControl, groups: bool) -> Result<(), String> {
     let session = find(config, account).ok_or(t("This account has no active PlayOnline session."))?;
     Ok(request_session_control(&session, action, groups)?)
+}
+
+/// The user picked `portrait` for this account's selected handle. Refused before anything is
+/// queued until the portrait field is confirmed, so nothing is written on a guess.
+pub(crate) fn request_native_portrait(config: &Config, account: &Account, portrait: u16) -> Result<(), String> {
+    if !crate::wire::PORTRAIT_FIELD_CONFIRMED { return Err(crate::portraits::unavailable().into()); }
+    if portrait > crate::wire::PORTRAIT_MASK { return Err(crate::i18n::tf("PlayOnline could not change your portrait ({code}).", &[("code", &-5120)])); }
+    request_native_status(config, account, NativeControl::Portrait(portrait), true)
 }
 
 fn no_native_controls() -> &'static str { t("This session does not support native PlayOnline controls. Launch it using the current build.") }
@@ -2628,6 +2669,26 @@ mod tests {
     }
 
     #[test]
+    fn an_unconfirmed_portrait_queues_nothing_even_for_an_idle_session() {
+        let fixture = Fixture::new();
+        let config = config(&fixture.0);
+        let account = account();
+        let directory = config.account_directory(&account);
+        let worker = identity(std::process::id()).unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        save_record(&record_path(&config, &account), &Record { worker, state: Event::Progress("fixture".into()), social_only: false, authenticated: false, native_batch: false, otp_used: Some(false), launch_choice: None, launch_tool: None }).unwrap();
+        let mut snapshot = crate::friends::Snapshot { game_running: Some(false), ..Default::default() };
+        snapshot.social.ready = true;
+        publish_friends(&directory, &snapshot).unwrap();
+        assert!(!crate::wire::PORTRAIT_FIELD_CONFIRMED);
+        assert_eq!(request_native_portrait(&config, &account, 12), Err(crate::portraits::unavailable().to_owned()));
+        assert!(!directory.join("native-control.json").exists(), "nothing reaches the loader");
+        // The request shape the loader receives once confirmed.
+        save_json(&directory.join("native-control.json"), &ControlRequest { worker, action: NativeControl::Portrait(12), groups: true }).unwrap();
+        assert_eq!(take_native_control(&directory), Some((NativeControl::Portrait(12), true)));
+    }
+
+    #[test]
     fn one_shot_commands_are_not_delivered_until_windows_allows_removal() {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
@@ -3430,6 +3491,24 @@ mod tests {
         assert!(windower_turn_at(&path, &mut |_| {}, &|| None, Duration::from_millis(100)).is_ok());
     }
 
+    /// Live 2026-11-10: two of five Ashita hosts started in the same millisecond had pivot throw
+    /// in their start-up and ended before crystal-loader ran. One Ashita start at a time, in
+    /// its own lock: a Windower start never waits for it.
+    #[test]
+    fn ashita_turn_is_its_own_machine_wide_lock() {
+        let fixture = Fixture::new();
+        let (ashita, windower) = (fixture.0.join("locks/ashita.lock"), fixture.0.join("locks/windower.lock"));
+        let held = ashita_turn_at(&ashita, &mut |_| panic!("the first start doesn't wait"), &|| None, Duration::from_millis(100)).unwrap();
+        let mut waited = Vec::new();
+        let error = ashita_turn_at(&ashita, &mut |line| waited.push(line.to_owned()), &|| None, Duration::from_millis(100)).unwrap_err();
+        assert_eq!(error, t("Could not acquire the Ashita launch lock."));
+        assert_eq!(waited, [t("Waiting for the previous Ashita start to reach the game...")]);
+        assert!(windower_turn_at(&windower, &mut |_| panic!("Windower has its own turn"), &|| None, Duration::from_millis(100)).is_ok());
+        drop(held);
+        assert!(ashita_turn_at(&ashita, &mut |_| {}, &|| None, Duration::from_millis(100)).is_ok());
+        assert!(ashita_lock_path().unwrap().ends_with("Crystal Launcher/locks/ashita.lock"));
+    }
+
     /// Audit 2026-11-09: closing during a sign-in that failed before any worker was seen
     /// waited the whole 30 s.
     #[test]
@@ -3675,7 +3754,7 @@ mod tests {
         let worker = identity(std::process::id()).unwrap();
         save_record(&path, &Record { worker, state: Event::Progress("signed in".into()), social_only: false, authenticated: false, native_batch: false, otp_used: Some(false), launch_choice: None, launch_tool: None }).unwrap();
         let snapshot = crate::friends::Snapshot {
-            entries: vec![crate::friends::Friend { name: "Alice".into(), alternate: false, slot: 199, uid:None, online: Some(true), location: Some("Vana'diel".into()), character: None }],
+            entries: vec![crate::friends::Friend { name: "Alice".into(), alternate: false, slot: 199, uid:None, online: Some(true), location: Some("Vana'diel".into()), character: None, portrait: None }],
             fetched_at: 1, ..crate::friends::Snapshot::default()
         };
         publish_friends(&directory, &snapshot).unwrap();

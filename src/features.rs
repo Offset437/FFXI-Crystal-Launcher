@@ -16,6 +16,7 @@ pub(crate) mod desktop;
 pub(crate) mod discord;
 pub(crate) mod game_window;
 pub(crate) mod hotkeys;
+pub(crate) mod keyhook;
 pub(crate) mod layouts;
 pub(crate) mod notify;
 pub(crate) mod order;

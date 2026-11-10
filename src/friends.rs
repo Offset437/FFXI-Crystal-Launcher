@@ -18,6 +18,9 @@ pub(crate) struct Friend {
     /// The character part of `location`, when the game published one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub character: Option<String>,
+    /// The friend's portrait ID (`wire::friend_portrait`); show it with `portraits::image`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portrait: Option<u16>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -31,6 +34,9 @@ pub(crate) struct Snapshot {
     pub session_error: Option<String>,
     #[serde(default)]
     pub own_mode: Option<i32>,
+    /// The selected handle's portrait ID, from `native_own_portrait`.
+    #[serde(default)]
+    pub own_portrait: Option<u16>,
     #[serde(default)]
     pub social: crate::social::State,
 }
@@ -56,7 +62,7 @@ pub(crate) fn native_snapshot(blob:&[u8])->Result<Snapshot,String> {
         let location=if online==Some(true) {
             match class { 1=>Some("FINAL FANTASY XI".into()),1000=>Some("PlayOnline".into()),_=>None }
         } else { None };
-        entries.push(Friend { name:c_name(&rec[0xa0..]),alternate,slot:(if alternate { slot-200 } else { slot }) as u16,uid:Some(u64::from_le_bytes(rec[..8].try_into().unwrap())),online,location,character:None });
+        entries.push(Friend { name:c_name(&rec[0xa0..]),alternate,slot:(if alternate { slot-200 } else { slot }) as u16,uid:Some(u64::from_le_bytes(rec[..8].try_into().unwrap())),online,location,character:None,portrait:Some(crate::wire::friend_portrait(rec)) });
     }
     sort_entries(&mut entries);
     Ok(Snapshot { entries,fetched_at:now(), ..Snapshot::default() })
@@ -465,8 +471,8 @@ mod tests {
     #[test]
     fn game_locations_follow_catalog_slots_and_never_restore_offline_presence() {
         let mut snapshot = Snapshot { entries: vec![
-            Friend { name:"Alice".into(),alternate:false,slot:1,uid:None,online:Some(true),location:None,character:None },
-            Friend { name:"Zed".into(),alternate:false,slot:0,uid:None,online:Some(false),location:None,character:None },
+            Friend { name:"Alice".into(),alternate:false,slot:1,uid:None,online:Some(true),location:None,character:None,portrait:None },
+            Friend { name:"Zed".into(),alternate:false,slot:0,uid:None,online:Some(false),location:None,character:None,portrait:None },
         ], ..Snapshot::default() };
         let mut blob=vec![0;LOCATION_BLOB_LEN]; blob[..8].copy_from_slice(b"XIPOLG\x01\0");
         blob[8..13].copy_from_slice(b"Other");
@@ -484,6 +490,9 @@ mod tests {
         let mut blob=vec![0;BLOB_LEN];blob[..8].copy_from_slice(MAGIC);
         let record=&mut blob[8..8+RECORD_LEN];record[0x98]=1;record[0xa0..0xa5].copy_from_slice(b"Alice");
         let snapshot=native_snapshot(&blob).unwrap();assert_eq!(snapshot.entries[0].online,None);
+        assert_eq!(snapshot.entries[0].portrait,Some(0));
+        blob[8+0x9c..8+0xa0].copy_from_slice(&((3u32<<13)|1234).to_le_bytes());
+        assert_eq!(native_snapshot(&blob).unwrap().entries[0].portrait,Some(1234),"one accessor: +0x9c & 0x1fff");
         let record=&mut blob[8..8+RECORD_LEN];record[0x10..0x18].copy_from_slice(&123u64.to_le_bytes());
         record[8..16].copy_from_slice(&((1u64<<11)|(1u64<<33)).to_le_bytes());
         let snapshot=native_snapshot(&blob).unwrap();assert_eq!(snapshot.entries[0].online,Some(true));
@@ -509,7 +518,7 @@ mod tests {
 
     #[test]
     fn the_block_list_is_shown_apart_and_never_gets_a_location() {
-        let friend = |name: &str, alternate: bool| Friend { name: name.into(), alternate, slot: 0, uid: Some(1), online: Some(true), location: None, character: None };
+        let friend = |name: &str, alternate: bool| Friend { name: name.into(), alternate, slot: 0, uid: Some(1), online: Some(true), location: None, character: None, portrait: None };
         let entries = vec![friend("Alice", false), friend("Mallory", true), friend("Bob", false)];
         let (friends, blocked) = split_lists(&entries, "");
         assert_eq!(friends.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["Alice", "Bob"]);
@@ -525,7 +534,7 @@ mod tests {
 
     #[test]
     fn another_world_shows_only_its_world_label() {
-        let mut snapshot = Snapshot { entries: vec![Friend { name:"Alice".into(),alternate:false,slot:0,uid:None,online:Some(true),location:None,character:None }], ..Snapshot::default() };
+        let mut snapshot = Snapshot { entries: vec![Friend { name:"Alice".into(),alternate:false,slot:0,uid:None,online:Some(true),location:None,character:None,portrait:None }], ..Snapshot::default() };
         let mut blob = vec![0; LOCATION_BLOB_LEN]; blob[..8].copy_from_slice(b"XIPOLG\x01\0");
         blob[8 + 80..8 + 87].copy_from_slice(b"Phoenix");
         apply_native_locations(&mut snapshot, &blob).unwrap();
@@ -547,7 +556,7 @@ mod tests {
 
     /// Signed in, FFXI closed, Alyria (uid 1) and Bob (uid 2) on list A.
     fn signed_in() -> State {
-        let friend = |slot: u16, name: &str| Friend { name: name.into(), alternate: false, slot, uid: Some(slot as u64 + 1), online: Some(true), location: None, character: None };
+        let friend = |slot: u16, name: &str| Friend { name: name.into(), alternate: false, slot, uid: Some(slot as u64 + 1), online: Some(true), location: None, character: None, portrait: None };
         State {
             connected: true,
             snapshot: Some(Snapshot {

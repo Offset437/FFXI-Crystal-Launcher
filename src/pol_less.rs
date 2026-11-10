@@ -40,15 +40,23 @@ use zeroize::Zeroizing;
 /// Who may spawn a tool now, held from spawn to the loader's hello (`start_host`).
 /// Windower 4's injection handshake uses fixed-name objects (`WindowerMMFSettingsHandler`,
 /// `windower.signal-injection`), so one Windower start at a time, machine-wide, from spawn to
-/// hello; Ashita and Vanilla starts run in parallel. The third argument says the start was
+/// hello. Ashita's POL plugins share files in Ashita's folder while each game host starts
+/// (`session_worker::ashita_turn_at`), so one Ashita start at a time too, in a lock of its
+/// own; Vanilla starts run in parallel. The third argument says the start was
 /// closed meanwhile (a park's abort): the wait then ends with `park::ABORTED`. Tests supply
 /// their own gate.
 type TurnGate<'a> = dyn Fn(Tool, &mut dyn FnMut(&str), &dyn Fn() -> bool) -> Result<Option<Box<dyn Send>>, String> + Sync + 'a;
 
-/// The production gate: the machine-wide Windower launch lock (`session_worker::windower_turn_at`).
-fn windower_gate(tool: Tool, progress: &mut dyn FnMut(&str), aborted: &dyn Fn() -> bool) -> Result<Option<Box<dyn Send>>, String> {
-    if tool != Tool::Windower { return Ok(None); }
-    windower_gate_at(&crate::session_worker::windower_lock_path()?, progress, aborted)
+/// The production gate: the machine-wide Windower and Ashita launch locks
+/// (`session_worker::windower_turn_at`, `session_worker::ashita_turn_at`).
+fn launch_gate(tool: Tool, progress: &mut dyn FnMut(&str), aborted: &dyn Fn() -> bool) -> Result<Option<Box<dyn Send>>, String> {
+    match tool {
+        Tool::Windower => windower_gate_at(&crate::session_worker::windower_lock_path()?, progress, aborted),
+        Tool::Ashita => crate::session_worker::ashita_turn_at(&crate::session_worker::ashita_lock_path()?, progress,
+            &|| aborted().then(|| park::ABORTED.to_owned()), crate::session_worker::ASHITA_TURN_LIMIT)
+            .map(|turn| Some(Box::new(turn) as Box<dyn Send>)),
+        Tool::Vanilla => Ok(None),
+    }
 }
 
 /// The Windower turn at `lock`: waits up to WINDOWER_TURN_LIMIT, or until `aborted`
@@ -127,6 +135,10 @@ pub(crate) const AUTO_AWAY_CHOICES: [u8; 7] = [0, 10, 20, 30, 40, 50, 60];
 struct Timeouts {
     /// Injector start to loader connect. Covers Ashita's UAC prompt and Windower's update check.
     connect: Duration,
+    /// Ashita-cli's exit to the loader's connect. Ashita-cli exits once its in-process start-up
+    /// has run and the game host resumed; the loader connects about 30 ms into the host's
+    /// main. Past this the host's Ashita start-up failed and it never ran the loader.
+    host_start: Duration,
     /// Connect to hello.
     hello: Duration,
     /// Writing the session line.
@@ -146,6 +158,7 @@ impl Timeouts {
 
 const TIMEOUTS: Timeouts = Timeouts {
     connect: Duration::from_secs(60),
+    host_start: Duration::from_secs(8),
     hello: Duration::from_secs(10),
     send: Duration::from_secs(10),
     start: Duration::from_secs(120),
@@ -168,6 +181,8 @@ pub(crate) trait SignedIn: Send + Sync + 'static {
     fn game_running(&self) -> Option<Arc<AtomicBool>> { None }
     fn native_session_state(&self, _game: bool) -> Result<(), String> { Ok(()) }
     fn native_own_mode(&self, _mode: i32) -> Result<(), String> { Ok(()) }
+    /// The selected handle's portrait, from `native_own_portrait`.
+    fn native_own_portrait(&self, _portrait: u16) -> Result<(), String> { Ok(()) }
     fn native_control_result(&self, _action: &str, _code: i32) -> Result<(), String> { Ok(()) }
     fn take_controller_settings(&self) -> Option<Vec<u8>> { None }
     fn take_game_shutdown(&self) -> Option<Vec<u8>> { None }
@@ -206,9 +221,10 @@ pub(crate) trait SignedIn: Send + Sync + 'static {
 /// Status controls carry `groups`: the Viewer follows a status change with
 /// ChgAllGrpStatus 404 when I am in groups (app 10040f39) unless told not to.
 fn native_control_line(action: crate::session_worker::NativeControl, groups: bool) -> String {
-    use crate::session_worker::NativeControl::{Away, Invisible, Visible};
+    use crate::session_worker::NativeControl::{Away, Invisible, Portrait, Visible};
     match action {
         Visible | Away | Invisible => format!("{{\"type\":\"native_{}\",\"groups\":{groups}}}\n", action.name()),
+        Portrait(portrait) => format!("{{\"type\":\"native_portrait\",\"portrait\":{portrait}}}\n"),
         _ => format!("{{\"type\":\"native_{}\"}}\n", action.name()),
     }
 }
@@ -233,7 +249,7 @@ pub(crate) fn launch(
     timing.stage("preparation: dgVoodoo synchronized");
     timing.mark(Milestone::SignInStart);
     progress(t("Preparing native PlayOnline authentication..."));
-    run(prepared, auth, timing, progress, &mut spawn_injector, &windower_gate, TIMEOUTS)
+    run(prepared, auth, timing, progress, &mut spawn_injector, &launch_gate, TIMEOUTS)
 }
 
 /// The native sign-in for `account` with `plan`'s flags, shared by a cold launch and a parked
@@ -276,6 +292,8 @@ struct Prepared {
     install_dir: PathBuf,
     ini_name: String,
     base_ini: Option<Vec<u8>>,
+    /// Ashita only: the boot ini loads a POL plugin that races when two hosts start together (`tools::SERIAL_POLPLUGINS`), so this start takes the machine-wide turn. Other starts go at once.
+    serial_start: bool,
     profile: String,
     /// Profile video/sound values and Crystal's retained menu size, served in-process
     /// (`ffxi_settings`), so the shared registry they are also written to doesn't matter.
@@ -435,6 +453,7 @@ fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, timing
     timing.stage("preparation: game directory resolved");
     let tool_dir = tool_dir.unwrap_or_else(|| install_dir.clone());
     let mut base_ini = None;
+    let mut serial_start = true;
     let mut profile = String::new();
     let mut profile_access = None;
     let mut bootstrap_key = Err("not a Windower launch");
@@ -453,6 +472,7 @@ fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, timing
                 return Err(t("The base boot config must be an .ini file name in Ashita's config\\boot folder.").into());
             }
             let path = tool_dir.join("config").join("boot").join(name);
+            serial_start = tools::boot_ini_needs_turn(&path);
             match fs::metadata(&path) {
                 Ok(meta) if meta.len() > 1024 * 1024 => return Err(tf("{path} is too large to be a boot config.", &[("path", &path.display())])),
                 Ok(_) => base_ini = Some(fs::read(&path).map_err(|_| tf("Could not read {path}.", &[("path", &path.display())]))?),
@@ -477,7 +497,7 @@ fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, timing
             timing.stage("preparation: profile access acquired");
             // A previous Windower launcher may now be saving this same file.
             // Its native host holds the shared launch turn through that exit.
-            let _snapshot_turn = windower_gate(Tool::Windower, progress, aborted)?;
+            let _snapshot_turn = launch_gate(Tool::Windower, progress, aborted)?;
             timing.stage("preparation: profile snapshot turn acquired");
             ffxi_settings = Some(ffxi_settings::for_windower(&tool_dir, &profile)?);
             bootstrap_key = windower_parallel::Key::new(&tool_dir, &profile, &install_dir, &windower_startup_store(config));
@@ -499,6 +519,7 @@ fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, timing
         install_dir,
         ini_name: tools::boot_ini_name(&crate::backend::account_key(account)),
         base_ini,
+        serial_start,
         profile,
         ffxi_settings,
         profile_access,
@@ -935,6 +956,10 @@ fn handle_event(event: LoaderEvent, auth: &impl SignedIn, log: &mut SessionLog) 
             if let Err(error) = auth.native_own_mode(mode) { log.line(&error); }
             Step::Continue
         }
+        LoaderEvent::NativeOwnPortrait(portrait) => {
+            if let Err(error) = auth.native_own_portrait(portrait) { log.line(&error); }
+            Step::Continue
+        }
         LoaderEvent::GameShutdownResult { id, game, ok, message } => {
             if let Err(error) = auth.game_shutdown_result(id, game, ok, &message) { log.line(&error); }
             Step::Continue
@@ -1213,6 +1238,59 @@ fn accept_failure(p: &Prepared, error: AcceptError, timeout: Duration) -> String
     }
 }
 
+/// An Ashita start whose host never ran the loader after Ashita-cli finished (`connect_host`),
+/// with what Ashita's own log says went wrong in that host's start-up when it says anything.
+fn host_never_ran(p: &Prepared, since: std::time::SystemTime, waited: Duration) -> String {
+    let logs = p.tool_dir.join("logs");
+    let errors = ashita_start_errors(&logs, &p.ini_name, since);
+    let detail = if errors.is_empty() {
+        tf("Check Ashita's log in {folder}.", &[("folder", &logs.display())])
+    } else {
+        tf("Ashita's log: {errors}", &[("errors", &errors.join(" "))])
+    };
+    tf("{exe} finished, but the game host it started did not run crystal-loader within {seconds} s. {detail}",
+        &[("exe", &p.tool.exe()), ("seconds", &waited.as_secs()), ("detail", &detail)])
+}
+
+/// The errors Ashita logged while starting the host that boots `ini_name`, in logs created
+/// since `since`. Ashita names a log after the second its host started, so hosts that start
+/// in the same second share one; each host's part begins with its `Installing Ashita` line
+/// and names its boot ini a few lines later.
+fn ashita_start_errors(logs: &Path, ini_name: &str, since: std::time::SystemTime) -> Vec<String> {
+    const MAX_LOG: u64 = 8 * 1024 * 1024;
+    let since = since.checked_sub(Duration::from_secs(2)).unwrap_or(since);
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(logs).into_iter().flatten().flatten()
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok().filter(|m| m.is_file() && m.len() <= MAX_LOG)?;
+            let created = meta.created().ok().filter(|created| *created >= since)?;
+            Some((created, entry.path()))
+        })
+        .collect();
+    files.sort();
+    let boot = format!("\\boot\\{ini_name}");
+    let mut errors: Vec<String> = Vec::new();
+    for (_, path) in files {
+        let Ok(bytes) = fs::read(&path) else { continue };
+        let mut ours = false;
+        for line in String::from_utf8_lossy(&bytes).lines() {
+            let parts: Vec<&str> = line.split(" | ").collect();
+            if parts.len() < 4 { continue; }
+            let message = parts[3..].join(" | ");
+            let message = message.trim();
+            if parts[2].trim() == "InstallAshita" && message.starts_with("Installing Ashita") {
+                ours = false;
+            } else if message.contains("Config Script:") {
+                ours = message.trim_end().ends_with(&boot);
+            } else if ours && matches!(parts[1].trim(), "ERROR" | "CRITICAL" | "FATAL") {
+                let message: String = message.chars().take(240).collect();
+                if !errors.contains(&message) { errors.push(message); }
+            }
+        }
+    }
+    errors.truncate(3);
+    errors
+}
+
 type Spawner<'a> = dyn FnMut(&Prepared, &str, &mut SessionLog) -> Result<Injector, String> + 'a;
 
 struct HandoffTiming {
@@ -1327,7 +1405,19 @@ struct Host {
 /// own files is noted (07d §4.6).
 fn start_host(p: &mut Prepared, log: &mut SessionLog, timing: &mut Timeline, progress: &mut dyn FnMut(&str),
     spawn: &mut Spawner<'_>, turns: &TurnGate<'_>, limits: Timeouts) -> Result<Host, String> {
-    let result = start_host_once(p, log, timing, progress, spawn, turns, limits, true);
+    let mut never_ran = false;
+    let mut result = start_host_once(p, log, timing, progress, spawn, turns, limits, true, &mut never_ran);
+    if let Err(error) = &result {
+        if never_ran && !limits.aborted() {
+            // Ashita's start-up in the host failed before the loader ran, so no credentials
+            // were sent: once more, in a turn of its own (a plugin that lost a race to
+            // another host's start-up loads alone this time).
+            log.line(&format!("{error} Starting {} once more.", p.tool.exe()));
+            timing.stage("ashita: game host never ran crystal-loader; starting once more");
+            never_ran = false;
+            result = start_host_once(p, log, timing, progress, spawn, turns, limits, true, &mut never_ran);
+        }
+    }
     if let Err(error) = &result {
         if p.private_bootstrap.take().is_some() && !limits.aborted() {
             // No credentials were sent. Drop the snapshot that failed, so this
@@ -1335,7 +1425,7 @@ fn start_host(p: &mut Prepared, log: &mut SessionLog, timing: &mut Timeline, pro
             if let Ok(key) = &p.bootstrap_key { key.discard(); }
             log.line(&format!("Private Windower startup failed ({error}); starting Windower.exe instead, before any credentials are sent."));
             timing.stage("windower: private startup failed; falling back to Windower.exe");
-            return start_host_once(p, log, timing, progress, spawn, turns, limits, false);
+            return start_host_once(p, log, timing, progress, spawn, turns, limits, false, &mut false);
         }
     }
     result
@@ -1366,13 +1456,16 @@ fn load_windower_snapshot(p: &mut Prepared, log: &mut SessionLog, timing: &mut T
     }
 }
 
+/// `never_ran`: set when the failure is a game host that never ran the loader after its tool
+/// finished (`connect_host`), the one failure `start_host` starts again.
 #[allow(clippy::too_many_arguments)]
 fn start_host_once(p: &mut Prepared, log: &mut SessionLog, timing: &mut Timeline, progress: &mut dyn FnMut(&str),
-    spawn: &mut Spawner<'_>, turns: &TurnGate<'_>, limits: Timeouts, allow_private: bool) -> Result<Host, String> {
+    spawn: &mut Spawner<'_>, turns: &TurnGate<'_>, limits: Timeouts, allow_private: bool, never_ran: &mut bool) -> Result<Host, String> {
     if allow_private && p.private_bootstrap.is_none() { load_windower_snapshot(p, log, timing, false); }
+    // An Ashita start whose boot ini loads none of `tools::SERIAL_POLPLUGINS` needs no turn either.
     // A private host needs no turn: it never runs Windower.exe, so no
     // launcher, update chain or profile save can collide with another launch.
-    let mut turn = if p.private_bootstrap.is_none() { turns(p.tool, progress, &|| limits.aborted())? } else { None };
+    let mut turn = if p.private_bootstrap.is_none() && (p.tool != Tool::Ashita || p.serial_start) { turns(p.tool, progress, &|| limits.aborted())? } else { None };
     // Another launch's Windower.exe may have supplied this profile while this
     // one waited. Release the turn before starting a private host.
     if allow_private && p.private_bootstrap.is_none() && p.bootstrap_key.is_ok() {
@@ -1394,7 +1487,7 @@ fn start_host_once(p: &mut Prepared, log: &mut SessionLog, timing: &mut Timeline
     else{log.line(&format!("Started {}; waiting for crystal-loader on its session pipe.", p.tool.exe()));}
     log.reached(timing, Milestone::ToolStarted);
     progress(t("Waiting for crystal-loader to connect..."));
-    let connected = connect_host(p, log, timing, &mut pipe, &mut injector, capture, limits);
+    let connected = connect_host(p, log, timing, &mut pipe, &mut injector, capture, limits, never_ran);
     let pid = match connected {
         Ok(pid) => pid,
         Err(error) => {
@@ -1418,19 +1511,35 @@ fn start_host_once(p: &mut Prepared, log: &mut SessionLog, timing: &mut Timeline
 
 /// A spawned tool's connect, verified hello and handoff (private Windower readiness, or
 /// closing Windower's launcher). Returns the loader's PID.
+#[allow(clippy::too_many_arguments)]
 fn connect_host(p: &mut Prepared, log: &mut SessionLog, timing: &mut Timeline, pipe: &mut LoaderPipe,
-    injector: &mut LaunchedInjector, capture: Option<windower_parallel::Capture>, limits: Timeouts) -> Result<u32, String> {
+    injector: &mut LaunchedInjector, capture: Option<windower_parallel::Capture>, limits: Timeouts, never_ran: &mut bool) -> Result<u32, String> {
     let tool = p.tool;
+    let since = std::time::SystemTime::now();
+    // When Ashita-cli was seen to have exited after a successful injection.
+    let mut injected: Option<Instant> = None;
     let accepted = pipe.accept(limits.connect, || match injector.injector.exited() {
         _ if limits.aborted() => Err(park::ABORTED.into()),
         Some(Some(code)) if code != 0 => Err(tf("{exe} exited with code {code} before crystal-loader connected.", &[("exe", &tool.exe()), ("code", &code)])),
         Some(None) => Err(tf("{exe} ended before crystal-loader connected.", &[("exe", &tool.exe())])),
+        // Live 2026-11-10: Ashita-cli reported "injected and installed" and exited, but a POL
+        // plugin threw inside the host's start-up and the host ended without running the
+        // loader. Waiting out `connect` (60 s) helped nothing.
+        Some(Some(_)) if tool == Tool::Ashita => {
+            let at = *injected.get_or_insert_with(Instant::now);
+            if at.elapsed() < limits.host_start { return Ok(()); }
+            *never_ran = true;
+            Err(String::new())
+        }
         _ => Ok(()),
     });
     if let Err(error) = accepted {
         // Windower.exe first; the loader it started finds no pipe and exits (07a).
         injector.injector.stop();
         if limits.aborted() { return Err(park::ABORTED.into()); }
+        if *never_ran {
+            return Err(host_never_ran(p, since, limits.host_start));
+        }
         return Err(accept_failure(p, error, limits.connect));
     }
     let pid = pipe.handshake(&p.loader, limits.hello)?;
@@ -1727,6 +1836,7 @@ mod tests {
         assert_eq!(native_control_line(NativeControl::Invisible, true), "{\"type\":\"native_invisible\",\"groups\":true}\n");
         assert_eq!(native_control_line(NativeControl::SignOut, true), "{\"type\":\"native_sign_out\"}\n");
         assert_eq!(native_control_line(NativeControl::StartGame, false), "{\"type\":\"native_start_game\"}\n");
+        assert_eq!(native_control_line(NativeControl::Portrait(301), true), "{\"type\":\"native_portrait\",\"portrait\":301}\n");
     }
 
     #[test]
@@ -1874,6 +1984,7 @@ mod tests {
             install_dir: PathBuf::from(r"C:\FFXI"),
             ini_name: "crystal-test.ini".into(),
             base_ini: None,
+            serial_start: true,
             profile: String::new(),
             ffxi_settings: None,
             profile_access: None,
@@ -1890,6 +2001,7 @@ mod tests {
 
     const FAST: Timeouts = Timeouts {
         connect: Duration::from_millis(400),
+        host_start: Duration::from_millis(150),
         hello: Duration::from_secs(5),
         send: Duration::from_secs(5),
         start: Duration::from_secs(5),
@@ -2133,12 +2245,95 @@ mod tests {
     }
 
     #[test]
-    fn launch_all_with_ashita_starts_every_tool_at_once() {
+    fn launch_all_direct_starts_every_host_at_once() {
         // The fake loader connects within FAST's 400 ms connect bound.
-        for tool in [Tool::Ashita, Tool::Vanilla] {
-            let handshakes = launch_batch(tool, 3, Duration::from_millis(300));
-            assert_eq!(handshakes, 3, "{} starts don't wait for each other", tool.name());
+        let handshakes = launch_batch(Tool::Vanilla, 3, Duration::from_millis(300));
+        assert_eq!(handshakes, 3, "direct starts don't wait for each other");
+    }
+
+    /// Live 2026-11-10: Ashita's POL plugins load inside each host's start-up and share files
+    /// (pivot.ini); five at once made pivot throw in two hosts. One start at a time, each turn
+    /// ending at its hello.
+    #[test]
+    fn launch_all_with_ashita_hands_over_one_at_a_time() {
+        let started = Instant::now();
+        let handshakes = launch_batch(Tool::Ashita, 4, Duration::from_millis(150));
+        assert_eq!(handshakes, 1, "Ashita host start-ups never overlap");
+        assert!(started.elapsed() < Duration::from_millis(1600), "{:?}", started.elapsed());
+    }
+
+    /// Ashita-cli reported a good injection and exited, and the host never connected: the start
+    /// fails at `host_start`, not at `connect`, with what Ashita's log says about this host, and
+    /// is started once more. A second start that connects signs in.
+    #[test]
+    fn ashita_host_that_never_runs_the_loader_fails_fast_and_starts_once_more() {
+        for second_connects in [true, false] {
+            let (prepared, dir) = fixture(Tool::Ashita);
+            let logs = dir.join("logs");
+            fs::create_dir_all(&logs).unwrap();
+            let spawns = Arc::new(AtomicUsize::new(0));
+            let done = Arc::new(AtomicBool::new(false));
+            let (counted, log_dir, finished) = (spawns.clone(), logs.clone(), done.clone());
+            let mut spawn = move |_: &Prepared, pipe: &str, _: &mut SessionLog| -> Result<Injector, String> {
+                let attempt = counted.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 || !second_connects {
+                    // Two hosts in one log (same second): another account's start-up, then ours.
+                    let text = [
+                        "11/10/2026 08:27:19.450 | DEBUG    |                                      InstallAshita | Installing Ashita into the current process.",
+                        "11/10/2026 08:27:19.450 | DEBUG    |                             AshitaCore::Initialize |  - Ashita Config Script: \\boot\\crystal-other.ini",
+                        "11/10/2026 08:27:19.456 | ERROR    |                             PolPluginManager::Load | Failed to load POL plugin 'other'.",
+                        "11/10/2026 08:27:19.450 | DEBUG    |                                      InstallAshita | Installing Ashita into the current process.",
+                        "11/10/2026 08:27:19.450 | DEBUG    |                             AshitaCore::Initialize |  - Ashita Config Script: \\boot\\crystal-test.ini",
+                        "11/10/2026 08:27:19.456 | ERROR    |                             PolPluginManager::Load | Failed to load POL plugin 'pivot'; POL plugin threw an unknown exception.",
+                    ].join("\r\n");
+                    fs::write(log_dir.join(format!("attempt {attempt}.txt")), text).unwrap();
+                    return Ok(Injector::Fake(Arc::new(AtomicBool::new(true))));
+                }
+                let (name, finished) = (pipe.to_owned(), finished.clone());
+                std::thread::spawn(move || {
+                    let file = OpenOptions::new().read(true).write(true).open(&name).unwrap();
+                    let mut writer = file.try_clone().unwrap();
+                    writeln!(writer, "{}", native_hello()).unwrap();
+                    let mut session = String::new();
+                    BufReader::new(file).read_line(&mut session).unwrap();
+                    writeln!(writer, r#"{{"type":"started","pid":{}}}"#, std::process::id()).unwrap();
+                    while !finished.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(20)); }
+                    writeln!(writer, r#"{{"type":"exit","code":0}}"#).unwrap();
+                });
+                Ok(Injector::Fake(Arc::new(AtomicBool::new(true))))
+            };
+            let started = Instant::now();
+            let slow = Timeouts { connect: Duration::from_secs(30), ..FAST };
+            let result = run(prepared, FakeAuth::new(), Timeline::begin(), &mut |_: &str| {}, &mut spawn, test_turns(), slow);
+            assert!(started.elapsed() < Duration::from_secs(5), "failed at host_start, not at connect: {:?}", started.elapsed());
+            assert_eq!(spawns.load(Ordering::SeqCst), 2, "started once more, and only once");
+            let log = fs::read_to_string(dir.join("a.crystal.log")).unwrap();
+            assert!(log.contains("did not run crystal-loader") && log.contains("Starting Ashita-cli.exe once more."), "{log}");
+            match result {
+                Ok(result) => {
+                    assert!(second_connects);
+                    done.store(true, Ordering::SeqCst);
+                    wait_for(&result.alive, false);
+                }
+                Err(error) => {
+                    assert!(!second_connects, "{error}");
+                    assert!(error.contains("Ashita-cli.exe finished, but the game host it started did not run crystal-loader within 0 s."), "{error}");
+                    assert!(error.contains("Ashita's log: Failed to load POL plugin 'pivot'; POL plugin threw an unknown exception."), "{error}");
+                    assert!(!error.contains("'other'"), "another host's start-up is not this one's: {error}");
+                    assert!(!error.contains("administrator prompt"), "{error}");
+                }
+            }
+            let _ = fs::remove_dir_all(dir);
         }
+    }
+
+    #[test]
+    fn ashita_start_errors_without_a_log_point_at_the_folder() {
+        let (prepared, dir) = fixture(Tool::Ashita);
+        let message = host_never_ran(&prepared, std::time::SystemTime::now(), Duration::from_secs(8));
+        assert!(message.contains("within 8 s. Check Ashita's log in "), "{message}");
+        assert!(ashita_start_errors(&dir.join("logs"), "crystal-test.ini", std::time::SystemTime::now()).is_empty());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// Each game gets its own profile's settings in-process. Verified bootstrap
@@ -2603,7 +2798,7 @@ mod tests {
         impl Drop for Probe{fn drop(&mut self){unsafe{TerminateProcess(self.1.as_raw_handle(),0);};let _=fs::remove_dir_all(&self.2);}}
         let start=|mut p:Prepared,dir:PathBuf|{
             let mut log=SessionLog::open(&p.session.log).unwrap();let mut timeline=Timeline::begin();
-            let host=start_host(&mut p,&mut log,&mut timeline,&mut |_|{},&mut spawn_injector,&windower_gate,TIMEOUTS).unwrap();
+            let host=start_host(&mut p,&mut log,&mut timeline,&mut |_|{},&mut spawn_injector,&launch_gate,TIMEOUTS).unwrap();
             let handle=unsafe{OpenProcess(PROCESS_TERMINATE|PROCESS_SYNCHRONIZE,0,host.pid)};
             assert!(!handle.is_null());let handle=unsafe{OwnedHandle::from_raw_handle(handle)};
             let private=p.private_bootstrap.is_some();drop(log);

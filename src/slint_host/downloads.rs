@@ -20,9 +20,9 @@ use std::rc::Rc;
 
 /// The installer's volumes (FFXIFullSetup_US.part1.exe … part5.rar).
 const PARTS: u64 = 5;
-/// The side column shows beside the main one from this window width. Slint
-/// can't work it out from the page's own width: the page's layout depends on it.
-const WIDE_W: f32 = 1150.0;
+/// The crystal gauge shows beside the sections from this window width (a strip above them
+/// below it). Slint can't work it out from the page's own width: the page's layout depends on it.
+const WIDE_W: f32 = 1360.0;
 
 /// Lists of words joined once per language (a card's steps), by the words they join.
 type Joined<K> = Vec<(K, SharedString)>;
@@ -351,11 +351,10 @@ fn result_look(tone: ResultTone) -> (Glyph, Ink) {
 
 fn activity(dl: &Downloads, app: &App, state: &mut State, private: &Private) {
     let cancelled = app.maintenance_cancelled;
-    let mut view = DlActivity::default();
+    let mut view = DlActivity { gauge: -1.0, ..DlActivity::default() };
     state.can_cancel = false;
     if let Some(kind) = app.maintenance {
         let progress = &app.maintenance_progress;
-        let remaining_percent = progress.remaining_percent();
         let has_overall = progress.overall.is_some();
         view.running = true;
         view.cancellable = kind.cancellable();
@@ -366,16 +365,14 @@ fn activity(dl: &Downloads, app: &App, state: &mut State, private: &Private) {
         if let Some(overall) = &progress.overall {
             view.overall_fraction = overall.fraction.unwrap_or(0.0).clamp(0.0, 1.0) as f32;
             match overall.remaining_percent() {
-                Some(percent) => {
-                    view.overall_line = tf("{percent}% remaining overall", &[("percent", &percent)]).into();
-                    view.overall_known = true;
-                }
+                // The header shows the share; only an unknown total needs a line.
+                Some(_) => view.overall_known = true,
                 None => view.overall_line = t("Calculating total update size…").into(),
             }
             if !cancelled {
                 view.estimate = match overall.remaining {
                     Some(duration) if duration.is_zero() && !overall.complete => t("Finalizing update…").to_owned(),
-                    Some(duration) => tf("About {time} remaining for the whole update", &[("time", &crate::play_update::remaining_time(duration))]),
+                    Some(duration) => tf("{time} left", &[("time", &crate::play_update::remaining_time(duration))]),
                     None => t("Estimating total time remaining…").to_owned(),
                 }
                 .into();
@@ -392,25 +389,31 @@ fn activity(dl: &Downloads, app: &App, state: &mut State, private: &Private) {
             } else {
                 tf("{done} of {total}", &[("done", &progress.done), ("total", &progress.total)])
             };
-            let complete_percent = 100_u8.saturating_sub(remaining_percent.unwrap_or(100));
-            view.amount = tf("{amount} · {percent}%", &[("amount", &amount), ("percent", &complete_percent)]).into();
+            // The share is the header's figure: the amount alone here.
+            view.amount = amount.into();
         } else if progress.detail.is_empty() {
             view.detail = SharedString::new();
         }
         if !has_overall {
-            let mut remaining = Vec::with_capacity(2);
-            if let Some(percent) = remaining_percent {
-                remaining.push(tf("{percent}% remaining in this step", &[("percent", &percent)]));
-            }
+            // Time left only: the share is the header's figure.
             if kind.cancellable() && !cancelled {
-                remaining.push(match progress.remaining {
-                    Some(duration) => tf("About {time} remaining", &[("time", &crate::play_update::remaining_time(duration))]),
+                view.remaining = match progress.remaining {
+                    Some(duration) => tf("{time} left", &[("time", &crate::play_update::remaining_time(duration))]),
                     None => t("Estimating time remaining…").to_owned(),
-                });
+                }
+                .into();
             }
-            view.remaining = remaining.join(" · ").into();
         }
         view.official_note = !kind.cancellable();
+        // The gauge follows the whole operation's figure, else the step's; no figure lights nothing.
+        let known = match &progress.overall {
+            Some(overall) => overall.fraction.map(|f| f.clamp(0.0, 1.0) as f32),
+            None => view.has_total.then_some(view.fraction),
+        };
+        view.gauge = known.unwrap_or(0.0);
+        if let Some(fraction) = known {
+            view.gauge_label = format!("{}%", (fraction * 100.0).round() as u32).into();
+        }
     }
     if !app.maintenance_result.is_empty() {
         let (glyph, ink) = result_look(app.maintenance_tone);
@@ -520,13 +523,14 @@ fn updates(dl: &Downloads, app: &App, state: &mut State, private: &Private, card
     put!(dl, get_update_banner, set_update_banner, strip.is_some());
     let strip = strip.unwrap_or(crate::self_update::model::Line { text: String::new(), action: None });
     state.strip_action = strip.action.as_ref().map(|(_, msg)| msg.clone());
-    put!(dl, get_update_strip, set_update_strip, UpdateLine { text: strip.text.into(), action: strip.action.map_or("", |(label, _)| label).into() });
+    let (pill, busy) = crate::self_update::model::pill(app).unwrap_or_default();
+    put!(dl, get_update_strip, set_update_strip, UpdateLine { text: strip.text.into(), action: strip.action.map_or("", |(label, _)| label).into(), pill: pill.into(), busy });
     if !card {
         return;
     }
     let card = crate::self_update::model::card(app);
     state.card_action = card.action.as_ref().map(|(_, msg)| msg.clone());
-    put!(dl, get_update_card, set_update_card, UpdateLine { text: private.text(&card.text).into(), action: card.action.map_or("", |(label, _)| label).into() });
+    put!(dl, get_update_card, set_update_card, UpdateLine { text: private.text(&card.text).into(), action: card.action.map_or("", |(label, _)| label).into(), ..Default::default() });
     put!(dl, get_auto_check, set_auto_check, app.settings.launcher_auto_updates);
 }
 
@@ -745,7 +749,7 @@ mod tests {
         assert_eq!(install.folder, r"C:\Games\FINAL FANTASY XI");
         assert!(install.folder_mono && install.confirmed && install.troubleshooting_open);
         assert!(install.can_check && install.can_repair, "a confirmed folder, vault ready, no sessions");
-        assert!(!dl.get_activity().running);
+        assert!(!dl.get_activity().running && dl.get_activity().gauge < 0.0, "idle shows the whole, unlit crystal");
         assert!(!dl.get_installer().show_parts && dl.get_parts().row_count() == 0);
 
         dl.invoke_change_in_settings();
@@ -778,7 +782,17 @@ mod tests {
         let activity = dl.get_activity();
         assert!(activity.running && activity.cancellable && activity.cancel_enabled && activity.has_total);
         assert_eq!(activity.step, t("Downloading the official installer"));
-        assert!(activity.amount.ends_with("· 50%"), "{}", activity.amount);
+        assert!(!activity.amount.contains('%'), "the share is the header's: {}", activity.amount);
+        assert!((activity.gauge - 0.5).abs() < 0.01 && activity.gauge_label == "50%", "the crystal follows the step: {} {}", activity.gauge, activity.gauge_label);
+        // With an overall figure the crystal shows that one; with none known it is lit to nothing.
+        app.maintenance_progress.overall = Some(crate::operation::OverallProgress { fraction: Some(0.28), remaining: None, complete: false });
+        resync(&ui, &app);
+        assert_eq!((dl.get_activity().gauge_label.as_str(), dl.get_activity().gauge > 0.27), ("28%", true));
+        app.maintenance_progress.overall = Some(crate::operation::OverallProgress { fraction: None, remaining: None, complete: false });
+        resync(&ui, &app);
+        assert_eq!((dl.get_activity().gauge, dl.get_activity().gauge_label.as_str()), (0.0, ""));
+        app.maintenance_progress.overall = None;
+        resync(&ui, &app);
         assert!(activity.detail.contains("part3.rar"));
         let parts: Vec<DlPart> = dl.get_parts().iter().collect();
         assert_eq!(parts.len(), 5);
@@ -976,10 +990,16 @@ mod tests {
         let sweep = |depth: usize| {
             [pad::Way::Up; 40].into_iter().chain([pad::Way::Right; 6]).chain(std::iter::repeat_n(pad::Way::Down, depth)).chain([pad::Way::Left]).chain([pad::Way::Down; 30])
         };
-        // And up from the footer's left end, where the main column's left-aligned controls are.
-        let footer = || [pad::Way::Down; 40].into_iter().chain([pad::Way::Left; 8]);
-        let from_footer = footer().chain([pad::Way::Up; 30]).chain(footer()).chain([pad::Way::Up, pad::Way::Right]);
-        for way in (1..8).flat_map(sweep).chain(from_footer) {
+        // And across from the account rail at its left (Play at the foot, then each step up it)
+        // into the main column's left-aligned controls, and up them.
+        let from_rail = |ups: usize| {
+            [pad::Way::Down; 40].into_iter().chain([pad::Way::Left; 8]).chain(std::iter::repeat_n(pad::Way::Up, ups)).chain([pad::Way::Right]).chain([pad::Way::Up; 30])
+        };
+        // And right from each stop down the right-hand side (a field's Browse button).
+        let across = |depth: usize| {
+            [pad::Way::Up; 40].into_iter().chain([pad::Way::Right; 6]).chain(std::iter::repeat_n(pad::Way::Down, depth)).chain([pad::Way::Right])
+        };
+        for way in (1..8).flat_map(sweep).chain((0..8).flat_map(from_rail)).chain((1..10).flat_map(across)) {
             pad::step(w, way);
             let _ = window.draw_if_needed(|_| {});
             sent.extend(press());

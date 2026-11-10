@@ -450,7 +450,7 @@ mod tests {
     const W1: (u32, u64) = (10, 1);
 
     fn friend(name: &str, alternate: bool, online: Option<bool>) -> Friend {
-        Friend { name: name.into(), alternate, slot: 0, uid: None, online, location: None, character: None }
+        Friend { name: name.into(), alternate, slot: 0, uid: None, online, location: None, character: None, portrait: None }
     }
     fn snap(friends: Vec<Friend>, unread: Option<u32>, changed: bool) -> Snapshot {
         let mut s = Snapshot { entries: friends, ..Snapshot::default() };

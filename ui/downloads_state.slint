@@ -113,6 +113,11 @@ export struct DlActivity {
     amount: string,
     remaining: string,
     official-note: bool,
+    /// The crystal's and the job bar's fill: the overall figure when there is one, else the
+    /// step's; -1 with nothing running (the whole crystal, unlit).
+    gauge: float,
+    /// Its percent ("" while no figure is known).
+    gauge-label: string,
     result: string,
     result-glyph: Glyph,
     result-ink: Ink,
@@ -151,6 +156,9 @@ export struct DlSettings {
 export struct UpdateLine {
     text: string,
     action: string,
+    /// The rail pill's words (the strip only) and whether work is under way.
+    pill: string,
+    busy: bool,
 }
 
 /// A Windows components card button.

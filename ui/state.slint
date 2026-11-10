@@ -3,6 +3,7 @@
 // turns its callbacks into core messages. Colours are named (`Ink`), never passed from Rust, so
 // a theme switch recolours everything without a sync.
 import { Theme } from "theme.slint";
+import { Glyph, LampState } from "widgets.slint";
 
 /// A named palette colour.
 export enum Ink { ink, sub, faint, accent, ok, info, warn, danger, play-text, ok-tone, warn-tone, danger-tone }
@@ -22,11 +23,11 @@ export struct Strings {
     news: string,
     refresh-news: string,
     view-all-news: string,
-    more-news: string,
+    /// The news header's link (`.all`).
+    all-news: string,
+    /// The first-run section's heading.
+    before-you-play: string,
     accounts: string,
-    shut-down-all: string,
-    play-all: string,
-    import: string,
     add-account: string,
     no-accounts: string,
     no-accounts-body: string,
@@ -37,15 +38,32 @@ export struct Strings {
     wiki-title: string,
     wiki-placeholder: string,
     find-item: string,
-    install-repair: string,
-    help-support: string,
     launch-with: string,
-    character-select: string,
+    // ---- the rail and the sky (v1.2) ----
+    /// The greeting before any account is added.
+    greeting-first: string,
+    features: string,
+    more: string,
+    import-from-pol: string,
+    nothing-picked: string,
+    one-time-code: string,
+    /// The Play button's key hint.
+    enter: string,
+}
+
+/// A line of the rail's status block: what Crystal already knows (the Play state's detail, the
+/// Windows components check).
+export struct RailNote {
+    glyph: Glyph,
+    text: string,
+    ink: Ink,
 }
 
 /// One news card.
 export struct NewsCard {
     title: string,
+    /// The whole headline, when `title` is elided (the tooltip and the accessible name).
+    headline: string,
     teaser: string,
     kind: string,
     kind-ink: Ink,
@@ -54,6 +72,24 @@ export struct NewsCard {
     has-image: bool,
     /// A maintenance notice (wrench placeholder) rather than an article (feed placeholder).
     notice: bool,
+    /// Its default picture when it has none (NewsArt): 0 update, 1 event, 2 maintenance,
+    /// 3 community, 4 PlayOnline.
+    art: int,
+}
+
+/// One check of Home's first-run section (no accounts yet): what it is, its state, and its one
+/// action.
+export struct SetupStep {
+    glyph: Glyph,
+    ink: Ink,
+    title: string,
+    body: string,
+    /// A path or a count under the state, mono when `detail-mono`.
+    detail: string,
+    detail-mono: bool,
+    action: string,
+    action-glyph: Glyph,
+    action-enabled: bool,
 }
 
 /// One account row.
@@ -71,26 +107,36 @@ export struct AccountLine {
     working: bool,
     otp: bool,
     otp-text: string,
+    /// The code as the boxes draw it (bullets in privacy mode), and its length.
+    otp-shown: string,
+    otp-len: int,
     action: string,
     action-soft: bool,
     action-enabled: bool,
     /// This row is being dragged to a new place.
     dragging: bool,
+    /// The crystal lamp, and how far it has risen while signing in (0..1).
+    lamp: LampState,
+    fill: float,
+    /// The session clock while in game ("3h 12m").
+    clock: string,
+    /// Your PlayOnline portrait (the silhouette in privacy mode), once a session reported it.
+    picture: image,
+    has-picture: bool,
 }
 
-/// The footer play bar.
+/// The rail's status block and Play button (the former footer play bar). The status's detail is
+/// the first of View.notes.
 export struct Footer {
     status: string,
-    detail: string,
-    /// 0 ready (check), 1 attention, 2 busy, 3 unchecked (question mark).
+    /// 0 ready (dot), 1 attention (amber dot), 2 busy (ring), 3 unchecked (faint dot), 4 nothing
+    /// to play yet (info glyph).
     badge: int,
     shutdown: bool,
     shutdown-busy: bool,
     shutdown-enabled: bool,
     shutdown-label: string,
-    picks: bool,
     launch-current: int,
-    select-current: int,
     play-label: string,
     /// 0 triangle, 1 check, 2 busy, 3 download, 4 wrench, 5 alert.
     play-glyph: int,
@@ -98,6 +144,7 @@ export struct Footer {
     /// 0 the Play fill, 1 the attention fill, 2 tint, 3 the ok fill.
     play-fill: int,
     play-enabled: bool,
+    /// Who Play starts ("" when nothing is picked).
     names: string,
 }
 
@@ -144,6 +191,7 @@ export struct SheetStrings {
     cancel: string,
     edit-profiles: string,
     close: string,
+    portrait: string,
 }
 
 /// The account sheet's state.
@@ -195,6 +243,11 @@ export struct Sheet {
     delete-enabled: bool,
     save-label: string,
     save-enabled: bool,
+    /// A saved retail account: its PlayOnline portrait row (the picture once a session reported
+    /// it, the silhouette in privacy mode) and the picker button.
+    portrait-shown: bool,
+    picture: image,
+    has-picture: bool,
 }
 
 export global View {
@@ -202,16 +255,14 @@ export global View {
     in property <Strings> strings;
     /// 0 Home, 1 Friends, 2 Downloads, 3 Settings.
     in property <int> page;
-    /// The window is narrower than 1180 px: the title bar's buttons show glyphs only.
-    in property <bool> compact;
+    /// The Friends tab's count badge ("" hides it).
+    in property <string> friends-badge;
     in property <bool> privacy;
     callback navigate(int);
     callback toggle-privacy();
     callback toggle-theme();
 
-    // ---- hero ----
-    in property <string> signed-in;
-    in property <bool> any-signed-in;
+    // ---- hero (the clock is the Sky global's) ----
     /// Japanese keeps the interface face upright (Source Serif has no Japanese).
     in property <bool> serif-greeting: true;
 
@@ -227,12 +278,10 @@ export global View {
     in property <string> news-note;
     in property <[string]> news-tabs;
     in property <int> news-tab;
+    /// The large cards (three, two in the small window).
     in property <[NewsCard]> news;
-    in property <int> news-cols: 4;
-    /// One card's width, from the window width.
-    in property <length> news-card-w: 300px;
-    in property <bool> news-thumbs: true;
-    in property <bool> news-more;
+    /// The older headlines under them, one line each; `open-news` numbers them after the cards.
+    in property <[NewsCard]> news-older;
     /// 0 cards, 1 loading, 2 unavailable, 3 nothing in this tab.
     in property <int> news-state;
     in property <string> news-empty-title;
@@ -242,19 +291,21 @@ export global View {
     callback view-all-news();
     callback open-news(int);
 
+    // ---- first run (no accounts yet) ----
+    in property <bool> first-run;
+    /// Why the saved accounts could not be read; empty when they were (or are still loading).
+    in property <string> vault-error;
+    in property <[SetupStep]> setup;
+    callback setup-action(int);
+
     // ---- accounts ----
     in property <string> accounts-note;
-    in property <bool> show-shut-down-all;
-    in property <bool> show-play-all;
     in property <bool> can-add;
     in property <[AccountLine]> accounts;
-    in property <bool> wide: true;
     callback toggle-account(int, bool);
     callback edit-account(int);
     callback otp-edited(int, string);
     callback row-action(int);
-    callback shut-down-all();
-    callback play-all();
     callback import-accounts();
     callback add-account();
 
@@ -263,6 +314,8 @@ export global View {
     in-out property <string> ah-query;
     in property <[string]> ah-servers;
     in property <int> ah-server;
+    /// The look-up bar's site: 0 the wiki, 1 FFXIAH (with its world picker).
+    in-out property <int> look-scope: 1;
     callback wiki-edited(string);
     callback wiki-search();
     callback ah-edited(string);
@@ -271,17 +324,17 @@ export global View {
     callback open-wiki();
     callback open-ffxiah();
 
-    // ---- footer ----
+    // ---- the rail's status block and Play (the former footer) ----
     in property <Footer> footer;
+    /// The lines under the status line.
+    in property <[RailNote]> notes;
+    /// The rail's More menu, and its pick (view.rs keeps what each entry does).
+    in property <[string]> rail-menu;
+    callback rail-menu-picked(int);
     in property <[string]> launch-items;
-    in property <[string]> select-items;
     in property <string> mixed;
-    in property <bool> show-names;
     callback toggle-details();
-    callback install-repair();
-    callback help-support();
     callback launch-picked(int);
-    callback select-picked(int);
     callback shut-down-selected();
     callback main-action();
 
@@ -330,6 +383,7 @@ export global View {
     callback view-log();
     callback open-logs();
     callback delete-account();
+    callback choose-portrait();
 
     public pure function tone(which: Ink) -> color {
         which == Ink.ink ? Theme.ink

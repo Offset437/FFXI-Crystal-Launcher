@@ -6,7 +6,7 @@
 //
 // Unlike Home, only the page header scales.
 import { Theme } from "theme.slint";
-import { Glyph, Icon, Pressable, Control, Tone, Check, Field, Select, Rule, ScrollThumb, IconButton, Hint, Menu, RoundGlyph, Banner } from "widgets.slint";
+import { Glyph, Icon, Pressable, Control, Tone, Check, Field, Select, Rule, ScrollThumb, IconButton, Hint, Menu, RoundGlyph, Banner, Panel, CountBadge } from "widgets.slint";
 
 /// The words that change only with the language.
 export struct FriendsStrings {
@@ -51,6 +51,9 @@ export struct FriendLine {
     secondary: string,
     initial: string,
     tint: int,
+    /// An optional profile picture; without one the initial shows.
+    picture: image,
+    has-picture: bool,
     /// 0 online, 1 away, 2 offline, 3 no status yet.
     presence: int,
     selected: bool,
@@ -80,6 +83,8 @@ export struct ChatBlock {
     time: string,
     initial: string,
     tint: int,
+    picture: image,
+    has-picture: bool,
     items: [ChatItem],
 }
 
@@ -91,6 +96,8 @@ export struct MailLine {
     tint: int,
     correspondent: string,
     subject: string,
+    picture: image,
+    has-picture: bool,
     enabled: bool,
 }
 
@@ -99,6 +106,8 @@ export struct BlockedLine {
     name: string,
     initial: string,
     tint: int,
+    picture: image,
+    has-picture: bool,
     enabled: bool,
 }
 
@@ -143,6 +152,12 @@ export global FriendsView {
     in property <[string]> statuses;
     in property <int> status-current: -1;
     in property <int> own-presence: 3;
+    in property <image> own-picture;
+    in property <bool> has-own-picture;
+    /// Your avatar opens the portrait picker.
+    in property <bool> portrait-enabled;
+    in property <string> portrait-label;
+    callback choose-portrait();
     in property <bool> options-open;
     in property <bool> groups;
     in property <bool> auto-away-shown;
@@ -187,6 +202,8 @@ export global FriendsView {
     in property <string> friend-secondary;
     in property <string> friend-initial;
     in property <int> friend-tint;
+    in property <image> friend-picture;
+    in property <bool> has-friend-picture;
     in property <int> friend-presence: 3;
     in property <bool> remove-enabled;
     callback remove();
@@ -254,6 +271,9 @@ component Avatar inherits Rectangle {
     in property <string> initial;
     /// AVATAR_TINTS index, or -1 for the neutral fill.
     in property <int> tint: -1;
+    /// The slot for a profile picture: shown in the circle when has-picture, else the initial.
+    in property <image> picture;
+    in property <bool> has-picture;
     /// -1 none, 0 online, 1 away, 2 offline, 3 no status yet.
     in property <int> presence: -1;
     /// What the dot is cut out of: the surface behind the avatar.
@@ -265,14 +285,31 @@ component Avatar inherits Rectangle {
         : root.tint == 3 ? #A08A5C : root.tint == 4 ? #8A6F96 : #6B7A8F;
     private property <color> fill: root.mine ? Theme.play : root.tint < 0 ? Theme.select : root.hue.mix(Theme.select, Theme.light ? 0.35 : 0.55);
     private property <color> ink: root.mine ? Theme.play-text : root.tint < 0 ? Theme.sub : Theme.ink;
-    private property <bool> glyph: root.mine || root.tint < 0 || root.initial == "";
+    private property <bool> glyph: !root.has-picture && (root.mine || root.tint < 0 || root.initial == "");
+    private property <length> corner: root.size * 0.21;
     private property <length> dot: max(root.size * 0.32, 10px);
     private property <color> away: Theme.light ? #B7862F : #D9B060;
     Rectangle {
         border-radius: root.size / 2;
         background: root.fill;
         if root.glyph: Icon { glyph: Glyph.user; size: root.size * 0.48; tint: root.ink; }
-        if !root.glyph: Text {
+        if root.has-picture: Image {
+            width: root.size;
+            height: root.size;
+            source: root.picture;
+            image-fit: cover;
+            // The software renderer clips a picture square: an annulus of the surface rounds it.
+            Rectangle {
+                x: -root.corner;
+                y: -root.corner;
+                width: root.size + 2 * root.corner;
+                height: root.size + 2 * root.corner;
+                border-radius: root.size / 2 + root.corner;
+                border-width: root.corner;
+                border-color: root.ring;
+            }
+        }
+        if !root.glyph && !root.has-picture: Text {
             text: root.initial;
             font-size: root.size * 0.42;
             font-weight: 600;
@@ -314,25 +351,6 @@ component Avatar inherits Rectangle {
             border-width: root.presence == 2 ? 2px : 1.5px;
             border-color: Theme.sub.with-alpha(root.presence == 2 ? 0.9 : 0.5);
         }
-    }
-}
-
-/// An unread count: a small accent pill.
-component Badge inherits Rectangle {
-    in property <string> text;
-    horizontal-stretch: 0;
-    height: caption.preferred-height + 2px;
-    min-width: caption.preferred-width + 14px;
-    preferred-width: self.min-width;
-    border-radius: 9px;
-    background: Theme.select;
-    caption := Text {
-        text: root.text;
-        font-size: Theme.type-micro;
-        font-weight: 600;
-        color: Theme.select-ink;
-        horizontal-alignment: center;
-        vertical-alignment: center;
     }
 }
 
@@ -454,13 +472,17 @@ component PaneButton inherits IconButton {
 component AccountFace inherits Rectangle {
     in property <bool> sidebar;
     in property <string> status-line;
+    /// The avatar's inset: the sidebar's hover pad, none where the face lines up with a column.
+    in property <length> inset: 8px;
     height: 54px;
     // The switcher: the whole face, short of the controls of its own (the status drop-down
     // under the name, the options button), so the D-pad reaches each of them apart.
+    // In the sidebar the avatar is a control of its own: it opens the portrait picker.
+    private property <bool> portrait: root.sidebar && FriendsView.portrait-enabled;
     face := Pressable {
-        x: 0;
+        x: root.portrait ? 54px : 0;
         y: 0;
-        width: root.sidebar ? root.width - 48px : root.width;
+        width: (root.sidebar ? root.width - 48px : root.width) - self.x;
         height: root.sidebar && FriendsView.status-editable ? 31px : root.height;
         label: FriendsView.account-label;
         enabled: FriendsView.switchable;
@@ -470,13 +492,15 @@ component AccountFace inherits Rectangle {
         clicked => { accounts.show(); }
     }
     HorizontalLayout {
-        padding-left: 6px;
-        padding-right: 6px;
+        padding-left: root.inset;
+        padding-right: root.inset;
         spacing: 10px;
         Avatar {
             cross-axis-self-alignment: center;
             size: 38px;
             mine: true;
+            picture: FriendsView.own-picture;
+            has-picture: FriendsView.has-own-picture;
             presence: root.sidebar ? FriendsView.own-presence : -1;
             ring: Theme.bg;
         }
@@ -531,6 +555,18 @@ component AccountFace inherits Rectangle {
             clicked => { FriendsView.status-options(); }
         }
     }
+    // Over the avatar (drawn after it, so its hover ring shows over the picture's rounding).
+    if root.portrait: Pressable {
+        x: 4px;
+        y: (root.height - self.height) / 2;
+        width: 46px;
+        height: 46px;
+        label: FriendsView.portrait-label;
+        border-radius: self.width / 2;
+        border-width: self.hot ? 2px : 0px;
+        border-color: Theme.ice;
+        clicked => { FriendsView.choose-portrait(); }
+    }
     // A popup can't sit inside the conditional status row: it is placed from where that row is.
     private property <Point> status-at;
     statuses := Menu {
@@ -554,12 +590,8 @@ component AccountFace inherits Rectangle {
 }
 
 /// Not signed in (or nothing fetched yet): what to do, and the sign-in controls.
-component SignInCard inherits Rectangle {
+component SignInCard inherits Panel {
     private property <length> column: 360px;
-    background: Theme.card;
-    border-radius: Theme.radius;
-    border-width: 1px;
-    border-color: Theme.hairline;
     VerticalLayout {
         alignment: center;
         padding: Theme.sp-3;
@@ -580,7 +612,7 @@ component SignInCard inherits Rectangle {
         if FriendsView.sign-in-controls: Rectangle { height: Theme.sp-s; }
         if FriendsView.sign-in-controls && FriendsView.sign-in-switcher: HorizontalLayout {
             alignment: center;
-            AccountFace { width: root.column; sidebar: false; status-line: FriendsView.strings.choose-account; }
+            AccountFace { width: root.column; inset: 0px; sidebar: false; status-line: FriendsView.strings.choose-account; }
         }
         if FriendsView.sign-in-controls: HorizontalLayout {
             alignment: center;
@@ -632,21 +664,18 @@ component NavRow inherits Item {
             Icon { glyph: root.glyph; size: 17px; tint: root.selected ? Theme.accent : Theme.sub; }
         }
         Text { horizontal-stretch: 1; text: root.text; font-size: Theme.type-body; font-weight: root.selected ? 600 : 400; color: Theme.ink; vertical-alignment: center; }
-        if root.count != "" && root.badge: Badge { cross-axis-self-alignment: center; text: root.count; }
+        if root.count != "" && root.badge: CountBadge { cross-axis-self-alignment: center; text: root.count; }
         if root.count != "" && !root.badge: Text { text: root.count; font-size: Theme.type-caption; color: Theme.sub; vertical-alignment: center; }
     }
 }
 
 component Sidebar inherits Rectangle {
-    background: Theme.bg;
-    // Inside TwoPane's 1 px border: one pixel tighter, so the fill stays within the card's curve.
-    border-top-left-radius: Theme.radius - 1px;
-    border-bottom-left-radius: Theme.radius - 1px;
+    // On the page itself (no card): the conversation beside it is the Panel.
     VerticalLayout {
         VerticalLayout {
             // Only the friend list takes the spare height.
             vertical-stretch: 0;
-            padding: Theme.sp-m;
+            padding-bottom: Theme.sp-s;
             spacing: Theme.sp-s;
             AccountFace { sidebar: true; }
             // On the search field's edges.
@@ -671,12 +700,12 @@ component Sidebar inherits Rectangle {
                     current: FriendsView.auto-away-current;
                     picked(index) => { FriendsView.auto-away-picked(index); }
                 }
-                if FriendsView.auto-away-shown: Text { text: FriendsView.strings.auto-away-note; font-size: Theme.type-micro; color: Theme.sub; wrap: word-wrap; }
+                if FriendsView.auto-away-shown: Text { text: FriendsView.strings.auto-away-note; font-size: Theme.type-caption; color: Theme.sub; wrap: word-wrap; }
             }
         }
         HorizontalLayout {
-            padding-left: Theme.sp-m;
-            padding-right: Theme.sp-m;
+            padding-left: 0px;
+            padding-right: 0px;
             Field {
                 font-size: Theme.type-small;
                 pad-x: Theme.sp-m;
@@ -696,15 +725,15 @@ component Sidebar inherits Rectangle {
                 content-height: rows.preferred-height;
                 rows := VerticalLayout {
                     width: list.width;
-                    padding-left: Theme.sp-s;
-                    padding-right: Theme.sp-s;
+                    padding-left: 0px;
+                    padding-right: 0px;
                     spacing: 2px;
                     alignment: start;
                     // Each line builds only its own kind.
                     for row[index] in FriendsView.rows: VerticalLayout {
                         if row.kind == 0: Pressable {
                             height: 32px;
-                            label: row.text;
+                            label: row.text + " " + row.secondary;
                             accessible-role: button;
                             accessible-expandable: true;
                             accessible-expanded: !row.folded;
@@ -714,10 +743,11 @@ component Sidebar inherits Rectangle {
                                 padding-right: Theme.sp-s;
                                 spacing: 6px;
                                 Icon { cross-axis-self-alignment: center; glyph: row.folded ? Glyph.chevron-right : Glyph.chevron-down; size: 12px; tint: Theme.faint; }
-                                Text { horizontal-stretch: 1; text: row.text; font-size: Theme.type-micro; font-weight: 600; color: Theme.faint; vertical-alignment: center; }
+                                Text { horizontal-stretch: 0; text: row.text; font-size: Theme.type-note; font-weight: 600; color: Theme.ink2; vertical-alignment: center; }
+                                Text { horizontal-stretch: 1; text: row.secondary; font-size: Theme.type-note; color: Theme.faint; vertical-alignment: center; }
                             }
                         }
-                        if row.kind == 1: Item {
+                        if row.kind == 1: item := Item {
                             height: 50px;
                             label: row.text;
                             selected: row.selected;
@@ -731,8 +761,10 @@ component Sidebar inherits Rectangle {
                                     size: 34px;
                                     initial: row.initial;
                                     tint: row.tint;
+                                    picture: row.picture;
+                                    has-picture: row.has-picture;
                                     presence: row.presence;
-                                    ring: row.selected ? Theme.select.mix(Theme.bg, 0.85) : Theme.bg;
+                                    ring: row.selected ? Theme.select.mix(Theme.bg, 0.85) : item.hot ? Theme.select.mix(Theme.bg, 0.45) : Theme.bg;
                                 }
                                 VerticalLayout {
                                     horizontal-stretch: 1;
@@ -747,7 +779,7 @@ component Sidebar inherits Rectangle {
                                     }
                                     Text { text: row.secondary; font-size: Theme.type-caption; color: Theme.sub; overflow: elide; }
                                 }
-                                if row.unread != "": Badge { cross-axis-self-alignment: center; text: row.unread; }
+                                if row.unread != "": CountBadge { cross-axis-self-alignment: center; text: row.unread; }
                             }
                         }
                         if row.kind == 2: VerticalLayout {
@@ -770,7 +802,10 @@ component Sidebar inherits Rectangle {
         }
         Rule { tint: Theme.hairline; }
         VerticalLayout {
-            padding: Theme.sp-s;
+            padding-left: 0px;
+            padding-right: 0px;
+            padding-top: Theme.sp-s;
+            padding-bottom: 0px;
             spacing: 2px;
             NavRow {
                 glyph: Glyph.inbox;
@@ -817,7 +852,7 @@ component Group inherits HorizontalLayout {
     spacing: Theme.sp-m;
     VerticalLayout {
         alignment: start;
-        Avatar { size: 36px; mine: root.block.mine; initial: root.block.initial; tint: root.block.tint; ring: Theme.card; }
+        Avatar { size: 36px; mine: root.block.mine; initial: root.block.initial; tint: root.block.tint; picture: root.block.picture; has-picture: root.block.has-picture; ring: Theme.fill; }
     }
     VerticalLayout {
         horizontal-stretch: 1;
@@ -1023,8 +1058,13 @@ component ComposerView inherits VerticalLayout {
             clicked => { FriendsView.add-subject(); }
             toggle := Text { text: FriendsView.subject-toggle; font-size: Theme.type-caption; font-weight: 600; color: Theme.accent; vertical-alignment: center; }
         }
-        Rectangle { horizontal-stretch: 1; }
+        // The keys hint keeps its distance from the switch and gives way first when narrow.
+        Rectangle { width: Theme.sp-m; }
         Text {
+            horizontal-stretch: 1;
+            min-width: 0px;
+            horizontal-alignment: right;
+            overflow: elide;
             text: FriendsView.note;
             font-size: Theme.type-micro;
             color: FriendsView.note-tone == 2 ? Theme.danger : FriendsView.note-tone == 1 ? Theme.sub : Theme.sub.with-alpha(0.85);
@@ -1046,8 +1086,10 @@ component Conversation inherits VerticalLayout {
                 size: 38px;
                 initial: FriendsView.friend-initial;
                 tint: FriendsView.friend-tint;
+                picture: FriendsView.friend-picture;
+                has-picture: FriendsView.has-friend-picture;
                 presence: FriendsView.friend-presence;
-                ring: Theme.panel;
+                ring: Theme.fill;
             }
             VerticalLayout {
                 alignment: center;
@@ -1181,8 +1223,9 @@ component Mailbox inherits VerticalLayout {
                 clicked => { FriendsView.folder-picked(index); }
             }
         }
-        Rectangle { horizontal-stretch: 1; }
-        Text { text: FriendsView.mail-count; font-size: Theme.type-caption; color: Theme.sub; vertical-alignment: center; }
+        // The count gives way (elided) before the tabs or the page buttons.
+        Rectangle { width: Theme.sp-s; }
+        Text { horizontal-stretch: 1; min-width: 0px; horizontal-alignment: right; overflow: elide; text: FriendsView.mail-count; font-size: Theme.type-caption; color: Theme.sub; vertical-alignment: center; }
         if FriendsView.paging: Control { cross-axis-self-alignment: center; text: FriendsView.strings.previous; enabled: FriendsView.previous-enabled; clicked => { FriendsView.previous(); } }
         if FriendsView.paging: Control { cross-axis-self-alignment: center; text: FriendsView.strings.next; enabled: FriendsView.next-enabled; clicked => { FriendsView.next(); } }
     }
@@ -1229,7 +1272,7 @@ component Mailbox inherits VerticalLayout {
                             width: 8px;
                             if line.unread: Rectangle { width: 8px; height: 8px; border-radius: 4px; background: Theme.accent; }
                         }
-                        Avatar { cross-axis-self-alignment: center; size: 32px; mine: line.mine; initial: line.initial; tint: line.tint; ring: Theme.card; }
+                        Avatar { cross-axis-self-alignment: center; size: 32px; mine: line.mine; initial: line.initial; tint: line.tint; picture: line.picture; has-picture: line.has-picture; ring: Theme.fill; }
                         VerticalLayout {
                             horizontal-stretch: 1;
                             alignment: center;
@@ -1290,7 +1333,7 @@ component Blocked inherits VerticalLayout {
                     padding-top: 6px;
                     padding-bottom: 6px;
                     spacing: Theme.sp-m;
-                    Avatar { cross-axis-self-alignment: center; size: 34px; initial: line.initial; tint: line.tint; ring: Theme.card; }
+                    Avatar { cross-axis-self-alignment: center; size: 34px; initial: line.initial; tint: line.tint; picture: line.picture; has-picture: line.has-picture; ring: Theme.fill; }
                     Text { horizontal-stretch: 1; text: line.name; font-size: Theme.type-body; color: Theme.ink; vertical-alignment: center; overflow: elide; }
                     Control { text: FriendsView.strings.unblock; enabled: line.enabled; clicked => { FriendsView.unblock(index); } }
                 }
@@ -1306,18 +1349,18 @@ component Blocked inherits VerticalLayout {
     }
 }
 
-/// The friends sidebar and the open pane, in one card.
-component TwoPane inherits Rectangle {
-    background: Theme.card;
-    border-radius: Theme.radius;
-    border-width: 1px;
-    border-color: Theme.hairline;
-    HorizontalLayout {
-        padding: 1px;
-        Sidebar { width: FriendsView.side-w; }
-        Rectangle { width: 1px; background: Theme.line; }
+/// The friends sidebar on the page, and the open pane in a card beside it.
+component TwoPane inherits HorizontalLayout {
+    spacing: Theme.sp-xl;
+    Sidebar { width: FriendsView.side-w; }
+    Panel {
+        horizontal-stretch: 1;
+        // Inside the card's 1 px border.
         Rectangle {
-            horizontal-stretch: 1;
+            x: 1px;
+            y: 1px;
+            width: parent.width - 2px;
+            height: parent.height - 2px;
             if FriendsView.pane == 0: Empty { glyph: Glyph.message; title: FriendsView.strings.welcome; }
             if FriendsView.pane == 1: Conversation { }
             if FriendsView.pane == 2: Mailbox { }
@@ -1325,7 +1368,6 @@ component TwoPane inherits Rectangle {
         }
     }
 }
-
 /// The Friends page under the title bar.
 export component FriendsPage inherits VerticalLayout {
     private property <float> s: Theme.scale;
@@ -1351,5 +1393,10 @@ export component FriendsPage inherits VerticalLayout {
     }
     for problem in FriendsView.problems: Notice { text: problem; }
     if FriendsView.shown: TwoPane { vertical-stretch: 1; }
-    if !FriendsView.shown: SignInCard { vertical-stretch: 1; }
+    // A compact card centred on the page, not a page-sized panel.
+    if !FriendsView.shown: VerticalLayout {
+        vertical-stretch: 1;
+        alignment: center;
+        HorizontalLayout { alignment: center; SignInCard { width: 560px; } }
+    }
 }

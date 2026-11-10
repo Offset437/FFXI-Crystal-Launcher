@@ -17,13 +17,30 @@ use super::game_window::{self, Monitor};
 use super::hotkeys::{self, Action, Hotkey, Problem};
 use super::layouts::{self, Preset};
 use super::recovery::{self, Decision, EndKind};
-use super::{backups, desktop, discord, notify, order, perf, playtime, store, ClientKey, FeatureSettings};
+use super::{backups, desktop, discord, keyhook, notify, order, perf, playtime, store, ClientKey, FeatureSettings};
 use crate::backend::Config;
 use crate::launch_log::ExitReport;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// How long a switching hotkey waits for an ordering pass on another thread to stop.
+const ORDER_YIELD: Duration = Duration::from_millis(700);
+/// How long after a hotkey's switch the foreground and the stacking are read again for the
+/// history: whatever undoes a switch (a game or a tool taking the foreground back) shows there.
+const AFTER_SWITCH_MS: u32 = 300;
+/// How long the window a hotkey gave the foreground gets to come to the top of the game windows
+/// by itself (its thread handles the activation between frames) before it is moved there.
+const RAISE_SETTLE: Duration = Duration::from_millis(150);
+
+/// The window-ordering flag (`Shared::ordering`), held: released when dropped.
+struct OrderingHeld<'a>(&'a AtomicBool);
+impl<'a> OrderingHeld<'a> {
+    /// None while another holds it. (Built only once taken: dropping one releases the flag.)
+    fn take(flag: &'a AtomicBool) -> Option<Self> { (!flag.swap(true, Ordering::AcqRel)).then(|| Self(flag)) }
+}
+impl Drop for OrderingHeld<'_> { fn drop(&mut self) { self.0.store(false, Ordering::Release); } }
 
 /// What the runtime tells the interface.
 #[derive(Clone, Debug)]
@@ -100,6 +117,9 @@ struct Inner {
     order_pending: bool,
     /// The windows as last ordered, in Home order: an automatic pass with nothing new is skipped.
     last_ordered: Vec<isize>,
+    /// Windows refused an activation of the ordering pass while these games ran: automatic passes
+    /// only stack the windows (`order::Plan::stack_only`) until the last game ends.
+    alt_tab_refused: bool,
     recovery: recovery::Policy,
     wake_generation: u64,
     playtime: playtime::Tracker,
@@ -116,8 +136,12 @@ struct Shared {
     privacy: Arc<AtomicBool>,
     /// Moves whenever what the interface reads changes (`Runtime::revision`).
     revision: AtomicU64,
-    /// A window-ordering pass is running (one at a time, whichever thread asked).
+    /// A window-ordering pass is running (one at a time, whichever thread asked), or a hotkey is
+    /// switching windows: neither starts while the other is at it.
     ordering: AtomicBool,
+    /// Counts the switching hotkeys pressed. An ordering pass that sees it move stops: its own
+    /// activations, and the foreground it gives back at the end, would undo the hotkey's switch.
+    switches: AtomicU64,
 }
 
 /// The features' runtime. Cheap to clone (one shared state).
@@ -161,6 +185,7 @@ impl Runtime {
                     launching: false,
                     order_pending: false,
                     last_ordered: Vec::new(),
+                    alt_tab_refused: false,
                     recovery: recovery::Policy::default(),
                     wake_generation: 0,
                     notify,
@@ -171,6 +196,7 @@ impl Runtime {
                 privacy,
                 revision: AtomicU64::new(0),
                 ordering: AtomicBool::new(false),
+                switches: AtomicU64::new(0),
             }
         });
         let runtime = Self { shared };
@@ -181,6 +207,11 @@ impl Runtime {
     fn inner(&self) -> MutexGuard<'_, Inner> { lock(&self.shared.inner) }
 
     fn emit(&self, event: Event) { (self.shared.sink)(event) }
+
+    /// A diagnostic line in the launch history (`hotkeys: ...`): no account names, no keys typed.
+    fn diag(&self, line: &str) {
+        crate::launch_log::append_history(&self.shared.config.history_path(), "Crystal", line, None);
+    }
 
     fn changed(&self) { self.shared.revision.fetch_add(1, Ordering::AcqRel); }
 
@@ -228,7 +259,7 @@ impl Runtime {
             inner.order = order;
             if !inner.games.is_empty() { inner.order_pending = true; }
         }
-        self.order_if_due();
+        self.order_if_due("Home order changed");
     }
 
     /// Whether `order` differs from the account order the runtime has (no allocation: the
@@ -246,7 +277,7 @@ impl Runtime {
     /// last one is up, their windows are put in Home order once each has its window.
     pub(crate) fn set_launching(&self, on: bool) {
         if std::mem::replace(&mut self.inner().launching, on) == on || on { return; }
-        self.order_if_due();
+        self.order_if_due("Play finished");
     }
 
     /// FFXI is down for maintenance or an outage, or an Update runs: no automatic relaunch.
@@ -281,7 +312,7 @@ impl Runtime {
             self.on_window(&start.account, hwnd);
         }
         self.update_presence();
-        self.order_if_due();
+        self.order_if_due("game started");
     }
 
     /// A game ended. Records its play time and decides about recovery: the decision is returned
@@ -289,7 +320,9 @@ impl Runtime {
     pub(crate) fn game_ended(&self, end: GameEnd) -> Decision {
         let decision = {
             let mut inner = self.inner();
+            // Its Arrange all undo stays: Restore windows still puts its remembered window back.
             let Some(game) = inner.games.remove(&end.account) else { return Decision::None };
+            if inner.games.is_empty() { inner.alt_tab_refused = false; }
             inner.playtime.stop(&game.key, now_unix());
             self.changed();
             let clean = end.user_closed || end.report.as_ref().is_some_and(|r| r.kind == crate::launch_log::ExitKind::Normal);
@@ -423,10 +456,14 @@ impl Runtime {
     /// Handled on the desktop thread.
     fn on_desktop(&self, event: desktop::Event) {
         match event {
-            desktop::Event::Hotkey(id) => {
+            desktop::Event::Hotkey { id, via, key } => {
                 let action = self.inner().hotkeys.iter().find(|(i, _, _)| *i == id).map(|(_, a, _)| a.clone());
-                if let Some(action) = action { self.run_action(&action); }
+                match action {
+                    Some(action) => self.run_action(&action, via, key),
+                    None => self.diag(&format!("hotkeys: {} id {id}: no hotkey has this id", via.name())),
+                }
             }
+            desktop::Event::Log(line) => self.diag(&line),
             desktop::Event::Registered(results) => {
                 let statuses: Vec<hotkeys::Status> = {
                     let mut inner = self.inner();
@@ -500,7 +537,7 @@ impl Runtime {
                 game_window::apply(hwnd, rect, shown);
             }
         }
-        if adopted { self.order_if_due(); }
+        if adopted { self.order_if_due("game window found"); }
     }
 
     fn remember(&self, account: &str, hwnd: isize) {
@@ -533,71 +570,157 @@ impl Runtime {
     }
 
     /// Bring forward the game a hotkey names (on the desktop thread, which may set the
-    /// foreground: the hotkey's input is its own). Cycling goes through the games that have a
-    /// window, in Home order: one still loading (no window yet) or closed is skipped, and a
-    /// minimised one is restored, as Alt+Tab does.
-    fn run_action(&self, action: &Action) {
-        let (order, current) = {
-            let inner = self.inner();
-            let order: Vec<String> = match action {
-                Action::Account(_) => home_order(&inner),
-                Action::Next | Action::Previous => home_windows(&inner).into_iter().map(|(k, _)| k).collect(),
-            };
-            let current = game_window::foreground().and_then(|(_, pid)| inner.games.iter().find(|(_, g)| g.pids.contains(&pid)).map(|(k, _)| k.clone()));
-            (order, current)
+    /// foreground at once: a WM_HOTKEY's input is its own). Cycling goes through the games that
+    /// have a window, in Home order: one still loading (no window yet) or closed is skipped, and a
+    /// minimised one is restored, as Alt+Tab does (`hotkeys::cycle`). One history line: the press,
+    /// where it went (places in Home order, never names) and each foreground step's result.
+    ///
+    /// The window given the foreground is also put in front of the other game windows when it is
+    /// not (`game_window::raise`): the games cover each other exactly, so the one seen is the one
+    /// on top of the stack, whichever has the keyboard. An ordering pass on another thread stops
+    /// for the switch and none starts during it (`Shared::switches`, `Shared::ordering`). The
+    /// history line ends with the game windows' stacking, and a second line reads the foreground
+    /// and the stacking again a moment later (`after_switch`).
+    fn run_action(&self, action: &Action, via: desktop::Via, key: Option<keyhook::Fired>) {
+        let switches = self.shared.switches.fetch_add(1, Ordering::AcqRel) + 1;
+        let asked = Instant::now();
+        let held = loop {
+            if let Some(held) = OrderingHeld::take(&self.shared.ordering) { break Some(held); }
+            if asked.elapsed() >= ORDER_YIELD { break None; }
+            std::thread::sleep(Duration::from_millis(5));
         };
-        if let Some(account) = hotkeys::target(action, &order, current.as_deref()) { self.focus(&account); }
+        let waited = asked.elapsed();
+        let front = game_window::foreground();
+        let (games, in_front) = {
+            let inner = self.inner();
+            let in_front = front.and_then(|(_, pid)| inner.games.iter().find(|(_, g)| g.pids.contains(&pid)).map(|(k, _)| k.clone()));
+            (home_candidates(&inner), in_front)
+        };
+        // Each game window with its place in Home order.
+        let windows: Vec<(usize, isize)> = games.iter().enumerate().filter_map(|(i, g)| Some((i + 1, g.window?))).collect();
+        // No window in front at all (a game between two windows of its own): the game the user
+        // is looking at is the one on top of the stack, and cycling goes on from it.
+        let current = if front.is_some() { in_front } else {
+            let on_top = game_window::z_order(&windows.iter().map(|(_, h)| *h).collect::<Vec<_>>()).into_iter().find(|h| game_window::is_shown(*h));
+            on_top.and_then(|hwnd| games.iter().find(|g| g.window == Some(hwnd)).map(|g| g.account.clone()))
+        };
+        let switch = hotkeys::cycle(action, &games, current.as_deref());
+        let result = switch.as_ref().map(|s| game_window::activate(s.hwnd, s.restore, true));
+        let raised = match (&switch, &result) {
+            (Some(s), Some(r)) if r.ok() => Some(game_window::raise(s.hwnd, &windows.iter().map(|(_, h)| *h).collect::<Vec<_>>(), RAISE_SETTLE)),
+            _ => None,
+        };
+        drop(held);
+        let name = match action {
+            Action::Next => "next".to_owned(),
+            Action::Previous => "previous".to_owned(),
+            Action::Account(key) => format!("account #{}", games.iter().position(|g| &g.account == key).map_or(0, |i| i + 1)),
+        };
+        let how = key.map_or(via.name().to_owned(), |k| format!("{} ({})", via.name(), k.describe()));
+        let from = current.as_ref().and_then(|c| games.iter().position(|g| &g.account == c)).map_or("-".to_owned(), |i| format!("#{}", i + 1));
+        let from = if front.is_none() { format!("{from} (no window in front)") } else { from };
+        let open = games.iter().filter(|g| g.window.is_some()).count();
+        let mut line = match (&switch, &result) {
+            (Some(s), Some(r)) => format!("hotkeys: {name} via {how}: {from} -> #{} of {} ({open} with a window): {}; {}{}; z {}",
+                s.index, games.len(), r.describe(), if r.ok() { "in front" } else { "NOT in front" }, describe_raise(raised), stack_line(&windows)),
+            _ => format!("hotkeys: {name} via {how}: from {from}, no window to switch to ({} running, {open} with a window)", games.len()),
+        };
+        if waited >= Duration::from_millis(20) {
+            line.push_str(&format!("; waited {} ms for an ordering pass{}", waited.as_millis(), if waited >= ORDER_YIELD { ", which did not stop" } else { "" }));
+        }
+        self.diag(&line);
+        if let Some(s) = &switch {
+            let weak = Arc::downgrade(&self.shared);
+            let (index, target) = (s.index, s.hwnd);
+            desktop::later(AFTER_SWITCH_MS, Box::new(move || {
+                if let Some(shared) = weak.upgrade() { Runtime { shared }.after_switch(index, target, switches, &windows); }
+            }));
+        }
+    }
+
+    /// The history's second look at a hotkey's switch to `target` (place `index` in Home order),
+    /// `AFTER_SWITCH_MS` later: which window is in front now, and the game windows' stacking.
+    fn after_switch(&self, index: usize, target: isize, switches: u64, windows: &[(usize, isize)]) {
+        let front = match game_window::foreground() {
+            None => "no window".to_owned(),
+            Some((hwnd, _)) if hwnd == target => format!("#{index}"),
+            Some((hwnd, pid)) => {
+                let who = match windows.iter().find(|(_, h)| *h == hwnd) {
+                    Some((other, _)) => format!("#{other}"),
+                    None if lock(&self.shared.pids).contains(&pid) => "another window of a game".to_owned(),
+                    None => "not a game".to_owned(),
+                };
+                // Another hotkey since explains it; anything else took the foreground back.
+                let why = if self.shared.switches.load(Ordering::Acquire) != switches { "a later hotkey" } else { "NOT the target" };
+                format!("{who} ({why})")
+            }
+        };
+        self.diag(&format!("hotkeys: {AFTER_SWITCH_MS} ms after -> #{index}: in front {front}; z {}", stack_line(windows)));
     }
 
     /// Put the game windows' taskbar buttons and Alt+Tab order in Home order now (the "Order
     /// windows" button). Returns how many game windows there are; `Err` when there is none, or
     /// when Windows refused the Alt+Tab part (the taskbar part is still done).
-    pub(crate) fn order_windows(&self) -> Result<usize, String> { self.order(true).unwrap_or(Ok(0)) }
+    pub(crate) fn order_windows(&self) -> Result<usize, String> { self.order(None).unwrap_or(Ok(0)) }
 
-    /// The automatic pass: when on, something changed, no Play is still bringing up games, and
-    /// the windows differ from the last pass. It stays due while a game has no window yet, so
-    /// that window is ordered too when it appears.
-    fn order_if_due(&self) {
+    /// The automatic pass: when on, something changed, no Play is still bringing up games, every
+    /// running game has its window (games coming up one by one get one pass, not one per window),
+    /// and the windows differ from the last pass. It stays due while a game has no window yet.
+    /// `why` names what made it due, for the history.
+    fn order_if_due(&self, why: &'static str) {
         {
             let mut inner = self.inner();
             if !inner.settings.layouts.order_windows || !inner.order_pending || inner.launching || inner.games.is_empty() { return; }
-            if inner.games.values().all(|g| g.hwnd.is_some_and(game_window::exists)) { inner.order_pending = false; }
+            if !inner.games.values().all(|g| g.hwnd.is_some_and(game_window::exists)) { return; }
+            inner.order_pending = false;
         }
-        match self.order(false) {
-            // Another pass is running: due again at the next change.
+        match self.order(Some(why)) {
+            // Another pass is running, or a hotkey is switching: due again at the next change.
             None => self.inner().order_pending = true,
             Some(Err(error)) => self.emit(Event::Error(error)),
             Some(Ok(_)) => {}
         }
     }
 
-    /// One ordering pass; `None` when another is running.
-    fn order(&self, asked: bool) -> Option<Result<usize, String>> {
-        struct Running<'a>(&'a AtomicBool);
-        impl Drop for Running<'_> { fn drop(&mut self) { self.0.store(false, Ordering::Release); } }
+    /// One ordering pass, asked for (`why` is None) or automatic (`why` names its cause); `None`
+    /// when another is running or a hotkey is switching windows. Every pass leaves one history
+    /// line with its cause. An automatic pass whose activations Windows refuses still sets the
+    /// order by stacking (`order::apply`), and later automatic passes only stack. A switching
+    /// hotkey pressed meanwhile stops the pass (it would undo the switch): it is then due again.
+    fn order(&self, why: Option<&'static str>) -> Option<Result<usize, String>> {
+        let asked = why.is_none();
         // One pass at a time: two interleaved activation sequences would undo each other.
-        if self.shared.ordering.swap(true, Ordering::AcqRel) { return None; }
-        let _running = Running(&self.shared.ordering);
-        let hwnds: Vec<isize> = home_windows(&self.inner()).into_iter().map(|(_, h)| h).collect();
+        let _running = OrderingHeld::take(&self.shared.ordering)?;
+        let switches = self.shared.switches.load(Ordering::Acquire);
+        let (hwnds, refused_before) = {
+            let inner = self.inner();
+            (home_windows(&inner).into_iter().map(|(_, h)| h).collect::<Vec<isize>>(), inner.alt_tab_refused)
+        };
         if hwnds.is_empty() {
             return Some(if asked { Err(crate::i18n::t("No game window to order.").into()) } else { Ok(0) });
         }
         if !asked && self.inner().last_ordered == hwnds { return Some(Ok(hwnds.len())); }
         let windows: Vec<order::Window> = hwnds.iter().map(|h| order::Window { hwnd: *h, minimized: game_window::is_minimized(*h) }).collect();
-        let plan = order::plan(&windows, game_window::foreground().map(|(h, _)| h));
-        let outcome = order::apply(&plan);
-        self.inner().last_ordered = hwnds.clone();
-        if outcome.refused || !outcome.restored {
+        let mut plan = order::plan(&windows, game_window::foreground().map(|(h, _)| h));
+        plan.stack_only = !asked && refused_before;
+        let outcome = order::apply(&plan, &|| self.shared.switches.load(Ordering::Acquire) != switches);
+        {
+            let mut inner = self.inner();
+            if outcome.stopped { inner.order_pending = true; } else { inner.last_ordered = hwnds.clone(); }
+            if outcome.refused { inner.alt_tab_refused = true; }
+        }
+        if outcome.taskbar > 0 || !plan.activate.is_empty() {
+            let kind = match (why, plan.stack_only) {
+                (None, _) => "asked".to_owned(),
+                (Some(why), false) => why.to_owned(),
+                (Some(why), true) => format!("{why}, stack only"),
+            };
+            self.diag(&format!("hotkeys: order ({kind}): {}", outcome.describe(hwnds.len())));
+        }
+        if asked && !outcome.stopped && !outcome.alt_tab_set() {
             return Some(Err(crate::i18n::t("Windows did not allow changing the Alt+Tab order.").into()));
         }
         Some(Ok(hwnds.len()))
-    }
-
-    /// Bring `account`'s game window forward. Whether it is now in the foreground.
-    pub(crate) fn focus(&self, account: &str) -> bool {
-        let Some((hwnd, pids)) = self.with_game(account, |g| (g.hwnd.filter(|h| game_window::exists(*h)), g.pids.clone())) else { return false };
-        let Some(hwnd) = hwnd.or_else(|| game_window::find_main_window(&pids)) else { return false };
-        game_window::bring_forward(hwnd)
     }
 
     /// The monitors now (for choosing where to arrange).
@@ -605,29 +728,141 @@ impl Runtime {
 
     /// Arrange every running game window with `preset` on the monitors named in `devices` (all,
     /// in Windows' order with the primary first, when empty), in the launcher's account order,
-    /// and remember the result. Fullscreen games are left alone. Returns how many were placed.
+    /// and remember the result. Games that may hold their display (fullscreen) are left alone; a
+    /// borderless game at its monitor's size is arranged (`game_window::holds_display`). Returns
+    /// how many were placed.
     pub(crate) fn arrange(&self, preset: Preset, devices: &[String]) -> Result<usize, String> {
         let monitors = game_window::monitors();
         let chosen: Vec<&Monitor> = if devices.is_empty() { monitors.iter().collect() }
             else { devices.iter().filter_map(|d| monitors.iter().find(|m| &m.device == d)).collect() };
         let areas: Vec<_> = if chosen.is_empty() { monitors.iter().filter(|m| m.primary).map(|m| m.work).collect() } else { chosen.iter().map(|m| m.work).collect() };
-        let (windows, aspect) = {
+        let (found, aspect) = {
             let inner = self.inner();
-            let windows: Vec<(String, isize)> = home_windows(&inner).into_iter()
-                .filter(|(_, hwnd)| !game_window::capture(*hwnd).is_some_and(|p| p.mode == game_window::Mode::Fullscreen))
-                .collect();
-            (windows, inner.settings.layouts.aspect)
+            (home_windows(&inner), inner.settings.layouts.aspect)
         };
-        if windows.is_empty() { return Err(crate::i18n::t("No game window to arrange.").into()); }
+        let front = game_window::foreground().map(|(hwnd, _)| hwnd);
+        let placements: Vec<Option<game_window::Placement>> = found.iter().map(|(_, hwnd)| game_window::capture(*hwnd)).collect();
+        let windows = arrangeable(&found, &placements, front);
+        if windows.is_empty() {
+            let text = if found.is_empty() { crate::i18n::t("No game window to arrange.") } else { crate::i18n::t("Fullscreen games are left alone.") };
+            return Err(text.into());
+        }
         let rects = layouts::arrange(preset, windows.len(), &areas, aspect);
         let mut placed = 0;
+        let mut moved = Vec::new();
         for ((account, hwnd), rect) in windows.iter().zip(rects) {
+            let before = found.iter().position(|(_, h)| h == hwnd).and_then(|i| placements[i].clone());
             if game_window::apply(*hwnd, rect, game_window::Shown::Normal) {
                 placed += 1;
                 self.remember(account, *hwnd);
+                // Where it landed (a game may adjust the size it is given).
+                let arranged = game_window::capture(*hwnd).map_or(rect, |p| p.rect);
+                let id = self.with_game(account, |g| g.key.id());
+                if let (Some(before), Some(id)) = (before, id) {
+                    moved.push((id, layouts::Arranged { before: layouts::Saved::from_placement(&before), arranged }));
+                }
             }
         }
+        let undone = moved.len();
+        if !moved.is_empty() {
+            let saved = {
+                let mut inner = self.inner();
+                inner.settings.layouts.undo = next_undo(&inner.settings.layouts.undo, moved);
+                self.changed();
+                inner.load_error.is_none().then(|| store::save(&self.shared.config, &inner.settings))
+            };
+            if let Some(Err(error)) = saved { self.emit(Event::Error(error)); }
+        }
+        self.diag(&format!("features: arrange: {placed} of {} windows moved, {undone} can be restored", windows.len()));
         Ok(placed)
+    }
+
+    /// Whether Restore windows has something to do: an Arrange all moved a window of a game that
+    /// runs now and has its window.
+    pub(crate) fn can_restore_windows(&self) -> bool {
+        let inner = self.inner();
+        let undo = &inner.settings.layouts.undo;
+        !undo.is_empty() && inner.games.values().any(|g| g.hwnd.is_some_and(game_window::exists) && undo.contains_key(&g.key.id()))
+    }
+
+    /// Undo the last Arrange all (the first of several in a row, `next_undo`), also after Crystal
+    /// or the games restarted: each running game's window goes back exactly as it was (rectangle,
+    /// show state and frame; `restore_step`), by the move the launch-time restore uses, and each
+    /// client's remembered window goes back to that placement too, so its next start is the
+    /// original one (Arrange all remembered the arranged one). A window that may hold its display
+    /// now is left alone and stays restorable. One history line per window. Returns how many
+    /// windows were put back.
+    pub(crate) fn restore_windows(&self) -> Result<usize, String> {
+        struct Target { place: usize, hwnd: isize }
+        let (undo, targets) = {
+            let mut inner = self.inner();
+            let undo = std::mem::take(&mut inner.settings.layouts.undo);
+            let targets: BTreeMap<String, Target> = home_candidates(&inner).into_iter().enumerate()
+                .filter_map(|(i, c)| Some((inner.games[&c.account].key.id(), Target { place: i + 1, hwnd: c.window? })))
+                .collect();
+            (undo, targets)
+        };
+        if undo.is_empty() { return Err(crate::i18n::t("No arranged window is open.").into()); }
+        let front = game_window::foreground().map(|(hwnd, _)| hwnd);
+        let monitors = game_window::monitors();
+        let (mut restored, mut open, mut held) = (0usize, 0usize, 0usize);
+        let mut keep: BTreeMap<String, layouts::Arranged> = BTreeMap::new();
+        let mut put_back: Vec<(String, layouts::Saved)> = Vec::new();
+        for (id, entry) in undo {
+            let Some(target) = targets.get(&id) else {
+                // Not running: only its remembered window goes back.
+                self.diag(&format!("features: restore -: {} -> {}: not running, remembered window put back", show(entry.arranged), show(entry.before.rect)));
+                put_back.push((id, entry.before));
+                continue;
+            };
+            let now = game_window::capture(target.hwnd);
+            let from = now.as_ref().map_or_else(|| "?".to_owned(), |p| show(p.rect));
+            match restore_step(&entry, now.as_ref(), front == Some(target.hwnd), &monitors) {
+                None => {
+                    self.diag(&format!("features: restore #{}: window unreadable, kept", target.place));
+                    keep.insert(id, entry);
+                }
+                Some(Step::Held) => {
+                    held += 1;
+                    self.diag(&format!("features: restore #{}: {from}: may hold its display, left alone", target.place));
+                    keep.insert(id, entry);
+                }
+                Some(Step::Move { rect, shown, frame }) => {
+                    open += 1;
+                    let ok = game_window::apply_frame(target.hwnd, rect, shown, frame);
+                    let landed = game_window::capture(target.hwnd);
+                    let result = match (&landed, ok) {
+                        (_, false) => "failed".to_owned(),
+                        (Some(p), true) if shown == game_window::Shown::Normal && p.rect != rect => format!("landed at {}", show(p.rect)),
+                        (Some(p), true) if frame.is_some_and(|f| f != p.frame) => "ok, frame not taken".to_owned(),
+                        _ => "ok".to_owned(),
+                    };
+                    self.diag(&format!("features: restore #{}: {from} -> {}: {result}", target.place, show(rect)));
+                    if ok {
+                        restored += 1;
+                        put_back.push((id, entry.before));
+                    } else {
+                        keep.insert(id, entry);
+                    }
+                }
+            }
+        }
+        let saved = {
+            let mut inner = self.inner();
+            // An Arrange all meanwhile (another thread) recorded its own undo: it wins.
+            for (id, entry) in keep { inner.settings.layouts.undo.entry(id).or_insert(entry); }
+            if inner.settings.layouts.remember {
+                for (id, before) in put_back { inner.settings.layouts.saved.insert(id, before); }
+            }
+            self.changed();
+            inner.load_error.is_none().then(|| store::save(&self.shared.config, &inner.settings))
+        };
+        if let Some(Err(error)) = saved { self.emit(Event::Error(error)); }
+        if open == 0 {
+            let text = if held > 0 { crate::i18n::t("Fullscreen games are left alone.") } else { crate::i18n::t("No arranged window is open.") };
+            return Err(text.into());
+        }
+        Ok(restored)
     }
 
     /// Forget a client's remembered window.
@@ -738,14 +973,103 @@ fn home_order(inner: &Inner) -> Vec<String> {
     keys
 }
 
-/// The running games that have a window now, in Home order, with that window.
-fn home_windows(inner: &Inner) -> Vec<(String, isize)> {
-    home_order(inner).into_iter().filter_map(|k| {
-        let game = &inner.games[&k];
-        let hwnd = game.hwnd.filter(|h| game_window::exists(*h)).or_else(|| game_window::find_main_window(&game.pids))?;
-        Some((k, hwnd))
+/// The running games in Home order, each with its window now (none while it is still loading or
+/// once closed) and whether that window is minimised.
+fn home_candidates(inner: &Inner) -> Vec<hotkeys::Candidate> {
+    home_order(inner).into_iter().map(|account| {
+        let game = &inner.games[&account];
+        let window = game.hwnd.filter(|h| game_window::exists(*h)).or_else(|| game_window::find_main_window(&game.pids));
+        hotkeys::Candidate { minimized: window.is_some_and(game_window::is_minimized), window, account }
     }).collect()
 }
+
+/// The game windows' stacking for the history (`hotkeys::describe_z`): `windows` is each one with
+/// its place in Home order.
+fn stack_line(windows: &[(usize, isize)]) -> String {
+    let hwnds: Vec<isize> = windows.iter().map(|(_, hwnd)| *hwnd).collect();
+    let z: Vec<hotkeys::Stacked> = game_window::z_order(&hwnds).into_iter().filter_map(|hwnd| {
+        let index = windows.iter().find(|(_, h)| *h == hwnd)?.0;
+        let minimized = game_window::is_minimized(hwnd);
+        Some(hotkeys::Stacked { index, minimized, hidden: !minimized && !game_window::is_shown(hwnd), topmost: game_window::is_topmost(hwnd) })
+    }).collect();
+    hotkeys::describe_z(&z)
+}
+
+/// What putting a hotkey's window in front of the other game windows took, for the history:
+/// nothing to say when it was in front at once (or was not given the foreground); how long it
+/// took to get there by itself; or how many were still in front of it when it was moved.
+fn describe_raise(raised: Option<game_window::Raise>) -> String {
+    match raised {
+        Some(raise) if raise.over > 0 => {
+            let lowered = if raise.lowered > 0 { format!(", {} always on top put behind it", raise.lowered) } else { String::new() };
+            format!("; {} in front of it after {} ms: {}{lowered}", raise.over, raise.waited, if raise.top { "raised" } else { "NOT raised" })
+        }
+        Some(raise) if raise.waited > 0 => format!("; on top after {} ms", raise.waited),
+        _ => String::new(),
+    }
+}
+
+/// The running games that have a window now, in Home order, with that window.
+fn home_windows(inner: &Inner) -> Vec<(String, isize)> {
+    home_candidates(inner).into_iter().filter_map(|c| Some((c.account, c.window?))).collect()
+}
+
+/// The game windows Arrange all may move: `found` (Home order) with each one's placement now
+/// (`None` when it could not be read) and the window in front. A game that may hold its display
+/// is left alone; every other one is kept, in order.
+fn arrangeable(found: &[(String, isize)], placements: &[Option<game_window::Placement>], front: Option<isize>) -> Vec<(String, isize)> {
+    found.iter().zip(placements)
+        .filter(|((_, hwnd), placement)| !placement.as_ref().is_some_and(|p| game_window::holds_display(p, front == Some(*hwnd))))
+        .map(|(window, _)| window.clone())
+        .collect()
+}
+
+/// The undo after an Arrange all that moved `moved` (by `ClientKey::id`). A window still where
+/// the previous Arrange all left it keeps its earlier `before`, so a restore after several in a
+/// row returns to the placement before the first; so does a game restarted since, which its
+/// remembered window put back in the arranged place. One the user moved since starts again from
+/// where it is now. A client this pass left alone (in front, or not running) keeps its entry.
+fn next_undo(old: &BTreeMap<String, layouts::Arranged>, moved: Vec<(String, layouts::Arranged)>) -> BTreeMap<String, layouts::Arranged> {
+    let mut next = old.clone();
+    for (id, mut new) in moved {
+        if let Some(prev) = old.get(&id) {
+            if prev.arranged == new.before.rect { new.before = prev.before.clone(); }
+        }
+        next.insert(id, new);
+    }
+    next
+}
+
+/// What Restore windows does with one window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// It may hold its display now (`game_window::holds_display`), as Arrange all also leaves alone.
+    Held,
+    /// Put it here, shown so, with this frame (`None`: leave the frame as it is).
+    Move { rect: game_window::Rect, shown: game_window::Shown, frame: Option<game_window::Frame> },
+}
+
+/// Where Restore windows puts `entry`'s window back, given its placement `now` (`None` when it
+/// can't be read). On its unchanged monitor it goes back exactly, shown as it was (a borderless
+/// game covering its monitor gets the whole monitor again); when that monitor changed, it is
+/// placed as a remembered window is at launch (`layouts::restore_rect`). The frame goes back with it.
+fn restore_step(entry: &layouts::Arranged, now: Option<&game_window::Placement>, in_front: bool, monitors: &[Monitor]) -> Option<Step> {
+    let now = now?;
+    // Only the window as it is now decides this: the place it goes back to may well cover its
+    // monitor (FFXI's borderless full screen), which is what it is being restored to.
+    if game_window::holds_display(now, in_front) { return Some(Step::Held); }
+    let before = &entry.before;
+    let monitor = &before.monitor;
+    let frame = before.frame;
+    if monitors.iter().any(|m| m.device == monitor.device && m.rect == monitor.rect && m.work == monitor.work && m.dpi == monitor.dpi) {
+        return Some(Step::Move { rect: before.rect, shown: before.shown, frame });
+    }
+    let (rect, shown) = layouts::restore_rect(before, monitors)?;
+    Some(Step::Move { rect, shown, frame })
+}
+
+/// `(x,y wxh)` for the history.
+fn show(r: game_window::Rect) -> String { format!("({},{} {}x{})", r.x, r.y, r.w, r.h) }
 
 /// The cycle keys go to the gate (registered only while a game is in front), the rest are
 /// registered for as long as they are set.
@@ -869,6 +1193,230 @@ mod tests {
     }
 
     #[test]
+    fn the_history_says_what_raising_a_window_took_and_how_the_games_are_stacked() {
+        let raise = |waited, over, lowered, top| Some(game_window::Raise { waited, over, lowered, top });
+        assert_eq!(describe_raise(None), "");
+        assert_eq!(describe_raise(raise(0, 0, 0, true)), "", "in front at once: nothing to say");
+        assert_eq!(describe_raise(raise(35, 0, 0, true)), "; on top after 35 ms", "the game's own activation got it there");
+        assert_eq!(describe_raise(raise(150, 2, 0, true)), "; 2 in front of it after 150 ms: raised");
+        assert_eq!(describe_raise(raise(150, 1, 1, true)), "; 1 in front of it after 150 ms: raised, 1 always on top put behind it");
+        assert_eq!(describe_raise(raise(150, 1, 0, false)), "; 1 in front of it after 150 ms: NOT raised");
+        // Windows that are gone are in no stacking.
+        assert_eq!(stack_line(&[(1, 0x7FFF_FFF1), (2, 0x7FFF_FFF3)]), "no game window");
+        assert_eq!(stack_line(&[]), "no game window");
+    }
+
+    #[test]
+    fn a_hotkey_with_no_game_window_switches_nothing_and_holds_ordering_only_meanwhile() {
+        let (runtime, dir, _) = runtime();
+        runtime.game_started(GameStart { account: "a".into(), slot: None, label: String::new(), pid: std::process::id() });
+        // No window to switch to: nothing is activated, and the press is still counted (an
+        // ordering pass running on another thread stops for it).
+        runtime.run_action(&Action::Next, desktop::Via::Hook, None);
+        assert_eq!(runtime.shared.switches.load(Ordering::Acquire), 1);
+        assert!(!runtime.shared.ordering.load(Ordering::Acquire), "released after the switch");
+        // While a pass (or another switch) holds the flag, an ordering pass does not start.
+        let held = OrderingHeld::take(&runtime.shared.ordering).unwrap();
+        assert!(OrderingHeld::take(&runtime.shared.ordering).is_none());
+        assert_eq!(runtime.order(Some("test")), None);
+        drop(held);
+        assert_eq!(runtime.order(Some("test")), Some(Ok(0)), "no window: nothing to order");
+        runtime.game_ended(GameEnd { account: "a".into(), report: None, user_closed: true, maintenance: false });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The owner's five clients as Windows reported them (2026-11-10): FFXI borderless (`0034` =
+    /// 3) at the monitor's 3840x2160, each an unowned WS_POPUP window covering DISPLAY1 exactly,
+    /// and Crystal's own window in front while Arrange all is clicked.
+    fn covering(shown: game_window::Shown) -> game_window::Placement {
+        let monitor = game_window::Monitor {
+            device: r"\\.\DISPLAY1".into(), rect: game_window::Rect::new(0, 0, 3840, 2160),
+            work: game_window::Rect::new(0, 0, 3840, 2088), dpi: 144, primary: true,
+        };
+        game_window::Placement {
+            rect: monitor.rect, client: (3840, 2160), shown, mode: game_window::Mode::Fullscreen,
+            frame: game_window::Frame::from_styles(0x9400_0000, 0), monitor,
+        }
+    }
+
+    #[test]
+    fn arrange_all_moves_borderless_games_at_their_monitors_size() {
+        let found: Vec<(String, isize)> = (1..=5).map(|i| (format!("acct{i}"), 0x1000 + i as isize)).collect();
+        let placements: Vec<_> = found.iter().map(|_| Some(covering(game_window::Shown::Normal))).collect();
+        // Crystal in front: none of them holds the display, all five are arranged in Home order.
+        assert_eq!(arrangeable(&found, &placements, Some(0x9999)), found);
+        assert_eq!(arrangeable(&found, &placements, None), found);
+        // The game in front may be fullscreen: only it is left alone.
+        let rest: Vec<_> = found.iter().filter(|(_, h)| *h != 0x1003).cloned().collect();
+        assert_eq!(arrangeable(&found, &placements, Some(0x1003)), rest);
+        // A minimised one covering its monitor may be a fullscreen game that lost the display.
+        let mut minimised = placements.clone();
+        minimised[0] = Some(covering(game_window::Shown::Minimized));
+        assert_eq!(arrangeable(&found, &minimised, Some(0x9999)), found[1..].to_vec());
+        // Windowed and smaller borderless games always move; an unreadable window is kept (its
+        // move fails on its own).
+        let mut mixed = placements.clone();
+        mixed[1] = Some(game_window::Placement { mode: game_window::Mode::Windowed, ..covering(game_window::Shown::Minimized) });
+        mixed[2] = None;
+        assert_eq!(arrangeable(&found[..3], &mixed[..3], Some(0x1001)), found[1..3].to_vec());
+    }
+
+    /// A windowed game at `rect` on the owner's DISPLAY1.
+    fn windowed(rect: game_window::Rect, shown: game_window::Shown) -> game_window::Placement {
+        game_window::Placement {
+            rect, client: (rect.w - 16, rect.h - 39), shown, mode: game_window::Mode::Windowed,
+            frame: game_window::Frame::from_styles(0x14CF_0000, 0x300), ..covering(shown)
+        }
+    }
+
+    /// A borderless window at `rect` (where Arrange all leaves a borderless game).
+    fn tiled(rect: game_window::Rect) -> game_window::Placement {
+        game_window::Placement { rect, client: (rect.w, rect.h), mode: game_window::Mode::Borderless, ..covering(game_window::Shown::Normal) }
+    }
+
+    /// Arrange all moving clients `ids` (each now at `now`) to `to`: what it records.
+    fn arranged(ids: &[&str], now: &[game_window::Placement], to: &[game_window::Rect]) -> Vec<(String, layouts::Arranged)> {
+        ids.iter().zip(now).zip(to)
+            .map(|((id, before), arranged)| (id.to_string(), layouts::Arranged { before: layouts::Saved::from_placement(before), arranged: *arranged }))
+            .collect()
+    }
+
+    fn monitors() -> Vec<Monitor> { vec![covering(game_window::Shown::Normal).monitor] }
+
+    fn moved_to(step: Option<Step>) -> Option<(game_window::Rect, game_window::Shown, Option<game_window::Frame>)> {
+        match step { Some(Step::Move { rect, shown, frame }) => Some((rect, shown, frame)), _ => None }
+    }
+
+    #[test]
+    fn restore_windows_puts_the_owners_borderless_games_back_over_the_whole_monitor() {
+        use game_window::Shown;
+        let ids = ["acct1", "acct2", "acct3", "acct4", "acct5"];
+        let original = vec![covering(Shown::Normal); 5];
+        let rects = layouts::arrange(Preset::MainLarge, 5, &[original[0].monitor.work], 16.0 / 9.0);
+        let undo = next_undo(&BTreeMap::new(), arranged(&ids, &original, &rects));
+        // The tiles as the live windows showed them after Arrange all, Crystal in front.
+        assert_eq!(rects[0], game_window::Rect::new(0, 234, 2880, 1620));
+        assert_eq!(rects[1], game_window::Rect::new(2896, 0, 928, 522));
+        for (id, rect) in ids.iter().zip(&rects) {
+            let now = tiled(*rect);
+            assert!(!game_window::holds_display(&now, false));
+            // The target covers the monitor; only the window's state now decides "fullscreen".
+            let step = restore_step(&undo[*id], Some(&now), false, &monitors());
+            assert_eq!(moved_to(step), Some((original[0].monitor.rect, Shown::Normal, Some(original[0].frame))), "{id}");
+        }
+        // Even in front, a tiled window is not holding its display: it goes back too.
+        assert!(moved_to(restore_step(&undo["acct1"], Some(&tiled(rects[0])), true, &monitors())).is_some());
+    }
+
+    #[test]
+    fn restore_windows_returns_each_window_to_its_place_before_arrange_all() {
+        use game_window::{Rect, Shown};
+        let ids = ["acct1", "acct2", "acct3"];
+        let original = vec![
+            windowed(Rect::new(100, 80, 1296, 759), Shown::Normal),
+            // Covering the monitor behind Crystal: borderless at monitor size, arranged.
+            covering(Shown::Normal),
+            windowed(Rect::new(-8, 1200, 1936, 1119), Shown::Maximized),
+        ];
+        let grid = layouts::arrange(Preset::Grid, 3, &[original[0].monitor.work], 16.0 / 9.0);
+        let undo = next_undo(&BTreeMap::new(), arranged(&ids, &original, &grid));
+        for ((id, p), r) in ids.iter().zip(&original).zip(&grid) {
+            let step = restore_step(&undo[*id], Some(&windowed(*r, Shown::Normal)), false, &monitors());
+            assert_eq!(moved_to(step), Some((p.rect, p.shown, Some(p.frame))), "{id}: the exact rect, show state and frame");
+        }
+        // A changed monitor: placed as a remembered window is at launch (a covering one fills it).
+        let mut smaller = monitors();
+        smaller[0].rect = Rect::new(0, 0, 2560, 1440);
+        smaller[0].work = Rect::new(0, 0, 2560, 1392);
+        let step = restore_step(&undo["acct2"], Some(&windowed(grid[1], Shown::Normal)), false, &smaller);
+        assert_eq!(moved_to(step).map(|(r, ..)| r), Some(Rect::new(0, 0, 2560, 1440)));
+    }
+
+    #[test]
+    fn a_second_arrange_all_or_a_restart_keeps_the_placement_before_the_first() {
+        use game_window::{Rect, Shown};
+        let ids = ["acct1", "acct2"];
+        let original = vec![covering(Shown::Normal), windowed(Rect::new(900, 600, 1296, 759), Shown::Normal)];
+        let area = [original[0].monitor.work];
+        let large = layouts::arrange(Preset::MainLarge, 2, &area, 16.0 / 9.0);
+        let grid = layouts::arrange(Preset::Grid, 2, &area, 16.0 / 9.0);
+        let first = next_undo(&BTreeMap::new(), arranged(&ids, &original, &large));
+        // Arranged again, untouched since (or the games restarted and their remembered windows put
+        // them back in the arranged place): the undo still holds the original placement.
+        let at_large: Vec<_> = large.iter().map(|r| tiled(*r)).collect();
+        let second = next_undo(&first, arranged(&ids, &at_large, &grid));
+        assert_eq!(second["acct1"].before.rect, original[0].rect);
+        assert_eq!(second["acct2"].before.rect, original[1].rect);
+        assert_eq!(second["acct1"].arranged, grid[0]);
+        // The user moved the second one after the first Arrange all: it starts again from there.
+        let dragged = windowed(Rect::new(40, 40, 1296, 759), Shown::Normal);
+        let third = next_undo(&first, arranged(&ids, &[at_large[0].clone(), dragged.clone()], &grid));
+        assert_eq!((third["acct1"].before.rect, third["acct2"].before.rect), (original[0].rect, dragged.rect));
+        // A client the second pass left alone (not running, say) keeps its entry.
+        let partial = next_undo(&first, arranged(&ids[..1], &at_large[..1], &grid[..1]));
+        assert_eq!(partial.len(), 2);
+        assert_eq!(partial["acct2"], first["acct2"]);
+    }
+
+    #[test]
+    fn restore_windows_skips_unreadable_windows_and_games_holding_their_display() {
+        use game_window::{Rect, Shown};
+        let ids = ["acct1", "acct2"];
+        let original = vec![windowed(Rect::new(0, 0, 1296, 759), Shown::Normal); 2];
+        let grid = layouts::arrange(Preset::Grid, 2, &[original[0].monitor.work], 16.0 / 9.0);
+        let undo = next_undo(&BTreeMap::new(), arranged(&ids, &original, &grid));
+        assert_eq!(restore_step(&undo["acct1"], None, false, &monitors()), None);
+        // It went fullscreen and is in front, or covers its monitor minimised: left alone.
+        assert_eq!(restore_step(&undo["acct2"], Some(&covering(Shown::Normal)), true, &monitors()), Some(Step::Held));
+        assert_eq!(restore_step(&undo["acct2"], Some(&covering(Shown::Minimized)), false, &monitors()), Some(Step::Held));
+        // Covering its monitor behind Crystal is FFXI's borderless full screen: it moves.
+        assert!(moved_to(restore_step(&undo["acct2"], Some(&covering(Shown::Normal)), false, &monitors())).is_some());
+    }
+
+    #[test]
+    fn the_undo_survives_a_restart_and_restore_puts_the_remembered_window_back() {
+        let (runtime, dir, _) = runtime();
+        let original = covering(game_window::Shown::Normal);
+        let tile = game_window::Rect::new(2896, 0, 928, 522);
+        // What Arrange all leaves behind: the tile remembered (so the game would start there, at
+        // 928x522), and the undo, saved.
+        runtime.update(|s| {
+            layouts::remember(&mut s.layouts, &ClientKey::new("a", None), &tiled(tile));
+            s.layouts.undo = next_undo(&BTreeMap::new(), arranged(&["a"], &[original.clone()], &[tile]));
+        }).unwrap();
+        assert_eq!(layouts::launch_values(&runtime.settings().layouts, &ClientKey::new("a", None)), vec![("0001", 928), ("0002", 522), ("0034", 3)]);
+        // Crystal restarts: the undo is still there.
+        let config = Config { experiment: dir.clone(), ..Config::default() };
+        let again = Runtime::new(config.clone(), Arc::new(|_| {}));
+        assert_eq!(again.settings().layouts.undo.len(), 1);
+        // No game runs: nothing is offered, and a restore puts back only the remembered window.
+        assert!(!again.can_restore_windows());
+        assert!(again.restore_windows().is_err(), "no window was put back");
+        let after = store::load(&config).unwrap();
+        assert!(after.layouts.undo.is_empty());
+        assert_eq!(after.layouts.saved["a"], layouts::Saved::from_placement(&original));
+        assert!(layouts::launch_values(&after.layouts, &ClientKey::new("a", None)).is_empty(), "it starts at its own resolution again");
+        // Nothing left to undo: nothing is saved or said beyond that.
+        assert!(again.restore_windows().is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn restore_windows_is_offered_only_while_an_arranged_window_is_open() {
+        let (runtime, dir, _) = runtime();
+        assert!(!runtime.can_restore_windows(), "no Arrange all yet");
+        assert!(runtime.restore_windows().is_err());
+        // A game running without a window (a windowless stand-in) offers nothing either.
+        runtime.game_started(GameStart { account: "a".into(), slot: None, label: String::new(), pid: std::process::id() });
+        runtime.inner().settings.layouts.undo = next_undo(&BTreeMap::new(),
+            arranged(&["a"], &[covering(game_window::Shown::Normal)], &[game_window::Rect::new(0, 0, 10, 10)]));
+        assert!(!runtime.can_restore_windows());
+        runtime.game_ended(GameEnd { account: "a".into(), report: None, user_closed: true, maintenance: false });
+        assert_eq!(runtime.settings().layouts.undo.len(), 1, "a game ending keeps its undo");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn launch_values_combine_the_remembered_size_and_background_mute() {
         let (runtime, dir, _) = runtime();
         let config = Config { experiment: dir.clone(), ..Config::default() };
@@ -877,7 +1425,7 @@ mod tests {
             s.perf.mute_background = true;
             s.layouts.saved.insert("a".into(), layouts::Saved {
                 rect: game_window::Rect::new(0, 0, 1296, 759), client: (1280, 720), shown: game_window::Shown::Normal,
-                mode: game_window::Mode::Windowed,
+                mode: game_window::Mode::Windowed, frame: None,
                 monitor: layouts::MonitorRef { device: "x".into(), rect: game_window::Rect::new(0, 0, 1920, 1080), work: game_window::Rect::new(0, 0, 1920, 1040), dpi: 96 },
             });
         }).unwrap();

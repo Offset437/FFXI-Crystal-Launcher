@@ -17,7 +17,8 @@ export enum Glyph {
     none, sun, moon, close, plus, chevron-down, arrow-right, external-link, search, rss, refresh,
     check-circle, alert-circle, wrench, play, power, help, download, folder, edit, eye, eye-off,
     users, grip, check, play-solid, user, send, inbox, ban, user-minus, message, chevron-right,
-    settings, gamepad, trash
+    settings, gamepad, trash, more, info, file-check,
+    window, keyboard, shield, archive, cpu, clock, grid, monitor, speaker
 }
 
 /// One icon at `size`, tinted `tint`.
@@ -62,6 +63,17 @@ export component Icon inherits Rectangle {
         : root.glyph == Glyph.settings ? "M6 3.5V8M6 12V20.5M12 3.5V14M12 18V20.5M18 3.5V6M18 10V20.5M4 8H8L9 9V11L8 12H4L3 11V9ZM10 14H14L15 15V17L14 18H10L9 17V15ZM16 6H20L21 7V9L20 10H16L15 9V7Z"
         : root.glyph == Glyph.gamepad ? "M7 6.5H17L19.5 9 21 17.5 19.5 19H17.5L14.5 15.5H9.5L6.5 19H4.5L3 17.5 4.5 9ZM6 10.5H10M8 8.5V12.5"
         : root.glyph == Glyph.trash ? "M4.5 7H19.5M9 7V4.5H15V7M6 7 7 19.5 8.5 21H15.5L17 19.5 18 7M10 10.5V17.5M14 10.5V17.5"
+        : root.glyph == Glyph.info ? "M7 3.5H17L20.5 7V17L17 20.5H7L3.5 17V7ZM12 11V16.5"
+        : root.glyph == Glyph.file-check ? "M7 3.5H14L18.5 8V19L17 20.5H7L5.5 19V5ZM13.5 3.5V8.5H18.5M9 14.5 11 16.5 15 12.5"
+        : root.glyph == Glyph.window ? "M5.5 4.5H18.5L20 6V18L18.5 19.5H5.5L4 18V6ZM4 9H20"
+        : root.glyph == Glyph.keyboard ? "M5 6.5H19L21 8.5V15.5L19 17.5H5L3 15.5V8.5ZM7 10.5H8M11.5 10.5H12.5M16 10.5H17M8 14H16"
+        : root.glyph == Glyph.shield ? "M12 3.5 19.5 6V12L16.5 17.5 12 20.5 7.5 17.5 4.5 12V6ZM9 12 11 14 15 10"
+        : root.glyph == Glyph.archive ? "M4 5.5H20V9H4ZM5.5 9V18L7 19.5H17L18.5 18V9M10 13H14"
+        : root.glyph == Glyph.cpu ? "M8 6.5H16L17.5 8V16L16 17.5H8L6.5 16V8ZM10.5 10.5H13.5V13.5H10.5ZM10 3.5V6.5M14 3.5V6.5M10 17.5V20.5M14 17.5V20.5M3.5 10H6.5M3.5 14H6.5M17.5 10H20.5M17.5 14H20.5"
+        : root.glyph == Glyph.clock ? "M8 3.5H16L20.5 8V16L16 20.5H8L3.5 16V8ZM12 7.5V12L15 14"
+        : root.glyph == Glyph.grid ? "M5 5H10.5V10.5H5ZM13.5 5H19V10.5H13.5ZM5 13.5H10.5V19H5ZM13.5 13.5H19V19H13.5Z"
+        : root.glyph == Glyph.monitor ? "M4 5H20V16H4ZM9 19.5H15M12 16V19.5"
+        : root.glyph == Glyph.speaker ? "M4.5 9.5H8L12.5 5.5V18.5L8 14.5H4.5ZM16 9.5 17 12 16 14.5M18.5 6.5 20.5 12 18.5 17.5"
         : "";
     private property <string> solid:
         root.glyph == Glyph.rss ? "M5 17.5 6.5 19 5 20.5 3.5 19Z"
@@ -71,6 +83,8 @@ export component Icon inherits Rectangle {
         : root.glyph == Glyph.play-solid ? "M3 2 21 12 3 22Z"
         : root.glyph == Glyph.grip ? "M8 5 9.5 6.5 8 8 6.5 6.5ZM16 5 17.5 6.5 16 8 14.5 6.5ZM8 10.5 9.5 12 8 13.5 6.5 12ZM16 10.5 17.5 12 16 13.5 14.5 12ZM8 16 9.5 17.5 8 19 6.5 17.5ZM16 16 17.5 17.5 16 19 14.5 17.5Z"
         : root.glyph == Glyph.gamepad ? "M15 10.5 16 11.5 15 12.5 14 11.5ZM18 8.5 19 9.5 18 10.5 17 9.5Z"
+        : root.glyph == Glyph.more ? "M5.5 10.5 7 12 5.5 13.5 4 12ZM12 10.5 13.5 12 12 13.5 10.5 12ZM18.5 10.5 20 12 18.5 13.5 17 12Z"
+        : root.glyph == Glyph.info ? "M12 6.75 13.25 8 12 9.25 10.75 8Z"
         : "";
     if root.line != "": Path {
         width: root.size;
@@ -195,46 +209,48 @@ export component Pressable inherits Rectangle {
     }
 }
 
-/// A CONTROL_SM_H list button: `soft` is the soft accent fill of a row's
-/// main action, otherwise bordered and quiet; `danger` is a bordered destructive action. `busy`
-/// turns the ring in the glyph's place. `scale` is Home's layout scale (1 in the sheet).
+/// A CONTROL_SM_H list button (the renders' `.btn`): bordered in `line`, ink words, its glyph in
+/// `sub`, a fill on hover. `soft` is the soft ice fill of a row's main action; `danger` is a
+/// bordered destructive action. `slim` is the rail's 26 px `.btn.sm`. `busy` turns the ring in
+/// the glyph's place. `scale` is Home's layout scale (1 in the sheet).
 export component SmallButton inherits Pressable {
     in property <string> text;
     in property <Glyph> glyph: Glyph.none;
     in property <bool> soft;
     in property <bool> danger;
     in property <bool> busy;
+    in property <bool> slim;
     in property <float> scale: Theme.scale;
     label: root.text;
-    height: 28px * root.scale;
-    min-width: row.preferred-width + 22px * root.scale;
+    height: (root.slim ? 26px : 28px) * root.scale;
+    min-width: row.preferred-width + (root.slim ? 20px : 22px) * root.scale;
     preferred-width: self.min-width;
     horizontal-stretch: 0;
     border-radius: Theme.radius-inner;
-    background: root.soft ? (!root.enabled ? Theme.tint : root.hot ? Theme.select-ink.mix(Theme.select, 0.12) : Theme.select)
+    background: root.soft ? (!root.enabled ? Theme.fill : root.hot ? Theme.select-ink.mix(Theme.select, 0.12) : Theme.select)
         : root.danger && root.hot ? Theme.danger.with-alpha(0.12)
-        : root.hot ? Theme.tint : transparent;
+        : root.down ? Theme.fill2 : root.hot ? Theme.fill : transparent;
     border-width: root.soft ? 0px : 1px;
-    border-color: root.danger && root.enabled ? Theme.danger : root.hot ? Theme.accent : Theme.line;
-    private property <color> ink: !root.enabled ? Theme.faint : root.soft ? Theme.select-ink : root.danger ? Theme.danger : Theme.ink2;
+    border-color: root.danger && root.enabled ? Theme.danger : Theme.line;
+    private property <color> ink: !root.enabled ? Theme.faint : root.soft ? Theme.select-ink : root.danger ? Theme.danger : Theme.ink;
     row := HorizontalLayout {
         x: (parent.width - self.preferred-width) / 2;
         width: self.preferred-width;
         spacing: 6px * root.scale;
         if root.busy: Spinner {
             cross-axis-self-alignment: center;
-            size: 13px * root.scale;
+            size: 14px * root.scale;
             tint: root.ink;
         }
         if !root.busy && root.glyph != Glyph.none: Icon {
             cross-axis-self-alignment: center;
             glyph: root.glyph;
-            size: 13px * root.scale;
-            tint: root.ink;
+            size: 14px * root.scale;
+            tint: !root.enabled ? Theme.faint : root.soft ? Theme.select-ink : root.danger ? Theme.danger : Theme.sub;
         }
         Text {
             text: root.text;
-            font-size: Theme.type-small * root.scale;
+            font-size: (root.slim ? Theme.type-note : Theme.type-small) * root.scale;
             font-weight: 600;
             color: root.ink;
             vertical-alignment: center;
@@ -258,17 +274,17 @@ export component Control inherits Pressable {
     min-width: row.preferred-width + 2 * root.pad;
     preferred-width: self.min-width;
     horizontal-stretch: 0;
-    border-radius: Theme.radius-inner;
-    background: root.tone == Tone.primary ? (!root.enabled ? Theme.tint : root.hot ? Theme.play-text.mix(Theme.play, 0.1) : Theme.play)
-        : root.tone == Tone.secondary ? (root.hot ? Theme.tint : transparent)
+    border-radius: Theme.radius-mid;
+    background: root.tone == Tone.primary ? (!root.enabled ? Theme.fill : root.hot ? Theme.ice-ink.mix(Theme.ice, 0.1) : Theme.ice)
+        : root.tone == Tone.secondary ? (root.hot ? Theme.fill : transparent)
         : root.tone == Tone.danger ? (root.hot ? Theme.bg.mix(Theme.danger, 0.12) : Theme.danger)
         : (root.hot ? Theme.danger.with-alpha(0.12) : transparent);
     border-width: root.tone == Tone.secondary || (root.tone == Tone.primary && !root.enabled) ? 1px : 0px;
-    border-color: root.tone == Tone.primary ? Theme.hairline : root.hot ? Theme.accent : Theme.line;
-    private property <color> ink: root.tone == Tone.primary ? (root.enabled ? Theme.play-text : Theme.sub)
+    border-color: root.tone == Tone.primary ? Theme.hairline : Theme.line;
+    private property <color> ink: root.tone == Tone.primary ? (root.enabled ? Theme.ice-ink : Theme.faint)
         : root.tone == Tone.danger ? (Theme.light ? #FFFFFF : #2A0E06)
         : root.tone == Tone.danger-link ? Theme.danger
-        : root.enabled ? Theme.ink2 : Theme.faint;
+        : root.enabled ? Theme.ink : Theme.faint;
     row := HorizontalLayout {
         x: (parent.width - self.preferred-width) / 2;
         width: self.preferred-width;
@@ -316,21 +332,25 @@ export component IconButton inherits Pressable {
     in property <Glyph> glyph;
     in property <bool> bordered;
     in property <length> side: Theme.control-h;
+    /// Its width when not square (the top bar's 34 x 30 tools).
+    in property <length> wide: root.side;
     in property <length> glyph-size: 15px;
     in property <string> hint;
+    /// The glyph's colour at rest.
+    in property <color> ink: root.bordered ? Theme.ink2 : Theme.sub;
     label: root.hint;
-    width: root.side;
+    width: root.wide;
     height: root.side;
     border-radius: Theme.radius-inner;
-    background: root.bordered ? (root.hot ? Theme.tint : transparent) : (root.hot ? Theme.select.with-alpha(0.8) : transparent);
+    background: root.down ? Theme.fill2 : root.hot ? Theme.fill : transparent;
     border-width: root.bordered ? 1px : 0px;
-    border-color: root.hot ? Theme.accent : Theme.line;
+    border-color: Theme.line;
     Icon {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         glyph: root.glyph;
         size: root.glyph-size;
-        tint: !root.enabled ? Theme.faint : root.bordered ? Theme.ink2 : Theme.sub;
+        tint: !root.enabled ? Theme.faint : root.hot ? Theme.ink : root.ink;
     }
     if root.hint != "": Tooltip { Hint { caption: root.hint; } }
 }
@@ -377,21 +397,24 @@ export component Check inherits Pressable {
     min-height: max(root.box, caption.preferred-height);
     horizontal-stretch: root.text == "" ? 0 : 1;
     clicked => { root.toggled(!root.checked); }
+    // Skyline's box: a 1.5 px `line` outline (ice under the pointer), ice-filled with a heavier
+    // tick in `chk` when ticked.
     mark := Rectangle {
         x: 0;
         y: (parent.height - root.box) / 2;
         width: root.box;
         height: root.box;
-        border-radius: 3px;
-        border-width: 1px;
-        background: root.checked ? (root.enabled ? Theme.accent : Theme.accent.with-alpha(0.45)) : Theme.field;
-        border-color: root.checked || root.hot ? Theme.accent : Theme.faint;
+        border-radius: root.box >= 18px ? Theme.radius-sm : 4px;
+        border-width: 1.5px;
+        background: root.checked ? (root.enabled ? Theme.ice : Theme.ice.with-alpha(0.45)) : transparent;
+        border-color: root.checked ? (root.enabled ? Theme.ice : Theme.ice.with-alpha(0.45)) : root.hot ? Theme.ice : Theme.line;
         if root.checked: Icon {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             glyph: Glyph.check;
-            size: root.box * 0.8;
-            tint: Theme.light ? #FFFFFF : Theme.play-text;
+            size: root.box * 0.7;
+            weight: 2.6;
+            tint: Theme.chk;
         }
     }
     caption := Text {
@@ -427,7 +450,7 @@ export component Field inherits Rectangle {
     height: Theme.control-h;
     min-width: 40px;
     horizontal-stretch: 1;
-    border-radius: Theme.radius-inner;
+    border-radius: Theme.radius-mid;
     border-width: root.framed ? 1px : 0px;
     background: !root.framed ? transparent : root.enabled ? Theme.field : Theme.tint;
     border-color: input.has-focus ? Theme.accent : hit.has-hover && root.enabled ? Theme.line.mix(Theme.accent, 0.5) : Theme.line;
@@ -543,7 +566,7 @@ export component Select inherits Pressable {
     accessible-role: combobox;
     accessible-value: root.current >= 0 && root.current < root.items.length ? root.items[root.current] : root.placeholder;
     height: 36px * root.scale;
-    border-radius: Theme.radius-inner;
+    border-radius: root.framed ? Theme.radius-mid : Theme.radius-inner;
     border-width: root.framed ? 1px : 0px;
     border-color: root.hot ? Theme.line.mix(Theme.accent, 0.5) : Theme.line;
     background: root.framed ? root.fill : root.hot ? root.hot-fill : transparent;
@@ -646,10 +669,11 @@ export component Segmented inherits Rectangle {
     preferred-height: root.quiet ? row.preferred-height : Theme.control-h * root.scale;
     max-height: root.quiet ? row.preferred-height : Theme.control-h * root.scale;
     horizontal-stretch: root.quiet ? 0 : 1;
-    border-radius: (root.quiet ? 8px : Theme.radius-mid) * root.scale;
-    border-width: root.single ? 0px : 1px;
-    border-color: root.quiet ? Theme.line : Theme.hairline;
-    background: root.single ? transparent : root.quiet ? Theme.field : Theme.tint;
+    // Skyline's `.segw`: a borderless `seg` track, the chosen segment raised on fill2.
+    border-radius: (root.quiet ? 8px : 9px) * root.scale;
+    border-width: root.quiet && !root.single ? 1px : 0px;
+    border-color: Theme.line;
+    background: root.single ? transparent : root.quiet ? Theme.field : Theme.seg;
     accessible-role: tab-list;
     row := HorizontalLayout {
         padding: root.single ? 0px : 3px * root.scale;
@@ -663,17 +687,13 @@ export component Segmented inherits Rectangle {
             horizontal-stretch: root.quiet ? 0 : 1;
             min-width: root.quiet ? caption.preferred-width + 24px * root.scale : 0;
             min-height: root.quiet ? caption.preferred-height + 12px * root.scale : 0;
-            border-radius: root.quiet ? 6px * root.scale : (Theme.radius-mid - 3px) * root.scale;
-            border-width: root.quiet && index == root.current ? 1px : 0px;
-            border-color: Theme.line;
+            border-radius: 6px * root.scale;
+            // Light-theme segments are white on a pale track: a hairline keeps the chosen one.
+            border-width: index == root.current && (root.quiet || Theme.light) ? 1px : 0px;
+            border-color: root.quiet ? Theme.line : Theme.hairline;
             background: root.quiet
                 ? (index == root.current ? Theme.card : self.hot ? Theme.select : transparent)
-                : (index == root.current ? (Theme.light ? #FFFFFF : Theme.select) : self.hot ? Theme.card : transparent);
-            drop-shadow-color: index != root.current ? transparent
-                : root.quiet ? (Theme.light ? #0000000F : #00000040)
-                : Theme.light ? #1421301F : transparent;
-            drop-shadow-offset-y: 1px;
-            drop-shadow-blur: root.quiet ? 3px : 2px;
+                : (index == root.current ? Theme.fill2 : self.hot ? Theme.seg : transparent);
             clicked => { root.picked(index); }
             caption := Text {
                 text: item;
@@ -681,7 +701,7 @@ export component Segmented inherits Rectangle {
                 font-weight: root.quiet && index != root.current ? 400 : 600;
                 color: root.quiet
                     ? (index == root.current ? Theme.accent : !parent.enabled ? Theme.sub.with-alpha(0.55) : Theme.sub)
-                    : (index == root.current ? Theme.select-ink : parent.hot ? Theme.ink : Theme.sub);
+                    : (index == root.current || parent.hot ? Theme.ink : Theme.sub);
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
@@ -689,7 +709,8 @@ export component Segmented inherits Rectangle {
     }
 }
 
-/// The one switch: the Play fill when on, an outlined field when off.
+/// The one switch (Skyline's `.sw`): a 36 x 20 ice track with a `chk` knob when on, a `line`
+/// track with a `sub` knob when off.
 export component Switch inherits Pressable {
     in property <bool> on;
     in property <string> text;
@@ -699,30 +720,28 @@ export component Switch inherits Pressable {
     accessible-checked: root.on;
     label: root.text;
     min-height: 20px;
-    min-width: 50px + caption.preferred-width;
+    min-width: 46px + caption.preferred-width;
     clicked => { root.toggled(!root.on); }
     track := Rectangle {
         x: 0;
         y: (parent.height - self.height) / 2;
-        width: 40px;
+        width: 36px;
         height: 20px;
         border-radius: 10px;
-        border-width: 1px;
-        background: root.on ? (root.hot ? Theme.play.mix(Theme.play-text, 0.9) : Theme.play) : Theme.field;
-        border-color: root.on ? Theme.play : root.hot ? Theme.sub : Theme.line;
+        background: root.on ? (root.hot ? Theme.ice.mix(Theme.ice-ink, 0.9) : Theme.ice) : root.hot ? Theme.line.mix(Theme.sub, 0.8) : Theme.line;
         Rectangle {
-            x: root.on ? parent.width - self.width - 4px : 4px;
+            x: root.on ? parent.width - self.width - 3px : 3px;
             animate x { duration: Theme.quick; }
             y: (parent.height - self.height) / 2;
-            width: 12px;
-            height: 12px;
-            border-radius: 6px;
-            background: root.on ? Theme.play-text : Theme.sub;
+            width: 14px;
+            height: 14px;
+            border-radius: 7px;
+            background: root.on ? Theme.chk : Theme.sub;
         }
     }
     caption := Text {
-        x: 50px;
-        width: parent.width - 50px;
+        x: 46px;
+        width: parent.width - 46px;
         text: root.text;
         font-size: Theme.type-body;
         color: Theme.ink;
@@ -909,35 +928,37 @@ export component Toggle inherits Pressable {
     in property <length> gap: 10px * Theme.scale;
     in property <length> font-size: Theme.type-body * Theme.scale;
     in property <color> ink: Theme.ink;
-    out property <length> label-x: 2 * root.size + root.gap;
+    /// The track's width: Skyline's 36 x 20 (1.8 : 1).
+    private property <length> track-w: round(root.size * 1.8 / 1px) * 1px;
+    out property <length> label-x: root.track-w + root.gap;
     callback toggled(bool);
     accessible-role: checkbox;
     label: root.text;
     accessible-checkable: true;
     accessible-checked: root.on;
-    min-width: root.text == "" ? 2 * root.size : root.label-x + caption.min-width;
-    preferred-width: root.text == "" ? 2 * root.size : root.label-x + caption.preferred-width;
+    min-width: root.text == "" ? root.track-w : root.label-x + caption.min-width;
+    preferred-width: root.text == "" ? root.track-w : root.label-x + caption.preferred-width;
     min-height: max(root.size, caption.preferred-height);
     horizontal-stretch: root.text == "" ? 0 : 1;
     clicked => { root.toggled(!root.on); }
+    // Skyline's `.sw`: an ice track with a `chk` knob when on, a `line` track with a `sub` knob
+    // when off; no outline.
     track := Rectangle {
         x: 0;
         y: (parent.height - root.size) / 2;
-        width: 2 * root.size;
+        width: root.track-w;
         height: root.size;
         border-radius: root.size / 2;
-        border-width: 1px;
         opacity: root.enabled ? 1 : 0.45;
-        background: root.on ? (root.hot ? Theme.play.mix(Theme.play-text, 0.9) : Theme.play) : Theme.field;
-        border-color: root.on ? Theme.play : root.hot ? Theme.sub : Theme.line;
+        background: root.on ? (root.hot ? Theme.ice.mix(Theme.ice-ink, 0.9) : Theme.ice) : root.hot ? Theme.line.mix(Theme.sub, 0.8) : Theme.line;
         knob := Rectangle {
-            width: root.size * 0.6;
-            height: root.size * 0.6;
-            y: root.size * 0.2;
-            x: root.on ? parent.width - self.width - root.size * 0.2 : root.size * 0.2;
+            width: root.size * 0.7;
+            height: root.size * 0.7;
+            y: root.size * 0.15;
+            x: root.on ? parent.width - self.width - root.size * 0.15 : root.size * 0.15;
             animate x { duration: Theme.quick; }
             border-radius: self.width / 2;
-            background: root.on ? Theme.play-text : Theme.sub;
+            background: root.on ? Theme.chk : Theme.sub;
         }
     }
     caption := Text {
@@ -1147,5 +1168,447 @@ export component TipBody inherits Rectangle {
         padding-top: 6px;
         padding-bottom: 6px;
         Text { text: root.text; font-size: Theme.type-caption; color: Theme.ink; }
+    }
+}
+
+// ---- Skyline building blocks (v1.2) ----
+
+/// Paints the outside of a rounded corner in `surface`: the software renderer clips pictures and
+/// gradients square, so a rounded picture or the Play button's gradient gets this over its corners.
+/// Put it last in the rounded element; it reaches `r` past its edges, over the surface around it.
+export component CornerMask inherits Rectangle {
+    in property <length> r: Theme.radius-mid;
+    in property <color> surface: Theme.bg;
+    /// The rounded element's size (its parent's).
+    in property <length> target-width;
+    in property <length> target-height;
+    x: -root.r;
+    y: -root.r;
+    width: root.target-width + 2 * root.r;
+    height: root.target-height + 2 * root.r;
+    border-radius: 2 * root.r;
+    border-width: root.r;
+    border-color: root.surface;
+}
+
+/// A keycap (`.kc`): mono 11 px in `sub` on a `line` outline. `edge` and `ink` recolour it (on
+/// the Play button).
+export component KeyCap inherits Rectangle {
+    in property <string> text;
+    in property <color> ink: Theme.sub;
+    in property <color> edge: Theme.line;
+    in property <color> fill: transparent;
+    in property <length> cap-h: 20px;
+    in property <length> pad-x: 6px;
+    in property <length> font-size: Theme.type-micro;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    height: root.cap-h;
+    width: max(root.cap-h, caption.preferred-width + 2 * root.pad-x);
+    border-radius: Theme.radius-sm;
+    border-width: 1px;
+    border-color: root.edge;
+    background: root.fill;
+    accessible-role: none;
+    caption := Text {
+        text: root.text;
+        font-family: Theme.mono;
+        font-size: root.font-size;
+        font-weight: 500;
+        color: root.ink;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+/// A card surface: `fill` with a hairline and the 10 px radius (`raised` steps up to fill2 with
+/// a `line` edge: a dragged row, a chosen monitor window). Children are laid out by the caller.
+export component Panel inherits Rectangle {
+    in property <bool> raised;
+    background: root.raised ? Theme.fill2 : Theme.fill;
+    border-width: 1px;
+    border-color: root.raised ? Theme.line : Theme.hairline;
+    border-radius: Theme.radius;
+}
+
+/// A section header (`.nh`): the 16 px semibold title, an optional faint note after it, then
+/// whatever the section adds (tabs, a refresh button, a link) as children.
+export component SectionHeader inherits HorizontalLayout {
+    in property <string> title;
+    in property <string> note;
+    height: 24px;
+    spacing: 10px;
+    alignment: stretch;
+    Text {
+        horizontal-stretch: 0;
+        text: root.title;
+        font-size: Theme.type-heading;
+        font-weight: 600;
+        color: Theme.ink;
+        vertical-alignment: center;
+    }
+    if root.note != "": Text {
+        horizontal-stretch: 0;
+        text: root.note;
+        font-size: Theme.type-note;
+        color: Theme.faint;
+        vertical-alignment: center;
+    }
+    @children
+}
+
+/// A text tab (`.nh .tabs a`): 13 px in `sub`, ink and semibold when active, ink under the pointer.
+export component TextTab inherits Pressable {
+    in property <string> text;
+    in property <bool> active;
+    in property <length> font-size: Theme.type-small;
+    label: root.text;
+    accessible-role: tab;
+    accessible-checked: root.active;
+    min-width: caption.preferred-width;
+    preferred-width: self.min-width;
+    horizontal-stretch: 0;
+    caption := Text {
+        text: root.text;
+        font-size: root.font-size;
+        font-weight: root.active ? 600 : 400;
+        color: root.active || root.hot ? Theme.ink : Theme.sub;
+        vertical-alignment: center;
+    }
+}
+
+/// A count badge (`.bd`): the Friends tab's.
+export component CountBadge inherits Rectangle {
+    in property <string> text;
+    horizontal-stretch: 0;
+    height: 16px;
+    width: max(16px, caption.preferred-width + 8px);
+    border-radius: 8px;
+    background: Theme.badge;
+    caption := Text {
+        text: root.text;
+        font-size: Theme.type-micro;
+        font-weight: 700;
+        color: Theme.ice;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+/// The default picture of a news post that has none (assets/news, crystal-news-art): one per
+/// category, `art` 0 update, 1 event, 2 maintenance, 3 community, 4 PlayOnline (anything else),
+/// in the theme's version. Cover-fit and centred: the middle 3.85 : 1 strip holds the whole scene.
+export component NewsArt inherits Image {
+    in property <int> art: 4;
+    private property <[image]> dark: [
+        @image-url("../assets/news/news-update-dark.jpg"),
+        @image-url("../assets/news/news-event-dark.jpg"),
+        @image-url("../assets/news/news-maintenance-dark.jpg"),
+        @image-url("../assets/news/news-community-dark.jpg"),
+        @image-url("../assets/news/news-playonline-dark.jpg"),
+    ];
+    private property <[image]> light: [
+        @image-url("../assets/news/news-update-light.jpg"),
+        @image-url("../assets/news/news-event-light.jpg"),
+        @image-url("../assets/news/news-maintenance-light.jpg"),
+        @image-url("../assets/news/news-community-light.jpg"),
+        @image-url("../assets/news/news-playonline-light.jpg"),
+    ];
+    private property <int> pick: root.art >= 0 && root.art <= 4 ? root.art : 4;
+    source: Theme.light ? root.light[root.pick] : root.dark[root.pick];
+    image-fit: cover;
+    accessible-role: none;
+}
+
+/// A news card (`.nc`): the picture (the post's own, else its category's default) in an 84 px
+/// frame, kind and date, the headline and up to two lines of teaser (wrapped by the caller, as
+/// view.rs's `wrap_lines` does). `surface` is what it sits on, for the picture's corners.
+export component NewsTile inherits Pressable {
+    in property <image> picture;
+    in property <bool> has-picture;
+    in property <int> art: 4;
+    in property <string> kind;
+    in property <color> kind-ink: Theme.ice;
+    in property <string> date;
+    in property <string> title;
+    in property <string> teaser;
+    in property <length> picture-h: 84px;
+    in property <color> surface: Theme.bg;
+    label: root.title;
+    accessible-role: button;
+    VerticalLayout {
+        alignment: start;
+        spacing: 0px;
+        Rectangle {
+            height: root.picture-h;
+            background: Theme.fill;
+            clip: true;
+            if root.has-picture: Image {
+                width: parent.width;
+                height: parent.height;
+                source: root.picture;
+                image-fit: cover;
+                accessible-role: none;
+            }
+            if !root.has-picture: NewsArt {
+                width: parent.width;
+                height: parent.height;
+                art: root.art;
+            }
+            CornerMask { r: Theme.radius-mid; surface: root.surface; target-width: parent.width; target-height: parent.height; }
+            Rectangle {
+                border-radius: Theme.radius-mid;
+                border-width: 1px;
+                border-color: root.hot ? Theme.ice.with-alpha(0.6) : Theme.pic-edge;
+            }
+        }
+        Rectangle { height: 12px; }
+        HorizontalLayout {
+            height: 16px;
+            spacing: 9px;
+            alignment: start;
+            Text { text: root.kind; font-size: Theme.type-caption; font-weight: 600; color: root.kind-ink; vertical-alignment: center; }
+            Text { text: root.date; font-size: Theme.type-caption; color: Theme.faint; vertical-alignment: center; overflow: elide; }
+        }
+        Rectangle { height: 5px; }
+        Text {
+            height: 22px;
+            text: root.title;
+            font-size: Theme.type-heading;
+            font-weight: 600;
+            color: root.hot ? Theme.ice-hi : Theme.ink;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        if root.teaser != "": Rectangle { height: 4px; }
+        if root.teaser != "": Text {
+            height: 36px;
+            text: root.teaser;
+            font-size: Theme.type-small;
+            color: Theme.sub;
+            vertical-alignment: top;
+            overflow: clip;
+        }
+    }
+}
+
+/// An older headline (`.mr`): kind in a 104 px column, the headline, its date and a chevron,
+/// over a hairline.
+export component NewsLine inherits Pressable {
+    in property <string> kind;
+    in property <color> kind-ink: Theme.ice;
+    in property <string> title;
+    in property <string> date;
+    label: root.title;
+    accessible-role: button;
+    height: Theme.row-h;
+    background: root.hot ? Theme.fill.with-alpha(0.6) : transparent;
+    HorizontalLayout {
+        spacing: 0px;
+        Text { width: 104px; text: root.kind; font-size: Theme.type-caption; font-weight: 600; color: root.kind-ink; vertical-alignment: center; overflow: elide; }
+        Text { horizontal-stretch: 1; text: root.title; font-size: Theme.type-body; font-weight: 500; color: root.hot ? Theme.ink : Theme.ink2; vertical-alignment: center; overflow: elide; }
+        Rectangle { width: 16px; }
+        Text { horizontal-stretch: 0; text: root.date; font-size: Theme.type-note; color: Theme.faint; vertical-alignment: center; }
+        Rectangle { width: 14px; }
+        Icon { cross-axis-self-alignment: center; glyph: Glyph.chevron-right; size: 14px; tint: Theme.faint; }
+    }
+    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.hairline; }
+}
+
+/// A PlayOnline portrait in a circle, the face centred. The software renderer clips a picture
+/// square, so an annulus of `ring` (the surface behind it) rounds it, reaching a fifth of `size`
+/// past the circle.
+export component Face inherits Rectangle {
+    in property <image> source;
+    in property <length> size: 20px;
+    in property <color> ring: Theme.bg;
+    private property <length> corner: root.size * 0.21;
+    width: root.size;
+    height: root.size;
+    accessible-role: none;
+    Image { width: root.size; height: root.size; source: root.source; image-fit: cover; }
+    Rectangle {
+        x: -root.corner;
+        y: -root.corner;
+        width: root.size + 2 * root.corner;
+        height: root.size + 2 * root.corner;
+        border-radius: root.size / 2 + root.corner;
+        border-width: root.corner;
+        border-color: root.ring;
+    }
+}
+
+/// What an account's crystal lamp shows (account_row::RowState, grouped).
+export enum LampState { off, rising, ready, game, code, error }
+
+/// An account's crystal lamp: grey signed out, filling while signing in (`fill` 0..1), blue when
+/// ready, bright with a halo in game, amber when it needs a code, coral on an error. The looks
+/// are sprite sheets baked from the HD crystal model (assets/crystal/bake.py) at the lamp's exact
+/// height at 1x, 1.5x and 2x (the renderer samples a scaled picture at its nearest pixel): five
+/// looks across (unlit, ready, in game, code, error), the dark theme's row over the light's.
+export component Lamp inherits Rectangle {
+    in property <LampState> state;
+    in property <float> fill: 0.5;
+    width: Theme.lamp-w;
+    height: Theme.lamp-h;
+    accessible-role: none;
+    private property <float> dpr: 1px / 1phx;
+    private property <int> at: root.dpr < 1.2 ? 0 : root.dpr < 1.75 ? 1 : 2;
+    private property <image> sheet: Theme.small
+        ? (root.at == 0 ? @image-url("../assets/crystal/lamps-55.png") : root.at == 1 ? @image-url("../assets/crystal/lamps-83.png")
+            : @image-url("../assets/crystal/lamps-110.png"))
+        : (root.at == 0 ? @image-url("../assets/crystal/lamps-66.png") : root.at == 1 ? @image-url("../assets/crystal/lamps-99.png")
+            : @image-url("../assets/crystal/lamps-132.png"));
+    private property <int> cell-w: root.sheet.width / 5;
+    private property <int> cell-h: root.sheet.height / 2;
+    private property <int> tone: Theme.light ? 1 : 0;
+    private property <int> look: root.state == LampState.off || root.state == LampState.rising ? 0
+        : root.state == LampState.ready ? 1 : root.state == LampState.game ? 2 : root.state == LampState.code ? 3 : 4;
+    // The crystal at its own aspect, centred in the lamp on whole pixels.
+    private property <length> crystal-w: root.height * root.cell-w / root.cell-h;
+    private property <length> crystal-x: round((root.width - root.crystal-w) / 2 / 1phx) * 1phx;
+    if root.state == LampState.game: Rectangle {
+        // A 96 px glow (84 small) centred on the crystal.
+        width: root.height * 96 / 66;
+        height: self.width;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        // CSS `circle closest-side`: Slint's default radius is the far corner.
+        background: @radial-gradient(circle, Theme.halo 0%, Theme.halo.with-alpha(0) 70.7%);
+    }
+    Image {
+        x: root.crystal-x;
+        width: root.crystal-w;
+        height: root.height;
+        source: root.sheet;
+        source-clip-x: root.look * root.cell-w;
+        source-clip-y: root.tone * root.cell-h;
+        source-clip-width: root.cell-w;
+        source-clip-height: root.cell-h;
+        image-fit: ImageFit.fill;
+    }
+    // Signing in: the ready crystal rises from the bottom.
+    if root.state == LampState.rising: Rectangle {
+        private property <length> lit: round(root.height * clamp(root.fill, 0, 1) / 1phx) * 1phx;
+        x: root.crystal-x;
+        y: root.height - self.lit;
+        width: root.crystal-w;
+        height: self.lit;
+        clip: true;
+        Image {
+            y: -parent.y;
+            width: root.crystal-w;
+            height: root.height;
+            source: root.sheet;
+            source-clip-x: root.cell-w;
+            source-clip-y: root.tone * root.cell-h;
+            source-clip-width: root.cell-w;
+            source-clip-height: root.cell-h;
+            image-fit: ImageFit.fill;
+        }
+    }
+}
+
+/// The large crystal as a progress gauge (Downloads): lit from the bottom to `fraction`, the rest
+/// unlit above it, a glow line on the fill level, inside two faint rings, with a tick and `label`
+/// at the fill line. `fraction` below 0 shows it whole and unlit (nothing running). The HD
+/// crystal (crystal-gauge-art): unlit and lit share one outline, and the line is stretched to
+/// the outline's width at the fill level (edge-l / edge-r, one entry per 2.5 %).
+export component CrystalGauge inherits Rectangle {
+    in property <float> fraction: -1;
+    in property <string> label;
+    accessible-role: progress-indicator;
+    accessible-value: root.label;
+    // The renders' proportions: the crystal is a tenth taller than the ring it sits in.
+    private property <length> ring: min(root.width * 0.94, root.height * 0.82);
+    private property <length> crystal-h: round(root.ring * 1.095 / 1phx) * 1phx;
+    private property <length> crystal-w: self.crystal-h * 272 / 860;
+    private property <length> cx: round((root.width - self.crystal-w) / 2 / 1phx) * 1phx;
+    private property <length> cy: round((root.height - self.crystal-h) / 2 / 1phx) * 1phx;
+    private property <float> lit: root.fraction < 0 ? 0 : clamp(root.fraction, 0, 1);
+    // The clip: anchored at the crystal's foot, `lit` of its height, on whole pixels.
+    private property <length> fill-h: round(root.crystal-h * root.lit / 1phx) * 1phx;
+    private property <length> line-y: root.cy + root.crystal-h - root.fill-h;
+    private property <[float]> edge-l: [0.494, 0.457, 0.420, 0.385, 0.353, 0.321, 0.289, 0.259, 0.235, 0.212, 0.188, 0.164, 0.143, 0.133, 0.122, 0.111, 0.100, 0.090, 0.079, 0.068, 0.057, 0.042, 0.026, 0.011, 0.015, 0.034, 0.054, 0.073, 0.093, 0.112, 0.132, 0.152, 0.172, 0.192, 0.212, 0.243, 0.295, 0.346, 0.397, 0.449, 0.500];
+    private property <[float]> edge-r: [0.494, 0.529, 0.564, 0.600, 0.635, 0.666, 0.695, 0.724, 0.750, 0.775, 0.800, 0.825, 0.851, 0.876, 0.903, 0.933, 0.964, 0.959, 0.943, 0.926, 0.923, 0.936, 0.950, 0.962, 0.973, 0.984, 0.995, 0.969, 0.936, 0.899, 0.863, 0.827, 0.797, 0.769, 0.741, 0.712, 0.684, 0.645, 0.597, 0.548, 0.500];
+    private property <int> seg: min(39, floor(root.lit * 40));
+    private property <float> t: root.lit * 40 - root.seg;
+    private property <float> left: root.edge-l[root.seg] + (root.edge-l[root.seg + 1] - root.edge-l[root.seg]) * root.t;
+    private property <float> right: root.edge-r[root.seg] + (root.edge-r[root.seg + 1] - root.edge-r[root.seg]) * root.t;
+    private property <float> span: root.right - root.left;
+    Rectangle {
+        x: (parent.width - root.ring) / 2;
+        y: (parent.height - root.ring) / 2;
+        width: root.ring;
+        height: root.ring;
+        border-radius: root.ring / 2;
+        border-width: 1px;
+        border-color: Theme.hairline;
+    }
+    Rectangle {
+        x: (parent.width - root.ring * 0.94) / 2;
+        y: (parent.height - root.ring * 0.94) / 2;
+        width: root.ring * 0.94;
+        height: self.width;
+        border-radius: self.width / 2;
+        border-width: 1px;
+        border-color: Theme.hairline.with-alpha(0.6);
+    }
+    // The unlit crystal above the fill (clipped, so the outline's soft pixels aren't drawn
+    // twice), then the lit one below it.
+    Rectangle {
+        x: root.cx;
+        y: root.cy;
+        width: root.crystal-w;
+        height: root.crystal-h - root.fill-h;
+        clip: true;
+        Image {
+            x: 0;
+            y: 0;
+            width: root.crystal-w;
+            height: root.crystal-h;
+            source: Theme.light ? @image-url("../assets/crystal/gauge-dim-light.png") : @image-url("../assets/crystal/gauge-dim.png");
+            image-fit: fill;
+        }
+    }
+    Rectangle {
+        x: root.cx;
+        y: root.line-y;
+        width: root.crystal-w;
+        height: root.fill-h;
+        clip: true;
+        Image {
+            x: 0;
+            y: root.fill-h - root.crystal-h;
+            width: root.crystal-w;
+            height: root.crystal-h;
+            source: Theme.light ? @image-url("../assets/crystal/gauge-lit-light.png") : @image-url("../assets/crystal/gauge-lit.png");
+            image-fit: fill;
+        }
+    }
+    // The glow on the fill level, as wide as the outline there; it fades out near the tips.
+    if root.lit > 0 && root.lit < 1: Image {
+        width: root.span * 1.06 * root.crystal-w;
+        height: root.crystal-w * 56 / 272;
+        x: root.cx + (root.left + root.right) / 2 * root.crystal-w - self.width / 2;
+        y: root.line-y - self.height / 2;
+        opacity: min(1, root.span / 0.35);
+        source: Theme.light ? @image-url("../assets/crystal/gauge-line-light.png") : @image-url("../assets/crystal/gauge-line.png");
+        image-fit: fill;
+    }
+    if root.fraction >= 0: Rectangle {
+        x: root.cx + root.crystal-w + root.ring * 0.027;
+        y: root.line-y;
+        width: root.ring * 0.102;
+        height: 1px;
+        background: Theme.sub.with-alpha(0.6);
+    }
+    if root.fraction >= 0: Text {
+        x: root.cx + root.crystal-w + root.ring * 0.129 + 8px;
+        y: root.line-y - self.height / 2;
+        text: root.label;
+        font-size: Theme.type-small;
+        font-weight: 600;
+        color: Theme.ink;
     }
 }

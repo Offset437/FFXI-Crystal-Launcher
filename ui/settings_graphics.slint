@@ -94,13 +94,30 @@ component RsCard inherits Card {
             toggled(on) => { SettingsView.rs-toggle(on); }
         }
     }
-    HorizontalLayout {
+    // Two rows of two: the four fit one row only on a page wider than the detail pane. The
+    // small window has room for one a row.
+    if Theme.small: VerticalLayout {
         spacing: 8px * root.s;
         alignment: start;
-        Control { scale: root.s; text: SettingsView.strings.rs-setup; glyph: Glyph.download; enabled: SettingsView.rs.setup-enabled; clicked => { SettingsView.rs-setup(); } }
-        Control { scale: root.s; text: SettingsView.strings.rs-preset; glyph: Glyph.settings; enabled: SettingsView.rs.preset-enabled; clicked => { SettingsView.rs-preset(); } }
-        Control { scale: root.s; text: SettingsView.strings.rs-folder; glyph: Glyph.folder; enabled: SettingsView.rs.folder-enabled; clicked => { SettingsView.rs-folder(); } }
-        Control { scale: root.s; text: SettingsView.strings.rs-website; glyph: Glyph.external-link; clicked => { SettingsView.rs-website(); } }
+        HorizontalLayout { alignment: start; Control { scale: root.s; text: SettingsView.strings.rs-setup; glyph: Glyph.download; enabled: SettingsView.rs.setup-enabled; clicked => { SettingsView.rs-setup(); } } }
+        HorizontalLayout { alignment: start; Control { scale: root.s; text: SettingsView.strings.rs-preset; glyph: Glyph.settings; enabled: SettingsView.rs.preset-enabled; clicked => { SettingsView.rs-preset(); } } }
+        HorizontalLayout { alignment: start; Control { scale: root.s; text: SettingsView.strings.rs-folder; glyph: Glyph.folder; enabled: SettingsView.rs.folder-enabled; clicked => { SettingsView.rs-folder(); } } }
+        HorizontalLayout { alignment: start; Control { scale: root.s; text: SettingsView.strings.rs-website; glyph: Glyph.external-link; clicked => { SettingsView.rs-website(); } } }
+    }
+    if !Theme.small: VerticalLayout {
+        spacing: 8px * root.s;
+        HorizontalLayout {
+            spacing: 8px * root.s;
+            alignment: start;
+            Control { scale: root.s; text: SettingsView.strings.rs-setup; glyph: Glyph.download; enabled: SettingsView.rs.setup-enabled; clicked => { SettingsView.rs-setup(); } }
+            Control { scale: root.s; text: SettingsView.strings.rs-preset; glyph: Glyph.settings; enabled: SettingsView.rs.preset-enabled; clicked => { SettingsView.rs-preset(); } }
+        }
+        HorizontalLayout {
+            spacing: 8px * root.s;
+            alignment: start;
+            Control { scale: root.s; text: SettingsView.strings.rs-folder; glyph: Glyph.folder; enabled: SettingsView.rs.folder-enabled; clicked => { SettingsView.rs-folder(); } }
+            Control { scale: root.s; text: SettingsView.strings.rs-website; glyph: Glyph.external-link; clicked => { SettingsView.rs-website(); } }
+        }
     }
     Text { text: SettingsView.rs.detail; font-size: Theme.type-caption * root.s; color: Theme.sub; wrap: word-wrap; }
     if SettingsView.rs.preset != "": Text { text: SettingsView.rs.preset; font-size: Theme.type-caption * root.s; color: Theme.sub; wrap: word-wrap; }
@@ -130,20 +147,31 @@ component ActionBar inherits Card {
                 picked(i) => { SettingsView.gc-region(i); }
             }
         }
-        Rectangle { horizontal-stretch: 1; }
+        // The state takes the rest of the row and gives way (elided) before the region chip.
+        Rectangle { width: 12px * root.s; }
         if SettingsView.gc.pending: HorizontalLayout {
             cross-axis-self-alignment: center;
+            horizontal-stretch: 1;
+            min-width: 0px;
+            alignment: end;
             spacing: 8px * root.s;
             Dot { cross-axis-self-alignment: center; size: 8px * root.s; tint: Theme.accent; }
-            Text { text: SettingsView.gc.pending-text; font-size: Theme.type-small * root.s; font-weight: 600; color: Theme.ink; vertical-alignment: center; }
+            Text { min-width: 0px; text: SettingsView.gc.pending-text; font-size: Theme.type-small * root.s; font-weight: 600; color: Theme.ink; vertical-alignment: center; overflow: elide; }
         }
         if !SettingsView.gc.pending: HorizontalLayout {
             cross-axis-self-alignment: center;
+            horizontal-stretch: 1;
+            alignment: end;
             spacing: 7px * root.s;
             Icon { cross-axis-self-alignment: center; glyph: Glyph.check-circle; size: 15px * root.s; tint: Theme.sub; }
             Text { text: SettingsView.strings.gc-clean; font-size: Theme.type-small * root.s; color: Theme.sub; vertical-alignment: center; }
         }
-        Rectangle { width: 10px * root.s; }
+    }
+    // The actions on their own row: the region, the state and five actions need more than the
+    // detail pane's width in one.
+    HorizontalLayout {
+        spacing: 6px * root.s;
+        Rectangle { horizontal-stretch: 1; }
         QuietButton {
             cross-axis-self-alignment: center;
             text: SettingsView.strings.gc-defaults;
@@ -293,70 +321,86 @@ component GcFolder inherits VerticalLayout {
     }
 }
 
-/// One option row (or the screenshot folder's own layout).
+/// An option's control: a drop-down, switch, slider with its value, or a read-only value.
+component GcControl inherits HorizontalLayout {
+    in property <GcRow> entry;
+    private property <float> s: Theme.scale;
+    if root.entry.kind == 0: Select {
+        cross-axis-self-alignment: center;
+        width: 262px * root.s;
+        scale: root.s;
+        label: root.entry.label;
+        items: root.entry.items;
+        current: root.entry.current;
+        picked(index) => { SettingsView.gc-pick(root.entry.id, index); }
+    }
+    if root.entry.kind == 1: Toggle {
+        cross-axis-self-alignment: center;
+        label: root.entry.label;
+        on: root.entry.on;
+        toggled(on) => { SettingsView.gc-toggle(root.entry.id, on); }
+    }
+    if root.entry.kind == 2: HorizontalLayout {
+        width: 262px * root.s;
+        spacing: 12px * root.s;
+        ValueSlider {
+            cross-axis-self-alignment: center;
+            scale: root.s;
+            label: root.entry.label;
+            value: root.entry.value;
+            minimum: root.entry.minimum;
+            maximum: root.entry.maximum;
+            step: root.entry.step;
+            has-reset: root.entry.has-reset;
+            reset: root.entry.reset;
+            changed(value) => { SettingsView.gc-slide(root.entry.id, value); }
+        }
+        Text {
+            width: 46px * root.s;
+            text: root.entry.shown;
+            font-size: Theme.type-small * root.s;
+            font-weight: 600;
+            color: Theme.ink;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+    }
+    if root.entry.kind == 3: Text { text: root.entry.text; font-size: Theme.type-small * root.s; color: Theme.sub; vertical-alignment: center; }
+}
+
+/// One option row (or the screenshot folder's own layout): the name and help beside the
+/// control, or over it in the small window, where a 262 px control would leave the name a
+/// word per line.
 component GcRowView inherits VerticalLayout {
     in property <GcRow> entry;
     private property <float> s: Theme.scale;
     padding-top: 13px * root.s;
     padding-bottom: 13px * root.s;
-    if root.entry.kind != 4: HorizontalLayout {
+    spacing: 8px * root.s;
+    if root.entry.kind != 4 && !Theme.small: HorizontalLayout {
         spacing: 20px * root.s;
         VerticalLayout {
             horizontal-stretch: 1;
+            // The width it gets beside the control: a layout measures wrapped help at its
+            // preferred width.
+            min-width: 0px;
+            preferred-width: max(0px, root.width - 282px * root.s);
             spacing: 3px * root.s;
             alignment: center;
             RowName { text: root.entry.label; changed: root.entry.changed; }
             Text { text: root.entry.help; font-size: Theme.type-caption * root.s; color: Theme.sub; wrap: word-wrap; }
         }
-        HorizontalLayout {
-            width: 262px * root.s;
-            alignment: end;
-            if root.entry.kind == 0: Select {
-                cross-axis-self-alignment: center;
-                width: 262px * root.s;
-                scale: root.s;
-                label: root.entry.label;
-                items: root.entry.items;
-                current: root.entry.current;
-                picked(index) => { SettingsView.gc-pick(root.entry.id, index); }
-            }
-            if root.entry.kind == 1: Toggle {
-                cross-axis-self-alignment: center;
-                label: root.entry.label;
-                on: root.entry.on;
-                toggled(on) => { SettingsView.gc-toggle(root.entry.id, on); }
-            }
-            if root.entry.kind == 2: HorizontalLayout {
-                width: 262px * root.s;
-                spacing: 12px * root.s;
-                ValueSlider {
-                    cross-axis-self-alignment: center;
-                    scale: root.s;
-                    label: root.entry.label;
-                    value: root.entry.value;
-                    minimum: root.entry.minimum;
-                    maximum: root.entry.maximum;
-                    step: root.entry.step;
-                    has-reset: root.entry.has-reset;
-                    reset: root.entry.reset;
-                    changed(value) => { SettingsView.gc-slide(root.entry.id, value); }
-                }
-                Text {
-                    width: 46px * root.s;
-                    text: root.entry.shown;
-                    font-size: Theme.type-small * root.s;
-                    font-weight: 600;
-                    color: Theme.ink;
-                    horizontal-alignment: right;
-                    vertical-alignment: center;
-                }
-            }
-            if root.entry.kind == 3: Text { text: root.entry.text; font-size: Theme.type-small * root.s; color: Theme.sub; vertical-alignment: center; }
-        }
+        GcControl { width: 262px * root.s; alignment: end; entry: root.entry; }
     }
+    if root.entry.kind != 4 && Theme.small: VerticalLayout {
+        preferred-width: root.width;
+        spacing: 3px * root.s;
+        RowName { text: root.entry.label; changed: root.entry.changed; }
+        Text { text: root.entry.help; font-size: Theme.type-caption * root.s; color: Theme.sub; wrap: word-wrap; }
+    }
+    if root.entry.kind != 4 && Theme.small: GcControl { alignment: start; entry: root.entry; }
     if root.entry.kind == 4: GcFolder { entry: root.entry; }
 }
-
 /// An options card: heading, help line, and its rows between hairlines.
 component GcCardView inherits Card {
     in property <GcCard> card;
@@ -387,6 +431,9 @@ component GcColumn inherits VerticalLayout {
 export component GameOptions inherits VerticalLayout {
     in property <length> width-hint;
     private property <float> s: Theme.scale;
+    // Two columns only where each still leaves a row's name its room beside a 262 px control;
+    // otherwise one column, the left cards then the right.
+    private property <bool> two: root.width-hint >= 1040px * root.s;
     private property <length> column: max(120px, (root.width-hint - 16px * root.s) / 2);
     spacing: 16px * root.s;
     padding-bottom: 8px * root.s;
@@ -396,10 +443,15 @@ export component GameOptions inherits VerticalLayout {
         padding: 24px * root.s;
         Text { text: SettingsView.strings.gc-reading; font-size: Theme.type-small * root.s; color: Theme.sub; }
     }
-    if SettingsView.gc.loaded: HorizontalLayout {
+    if SettingsView.gc.loaded && root.two: HorizontalLayout {
         spacing: 16px * root.s;
         GcColumn { width: root.column; cards: SettingsView.gc-left; }
         GcColumn { width: root.column; cards: SettingsView.gc-right; }
+    }
+    if SettingsView.gc.loaded && !root.two: VerticalLayout {
+        spacing: 16px * root.s;
+        GcColumn { cards: SettingsView.gc-left; }
+        GcColumn { cards: SettingsView.gc-right; }
     }
 }
 

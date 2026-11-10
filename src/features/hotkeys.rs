@@ -3,10 +3,16 @@
 //! that account's game forward.
 //!
 //! They are registered with RegisterHotKey on the desktop thread's message-only window
-//! (`desktop`), never with a low-level keyboard hook: Windows delivers only these chords to
-//! Crystal, nothing else is seen, and a chord another program already owns is reported back as a
-//! conflict instead of being stolen. The cycle keys are registered only while a Crystal-launched
-//! game window is in the foreground (`Gate`), so Ctrl+Tab stays with browsers and editors.
+//! (`desktop`): Windows delivers only these chords to Crystal, and a chord another program
+//! already owns is reported back as a conflict instead of being stolen. The cycle keys are
+//! registered only while a Crystal-launched game window is in the foreground (`Gate`), so Ctrl+Tab
+//! stays with browsers and editors. For that same span a low-level keyboard hook (`keyhook`) also
+//! takes exactly those chords, because a game reading the keyboard through DirectInput keeps
+//! registered hotkeys from arriving; it passes every other key on and records none. One press is
+//! one switch, however long the key is held (`keyhook::Matcher`); the window switched to is also
+//! put in front of the other game windows (`game_window::raise`); and each press leaves its
+//! result, the game windows' stacking (`describe_z`) and a second look a moment later in the
+//! launch history.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -235,6 +241,61 @@ pub(crate) fn target(action: &Action, order: &[String], current: Option<&str>) -
     }
 }
 
+/// A running game as the hotkeys see it, in Home order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Candidate {
+    pub account: String,
+    /// Its main window, when it has one now (none while it is still loading, or once closed).
+    pub window: Option<isize>,
+    pub minimized: bool,
+}
+
+/// The window a hotkey brings forward.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Switch {
+    pub account: String,
+    pub hwnd: isize,
+    /// Its place among the running games in Home order, from 1 (for the history: never a name).
+    pub index: usize,
+    /// It is minimised: restore it first, as Alt+Tab does.
+    pub restore: bool,
+}
+
+/// Where `action` goes: the cycle keys step through the games that have a window, in Home order
+/// (`games`), from the one in front (`current`, an account); a game without a window is skipped.
+/// An account hotkey goes to that account's window.
+pub(crate) fn cycle(action: &Action, games: &[Candidate], current: Option<&str>) -> Option<Switch> {
+    let open: Vec<String> = games.iter().filter(|g| g.window.is_some()).map(|g| g.account.clone()).collect();
+    let account = target(action, &open, current)?;
+    let index = games.iter().position(|g| g.account == account)?;
+    let game = &games[index];
+    Some(Switch { hwnd: game.window?, index: index + 1, restore: game.minimized, account })
+}
+
+/// A game window as it is stacked, for the history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Stacked {
+    /// Its game's place in Home order, from 1.
+    pub index: usize,
+    pub minimized: bool,
+    /// Visible and not minimised, but not drawn (hidden, or cloaked by the compositor).
+    pub hidden: bool,
+    /// Always on top (WS_EX_TOPMOST).
+    pub topmost: bool,
+}
+
+/// The game windows front to back, by place in Home order (never a name), each marked `m`
+/// minimised, `h` hidden, `t` always on top; then the one seen on top (the first that is
+/// drawn): `#2 #1 #3m #4 #5t, top #2`.
+pub(crate) fn describe_z(front_to_back: &[Stacked]) -> String {
+    if front_to_back.is_empty() { return "no game window".into(); }
+    let list: Vec<String> = front_to_back.iter().map(|w| {
+        format!("#{}{}{}", w.index, if w.minimized { "m" } else if w.hidden { "h" } else { "" }, if w.topmost { "t" } else { "" })
+    }).collect();
+    let top = front_to_back.iter().find(|w| !w.minimized && !w.hidden).map_or("none".to_owned(), |w| format!("#{}", w.index));
+    format!("{}, top {top}", list.join(" "))
+}
+
 /// Registers and releases hotkeys on Windows (the desktop thread), or a stand-in in tests.
 pub(crate) trait Registrar {
     fn register(&mut self, id: i32, hotkey: Hotkey) -> Result<(), u32>;
@@ -257,6 +318,8 @@ impl Gate {
     pub(crate) fn armed(&self) -> bool { !self.armed.is_empty() }
 
     pub(crate) fn is_key(&self, id: i32) -> bool { self.keys.iter().any(|(i, _)| *i == id) }
+
+    pub(crate) fn keys(&self) -> &[(i32, Hotkey)] { &self.keys }
 
     /// Each key's state: Ok while it works or waits for a game window, or the Windows error the
     /// last arm returned.
@@ -420,6 +483,53 @@ mod tests {
         assert_eq!(target(&Action::Account("b".into()), &order, None).as_deref(), Some("b"));
         assert_eq!(target(&Action::Account("z".into()), &order, None), None);
         assert_eq!(target(&Action::Next, &[], None), None);
+    }
+
+    fn game(account: &str, window: Option<isize>, minimized: bool) -> Candidate { Candidate { account: account.into(), window, minimized } }
+
+    #[test]
+    fn the_cycle_keys_step_through_open_windows_in_home_order() {
+        let games = [game("a", Some(10), false), game("b", Some(20), false), game("c", Some(30), false)];
+        let to = |action: Action, current: Option<&str>| cycle(&action, &games, current).map(|s| (s.index, s.hwnd));
+        assert_eq!(to(Action::Next, Some("a")), Some((2, 20)));
+        assert_eq!(to(Action::Next, Some("c")), Some((1, 10)), "wraps to the first");
+        assert_eq!(to(Action::Previous, Some("a")), Some((3, 30)), "wraps to the last");
+        assert_eq!(to(Action::Previous, Some("c")), Some((2, 20)));
+        // From no game (or one Crystal didn't start): the first, or the last going back.
+        assert_eq!(to(Action::Next, None), Some((1, 10)));
+        assert_eq!(to(Action::Previous, None), Some((3, 30)));
+        assert_eq!(to(Action::Account("b".into()), Some("a")), Some((2, 20)));
+    }
+
+    #[test]
+    fn games_without_a_window_are_skipped_and_minimised_ones_restored() {
+        // b is still loading (no window yet), d closed its window; c is minimised.
+        let games = [game("a", Some(10), false), game("b", None, false), game("c", Some(30), true), game("d", None, false), game("e", Some(50), false)];
+        let next = cycle(&Action::Next, &games, Some("a")).unwrap();
+        assert_eq!(next, Switch { account: "c".into(), hwnd: 30, index: 3, restore: true }, "b skipped, c restored");
+        assert_eq!(cycle(&Action::Next, &games, Some("c")).map(|s| s.index), Some(5), "d skipped");
+        assert_eq!(cycle(&Action::Next, &games, Some("e")).map(|s| s.index), Some(1));
+        assert_eq!(cycle(&Action::Previous, &games, Some("a")).map(|s| s.index), Some(5));
+        assert_eq!(cycle(&Action::Previous, &games, Some("e")).map(|s| (s.index, s.restore)), Some((3, true)));
+        assert!(!cycle(&Action::Next, &games, Some("c")).unwrap().restore);
+        // A game with no window can't be the target of its account hotkey either.
+        assert_eq!(cycle(&Action::Account("b".into()), &games, Some("a")), None);
+        // One window: it is its own next. None: nowhere to go.
+        let one = [game("a", Some(10), false), game("b", None, false)];
+        assert_eq!(cycle(&Action::Next, &one, Some("a")).map(|s| s.hwnd), Some(10));
+        assert_eq!(cycle(&Action::Next, &[game("a", None, false)], None), None);
+        assert_eq!(cycle(&Action::Next, &[], None), None);
+    }
+
+    #[test]
+    fn the_stacking_reads_front_to_back_by_place_with_the_one_on_top() {
+        let w = |index| Stacked { index, minimized: false, hidden: false, topmost: false };
+        assert_eq!(describe_z(&[w(2), w(1), w(3), w(4), w(5)]), "#2 #1 #3 #4 #5, top #2");
+        // A minimised or hidden window in front is not the one seen; always on top is marked.
+        let z = [Stacked { minimized: true, ..w(3) }, Stacked { hidden: true, ..w(1) }, Stacked { topmost: true, ..w(5) }, w(2)];
+        assert_eq!(describe_z(&z), "#3m #1h #5t #2, top #5");
+        assert_eq!(describe_z(&[Stacked { minimized: true, topmost: true, ..w(1) }]), "#1mt, top none");
+        assert_eq!(describe_z(&[]), "no game window");
     }
 
     #[test]

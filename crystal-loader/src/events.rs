@@ -89,6 +89,7 @@ pub fn start(pipe: Pipe, mut reader: LineReader) {
                         Ok(Some(proto::ServiceEvent::NativeBatchGame(token))) => crate::native_auth::request_batch_game(&token),
                         Ok(Some(proto::ServiceEvent::NativeSignOut)) => crate::native_auth::request_sign_out(),
                         Ok(Some(proto::ServiceEvent::NativeStatus { mode, groups })) => crate::native_auth::request_status(mode, groups),
+                        Ok(Some(proto::ServiceEvent::NativePortrait(portrait))) => crate::native_auth::request_portrait(portrait),
                         Ok(Some(proto::ServiceEvent::NativeSocial(request))) => crate::native_auth::request_social(request),
                         Ok(Some(proto::ServiceEvent::ViewerCheck(result))) => crate::native_auth::viewer_check_result(result),
                         Ok(Some(proto::ServiceEvent::NativePlayPending)) => crate::native_auth::note_play_pending(),

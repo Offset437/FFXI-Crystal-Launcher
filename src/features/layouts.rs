@@ -10,7 +10,7 @@
 //!
 //! Everything here is pure (monitors in, rectangles out) and unit-tested; `runtime` applies it.
 
-use super::game_window::{Mode, Monitor, Placement, Rect, Shown};
+use super::game_window::{Frame, Mode, Monitor, Placement, Rect, Shown};
 use super::ClientKey;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -31,12 +31,28 @@ pub(crate) struct Settings {
     pub order_windows: bool,
     /// Remembered windows by `ClientKey::id`.
     pub saved: BTreeMap<String, Saved>,
+    /// What Restore windows puts back, by `ClientKey::id`: kept here, not in memory, because
+    /// Arrange all also changes the remembered windows, so a game restarted after it starts
+    /// arranged (and at the arranged size, `launch_values`); Restore windows still undoes it.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub undo: BTreeMap<String, Arranged>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { remember: true, restore: true, launch_at_saved_size: true, aspect: 16.0 / 9.0, order_windows: true, saved: BTreeMap::new() }
+        Self {
+            remember: true, restore: true, launch_at_saved_size: true, aspect: 16.0 / 9.0, order_windows: true,
+            saved: BTreeMap::new(), undo: BTreeMap::new(),
+        }
     }
+}
+
+/// A client's window Arrange all moved: where it was before (before the first of several in a
+/// row), and where the last Arrange all left it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Arranged {
+    pub before: Saved,
+    pub arranged: Rect,
 }
 
 /// Where a monitor was, to find it again.
@@ -63,12 +79,15 @@ pub(crate) struct Saved {
     pub shown: Shown,
     #[serde(default)]
     pub mode: Mode,
+    /// Its frame styles (older files have none: the frame is then left as it is).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<Frame>,
     pub monitor: MonitorRef,
 }
 
 impl Saved {
     pub(crate) fn from_placement(p: &Placement) -> Self {
-        Self { rect: p.rect, client: p.client, shown: p.shown, mode: p.mode, monitor: MonitorRef::from(&p.monitor) }
+        Self { rect: p.rect, client: p.client, shown: p.shown, mode: p.mode, frame: Some(p.frame), monitor: MonitorRef::from(&p.monitor) }
     }
 }
 
@@ -242,7 +261,7 @@ mod tests {
     }
 
     fn placement(rect: Rect, mon: &Monitor) -> Placement {
-        Placement { rect, client: (rect.w - 16, rect.h - 39), shown: Shown::Normal, mode: Mode::Windowed, monitor: mon.clone() }
+        Placement { rect, client: (rect.w - 16, rect.h - 39), shown: Shown::Normal, mode: Mode::Windowed, frame: Frame::default(), monitor: mon.clone() }
     }
 
     #[test]
@@ -365,5 +384,11 @@ mod tests {
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(s, Settings::default());
         assert!(s.remember && s.restore && s.launch_at_saved_size);
+        // A remembered window written before frames were kept still loads (frame left alone), and
+        // an empty undo is not written.
+        let old = r#"{"saved":{"a":{"rect":{"x":0,"y":0,"w":10,"h":10},"client":[10,10],"monitor":{"device":"d","rect":{"x":0,"y":0,"w":10,"h":10},"work":{"x":0,"y":0,"w":10,"h":10},"dpi":96}}}}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.saved["a"].frame, None);
+        assert!(!serde_json::to_string(&s).unwrap().contains("undo"));
     }
 }

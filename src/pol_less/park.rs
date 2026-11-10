@@ -220,7 +220,7 @@ pub(crate) fn park(config: &Config, plan: &super::Plan, account: &Account, abort
         progress(&line);
     }
     let profile = ParkKey::for_plan(account, plan).profile;
-    park_prepared(p, &profile, plan.auto_login, timing, progress, &mut super::spawn_injector, &super::windower_gate,
+    park_prepared(p, &profile, plan.auto_login, timing, progress, &mut super::spawn_injector, &super::launch_gate,
         super::Timeouts { abort: Some(abort), ..super::TIMEOUTS }, PARKED_LIMIT)
 }
 

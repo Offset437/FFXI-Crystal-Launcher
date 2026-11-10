@@ -28,6 +28,33 @@ export struct DialogStrings {
     ah-note: string,
     open-ffxiah: string,
     truncated: string,
+    portrait: string,
+    previous: string,
+    next: string,
+}
+
+/// One choice in the portrait picker: a stock portrait from the Viewer install.
+export struct PortraitCell {
+    picture: image,
+    label: string,
+    /// The account's portrait now (never marked in privacy mode).
+    current: bool,
+}
+
+/// The portrait picker's state.
+export struct PortraitState {
+    /// The account (masked in privacy mode).
+    subtitle: string,
+    /// Reading the portraits, or none found; empty once they show.
+    message: string,
+    page: string,
+    previous: bool,
+    next: bool,
+    /// Picking changes the portrait (only once the field is confirmed).
+    enabled: bool,
+    /// Why picking is off.
+    note: string,
+    error: string,
 }
 
 /// What Connection & activity shows.
@@ -88,6 +115,13 @@ export global Dialogs {
     callback ah-close();
     callback ah-open-item(int);
     callback ah-open-site();
+    in property <bool> portrait-open;
+    in property <PortraitState> portrait;
+    in property <[PortraitCell]> portraits;
+    callback portrait-close();
+    callback portrait-previous();
+    callback portrait-next();
+    callback portrait-pick(int);
 }
 
 component Caption inherits Text {
@@ -247,17 +281,20 @@ export component DetailsDialog inherits DialogFrame {
                     Version { caption: Dialogs.strings.latest; value: Dialogs.details.latest; mono: Dialogs.details.latest-mono; }
                 }
             }
-            // The status blocks' columns.
+            // The status blocks' columns: equal halves whatever the buttons' widths, so the second
+            // button starts on the second column's edge.
             HorizontalLayout {
                 spacing: Theme.gutter * root.s;
                 HorizontalLayout {
                     horizontal-stretch: 1;
+                    min-width: 0px;
                     preferred-width: 0px;
                     alignment: start;
                     Control { scale: root.s; glyph: Glyph.arrow-right; text: Dialogs.strings.world-status; clicked => { Dialogs.world-status(); } }
                 }
                 HorizontalLayout {
                     horizontal-stretch: 1;
+                    min-width: 0px;
                     preferred-width: 0px;
                     alignment: start;
                     Control { scale: root.s; glyph: Glyph.arrow-right; text: Dialogs.strings.notices; clicked => { Dialogs.notices(); } }
@@ -375,6 +412,92 @@ export component AhDialog inherits DialogFrame {
                 Control { scale: root.s; glyph: Glyph.external-link; text: Dialogs.strings.open-ffxiah; clicked => { Dialogs.ah-open-site(); } }
                 Rectangle { horizontal-stretch: 1; }
                 close := Control { scale: root.s; tone: Tone.primary; text: Dialogs.strings.close; clicked => { Dialogs.ah-close(); } }
+            }
+        }
+    }
+}
+
+/// One stock portrait at its own 64x96 pixels, square-cornered (crisp in the software
+/// renderer) under a hairline; the account's current one ringed in ice.
+component PortraitChoice inherits Pressable {
+    in property <PortraitCell> cell;
+    label: root.cell.label;
+    background: Theme.fill;
+    Image { width: parent.width; height: parent.height; source: root.cell.picture; image-fit: fill; accessible-role: none; }
+    Rectangle { border-width: 1px; border-color: root.hot ? Theme.ice : Theme.line; }
+    if root.cell.current: Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-width: 2px;
+        border-color: Theme.ice;
+    }
+}
+
+/// The portrait picker: the stock portraits installed with the PlayOnline Viewer, a page of
+/// four rows of eight at a time. Picking stays off until the portrait field is confirmed.
+export component PortraitDialog inherits DialogFrame {
+    private property <float> s: Theme.scale;
+    private property <length> cell-w: 64px * root.s;
+    private property <length> cell-h: 96px * root.s;
+    private property <length> gap: 10px * root.s;
+    private property <length> pad: 24px * root.s;
+    dialog-width: 8 * root.cell-w + 7 * root.gap + 2 * root.pad;
+    dialog-height: layout.preferred-height;
+    init => { close.focus(); }
+    layout := VerticalLayout {
+        DialogHeader {
+            title: Dialogs.strings.portrait;
+            subtitle: Dialogs.portrait.subtitle;
+            close-label: Dialogs.strings.close;
+            close => { Dialogs.portrait-close(); }
+        }
+        Rule { }
+        Rectangle {
+            height: 4 * root.cell-h + 3 * root.gap + 2 * root.pad;
+            if Dialogs.portrait.message != "": Text {
+                text: Dialogs.portrait.message;
+                font-size: Theme.type-body * root.s;
+                color: Theme.sub;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            for cell[i] in Dialogs.portraits: PortraitChoice {
+                x: root.pad + mod(i, 8) * (root.cell-w + root.gap);
+                y: root.pad + floor(i / 8) * (root.cell-h + root.gap);
+                width: root.cell-w;
+                height: root.cell-h;
+                cell: cell;
+                enabled: Dialogs.portrait.enabled;
+                clicked => { Dialogs.portrait-pick(i); }
+            }
+        }
+        Rule { }
+        VerticalLayout {
+            padding: 16px * root.s;
+            padding-left: root.pad;
+            padding-right: root.pad;
+            spacing: 12px * root.s;
+            if Dialogs.portrait.error != "": SubText { text: Dialogs.portrait.error; color: Theme.danger; }
+            HorizontalLayout {
+                spacing: Theme.sp-s * root.s;
+                Control { scale: root.s; text: Dialogs.strings.previous; enabled: Dialogs.portrait.previous; clicked => { Dialogs.portrait-previous(); } }
+                Control { scale: root.s; text: Dialogs.strings.next; enabled: Dialogs.portrait.next; clicked => { Dialogs.portrait-next(); } }
+                Text {
+                    text: Dialogs.portrait.page;
+                    font-family: Theme.mono;
+                    font-size: Theme.type-caption * root.s;
+                    color: Theme.sub;
+                    vertical-alignment: center;
+                }
+                SubText {
+                    horizontal-stretch: 1;
+                    text: Dialogs.portrait.note;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                }
+                close := Control { scale: root.s; tone: Tone.primary; text: Dialogs.strings.close; clicked => { Dialogs.portrait-close(); } }
             }
         }
     }

@@ -1486,6 +1486,18 @@ fn native_controls_cannot_sign_out_under_a_game_or_queue_duplicate_starts() {
 }
 
 #[test]
+fn an_unconfirmed_portrait_is_refused_without_queuing_a_command() {
+    let _serial = CONTROL_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(!crate::wire::PORTRAIT_FIELD_CONFIRMED);
+    let before = CONTROL.swap(SOCIAL, Ordering::AcqRel);
+    let events = events::capture(|| request_portrait(12));
+    assert_eq!(events, [format!("{{\"type\":\"native_control_result\",\"action\":\"portrait\",\"code\":{}}}\n", crate::native_portrait::NOT_CONFIRMED)]);
+    assert_eq!(CONTROL.load(Ordering::Acquire), SOCIAL, "the owner never sees a portrait command");
+    assert_eq!(PORTRAIT_REQUEST.load(Ordering::Acquire), NO_PORTRAIT);
+    CONTROL.store(before, Ordering::Release);
+}
+
+#[test]
 fn play_latches_behind_a_running_user_command_and_starts_when_it_returns() {
     let control = AtomicU8::new(SOCIAL_REQUEST);
     let latch = AtomicBool::new(false);
@@ -1641,4 +1653,16 @@ fn localization_refuses_truncated_and_oversized_data() {
     decoded.extend_from_slice(&[b'H', 0, b'i', 0, 0, 0]);
     assert_eq!(resource_text(&decoded, 0x46c9).unwrap(), b"Hi");
     assert!(resource_text(&decoded[..decoded.len() - 1], 0x46c9).is_none());
+}
+
+#[test]
+fn a_held_portrait_slot_refuses_a_second_request_and_keeps_the_first_value() {
+    let slot = AtomicU16::new(NO_PORTRAIT);
+    assert_eq!(claim_portrait(&slot, 12, || 0), 0);
+    // Accepted, not yet read by the owner: the next request is refused and changes nothing.
+    assert_eq!(claim_portrait(&slot, 34, || panic!("no command is asked for")), BUSY);
+    assert_eq!(slot.swap(NO_PORTRAIT, Ordering::AcqRel), 12);
+    // A refused command gives the slot back.
+    assert_eq!(claim_portrait(&slot, 56, || BUSY), BUSY);
+    assert_eq!(slot.load(Ordering::Acquire), NO_PORTRAIT);
 }

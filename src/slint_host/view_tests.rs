@@ -1,24 +1,6 @@
 //! Home's helpers: news dates, tabs and headline wrapping, and the Play button's state.
 use super::*;
 
-/// A headline that fits two lines breaks evenly: no word alone on the second line, and no
-/// line opening with a separator.
-#[test]
-fn headlines_break_evenly_and_overflow_ends_in_an_ellipsis() {
-    let title = "Nomad Mog Bonanza · The results are in";
-    let size = 16.0;
-    // Just wide enough that a greedy wrap leaves "in" alone.
-    let width = text_em("Nomad Mog Bonanza · The results are") * size + 1.0;
-    assert_eq!(wrap_lines(title, width, size, 2)[1], "in");
-    let lines = balanced_lines(title, width, size, 2);
-    assert_eq!(lines.len(), 2);
-    assert!(lines[1].split_whitespace().count() > 1, "{lines:?}");
-    assert!(!lines[1].starts_with('·'), "{lines:?}");
-    assert_eq!(lines.join(" "), title);
-    let long = balanced_lines(&format!("{title} {title} {title}"), width, size, 2);
-    assert!(long[1].ends_with('…'), "{long:?}");
-}
-
 #[test]
 fn japanese_text_wraps_by_em_width_inside_the_card() {
     // Full-width characters are a whole em, so a 20-em line holds 20 of them.
@@ -96,18 +78,41 @@ fn japanese_titles_fall_into_the_same_tabs() {
         ("モーグリの新米冒険者＆復帰者応援キャンペーン ", false, true, "Event"),
         ("ヴァナ・ディールの異変を再調査せよ ", false, true, "Event"),
         ("「真夏のノマドモグボナンザ2026」当せん番号発表！", false, true, "Community"),
-        ("「第2回 『FFXI』冒険者意識調査」を実施します！", false, false, "Event"),
+        // Neither an update nor an event: the PlayOnline kind (its own default picture).
+        ("「第2回 『FFXI』冒険者意識調査」を実施します！", false, false, "PlayOnline"),
+        ("全ワールド メンテナンス作業のお知らせ(11/12)", false, false, "Maintenance"),
     ] {
         let item = item(title);
         assert_eq!(news_matches(&item, NewsTab::Updates), update, "{title}");
         assert_eq!(news_matches(&item, NewsTab::Events), event, "{title}");
         assert!(news_matches(&item, NewsTab::Latest), "{title}");
-        assert_eq!(category(&item).0, t(label), "{title}");
+        assert_eq!(Category::of(&item).look().0, t(label), "{title}");
     }
     crate::i18n::set(Lang::En);
     assert!(news_matches(&item("Free Trial Level Cap Raised to Level 75"), NewsTab::Updates));
     assert!(news_matches(&item("More Strange Happenings in Vana'diel"), NewsTab::Events));
-    assert_eq!(category(&item("Mog Bonanza results")).0, "Community");
+    assert_eq!(Category::of(&item("Mog Bonanza results")), Category::Community);
+}
+
+/// Every kind is reachable, each with its own colour and default picture; a title the words don't
+/// place is PlayOnline, not Event (1.1.0 called every such post an Event).
+#[test]
+fn news_kinds_map_to_their_colour_and_default_picture() {
+    crate::i18n::set(Lang::En);
+    let item = |title: &str| crate::services::NewsItem { title: title.into(), ..Default::default() };
+    for (title, kind, ink, art) in [
+        ("November version update", Category::Update, Ink::Ok, 0),
+        ("Autumn Adventures campaign", Category::Event, Ink::Info, 1),
+        ("All worlds maintenance on Wednesday 12 November", Category::Maintenance, Ink::Danger, 2),
+        // A maintenance notice about an update is maintenance.
+        ("Emergency maintenance for the version update", Category::Maintenance, Ink::Danger, 2),
+        ("Nomad Mog Bonanza: entries are open", Category::Community, Ink::Warn, 3),
+        ("Adventurer survey results", Category::PlayOnline, Ink::Sub, 4),
+    ] {
+        assert_eq!(Category::of(&item(title)), kind, "{title}");
+        let (_, shown_ink, shown_art) = kind.look();
+        assert_eq!((shown_ink, shown_art), (ink, art), "{title}");
+    }
 }
 
 #[test]

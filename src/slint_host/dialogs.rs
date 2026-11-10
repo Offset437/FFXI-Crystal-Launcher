@@ -3,7 +3,7 @@
 //! order: close > delete > editor > import > settings > details > FFXIAH, so at
 //! most one) and pushes what it shows.
 use super::sync::{private, put, sync_model, Private};
-use super::{send, AhItem, AhState, DetailsState, DialogStrings, Dialogs, Glyph, Ink, MainWindow};
+use super::{send, AhItem, AhState, DetailsState, DialogStrings, Dialogs, Glyph, Ink, MainWindow, PortraitCell, PortraitState};
 use crate::i18n::{t, tf, Lang};
 use crate::{App, Message, Page};
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -17,6 +17,11 @@ struct State {
     ah_urls: Vec<String>,
     ah_site: String,
     ah_items: Rc<VecModel<AhItem>>,
+    /// The portrait picker: the IDs shown, what they were built for, and (page, pages).
+    portrait_ids: Vec<u16>,
+    portrait_page: Option<(usize, Option<u16>, Lang)>,
+    portrait_paging: (usize, usize),
+    portraits: Rc<VecModel<PortraitCell>>,
 }
 
 thread_local! {
@@ -29,9 +34,26 @@ fn act(f: impl FnOnce(&State) -> Option<Message>) {
 }
 
 pub(super) fn wire(ui: &MainWindow) {
-    let state = State { lang: None, delete_key: None, ah_urls: Vec::new(), ah_site: String::new(), ah_items: Rc::new(VecModel::default()) };
+    let state = State {
+        lang: None,
+        delete_key: None,
+        ah_urls: Vec::new(),
+        ah_site: String::new(),
+        ah_items: Rc::new(VecModel::default()),
+        portrait_ids: Vec::new(),
+        portrait_page: None,
+        portrait_paging: (0, 0),
+        portraits: Rc::new(VecModel::default()),
+    };
     let dialogs = ui.global::<Dialogs>();
     dialogs.set_ah_items(ModelRc::from(state.ah_items.clone()));
+    dialogs.set_portraits(ModelRc::from(state.portraits.clone()));
+    dialogs.on_portrait_close(|| send(Message::PortraitPicker(None)));
+    dialogs.on_portrait_previous(|| act(|s| s.portrait_paging.0.checked_sub(1).map(Message::PortraitPage)));
+    dialogs.on_portrait_next(|| act(|s| (s.portrait_paging.0 + 1 < s.portrait_paging.1).then(|| Message::PortraitPage(s.portrait_paging.0 + 1))));
+    dialogs.on_portrait_pick(|i| {
+        act(|s| crate::portraits::PICKER_ENABLED.then(|| s.portrait_ids.get(usize::try_from(i).ok()?).copied().map(Message::PortraitPick)).flatten())
+    });
     STATE.with(|cell| *cell.borrow_mut() = Some(state));
     dialogs.on_delete_cancel(|| send(Message::CancelDeleteAccount));
     dialogs.on_delete_confirm(|| act(|s| s.delete_key.clone().map(Message::DeleteAccount)));
@@ -48,13 +70,18 @@ pub(super) fn forget() {
     STATE.with(|cell| cell.borrow_mut().take());
 }
 
-/// Which of these dialogs shows: none while one stacked above it is open.
+/// Which of these dialogs shows: none while one stacked above it is open. The portrait picker
+/// (`portrait_shown`) sits above the account sheet it can open from.
 fn shown(app: &App) -> (Option<&str>, bool, bool) {
     if app.confirm_close { return (None, false, false); }
     if let Some(key) = &app.pending_delete { return (Some(key), false, false); }
-    let above = app.editor.is_some() || app.account_import.open || app.show_settings;
+    let above = app.portrait_picker.is_some() || app.editor.is_some() || app.account_import.open || app.show_settings;
     let details = !above && app.show_details;
     (None, details, !above && !details && app.ah_lookup.open)
+}
+
+fn portrait_shown(app: &App) -> Option<&crate::portraits::Picker> {
+    app.portrait_picker.as_ref().filter(|_| !app.confirm_close && app.pending_delete.is_none())
 }
 
 pub(super) fn sync(ui: &MainWindow, app: &App) {
@@ -84,7 +111,58 @@ pub(super) fn sync(ui: &MainWindow, app: &App) {
             state.ah_urls.clear();
             sync_model(&state.ah_items, Vec::new());
         }
+        let picker = portrait_shown(app);
+        put!(dialogs, get_portrait_open, set_portrait_open, picker.is_some());
+        match picker {
+            Some(picker) => portraits(&dialogs, app, picker, state),
+            None if !state.portrait_ids.is_empty() || state.portrait_page.is_some() => {
+                // A closed picker keeps no pictures in the window.
+                state.portrait_ids.clear();
+                state.portrait_page = None;
+                sync_model(&state.portraits, Vec::new());
+            }
+            None => {}
+        }
     });
+}
+
+/// The portrait picker's page, as data. The cells are rebuilt only when the page, its current
+/// mark or the language changes.
+fn portraits(dialogs: &Dialogs, app: &App, picker: &crate::portraits::Picker, state: &mut State) {
+    let account = app.accounts.iter().find(|row| row.key == picker.account).map(|row| row.account.label.as_str()).unwrap_or_default();
+    let pages = picker.pages();
+    let message = match &picker.ids {
+        None => t("Reading portraits…"),
+        Some(ids) if ids.is_empty() => t("No portraits found."),
+        Some(_) => "",
+    };
+    put!(dialogs, get_portrait, set_portrait, PortraitState {
+        subtitle: crate::privacy::mask(account).into(),
+        message: message.into(),
+        page: if pages > 1 { format!("{} / {pages}", picker.page + 1) } else { String::new() }.into(),
+        previous: picker.page > 0,
+        next: picker.page + 1 < pages,
+        enabled: crate::portraits::PICKER_ENABLED,
+        note: (if crate::portraits::PICKER_ENABLED { "" } else { crate::portraits::unavailable() }).into(),
+        error: picker.error.as_deref().map(|error| private(app, error)).unwrap_or_default().into(),
+    });
+    state.portrait_paging = (picker.page, pages);
+    // Privacy mode marks no portrait as yours.
+    let current = if crate::privacy::on() { None } else { app.own_portraits.get(&picker.account).copied() };
+    let ids = picker.shown();
+    let key = (picker.page, current, crate::i18n::current());
+    if state.portrait_page == Some(key) && state.portrait_ids == ids { return; }
+    state.portrait_page = Some(key);
+    state.portrait_ids = ids.to_vec();
+    let cells = ids
+        .iter()
+        .map(|&id| PortraitCell {
+            picture: crate::portraits::stock_image(id).unwrap_or_default(),
+            label: tf("Portrait {number}", &[("number", &id)]).into(),
+            current: current == Some(id),
+        })
+        .collect();
+    sync_model(&state.portraits, cells);
 }
 
 fn strings() -> DialogStrings {
@@ -109,6 +187,9 @@ fn strings() -> DialogStrings {
         ah_note: t("Website links use the world saved in your browser. These results use the world selected in Crystal.").into(),
         open_ffxiah: t("Open FFXIAH").into(),
         truncated: t("Showing the first 30 matches.").into(),
+        portrait: t("Portrait").into(),
+        previous: t("Previous").into(),
+        next: t("Next").into(),
     }
 }
 
@@ -352,6 +433,77 @@ mod tests {
     }
 
     #[test]
+    fn the_portrait_picker_pages_marks_yours_and_writes_nothing_while_unconfirmed() {
+        crate::i18n::set(Lang::En);
+        crate::privacy::set(false);
+        let mut app = crate::tests::app();
+        let key = app.accounts[0].key.clone();
+        let _ = app.update(Message::EditAccount(key.clone()));
+        app.portrait_picker = Some(crate::portraits::Picker { account: key.clone(), ..Default::default() });
+        let (ui, window) = window(&app);
+        let dialogs = ui.global::<Dialogs>();
+        assert!(dialogs.get_portrait_open());
+        assert!(!super::super::view::sheet_shown(&app), "the picker stands in for the sheet it opened from");
+        assert_eq!(dialogs.get_portrait().message, t("Reading portraits…"));
+        assert_eq!(dialogs.get_portrait().note, crate::portraits::unavailable());
+        assert!(!dialogs.get_portrait().enabled);
+
+        // 70 choices: three pages, opening on the one holding yours.
+        app.own_portraits.insert(key.clone(), 40);
+        let ids: std::sync::Arc<[u16]> = (0..70u16).collect();
+        let current = app.own_portraits.get(&key).copied();
+        app.portrait_picker.as_mut().unwrap().listed(ids, current);
+        super::super::view::sync(&ui, &app);
+        sync(&ui, &app);
+        // The rail shows your portrait where the Viewer has it; the other rows show none.
+        let rows = ui.global::<super::super::View>().get_accounts();
+        assert_eq!(rows.row_data(0).unwrap().has_picture, crate::portraits::rgba(40).is_some());
+        assert!(!rows.row_data(1).unwrap().has_picture);
+        headless::draw(&window);
+        let state = dialogs.get_portrait();
+        assert!(state.message.is_empty());
+        assert_eq!(state.page, "2 / 3");
+        assert!(state.previous && state.next);
+        let cells = dialogs.get_portraits();
+        assert_eq!(cells.row_count(), crate::portraits::PAGE);
+        assert_eq!(cells.row_data(0).unwrap().label, tf("Portrait {number}", &[("number", &32)]).as_str());
+        assert!(cells.row_data(8).unwrap().current && cells.iter().filter(|c| c.current).count() == 1);
+        let names = pad::names(ui.window());
+        assert!(names.iter().any(|n| n == t("Next")) && !names.iter().any(|n| n.starts_with("Portrait ")), "disabled cells are no stops");
+
+        take_sent();
+        dialogs.invoke_portrait_previous();
+        dialogs.invoke_portrait_next();
+        dialogs.invoke_portrait_pick(3);
+        dialogs.invoke_portrait_close();
+        let sent = take_sent();
+        assert!(matches!(sent.as_slice(), [Message::PortraitPage(0), Message::PortraitPage(2), Message::PortraitPicker(None)]), "no pick while unconfirmed");
+
+        // The core refuses a pick too, and pages within range.
+        let _ = app.update(Message::PortraitPick(33));
+        assert!(app.portrait_picker.as_ref().is_some_and(|p| p.error.is_none()));
+        let _ = app.update(Message::PortraitPage(2));
+        sync(&ui, &app);
+        assert_eq!(dialogs.get_portraits().row_count(), 70 - 64);
+        let _ = app.update(Message::PortraitPage(3));
+        assert_eq!(app.portrait_picker.as_ref().unwrap().page, 2);
+
+        // Privacy mode marks nothing as yours.
+        let _ = app.update(Message::PortraitPage(1));
+        crate::privacy::set(true);
+        sync(&ui, &app);
+        let marked = dialogs.get_portraits().iter().filter(|c| c.current).count();
+        crate::privacy::set(false);
+        assert_eq!(marked, 0);
+
+        // Back closes the picker before the sheet under it.
+        let _ = app.update(Message::ControllerBack);
+        assert!(app.portrait_picker.is_none() && app.editor.is_some());
+        sync(&ui, &app);
+        assert!(!dialogs.get_portrait_open() && dialogs.get_portraits().row_count() == 0);
+    }
+
+    #[test]
     fn an_account_row_drag_sends_the_drag_messages_and_marks_the_dragged_row() {
         let mut app = crate::tests::app();
         let (ui, _window) = window(&app);
@@ -411,7 +563,7 @@ mod tests {
             ("home-wide", (1920, 1080), |_| {}),
             ("friends", (1440, 900), |app| app.page = Page::Friends),
             ("downloads", (1440, 900), |app| app.page = Page::Maintenance),
-            ("sheet-edit", (1440, 900), |app| { let key = app.accounts[0].key.clone(); let _ = app.update(Message::EditAccount(key)); }),
+            ("sheet-edit", (1440, 900), |app| { let key = app.accounts[0].key.clone(); app.own_portraits.insert(key.clone(), 256); let _ = app.update(Message::EditAccount(key)); }),
             ("sheet-add", (1440, 900), |app| { let _ = app.update(Message::NewAccount); }),
             ("close", (1440, 900), |app| app.confirm_close = true),
             ("controller-nav", (1440, 900), |app| app.controller_nav.preview_focus()),
@@ -464,7 +616,15 @@ mod tests {
         super::super::view::wire(&ui);
         wire(&ui);
         ui.show().unwrap();
-        let states: [(&str, fn(&mut App)); 4] = [
+        let states: [(&str, fn(&mut App)); 5] = [
+            // The installed Viewer's portraits, when this machine has them.
+            ("portraits", |app| {
+                let key = app.accounts[0].key.clone();
+                app.own_portraits.insert(key.clone(), 9);
+                let mut picker = crate::portraits::Picker { account: key, ..Default::default() };
+                picker.listed(crate::portraits::available(), Some(9));
+                app.portrait_picker = Some(picker);
+            }),
             ("delete", |app| app.pending_delete = Some(app.accounts[0].key.clone())),
             ("details", |app| {
                 app.show_details = true;

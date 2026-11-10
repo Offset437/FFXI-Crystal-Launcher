@@ -5,7 +5,7 @@
 //! row by row, and builds each news picture once, so a batch that changed nothing redraws
 //! nothing.
 use super::sync::{private, put, strings_model, sync_model};
-use super::{send, AccountLine, Footer, Ink, MainWindow, NewsCard, Sheet, SheetStrings, Strings, View};
+use super::{send, AccountLine, Footer, Glyph, Ink, LampState, MainWindow, NewsCard, RailNote, SetupStep, Sheet, SheetStrings, Strings, View};
 use crate::backend::AccountMode;
 use crate::i18n::{t, tf, Lang};
 use crate::account_row::RowState;
@@ -21,8 +21,7 @@ use crate::ffxiah::AH_SERVERS;
 use crate::play_update::{maintenance_percent, remaining_time};
 const NEWS_TABS: [NewsTab; 4] = [NewsTab::Latest, NewsTab::Updates, NewsTab::Events, NewsTab::Maintenance];
 const PAGES: [Page; 4] = [Page::Home, Page::Friends, Page::Maintenance, Page::Settings];
-const CHARACTER_SELECT: [CharacterSelect; 2] = [CharacterSelect::Automatic, CharacterSelect::AskEachTime];
-/// The footer's Character select choice for the accounts Play starts.
+/// The Character select choice for the accounts Play starts (the rail's More menu).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CharacterSelect {
     Automatic,
@@ -38,9 +37,8 @@ impl std::fmt::Display for CharacterSelect {
 }
 const EDITOR_LAUNCH: [Option<LaunchWith>; 4] = [None, Some(LaunchWith::Windower), Some(LaunchWith::Ashita), Some(LaunchWith::Vanilla)];
 const FIELDS: [Field; 7] = [Field::Label, Field::Server, Field::PolId, Field::PolPassword, Field::SeId, Field::SePassword, Field::PolHandleNames];
-/// Below this width the title bar's labelled buttons show glyphs only, and Home stacks Look up
-/// under the account list.
-const COMPACT_W: f32 = 1180.0;
+/// A one-time code's digits.
+const CODE_LEN: usize = 6;
 
 /// What the callbacks act on, as of the last sync, and the models the window draws from.
 struct State {
@@ -49,16 +47,26 @@ struct State {
     light: bool,
     row_keys: Vec<String>,
     row_actions: Vec<Option<Message>>,
+    /// When each row's game started (its session clock), by row.
+    row_started: Vec<Option<std::time::Instant>>,
+    /// What each entry of the rail's More menu sends.
+    menu: Vec<Message>,
+    /// The cards' then the older headlines' links (open-news numbers them in that order).
     news_urls: Vec<String>,
+    /// What each first-run check's action sends, in order.
+    setup_actions: Vec<Vec<Message>>,
     editor_key: Option<String>,
     flags: crate::EditorFlags,
     tool: i32,
     tool_values: Vec<Option<String>>,
     accounts: Rc<VecModel<AccountLine>>,
+    notes: Rc<VecModel<RailNote>>,
+    rail_menu: Rc<VecModel<SharedString>>,
     news: Rc<VecModel<NewsCard>>,
+    news_older: Rc<VecModel<NewsCard>>,
+    setup: Rc<VecModel<SetupStep>>,
     news_tabs: Rc<VecModel<SharedString>>,
     launch_items: Rc<VecModel<SharedString>>,
-    select_items: Rc<VecModel<SharedString>>,
     launch_choices: Rc<VecModel<SharedString>>,
     tool_items: Rc<VecModel<SharedString>>,
     slot_items: Rc<VecModel<SharedString>>,
@@ -74,16 +82,22 @@ impl State {
             light: false,
             row_keys: Vec::new(),
             row_actions: Vec::new(),
+            row_started: Vec::new(),
+            menu: Vec::new(),
             news_urls: Vec::new(),
+            setup_actions: Vec::new(),
             editor_key: None,
             flags: Default::default(),
             tool: 0,
             tool_values: Vec::new(),
             accounts: Rc::new(VecModel::default()),
+            notes: Rc::new(VecModel::default()),
+            rail_menu: Rc::new(VecModel::default()),
             news: Rc::new(VecModel::default()),
+            news_older: Rc::new(VecModel::default()),
+            setup: Rc::new(VecModel::default()),
             news_tabs: Rc::new(VecModel::default()),
             launch_items: Rc::new(VecModel::default()),
-            select_items: Rc::new(VecModel::default()),
             launch_choices: Rc::new(VecModel::default()),
             tool_items: Rc::new(VecModel::default()),
             slot_items: Rc::new(VecModel::default()),
@@ -118,10 +132,13 @@ pub(super) fn wire(ui: &MainWindow) {
     let state = State::new();
     let view = ui.global::<View>();
     view.set_accounts(ModelRc::from(state.accounts.clone()));
+    view.set_notes(ModelRc::from(state.notes.clone()));
+    view.set_rail_menu(ModelRc::from(state.rail_menu.clone()));
     view.set_news(ModelRc::from(state.news.clone()));
+    view.set_news_older(ModelRc::from(state.news_older.clone()));
+    view.set_setup(ModelRc::from(state.setup.clone()));
     view.set_news_tabs(ModelRc::from(state.news_tabs.clone()));
     view.set_launch_items(ModelRc::from(state.launch_items.clone()));
-    view.set_select_items(ModelRc::from(state.select_items.clone()));
     view.set_launch_choices(ModelRc::from(state.launch_choices.clone()));
     view.set_tool_items(ModelRc::from(state.tool_items.clone()));
     view.set_slot_items(ModelRc::from(state.slot_items.clone()));
@@ -140,14 +157,27 @@ pub(super) fn wire(ui: &MainWindow) {
     view.on_refresh_news(|| send(Message::Refresh));
     view.on_view_all_news(|| send(Message::OpenUrl(crate::services::sources(crate::i18n::current()).home.into())));
     view.on_open_news(|i| act(|s| s.news_urls.get(index(i)?).map(|url| Message::OpenUrl(url.clone()))));
+    view.on_setup_action(|i| {
+        for message in read(|s| s.setup_actions.get(index(i)?).cloned()).unwrap_or_default() {
+            send(message);
+        }
+    });
 
     // ---- accounts ----
     view.on_toggle_account(|i, on| act(|s| s.row_keys.get(index(i)?).map(|key| Message::ToggleAccount(key.clone(), on))));
     view.on_edit_account(|i| act(|s| s.row_keys.get(index(i)?).map(|key| Message::EditAccount(key.clone()))));
-    view.on_otp_edited(|i, value| act(|s| s.row_keys.get(index(i)?).map(|key| Message::OtpChanged(key.clone(), value.into()))));
+    view.on_otp_edited(|i, value| {
+        // The boxes take digits only, six at most; the sixth signs in (the row's Sign in, when
+        // the core offers it for that code).
+        let code: String = value.chars().filter(char::is_ascii_digit).take(CODE_LEN).collect();
+        let full = code.len() == CODE_LEN;
+        act(|s| s.row_keys.get(index(i)?).map(|key| Message::OtpChanged(key.clone(), code)));
+        if full {
+            act(|s| s.row_actions.get(index(i)?).cloned().flatten().filter(|message| matches!(message, Message::SignIn(_))));
+        }
+    });
     view.on_row_action(|i| act(|s| s.row_actions.get(index(i)?).cloned().flatten()));
-    view.on_shut_down_all(|| send(Message::ShutdownAll));
-    view.on_play_all(|| send(Message::LaunchAll));
+    view.on_rail_menu_picked(|i| act(|s| s.menu.get(index(i)?).cloned()));
     view.on_import_accounts(|| send(Message::AccountImport(crate::account_import_ui::Msg::Open)));
     view.on_add_account(|| send(Message::NewAccount));
     view.on_drag_start(|i| act(|s| s.row_keys.get(index(i)?).map(|key| Message::AccountDragStart(key.clone()))));
@@ -164,10 +194,7 @@ pub(super) fn wire(ui: &MainWindow) {
 
     // ---- footer ----
     view.on_toggle_details(|| send(Message::ToggleDetails));
-    view.on_install_repair(|| send(Message::Navigate(Page::Maintenance)));
-    view.on_help_support(|| send(Message::OpenUrl("https://support.na.square-enix.com/".into())));
     view.on_launch_picked(|i| { if let Some(tool) = index(i).and_then(|i| LaunchWith::ALL.get(i)) { send(Message::SetLaunchWith(*tool)); } });
-    view.on_select_picked(|i| { if let Some(choice) = index(i).and_then(|i| CHARACTER_SELECT.get(i)) { send(Message::SetCharacterSelect(*choice == CharacterSelect::Automatic)); } });
     view.on_shut_down_selected(|| send(Message::ShutdownSelected));
     view.on_main_action(|| send(Message::MainAction));
 
@@ -202,6 +229,7 @@ pub(super) fn wire(ui: &MainWindow) {
     view.on_view_log(|| act(|s| s.editor_key.clone().map(Message::OpenLog)));
     view.on_open_logs(|| act(|s| s.editor_key.clone().map(Message::OpenLogsFolder)));
     view.on_delete_account(|| act(|s| s.editor_key.clone().map(Message::RequestDeleteAccount)));
+    view.on_choose_portrait(|| act(|s| s.editor_key.clone().map(|key| Message::PortraitPicker(Some(key)))));
 }
 
 /// The window closed: its models and news pictures go with it (nothing stays in the background).
@@ -214,7 +242,7 @@ pub(super) fn forget() {
 /// changed is set, so an unchanged state redraws nothing.
 pub(super) fn sync(ui: &MainWindow, app: &App) {
     let view = ui.global::<View>();
-    STATE.with(|cell| {
+    let sky_needed = STATE.with(|cell| {
         let mut slot = cell.borrow_mut();
         let state = slot.get_or_insert_with(State::new);
         state.privacy = app.settings.privacy;
@@ -227,17 +255,49 @@ pub(super) fn sync(ui: &MainWindow, app: &App) {
             put!(view, get_mixed, set_mixed, t("Mixed").into());
             strings_model(&state.news_tabs, NEWS_TABS.iter().map(|tab| tab_label(*tab).to_owned()));
             strings_model(&state.launch_items, LaunchWith::ALL.iter().map(ToString::to_string));
-            strings_model(&state.select_items, CHARACTER_SELECT.iter().map(ToString::to_string));
             strings_model(&state.launch_choices, [t("Use default"), "Windower", "Ashita", t("Vanilla")].map(str::to_owned));
             strings_model(&state.slot_items, (1u8..=16).map(|number| tf("Slot {number}", &[("number", &number)])));
             put!(view, get_serif_greeting, set_serif_greeting, lang != Lang::Ja);
+            // The sky's day and moon in the new language.
+            super::sky::update(ui);
         }
         shell(&view, app);
         news(&view, app, state);
+        setup(&view, app, state);
         accounts(&view, app, state);
         look_up(&view, app);
-        footer(&view, app);
+        footer(&view, app, state);
         sheet(&view, app, state);
+        (app.page == Page::Home && !app.features_view.open) || state.row_started.iter().any(Option::is_some)
+    });
+    // Outside the state borrow: waking the sky catches the session clocks up.
+    super::sky::needed(ui, sky_needed);
+}
+
+/// A session clock: "3h 12m", or "12m" in the first hour.
+fn session_clock(elapsed: std::time::Duration) -> String {
+    let minutes = elapsed.as_secs() / 60;
+    match minutes / 60 {
+        0 => tf("{minutes}m", &[("minutes", &minutes)]),
+        hours => tf("{hours}h {minutes}m", &[("hours", &hours), ("minutes", &(minutes % 60))]),
+    }
+}
+
+/// Brings the rows' session clocks up to the minute (the sky's timer calls this: a quiet window
+/// sends no ticks while games run).
+pub(super) fn tick_clocks() {
+    STATE.with(|cell| {
+        let slot = cell.borrow();
+        let Some(state) = slot.as_ref() else { return };
+        for (i, started) in state.row_started.iter().enumerate() {
+            let Some(started) = started else { continue };
+            let Some(mut row) = slint::Model::row_data(&*state.accounts, i) else { continue };
+            let clock = SharedString::from(session_clock(started.elapsed()));
+            if row.clock != clock {
+                row.clock = clock;
+                slint::Model::set_row_data(&*state.accounts, i, row);
+            }
+        }
     });
 }
 
@@ -254,17 +314,22 @@ fn strings() -> Strings {
         light_theme: t("Light theme").into(),
         dark_theme: t("Dark theme").into(),
         greeting: t("Welcome back to Vana’diel.").into(),
+        greeting_first: t("Welcome to Vana’diel.").into(),
         news: t("PlayOnline news").into(),
         refresh_news: t("Refresh news").into(),
         view_all_news: t("View all news").into(),
-        more_news: t("More on PlayOnline").into(),
+        all_news: t("All news").into(),
+        before_you_play: t("Before you play").into(),
         accounts: t("Accounts").into(),
-        shut_down_all: t("Shut down all").into(),
-        play_all: t("Play all").into(),
-        import: t("Import").into(),
         add_account: t("Add account").into(),
         no_accounts: t("No accounts yet").into(),
-        no_accounts_body: t("Add a PlayOnline account.").into(),
+        no_accounts_body: t("Add the PlayOnline account you play on.\nIts password stays encrypted on this PC.").into(),
+        import_from_pol: t("Import from PlayOnline").into(),
+        features: t("Features").into(),
+        more: t("More").into(),
+        nothing_picked: t("Nothing picked").into(),
+        one_time_code: t("One-time code").into(),
+        enter: t("Enter").into(),
         code: t("Code").into(),
         sign_in: t("Sign in").into(),
         look_up: t("Look up").into(),
@@ -272,10 +337,7 @@ fn strings() -> Strings {
         wiki_title: wiki_title.into(),
         wiki_placeholder: wiki_placeholder.into(),
         find_item: t("Find an item").into(),
-        install_repair: t("Install & repair").into(),
-        help_support: t("Help & support").into(),
         launch_with: t("Launch with").into(),
-        character_select: t("Character select").into(),
     }
 }
 
@@ -322,6 +384,7 @@ fn sheet_strings() -> SheetStrings {
         cancel: t("Cancel").into(),
         edit_profiles: t("Edit profiles in Windower").into(),
         close: t("Close").into(),
+        portrait: t("Portrait").into(),
     }
 }
 
@@ -333,21 +396,11 @@ fn wiki_site() -> (&'static str, &'static str, &'static str) {
     }
 }
 
-/// The title bar and the hero band.
+/// The top bar and the Windows components banner.
 fn shell(view: &View, app: &App) {
     let page = PAGES.iter().position(|page| *page == app.page).unwrap_or(0) as i32;
     put!(view, get_page, set_page, page);
-    put!(view, get_compact, set_compact, app.viewport.width < COMPACT_W);
-    put!(view, get_wide, set_wide, app.viewport.width >= COMPACT_W);
     put!(view, get_privacy, set_privacy, app.settings.privacy);
-    let count = app.accounts.iter().filter(|row| row.pid.is_some() && !row.shutting_down && !row.signing_out).count();
-    let line = match count {
-        0 => t("No accounts signed in").to_owned(),
-        1 => t("1 account signed in").to_owned(),
-        _ => tf("{count} accounts signed in", &[("count", &count)]),
-    };
-    put!(view, get_signed_in, set_signed_in, line.into());
-    put!(view, get_any_signed_in, set_any_signed_in, count > 0);
     // The Windows components banner.
     let banner = crate::prereqs::banner_text(&app.prereqs);
     put!(view, get_banner, set_banner, banner.is_some());
@@ -379,14 +432,43 @@ fn news_matches(item: &crate::services::NewsItem, tab: NewsTab) -> bool {
     }
 }
 
-/// A card's kind, and the colour it is written in.
-fn category(item: &crate::services::NewsItem) -> (&'static str, Ink) {
-    if news_matches(item, NewsTab::Updates) {
-        (t("Update"), Ink::Ok)
-    } else if item.title.to_ascii_lowercase().contains("bonanza") || item.title.contains("ボナンザ") {
-        (t("Community"), Ink::Warn)
-    } else {
-        (t("Event"), Ink::Info)
+/// A post's category, by its title words (the feeds carry none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Category {
+    Update,
+    Event,
+    Maintenance,
+    Community,
+    /// Anything the words don't place.
+    PlayOnline,
+}
+
+impl Category {
+    fn of(item: &crate::services::NewsItem) -> Self {
+        let title = item.title.to_ascii_lowercase();
+        let any = |words: &[&str]| words.iter().any(|word| title.contains(word));
+        if any(&["maintenance", "outage", "メンテナンス", "障害"]) {
+            Category::Maintenance
+        } else if news_matches(item, NewsTab::Updates) {
+            Category::Update
+        } else if any(&["bonanza", "community", "contest", "ボナンザ", "コミュニティ", "コンテスト"]) {
+            Category::Community
+        } else if news_matches(item, NewsTab::Events) {
+            Category::Event
+        } else {
+            Category::PlayOnline
+        }
+    }
+
+    /// Its word, the colour it is written in, and its default picture (NewsArt's order).
+    fn look(self) -> (&'static str, Ink, i32) {
+        match self {
+            Category::Update => (t("Update"), Ink::Ok, 0),
+            Category::Event => (t("Event"), Ink::Info, 1),
+            Category::Maintenance => (t("Maintenance"), Ink::Danger, 2),
+            Category::Community => (t("Community"), Ink::Warn, 3),
+            Category::PlayOnline => (t("PlayOnline"), Ink::Sub, 4),
+        }
     }
 }
 
@@ -417,7 +499,7 @@ fn news_date(raw: &str) -> String {
 }
 
 // ---- headline wrapping ----
-// The card's two-line blocks are wrapped here rather than by the text engine:
+// The card's two-line teaser is wrapped here rather than by the text engine:
 // Slint's wrap-and-elide misplaces lines of Japanese set in a fallback face.
 
 /// Approximate advance of `ch` in ems, slightly generous so a line judged to fit does.
@@ -502,34 +584,6 @@ fn wrap_lines(text: &str, width: f32, size: f32, max_lines: usize) -> Vec<String
     lines
 }
 
-/// `wrap_lines` for headlines: a title that fits two lines breaks where they come out most
-/// even, never just before a separator.
-fn balanced_lines(text: &str, width: f32, size: f32, max_lines: usize) -> Vec<String> {
-    let greedy = wrap_lines(text, width, size, max_lines);
-    if max_lines < 2 || greedy.len() != 2 || greedy[1].ends_with('…') {
-        return greedy;
-    }
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let max_em = (width / size.max(1.0)).max(1.0);
-    let mut best: Option<(f32, usize)> = None;
-    for split in 1..words.len() {
-        let (first, second) = (words[..split].join(" "), words[split..].join(" "));
-        let (a, b) = (text_em(&first), text_em(&second));
-        if a > max_em || b > max_em {
-            continue;
-        }
-        let opens_on_separator = second.starts_with(['·', '|', '-', ':', '–', '—']);
-        let score = (a - b).abs() + if b > a { 0.5 } else { 0.0 } + if opens_on_separator { 100.0 } else { 0.0 };
-        if best.is_none_or(|(s, _)| score < s) {
-            best = Some((score, split));
-        }
-    }
-    match best {
-        Some((_, split)) => vec![words[..split].join(" "), words[split..].join(" ")],
-        None => greedy,
-    }
-}
-
 /// A news picture, built once per image id.
 fn picture(images: &mut HashMap<u64, Image>, source: &crate::services::NewsImage) -> Option<Image> {
     let expected = source.width as usize * source.height as usize * 4;
@@ -547,16 +601,23 @@ fn picture(images: &mut HashMap<u64, Image>, source: &crate::services::NewsImage
     )
 }
 
+/// Newest first by the date text's month and day (a month after this one is last year's);
+/// undated items keep their place after the dated ones.
+fn by_date(items: &mut [(&crate::services::NewsItem, Category)], month: u32) {
+    let key = |item: &crate::services::NewsItem| news_month_day(&item.date).map(|(m, d)| (m <= month, m, d));
+    items.sort_by(|a, b| key(b.0).cmp(&key(a.0)));
+}
+
 fn news(view: &View, app: &App, state: &mut State) {
-    let s = super::scale(app);
-    let width = (app.viewport.width - 80.0 * s).max(160.0);
-    let gap = 16.0 * s;
-    let cols = (1..=4usize).rev().find(|&n| (width - gap * (n - 1) as f32) / n as f32 >= 230.0 * s).unwrap_or(1);
-    put!(view, get_news_cols, set_news_cols, cols as i32);
-    let card_w = ((width - gap * (cols - 1) as f32) / cols as f32).floor();
-    put!(view, get_news_card_w, set_news_card_w, card_w);
-    let text_w = card_w - 2.0 - 28.0 * s;
-    put!(view, get_news_thumbs, set_news_thumbs, app.viewport.height >= 760.0);
+    // Three cards beside the rail (two in the small window), as wide as the main column allows
+    // (theme.slint's rail-w and page-x, the cards' 20 px gap), and up to four older headlines
+    // (two small). First run shows the cards alone, without teasers.
+    let small = super::small(app);
+    let (rail, margin, cols, lines) = if small { (300.0, 32.0, 2, 2) } else { (356.0, 40.0, 3, 4) };
+    let width = (app.viewport.width - rail - 2.0 * margin).max(160.0);
+    let card_w = ((width - 20.0 * (cols - 1) as f32) / cols as f32).floor();
+    let first_run = first_run(app);
+    let lines = if first_run { 0 } else { lines };
     put!(view, get_news_tab, set_news_tab, NEWS_TABS.iter().position(|tab| *tab == app.news_filter).unwrap_or(0) as i32);
 
     let month = {
@@ -576,38 +637,62 @@ fn news(view: &View, app: &App, state: &mut State) {
     };
     put!(view, get_news_note, set_news_note, note.into());
 
-    let mut picked: Vec<(&crate::services::NewsItem, &'static str, Ink, bool)> = Vec::new();
+    // The tab's posts in feed order: the first ones are the cards, the rest the older lines.
+    // Latest's older lines take the maintenance notices in too, newest first.
+    let mut picked: Vec<(&crate::services::NewsItem, Category)> = Vec::new();
+    let mut older: Vec<(&crate::services::NewsItem, Category)> = Vec::new();
     if let Some(snapshot) = &app.services {
-        if app.news_filter == NewsTab::Maintenance {
-            picked.extend(snapshot.notices.iter().take(cols).map(|item| (item, t("Maintenance"), Ink::Sub, true)));
+        let posts: Vec<_> = if app.news_filter == NewsTab::Maintenance {
+            snapshot.notices.iter().map(|item| (item, Category::Maintenance)).collect()
         } else {
-            picked.extend(
-                snapshot.news.iter().filter(|item| news_matches(item, app.news_filter)).take(cols).map(|item| {
-                    let (label, ink) = category(item);
-                    (item, label, ink, false)
-                }),
-            );
+            snapshot.news.iter().filter(|item| news_matches(item, app.news_filter)).map(|item| (item, Category::of(item))).collect()
+        };
+        let split = posts.len().min(cols);
+        picked.extend_from_slice(&posts[..split]);
+        older.extend_from_slice(&posts[split..]);
+        if app.news_filter == NewsTab::Latest {
+            older.extend(snapshot.notices.iter().map(|item| (item, Category::Maintenance)));
+            by_date(&mut older, month);
         }
+        older.truncate(lines);
     }
-    let shown: Vec<u64> = picked.iter().filter_map(|(item, ..)| item.image.as_ref().map(|image| image.id)).collect();
+    let shown: Vec<u64> = picked.iter().filter_map(|(item, _)| item.image.as_ref().map(|image| image.id)).collect();
     state.images.retain(|id, _| shown.contains(id));
-    let mut cards = Vec::with_capacity(picked.len());
     state.news_urls.clear();
-    for (item, label, ink, notice) in &picked {
+    let mut cards = Vec::with_capacity(picked.len());
+    for (item, kind) in &picked {
         let image = item.image.as_ref().and_then(|source| picture(&mut state.images, source));
+        let (label, ink, art) = kind.look();
         cards.push(NewsCard {
-            title: balanced_lines(&item.title, text_w, 16.0 * s, 2).join("\n").into(),
-            teaser: wrap_lines(&item.summary, text_w, 13.0 * s, 2).join("\n").into(),
-            kind: label.to_uppercase().into(),
-            kind_ink: *ink,
+            // Elided here to the card's width (16 px semibold): the renderer's own elision
+            // overruns the card on CJK headlines.
+            title: wrap_lines(&item.title, card_w, 16.5, 1).into_iter().next().unwrap_or_default().into(),
+            headline: item.title.as_str().into(),
+            teaser: if first_run { String::new() } else { wrap_lines(&item.summary, card_w, 13.0, 2).join("\n") }.into(),
+            kind: label.into(),
+            kind_ink: ink,
             date: news_date(&item.date).into(),
             has_image: image.is_some(),
             image: image.unwrap_or_default(),
-            notice: *notice,
+            notice: *kind == Category::Maintenance,
+            art,
         });
         state.news_urls.push(item.url.clone());
     }
-    put!(view, get_news_more, set_news_more, !picked.is_empty() && cols > picked.len());
+    let mut rows = Vec::with_capacity(older.len());
+    for (item, kind) in &older {
+        let (label, ink, art) = kind.look();
+        rows.push(NewsCard {
+            title: item.title.as_str().into(),
+            kind: label.into(),
+            kind_ink: ink,
+            date: news_date(&item.date).into(),
+            notice: *kind == Category::Maintenance,
+            art,
+            ..Default::default()
+        });
+        state.news_urls.push(item.url.clone());
+    }
     let (news_state, title, body) = if !picked.is_empty() {
         (0, "", "")
     } else if app.news_loading {
@@ -621,8 +706,95 @@ fn news(view: &View, app: &App, state: &mut State) {
     put!(view, get_news_empty_title, set_news_empty_title, title.into());
     put!(view, get_news_empty_body, set_news_empty_body, body.into());
     sync_model(&state.news, cards);
+    sync_model(&state.news_older, rows);
 }
 
+/// No account is added yet (and the vault has been read, so this is not just startup).
+fn first_run(app: &App) -> bool {
+    app.vault_ready && app.accounts.is_empty()
+}
+
+/// Home's first-run checks: the account, the game files and the Windows components, each with
+/// its one action. "Add account" stays the rail's alone; the account check offers the import.
+fn setup(view: &View, app: &App, state: &mut State) {
+    let first_run = first_run(app);
+    put!(view, get_first_run, set_first_run, first_run);
+    let vault_error = app.vault_error.as_deref().filter(|_| !app.vault_ready).map(|error| private(app, error)).unwrap_or_default();
+    put!(view, get_vault_error, set_vault_error, vault_error.into());
+    if !first_run || app.page != Page::Home {
+        state.setup_actions.clear();
+        sync_model(&state.setup, Vec::new());
+        return;
+    }
+    let mut steps = Vec::with_capacity(3);
+    let mut actions = Vec::with_capacity(3);
+
+    steps.push(SetupStep {
+        glyph: Glyph::User,
+        ink: Ink::Info,
+        title: t("Account").into(),
+        body: t("None added yet.").into(),
+        detail: "".into(),
+        detail_mono: false,
+        action: t("Import from PlayOnline").into(),
+        action_glyph: Glyph::Download,
+        action_enabled: app.vault_ready && !app.vault_saving,
+    });
+    actions.push(vec![Message::AccountImport(crate::account_import_ui::Msg::Open)]);
+
+    // The game: its version state and folder, and Check files (on Downloads, which shows it run).
+    let no_folder = app.settings.install_path.trim().is_empty();
+    let (glyph, ink, body) = match app.patch.as_ref().map(|p| p.state) {
+        _ if no_folder => (Glyph::AlertCircle, Ink::Warn, t("Not selected")),
+        Some(crate::patch::PatchState::Current) => (Glyph::CheckCircle, Ink::Ok, t("Up to date")),
+        Some(crate::patch::PatchState::Required) => (Glyph::Download, Ink::Warn, t("Update available")),
+        Some(crate::patch::PatchState::Interrupted) => (Glyph::AlertCircle, Ink::Warn, t("Interrupted update")),
+        _ if app.patch_loading => (Glyph::Refresh, Ink::Sub, t("Checking version…")),
+        _ => (Glyph::AlertCircle, Ink::Sub, t("Not checked")),
+    };
+    let can_check = app.maintenance.is_none() && !app.installation_loading && app.settings.install_selected;
+    let (action, action_glyph) = if can_check { (t("Check files"), Glyph::FileCheck) } else { (t("Open Downloads"), Glyph::Download) };
+    steps.push(SetupStep {
+        glyph,
+        ink,
+        title: t("FINAL FANTASY XI").into(),
+        body: body.into(),
+        detail: if no_folder { String::new() } else { crate::privacy::mask_path(&app.settings.install_path) }.into(),
+        detail_mono: true,
+        action: action.into(),
+        action_glyph,
+        action_enabled: true,
+    });
+    let mut open = vec![Message::Navigate(Page::Maintenance)];
+    if can_check { open.push(Message::StartMaintenance(crate::MaintenanceKind::Check)); }
+    actions.push(open);
+
+    // The Windows components: what is missing or pending, how many are ready, and the fix on
+    // Settings → System (the rail's note and the banner open the same place).
+    let ready = crate::prereqs::ready_count(&app.prereqs);
+    let banner = crate::prereqs::banner_text(&app.prereqs);
+    let (glyph, ink, body, action) = match (&ready, &banner) {
+        (None, _) => (Glyph::Refresh, Ink::Sub, t("Checking…").to_owned(), t("View")),
+        (_, Some(b)) if b.restart => (Glyph::Refresh, Ink::Warn, format!("{}{}", b.lead, b.rest), b.button),
+        (_, Some(b)) => (Glyph::AlertCircle, Ink::Warn, tf("Missing: {names}", &[("names", &b.lead)]), b.button),
+        (_, None) => (Glyph::CheckCircle, Ink::Ok, t("All installed.").to_owned(), t("View")),
+    };
+    steps.push(SetupStep {
+        glyph,
+        ink,
+        title: t("Windows components").into(),
+        body: body.into(),
+        detail: ready.map(|(ready, total)| tf("{ready} of {total} ready", &[("ready", &ready), ("total", &total)])).unwrap_or_default().into(),
+        detail_mono: crate::i18n::current() == Lang::En,
+        action: action.into(),
+        action_glyph: Glyph::Wrench,
+        action_enabled: true,
+    });
+    actions.push(vec![Message::OpenSettingsTab(crate::settings_page::Tab::System)]);
+
+    state.setup_actions = actions;
+    sync_model(&state.setup, steps);
+}
 fn row_ink(state: RowState) -> Ink {
     match state {
         RowState::Closing | RowState::Waiting | RowState::Updating | RowState::ViewerConfirm | RowState::Starting | RowState::SigningIn => Ink::Warn,
@@ -633,31 +805,60 @@ fn row_ink(state: RowState) -> Ink {
     }
 }
 
+/// The crystal lamp a row's state lights: grey signed out, rising while it signs in, starts or
+/// updates, blue when ready, bright in game, amber when it needs you, coral on an error.
+fn row_lamp(state: RowState) -> LampState {
+    match state {
+        RowState::Playing => LampState::Game,
+        RowState::SignedIn => LampState::Ready,
+        RowState::Starting | RowState::SigningIn | RowState::Updating => LampState::Rising,
+        RowState::NeedsCode | RowState::ViewerConfirm => LampState::Code,
+        RowState::Problem => LampState::Error,
+        RowState::Closing | RowState::Waiting | RowState::Private | RowState::Idle => LampState::Off,
+    }
+}
+
+/// The account's own PlayOnline portrait, once its session reported one (the silhouette in
+/// privacy mode); `None` shows no picture.
+fn own_picture(app: &App, key: &str) -> Option<slint::Image> {
+    app.own_portraits.get(key).and_then(|id| crate::portraits::image(Some(*id)))
+}
+
 fn accounts(view: &View, app: &App, state: &mut State) {
     let total = app.accounts.len();
     let ticked = app.accounts.iter().filter(|row| row.selected).count();
-    put!(view, get_accounts_note, set_accounts_note, tf("{ticked} of {total} selected", &[("ticked", &ticked), ("total", &total)]).into());
-    put!(view, get_show_shut_down_all, set_show_shut_down_all, app.shutdown_count(false) > 0);
-    put!(view, get_show_play_all, set_show_play_all, app.launchable_count() > 1 && app.vault_ready);
-    put!(view, get_can_add, set_can_add, app.vault_ready && !app.vault_saving);
+    put!(view, get_accounts_note, set_accounts_note, tf("{ticked} of {total} picked", &[("ticked", &ticked), ("total", &total)]).into());
+    let can_add = app.vault_ready && !app.vault_saving;
+    put!(view, get_can_add, set_can_add, can_add);
     let editing = app.editor.as_ref().and_then(|editor| editor.key.as_deref());
+    let privacy = crate::privacy::on();
     state.row_keys.clear();
     state.row_actions.clear();
+    state.row_started.clear();
     let mut lines = Vec::with_capacity(total);
     for item in &app.accounts {
         let row = crate::account_row::row_view(app, item);
+        let row_state = crate::account_row::row_state(app, item);
         let working = item.busy || item.shutting_down || item.signing_out || item.game_start_pending();
         let (action, action_soft, action_enabled, message) = match row.action {
             Some((label, message, soft)) => (label, soft, true, Some(message)),
             None if row.otp => (t("Sign in").to_owned(), true, false, None),
             None => (String::new(), false, false, None),
         };
+        let started = (row_state == RowState::Playing).then(|| item.play_timing.as_ref().map(|timing| timing.started())).flatten();
+        // The lamp rises with the row's own progress where it has one; a sign-in shows halfway,
+        // a start (signed in, the game opening) most of the way.
+        let fill = row.progress.unwrap_or(if row_state == RowState::Starting { 0.75 } else { 0.5 });
+        let code_len = item.otp.chars().count().min(CODE_LEN);
+        let picture = own_picture(app, &item.key);
         lines.push(AccountLine {
+            has_picture: picture.is_some(),
+            picture: picture.unwrap_or_default(),
             name: crate::privacy::mask(&item.account.label).into(),
             checked: item.selected,
             editing: editing == Some(item.key.as_str()),
             name_enabled: !app.vault_saving,
-            ink: row_ink(crate::account_row::row_state(app, item)),
+            ink: row_ink(row_state),
             label: private(app, &row.label).into(),
             detail: private(app, &row.detail).into(),
             progress: row.progress.unwrap_or(-1.0),
@@ -665,13 +866,19 @@ fn accounts(view: &View, app: &App, state: &mut State) {
             working: working && row.progress.is_none(),
             otp: row.otp,
             otp_text: item.otp.as_str().into(),
+            otp_shown: if privacy { "•".repeat(code_len) } else { item.otp.chars().take(CODE_LEN).collect() }.into(),
+            otp_len: code_len as i32,
             action: action.into(),
             action_soft,
             action_enabled,
             dragging: app.account_drag.source.as_deref() == Some(item.key.as_str()),
+            lamp: row_lamp(row_state),
+            fill: fill.clamp(0.0, 1.0),
+            clock: started.map(|at| session_clock(at.elapsed())).unwrap_or_default().into(),
         });
         state.row_keys.push(item.key.clone());
         state.row_actions.push(message);
+        state.row_started.push(started);
     }
     sync_model(&state.accounts, lines);
     put!(view, get_dragging, set_dragging, app.account_drag.source.is_some());
@@ -722,7 +929,17 @@ fn maintenance_status(app: &App) -> String {
     parts.join(" · ")
 }
 
-fn footer(view: &View, app: &App) {
+/// The current (or next) all-worlds maintenance window, in local time: "11/12 14:00 to 17:00".
+fn maintenance_window(app: &App) -> Option<String> {
+    use chrono::Local;
+    let now = chrono::Utc::now();
+    let window = app.services.as_ref()?.windows.iter().filter(|w| w.end > now).min_by_key(|w| w.start)?;
+    let (start, end) = (window.start.with_timezone(&Local), window.end.with_timezone(&Local));
+    let end = if start.date_naive() == end.date_naive() { end.format("%H:%M") } else { end.format("%m/%d %H:%M") };
+    Some(tf("{start} to {end}", &[("start", &start.format("%m/%d %H:%M")), ("end", &end)]))
+}
+
+fn footer(view: &View, app: &App, state: &mut State) {
     let current = app.accounts.iter().find(|a| a.selected).or_else(|| app.accounts.first());
     let main_action = app.main_action();
     let targets: Vec<&crate::AccountRow> = {
@@ -734,8 +951,11 @@ fn footer(view: &View, app: &App) {
     let playing_row = targets.iter().find(|a| a.is_playing());
     let starting_row = targets.iter().find(|a| a.game_start_pending());
     let play_update = targets.iter().find_map(|a| crate::play_update::line(app, &a.key));
-    let (status, detail, tone): (String, String, i32) = if let Some(kind) = app.maintenance {
-        (maintenance_status(app), super::downloads::dl_stage(kind, app.maintenance_progress.stage), 2)
+    let (status, detail, tone): (String, String, i32) = if app.accounts.is_empty() {
+        (t("Add an account to play").into(), String::new(), 4)
+    } else if app.maintenance.is_some() {
+        // The status names the job, its share and time left; the stage would repeat it.
+        (maintenance_status(app), String::new(), 2)
     } else if let Some(update) = &play_update {
         (update.headline.clone(), String::new(), 2)
     } else if let Some(update) = (main_action == MainAction::Maintenance)
@@ -744,7 +964,9 @@ fn footer(view: &View, app: &App) {
     } else if matches!(main_action, MainAction::Maintenance | MainAction::Offline) && targets.iter().any(|a| app.is_waiting(&a.key)) {
         ((if main_action == MainAction::Maintenance { t("Maintenance") } else { t("Worlds offline") }).into(), app.wait_headline().into(), 2)
     } else if main_action == MainAction::Maintenance {
-        (t("Maintenance").into(), t("View official maintenance notices").into(), 1)
+        // The official window when a notice stated one; else where to read about it.
+        let detail = maintenance_window(app).unwrap_or_else(|| t("View official maintenance notices").into());
+        (t("Maintenance").into(), detail, 1)
     } else if main_action == MainAction::Offline {
         (t("Worlds offline").into(), t("View official world status").into(), 1)
     } else if let (PlayState::Playing, Some(row)) = (play_state, playing_row) {
@@ -778,9 +1000,10 @@ fn footer(view: &View, app: &App) {
         MainAction::Maintenance => (t("Maintenance").to_owned(), badge_ink),
         MainAction::Offline => (t("Worlds offline").to_owned(), badge_ink),
         MainAction::Working if app.reshade.busy => (t("ReShade setup").to_owned(), Ink::Sub),
+        // The status line above names the job: the button keeps its share, unelided.
         MainAction::Working => (
             match maintenance_percent(&app.maintenance_progress) {
-                Some(percent) if app.maintenance.is_some() => tf("{label} · {percent}%", &[("label", &app.maintenance_label()), ("percent", &percent)]),
+                Some(percent) if app.maintenance.is_some() => format!("{percent}%"),
                 _ => app.maintenance_label().to_owned(),
             },
             Ink::Sub,
@@ -811,35 +1034,32 @@ fn footer(view: &View, app: &App) {
         _ if !enabled => 2,
         _ => 0,
     };
-    let ready = main_action == MainAction::Play && play_state == PlayState::Play && count > 0 && play_update.is_none();
-    let names = if ready && app.viewport.width >= 1280.0 {
+    // Who Play starts, under it in the rail; with none left to start (all in game), the picks
+    // themselves, so the line agrees with the header's count and Shut down selected.
+    let picked = |startable: bool| {
         app.accounts
             .iter()
-            .filter(|row| row.selected && row.account.mode == AccountMode::Retail && row.can_play())
+            .filter(|row| row.selected && row.account.mode == AccountMode::Retail && (!startable || row.can_play()))
             .map(|row| crate::privacy::mask(&row.account.label))
             .collect::<Vec<_>>()
-            .join(", ")
-    } else {
-        String::new()
     };
+    let names = Some(picked(true)).filter(|names| !names.is_empty()).unwrap_or_else(|| picked(false)).join(t(", "));
     let can_shutdown = app.shutdown_count(true) > 0;
     let shutdown_pending = app.accounts.iter().any(|a| a.selected && a.shutting_down);
     let busy = !can_shutdown && shutdown_pending;
     let retail: Vec<&&crate::AccountRow> = targets.iter().filter(|row| row.account.mode == AccountMode::Retail).collect();
-    let picks = !retail.is_empty() && app.viewport.width >= 1100.0;
-    let launcher = shared(retail.iter().map(|row| app.launcher_for(&row.account)));
-    let select = shared(retail.iter().map(|row| app.settings.account_auto_login.get(&row.key).copied().unwrap_or_default().enabled));
+    // The launcher picker always shows (with nothing to start, the default launcher).
+    let launcher = if retail.is_empty() { Some(app.settings.launch_with) } else { shared(retail.iter().map(|row| app.launcher_for(&row.account))) };
+    // Character select, for the retail accounts Play starts (None: they differ).
+    let select = (!retail.is_empty()).then(|| shared(retail.iter().map(|row| app.settings.account_auto_login.get(&row.key).copied().unwrap_or_default().enabled)));
     let footer = Footer {
         status: private(app, &status).into(),
-        detail: private(app, &detail).into(),
         badge: tone,
         shutdown: can_shutdown || shutdown_pending,
         shutdown_busy: busy,
         shutdown_enabled: can_shutdown,
         shutdown_label: (if busy { t("Shutting down…") } else { t("Shut down selected") }).into(),
-        picks,
         launch_current: launcher.and_then(|tool| LaunchWith::ALL.iter().position(|t| *t == tool)).map_or(-1, |i| i as i32),
-        select_current: select.map_or(-1, |automatic| if automatic { 0 } else { 1 }),
         play_label: label.into(),
         play_glyph: glyph,
         play_ink: ink,
@@ -848,6 +1068,42 @@ fn footer(view: &View, app: &App) {
         names: names.into(),
     };
     put!(view, get_footer, set_footer, footer);
+
+    // The line under the status: its detail. The Windows components check is its own line
+    // under the block (View.banner), since it opens Settings, not Connection & activity.
+    let mut notes = Vec::with_capacity(1);
+    if !detail.is_empty() {
+        let glyph = if main_action == MainAction::Maintenance { Glyph::Wrench } else if tone == 0 { Glyph::CheckCircle } else { Glyph::Info };
+        // "View official …" opens Connection & activity with those links: it reads as a link.
+        let link = detail == t("View official maintenance notices") || detail == t("View official world status");
+        notes.push(RailNote { glyph, text: private(app, &detail).into(), ink: if link { Ink::Accent } else { Ink::Ink } });
+    }
+    sync_model(&state.notes, notes);
+
+    // The rail's More menu: what Home's header and the footer offered besides Play.
+    let mut menu: Vec<(String, Message)> = Vec::new();
+    if app.vault_ready && !app.vault_saving {
+        menu.push((t("Import").into(), Message::AccountImport(crate::account_import_ui::Msg::Open)));
+    }
+    if app.launchable_count() > 1 && app.vault_ready {
+        menu.push((t("Play all").into(), Message::LaunchAll));
+    }
+    if app.shutdown_count(false) > 0 {
+        menu.push((t("Shut down all").into(), Message::ShutdownAll));
+    }
+    // Character select names its choice; picking it switches to the other one.
+    if let Some(choice) = select {
+        let (shown, next) = match choice {
+            Some(true) => (CharacterSelect::Automatic.to_string(), false),
+            Some(false) => (CharacterSelect::AskEachTime.to_string(), true),
+            None => (t("Mixed").to_owned(), true),
+        };
+        menu.push((format!("{} · {shown}", t("Character select")), Message::SetCharacterSelect(next)));
+    }
+    menu.push((t("Install & repair").into(), Message::Navigate(Page::Maintenance)));
+    menu.push((t("Help & support").into(), Message::OpenUrl("https://support.na.square-enix.com/".into())));
+    strings_model(&state.rail_menu, menu.iter().map(|(label, _)| label.clone()));
+    state.menu = menu.into_iter().map(|(_, message)| message).collect();
 }
 
 // ---- the account sheet ----
@@ -877,7 +1133,7 @@ fn picks(default_label: String, found: &[String], current: Option<&String>, miss
 
 /// Whether the account sheet shows: open, and no close or delete confirmation over it.
 pub(super) fn sheet_shown(app: &App) -> bool {
-    app.editor.is_some() && !app.confirm_close && app.pending_delete.is_none()
+    app.editor.is_some() && !app.confirm_close && app.pending_delete.is_none() && app.portrait_picker.is_none()
 }
 
 fn sheet(view: &View, app: &App, state: &mut State) {
@@ -968,7 +1224,11 @@ fn sheet(view: &View, app: &App, state: &mut State) {
         ""
     };
 
+    let picture = editor.key.as_deref().and_then(|key| own_picture(app, key));
     let sheet = Sheet {
+        portrait_shown: editing && retail && row.is_some(),
+        has_picture: picture.is_some(),
+        picture: picture.unwrap_or_default(),
         editing,
         caption: (if editing { t("Account settings") } else { t("New account") }).to_uppercase().into(),
         title: (if editing { crate::privacy::mask(&account.label) } else { t("Add account").to_owned() }).into(),

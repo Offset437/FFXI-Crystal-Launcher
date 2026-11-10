@@ -20,6 +20,18 @@ pub(crate) fn banner(app: &App) -> Option<Line> {
     Some(Line { text, action })
 }
 
+/// The rail's pill beside the brand while the banner shows: a few words, and whether work is
+/// under way (a spinner instead of the arrow).
+pub(crate) fn pill(app: &App) -> Option<(String, bool)> {
+    Some(match &app.self_update {
+        State::Available(release) => (tf("{version} available", &[("version", &release.payload.version)]), false),
+        State::Downloading => (t("Updating").into(), true),
+        State::Ready(stage) => (tf("{version} ready", &[("version", &stage.release.payload.version)]), false),
+        State::Applying => (t("Restarting").into(), true),
+        _ => return None,
+    })
+}
+
 /// The Launcher updates card's status line and button (Settings → System).
 pub(crate) fn card(app: &App) -> Line {
     let (text, action) = match &app.self_update {

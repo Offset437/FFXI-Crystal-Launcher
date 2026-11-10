@@ -108,7 +108,7 @@ use Group::*;
 pub(crate) const SERVICES: &[Service] = &[
     s(125, 1, SignIn), s(126, 4, Mail),
     s(163, 0, Friends), s(164, 1, Friends), s(167, 2, Friends), s(169, 2, Friends),
-    s(171, 0, Friends), s(172, 1, Friends), s(173, 2, Friends), s(175, 0, Friends), s(176, 1, Friends),
+    s(171, 0, Friends), s(172, 1, Friends), s(173, 2, Friends), s(174, 2, Handles), s(175, 0, Friends), s(176, 1, Friends),
     s(177, 2, Handles), s(183, 2, Handles), s(186, 1, Friends), s(188, 1, Friends), s(190, 0, SignIn),
     s(197, 3, Handles), s(206, 0, SignIn), s(207, 0, SignIn),
     s(270, 13, Mail), s(272, 5, Mail), s(284, 2, Mail), s(285, 2, Mail), s(286, 2, Mail), s(287, 2, Mail),

@@ -34,6 +34,8 @@ pub(crate) enum LoaderEvent {
     NativeStatus(i32),
     NativeSessionState(bool),
     NativeOwnMode(i32),
+    /// `native_own_portrait`: the selected handle's portrait ID (13 bits).
+    NativeOwnPortrait(u16),
     NativeGameEnded { code: i32, game_returned: bool, game_id: u64 },
     NativeSignOutComplete(i32),
     NativeControlResult { action: String, code: i32 },
@@ -112,6 +114,8 @@ struct Incoming {
     #[serde(default)]
     mode: Option<i64>,
     #[serde(default)]
+    portrait: Option<i64>,
+    #[serde(default)]
     id: Option<String>,
     #[serde(default)]
     request_id: Option<u64>,
@@ -166,6 +170,7 @@ pub(crate) fn parse_event(line: &[u8]) -> Result<LoaderEvent, String> {
         },
         "native_session_state" => LoaderEvent::NativeSessionState(value.game.ok_or("Invalid native POL session state.")?),
         "native_own_presence" => LoaderEvent::NativeOwnMode(value.mode.and_then(|m| i32::try_from(m).ok()).filter(|m| (-1..=4).contains(m)).ok_or("Invalid native POL presence mode.")?),
+        "native_own_portrait" => LoaderEvent::NativeOwnPortrait(value.portrait.filter(|p| (0..=i64::from(crate::wire::PORTRAIT_MASK)).contains(p)).ok_or("Invalid native POL portrait.")? as u16),
         "native_game_ended" => LoaderEvent::NativeGameEnded {
             code: value.code.and_then(|c| i32::try_from(c).ok()).ok_or("Invalid game exit result.")?,
             game_returned: value.game_returned,
@@ -176,7 +181,7 @@ pub(crate) fn parse_event(line: &[u8]) -> Result<LoaderEvent, String> {
                 .ok_or("Invalid native POL sign-out result.")?
         ),
         "native_control_result" => LoaderEvent::NativeControlResult {
-            action: value.action.filter(|a| matches!(a.as_str(), "start_game" | "sign_out" | "visible" | "away" | "invisible" | "groups")).ok_or("Invalid native POL control action.")?,
+            action: value.action.filter(|a| matches!(a.as_str(), "start_game" | "sign_out" | "visible" | "away" | "invisible" | "groups" | "portrait")).ok_or("Invalid native POL control action.")?,
             code: value.code.and_then(|c| i32::try_from(c).ok()).ok_or("Invalid native POL control result.")?,
         },
         "game_shutdown_result" => LoaderEvent::GameShutdownResult {
@@ -706,6 +711,9 @@ mod tests {
         assert!(parse_event(br#"{"type":"native_control_result","action":"delete_profile","code":0}"#).is_err());
         assert_eq!(parse_event(br#"{"type":"native_control_result","action":"sign_out","code":-256}"#).unwrap(), LoaderEvent::NativeControlResult { action: "sign_out".into(), code: -256 });
         assert_eq!(parse_event(br#"{"type":"native_control_result","action":"groups","code":1}"#).unwrap(), LoaderEvent::NativeControlResult { action: "groups".into(), code: 1 });
+        assert_eq!(parse_event(br#"{"type":"native_own_portrait","portrait":8191}"#).unwrap(), LoaderEvent::NativeOwnPortrait(8191));
+        assert!(parse_event(br#"{"type":"native_own_portrait","portrait":8192}"#).is_err());
+        assert!(parse_event(br#"{"type":"native_own_portrait"}"#).is_err());
         assert_eq!(parse_event(br#"{"type":"native_sign_out_complete","code":0}"#).unwrap(), LoaderEvent::NativeSignOutComplete(0));
         assert_eq!(parse_event(br#"{"type":"native_sign_out_complete","code":-2046}"#).unwrap(), LoaderEvent::NativeSignOutComplete(-2046));
         assert!(parse_event(br#"{"type":"native_sign_out_complete"}"#).is_err());

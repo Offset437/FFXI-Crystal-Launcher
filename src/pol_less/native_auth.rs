@@ -184,12 +184,19 @@ impl SignedIn for NativeAuth {
         snapshot.own_mode = Some(mode);
         self.publish(snapshot).map(|_| ())
     }
+    fn native_own_portrait(&self, portrait: u16) -> Result<(), String> {
+        let mut snapshot = self.snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if snapshot.own_portrait == Some(portrait) { return Ok(()); }
+        snapshot.own_portrait = Some(portrait);
+        self.publish(snapshot).map(|_| ())
+    }
     fn native_control_result(&self, action: &str, code: i32) -> Result<(), String> {
         let category = match action {
             "visible" | "away" | "invisible" => "presence",
             "groups" => "groups",
             "start_game" => "start_game",
             "sign_out" => "sign_out",
+            "portrait" => "portrait",
             _ => return Err(t("Invalid native POL control action.").into()),
         };
         let mut snapshot = self.snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -197,9 +204,12 @@ impl SignedIn for NativeAuth {
         if code < 0 && code != -261 {
             let args: [(&str, &dyn std::fmt::Display); 1] = [("code", &code)];
             let message = match category {
+                // Put Handle List went through, but the record read back holds another portrait.
+                "portrait" if code == crate::wire::PORTRAIT_NOT_SAVED => t("Portrait not saved").to_owned(),
                 "start_game" => tf("PlayOnline could not start the game ({code}).", &args),
                 "sign_out" => tf("PlayOnline could not sign out ({code}).", &args),
                 "presence" => tf("PlayOnline could not change your online status ({code}).", &args),
+                "portrait" => tf("PlayOnline could not change your portrait ({code}).", &args),
                 _ => tf("PlayOnline could not change your group status ({code}).", &args),
             };
             errors.insert(category, message);
@@ -347,6 +357,7 @@ impl SignedIn for NativeAuth {
         snapshot.game_running = previous.game_running;
         snapshot.session_error.clone_from(&previous.session_error);
         snapshot.own_mode = previous.own_mode;
+        snapshot.own_portrait = previous.own_portrait;
         snapshot.social.clone_from(&previous.social);
         drop(previous);
         // The native observer and COM owner publish on different threads. A
@@ -561,6 +572,29 @@ mod tests {
         fixture.auth.native_control_result("groups", -263).unwrap();
         fixture.auth.native_session_state(true).unwrap();
         fixture.auth.native_control_result("visible", 1).unwrap();
+        assert!(fixture.cached().session_error.is_none());
+    }
+
+    /// A portrait change the record read back doesn't hold says so in a short note; the portrait
+    /// shown is the one the loader read back, and the rest of the session is untouched.
+    #[test]
+    fn a_portrait_the_read_back_does_not_confirm_is_not_saved() {
+        let fixture = Fixture::new();
+        fixture.auth.native_session_state(false).unwrap();
+        fixture.auth.native_own_mode(4).unwrap();
+        fixture.auth.native_own_portrait(42).unwrap();
+        let mut log = super::super::SessionLog::default();
+        for line in [&br#"{"type":"native_own_portrait","portrait":42}"#[..], br#"{"type":"native_control_result","action":"portrait","code":-5121}"#] {
+            let event = pipe::parse_event(line).unwrap();
+            assert!(matches!(super::super::handle_event(event, &fixture.auth, &mut log), super::super::Step::Continue));
+        }
+        let cached = fixture.cached();
+        assert_eq!(cached.session_error.as_deref(), Some("Portrait not saved"));
+        assert_eq!((cached.own_portrait, cached.own_mode, cached.game_running), (Some(42), Some(4), Some(false)));
+        // Another failure keeps its own wording; a later success clears the note.
+        fixture.auth.native_control_result("portrait", -7).unwrap();
+        assert_eq!(fixture.cached().session_error.as_deref(), Some("PlayOnline could not change your portrait (-7)."));
+        fixture.auth.native_control_result("portrait", 1).unwrap();
         assert!(fixture.cached().session_error.is_none());
     }
 

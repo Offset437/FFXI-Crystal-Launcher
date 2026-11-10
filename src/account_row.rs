@@ -103,11 +103,9 @@ pub(crate) fn row_view(app: &App, item: &crate::AccountRow) -> RowView {
                 .unwrap_or_default();
             view(t("In game").into(), since)
         }
-        RowState::Starting => {
-            let step = if item.status.is_empty() { t("Signing in").into() } else { item.status_text().into_owned() };
-            view(t("Starting").into(), step)
-        }
-        RowState::SigningIn => view(t("Signing in").into(), item.status_text().into_owned()),
+        // The state alone, with the rail's working bar: the worker's step words repeat it.
+        RowState::Starting => view(t("Starting").into(), String::new()),
+        RowState::SigningIn => view(t("Signing in").into(), String::new()),
         RowState::SignedIn => {
             let mut row = view(t("Signed in").into(), String::new());
             if item.can_play() && app.vault_ready && !app.launch_blocked() {
@@ -134,7 +132,10 @@ pub(crate) fn row_view(app: &App, item: &crate::AccountRow) -> RowView {
         }
         RowState::Problem => {
             let mut row = view(item.status_text().into_owned(), String::new());
-            row.otp = idle;
+            // Code boxes only where a code could be the answer: a refused member login, or a
+            // spent code. A loader that never connected, a crash or a version stop asked for none
+            // (live 2026-11-10: two timed-out rows looked like they wanted a code).
+            row.otp = idle && (crate::launch_log::sign_in_refused(&item.status) || item.otp_spent);
             if item.log.is_some() && idle {
                 row.action = Some((t("View log").into(), Message::OpenLog(item.key.clone()), false));
             }
@@ -177,5 +178,29 @@ mod tests {
         // In game is playing, not signed in.
         app.accounts[0].game_running = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)));
         assert!(app.accounts[0].is_playing() && !signed_in(&app.accounts[0]));
+    }
+
+    /// Live 2026-11-10: a loader that never connected left the row with code boxes, which read
+    /// as "this account needs a one-time code". A failed row offers a code only after a refused
+    /// member login or a spent code; any other failure shows its message and View log.
+    #[test]
+    fn only_a_refused_sign_in_or_a_spent_code_offers_code_boxes_on_a_failed_row() {
+        crate::i18n::set(crate::i18n::Lang::En);
+        let mut app = crate::tests::app();
+        let row = &mut app.accounts[2];
+        row.problem = true;
+        row.log = Some(std::path::PathBuf::from("a.crystal.log"));
+        row.status = "crystal-loader did not connect within 60 s. Check that Ashita-cli.exe in C:\\Ashita started.".into();
+        let timed_out = row_view(&app, &app.accounts[2]);
+        assert_eq!(row_state(&app, &app.accounts[2]), RowState::Problem);
+        assert!(!timed_out.otp, "a timeout asks for no code");
+        assert!(matches!(timed_out.action, Some((_, Message::OpenLog(_), false))));
+        assert!(!app.settings.account_otp.contains(&app.accounts[2].key), "nothing marks the account");
+        app.accounts[2].status = "Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -1036). (Ashita v4 via crystal-loader).".into();
+        assert!(row_view(&app, &app.accounts[2]).otp, "a refused member login may want a code");
+        app.accounts[2].status = "Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -19). (Ashita v4 via crystal-loader).".into();
+        assert!(!row_view(&app, &app.accounts[2]).otp, "a network failure is no verdict on the account");
+        app.accounts[2].otp_spent = true;
+        assert!(row_view(&app, &app.accounts[2]).otp, "a spent code asks for a new one");
     }
 }

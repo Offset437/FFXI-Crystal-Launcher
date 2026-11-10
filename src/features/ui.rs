@@ -90,6 +90,8 @@ pub(crate) enum Msg {
     OrderWindows(bool),
     /// Arrange every game window; `None` uses every monitor.
     Arrange(Preset, Option<String>),
+    /// Put the windows the last Arrange all moved back where they were.
+    RestoreWindows,
     /// Forget a remembered window (a `ClientKey` id).
     Forget(String),
     // Hotkeys: the typed chord ("" clears it).
@@ -268,7 +270,7 @@ impl App {
         for (id, (w, h)) in [(key(0), (1920, 1080)), (format!("{}#2", key(1)), (1280, 720))] {
             settings.layouts.saved.insert(id, layouts::Saved {
                 rect: game_window::Rect::new(0, 0, w + 16, h + 39), client: (w, h), shown: game_window::Shown::Normal,
-                mode: game_window::Mode::Windowed, monitor: monitor.clone(),
+                mode: game_window::Mode::Windowed, frame: None, monitor: monitor.clone(),
             });
         }
         let _ = store::save(&config, &settings);
@@ -374,6 +376,13 @@ impl App {
                 view.notice = Some(match runtime.arrange(preset, &devices) {
                     Ok(1) => (false, t("Arranged 1 window.").to_owned()),
                     Ok(count) => (false, tf("Arranged {count} windows.", &[("count", &count)])),
+                    Err(error) => (true, error),
+                });
+            }
+            Msg::RestoreWindows => {
+                view.notice = Some(match runtime.restore_windows() {
+                    Ok(1) => (false, t("Restored 1 window.").to_owned()),
+                    Ok(count) => (false, tf("Restored {count} windows.", &[("count", &count)])),
                     Err(error) => (true, error),
                 });
             }

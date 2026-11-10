@@ -1,132 +1,87 @@
-// The title bar's content between the window's left edge and its caption buttons: the brand, the page tabs, Privacy mode and the theme switch. Empty parts of it fall
-// through to ChromeBar's title area, which drags the window.
+// The top bar's content right of the account rail (Skyline `.top`): the page tabs, then Privacy
+// mode and the theme switch as quiet icon tools and a separator before the caption buttons.
+// Empty parts of it fall through to ChromeBar's title area, which drags the window.
 import { Theme } from "theme.slint";
 import { View } from "state.slint";
-import { Glyph, Icon, Pressable, TipBody } from "widgets.slint";
+import { Features } from "features.slint";
+import { Glyph, IconButton, Pressable, CountBadge } from "widgets.slint";
 
-/// A title-bar tab: 14 px label, 12 px side padding; the active one is ink and semibold over a
-/// 2 px underline in the Play colour, the rest muted.
+/// A page tab: 14 px in `sub`; the active one ink and semibold over a 2 px ice underline 6 px
+/// above the bar's foot, as wide as its words.
 component NavTab inherits Pressable {
     in property <string> text;
     in property <bool> active;
+    in property <string> badge;
     label: root.text;
+    accessible-role: tab;
     accessible-checked: root.active;
     height: Theme.bar-h;
-    min-width: caption.preferred-width + 24px;
+    min-width: row.preferred-width;
     preferred-width: self.min-width;
     horizontal-stretch: 0;
-    caption := Text {
-        text: root.text;
-        font-size: 14px;
-        font-weight: root.active ? 600 : 500;
-        color: root.active || root.hot ? Theme.ink : Theme.sub;
-        vertical-alignment: center;
-        horizontal-alignment: center;
-    }
-    if root.active: Rectangle {
-        x: 12px;
-        y: parent.height - 2px;
-        width: parent.width - 24px;
-        height: 2px;
-        background: Theme.play;
-    }
-}
-
-/// A labelled title-bar button (Privacy mode, the theme switch): glyph and 13 px label in the
-/// quiet tone, a soft fill on hover, the soft accent fill while `on`. `compact` keeps the glyph
-/// and moves the label into a hint.
-component BarButton inherits Pressable {
-    in property <Glyph> glyph;
-    in property <string> text;
-    in property <string> tip;
-    in property <bool> on;
-    in property <bool> compact;
-    label: root.text;
-    height: 30px;
-    min-width: row.preferred-width + 22px;
-    preferred-width: self.min-width;
-    horizontal-stretch: 0;
-    border-radius: Theme.radius-inner;
-    background: root.on ? Theme.select : root.hot ? Theme.tint : transparent;
-    private property <color> ink: root.on ? Theme.select-ink : root.hot ? Theme.ink : Theme.quiet;
     row := HorizontalLayout {
-        x: 11px;
-        width: self.preferred-width;
-        spacing: root.compact ? 0px : 7px;
-        Icon {
-            cross-axis-self-alignment: center;
-            glyph: root.glyph;
-            size: 15px;
-            tint: root.on ? Theme.select-ink : Theme.quiet;
-        }
-        if !root.compact: Text {
+        spacing: 7px;
+        caption := Text {
             text: root.text;
-            font-size: 13px;
-            color: root.ink;
+            font-size: Theme.type-body;
+            font-weight: root.active ? 600 : 400;
+            color: root.active || root.hot ? Theme.ink : Theme.sub;
             vertical-alignment: center;
         }
+        if root.badge != "": CountBadge { cross-axis-self-alignment: center; text: root.badge; }
     }
-    if root.tip != "": Tooltip {
-        TipBody { text: root.tip; }
+    if root.active: Rectangle {
+        x: 0;
+        y: parent.height - 8px;
+        width: caption.width;
+        height: 2px;
+        border-radius: 1px;
+        background: Theme.ice;
     }
 }
 
 export component TitleContent inherits HorizontalLayout {
     alignment: stretch;
-    padding-left: 20px;
+    padding-left: Theme.page-x;
     spacing: 0px;
-    // Brand: the pre-downscaled crystal mark at 7x20 and the name, in a 196 px column.
     HorizontalLayout {
-        width: 196px;
-        spacing: 10px;
-        alignment: start;
-        Image {
-            y: (parent.height - 20px) / 2;
-            width: 7px;
-            height: 20px;
-            source: @image-url("../assets/crystal-mark.png");
-            accessible-role: none;
-        }
-        Text {
-            text: "Crystal Launcher";
-            font-size: 15px;
-            font-weight: 600;
-            color: Theme.ink;
-            vertical-alignment: center;
-        }
-    }
-    Rectangle { width: 28px; }
-    HorizontalLayout {
-        spacing: 4px;
+        spacing: Theme.small ? 18px : 28px;
         horizontal-stretch: 0;
-        NavTab { text: View.strings.home; active: View.page == 0; clicked => { View.navigate(0); } }
-        NavTab { text: View.strings.friends; active: View.page == 1; clicked => { View.navigate(1); } }
-        NavTab { text: View.strings.downloads; active: View.page == 2; clicked => { View.navigate(2); } }
-        NavTab { text: View.strings.settings; active: View.page == 3; clicked => { View.navigate(3); } }
+        NavTab { text: View.strings.home; active: View.page == 0 && !Features.open; clicked => { View.navigate(0); } }
+        NavTab { text: View.strings.friends; badge: View.friends-badge; active: View.page == 1 && !Features.open; clicked => { View.navigate(1); } }
+        NavTab { text: View.strings.downloads; active: View.page == 2 && !Features.open; clicked => { View.navigate(2); } }
+        NavTab { text: View.strings.features; active: Features.open; clicked => { Features.open-sheet(true); } }
+        NavTab { text: View.strings.settings; active: View.page == 3 && !Features.open; clicked => { View.navigate(3); } }
     }
-    Rectangle { horizontal-stretch: 1; }
-    VerticalLayout {
-        alignment: center;
-        BarButton {
-            glyph: View.privacy ? Glyph.eye-off : Glyph.eye;
-            text: View.strings.privacy;
-            tip: View.privacy ? View.strings.privacy-on-tip : View.strings.privacy-off-tip;
-            on: View.privacy;
-            compact: View.compact;
-            clicked => { View.toggle-privacy(); }
-        }
+    // The tabs never run into the tools: at least a tab gap between them.
+    Rectangle { horizontal-stretch: 1; min-width: Theme.small ? 12px : 28px; }
+    IconButton {
+        cross-axis-self-alignment: center;
+        side: 30px;
+        wide: 34px;
+        glyph-size: 16px;
+        glyph: View.privacy ? Glyph.eye-off : Glyph.eye;
+        ink: View.privacy ? Theme.ice : Theme.sub;
+        hint: View.privacy ? View.strings.privacy-on-tip : View.strings.privacy-off-tip;
+        accessible-label: View.strings.privacy;
+        accessible-checkable: true;
+        accessible-checked: View.privacy;
+        clicked => { View.toggle-privacy(); }
+    }
+    // One switch that names the theme it turns on.
+    IconButton {
+        cross-axis-self-alignment: center;
+        side: 30px;
+        wide: 34px;
+        glyph-size: 16px;
+        glyph: Theme.light ? Glyph.moon : Glyph.sun;
+        hint: Theme.light ? View.strings.dark-theme : View.strings.light-theme;
+        clicked => { View.toggle-theme(); }
+    }
+    Rectangle { width: 8px; }
+    Rectangle {
+        width: 1px;
+        Rectangle { y: (parent.height - 16px) / 2; height: 16px; background: Theme.line; }
     }
     Rectangle { width: 6px; }
-    VerticalLayout {
-        alignment: center;
-        // One switch that names the theme it turns on.
-        BarButton {
-            glyph: Theme.light ? Glyph.moon : Glyph.sun;
-            text: Theme.light ? View.strings.dark-theme : View.strings.light-theme;
-            tip: View.compact ? self.text : "";
-            compact: View.compact;
-            clicked => { View.toggle-theme(); }
-        }
-    }
-    Rectangle { width: 10px; }
 }

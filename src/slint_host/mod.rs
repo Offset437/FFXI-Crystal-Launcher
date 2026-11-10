@@ -16,6 +16,7 @@ mod downloads;
 mod jobs;
 mod features;
 mod settings;
+mod sky;
 mod sync;
 mod view;
 mod friends;
@@ -41,6 +42,12 @@ const RENDERER: &str = if cfg!(feature = "skia") { "skia" } else if cfg!(feature
 /// room), shrinking with the window below it to a floor at the 900 px minimum window.
 pub(super) fn scale(app: &App) -> f32 {
     (app.viewport.width / 1440.0).clamp(0.8, 1.0)
+}
+
+/// The small window (Theme.small): narrower than 1180 px, the account rail narrows to 300 px and
+/// its rows tighten.
+pub(super) fn small(app: &App) -> bool {
+    app.viewport.width < 1180.0
 }
 
 /// Runs the window loop until the core exits.
@@ -185,6 +192,7 @@ impl Host {
             let theme = shown.ui.global::<Theme>();
             theme.set_light(app.settings.light_theme);
             theme.set_scale(scale(&app));
+            theme.set_small(small(&app));
             view::sync(&shown.ui, &app);
             friends::sync(&shown.ui, &app);
             downloads::sync(&shown.ui, &app);
@@ -330,6 +338,7 @@ impl Host {
         settings::wire(&ui);
         features::wire(&ui);
         dialogs::wire(&ui);
+        sky::update(&ui);
         // Escape no control took goes back.
         ui.on_escape(|| send(Message::ControllerBack));
         ui.set_window_icon(window_icon());
@@ -346,15 +355,22 @@ impl Host {
             if user_input(event) {
                 if let Some(message) = crate::user_activity() { post(message); }
             }
+            // The native window exists by its first event: its icons, once.
+            native_icons(native_handle(window), false);
             match event {
                 WindowEvent::Focused(focused) => {
                     let focused = *focused;
                     if let Some(host) = host() {
-                        if let Some(shown) = host.window.borrow().as_ref() { shown.ui.global::<Theme>().set_animate(focused); }
+                        if let Some(shown) = host.window.borrow().as_ref() {
+                            shown.ui.global::<Theme>().set_animate(focused);
+                            sky::focused(&shown.ui, focused);
+                        }
                         // account_order::input: losing the focus cancels a drag.
                         if !focused && host.account_drag.get() { post(Message::AccountDragCancel); }
                     }
                 }
+                // The icons at the new DPI's sizes.
+                WindowEvent::ScaleFactorChanged { .. } => native_icons(native_handle(window), true),
                 // account_order::input: a left release anywhere ends a drag.
                 WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                     if host().is_some_and(|host| host.account_drag.get()) { post(Message::AccountDragFinish); }
@@ -364,6 +380,27 @@ impl Host {
                     post(Message::ControllerBack);
                     return EventResult::PreventDefault;
                 }
+                // Ctrl, Alt or the Windows key held: a key is no shortcut (shortcut).
+                WindowEvent::ModifiersChanged(modifiers) => {
+                    let state = modifiers.state();
+                    CHORD.with(|held| held.set(state.control_key() || state.alt_key() || state.super_key()));
+                }
+                // So do Home's number keys and Return (Play's Enter cap): MainWindow's
+                // number-key / enter-key decide whether they apply now.
+                WindowEvent::KeyboardInput { event: key, .. } if !pad::has_focus(window) => {
+                    if let Some(shortcut) = shortcut(key).filter(|_| !CHORD.with(Cell::get)) {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            let Some(host) = host() else { return };
+                            let window = host.window.borrow();
+                            let Some(shown) = window.as_ref() else { return };
+                            let _ = match shortcut {
+                                Shortcut::Number(n) => shown.ui.invoke_number_key(n),
+                                Shortcut::Enter => shown.ui.invoke_enter_key(),
+                            };
+                        });
+                        return EventResult::PreventDefault;
+                    }
+                }
                 _ => {}
             }
             EventResult::Propagate
@@ -372,6 +409,8 @@ impl Host {
             let app = self.app.borrow();
             let theme = ui.global::<Theme>();
             theme.set_light(app.settings.light_theme);
+            theme.set_scale(scale(&app));
+            theme.set_small(small(&app));
             view::sync(&ui, &app);
             friends::sync(&ui, &app);
             downloads::sync(&ui, &app);
@@ -382,6 +421,7 @@ impl Host {
         if ui.show().is_err() { return; }
         if maximized { ui.window().set_maximized(true); }
         let hwnd = native_handle(ui.window());
+        native_icons(hwnd, false);
         *self.window.borrow_mut() = Some(Shown { id, ui, hwnd });
         if let Some(shown) = self.window.borrow().as_ref() {
             shown.ui.window().with_winit_window(|w| w.focus_window());
@@ -396,7 +436,9 @@ impl Host {
         let _ = shown.ui.hide();
         let id = shown.id;
         drop(shown);
+        drop_native_icons();
         view::forget();
+        sky::forget();
         friends::forget();
         downloads::forget();
         settings::forget();
@@ -467,13 +509,42 @@ fn user_input(event: &winit::event::WindowEvent) -> bool {
     }
 }
 
+/// A key the window takes when no control has the focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shortcut {
+    /// 1 to 9: toggle that account's Play pick on Home.
+    Number(i32),
+    /// Return: Play.
+    Enter,
+}
+
+thread_local! {
+    /// Ctrl, Alt or the Windows key is held (winit reports modifiers apart from keys).
+    static CHORD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The shortcut a first press (not a repeat) of key is; the caller leaves out chords (CHORD).
+fn shortcut(key: &winit::event::KeyEvent) -> Option<Shortcut> {
+    use winit::keyboard::{Key, NamedKey};
+    if key.state != winit::event::ElementState::Pressed || key.repeat { return None; }
+    match &key.logical_key {
+        Key::Named(NamedKey::Enter) => Some(Shortcut::Enter),
+        Key::Character(text) => match text.as_str().as_bytes() {
+            [digit @ b'1'..=b'9'] => Some(Shortcut::Number(i32::from(digit - b'0'))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// A first press of Escape (not a key repeat).
 fn escape(key: &winit::event::KeyEvent) -> bool {
     use winit::keyboard::{Key, NamedKey};
     key.state == winit::event::ElementState::Pressed && !key.repeat && key.logical_key == Key::Named(NamedKey::Escape)
 }
 
-/// The taskbar and Alt+Tab icon: assets/crystal-icon-64.rgba (64 x 64).
+/// The window's icon as Slint sets it (assets/crystal-icon-64.rgba, 64 x 64). winit makes it
+/// only the small icon; `native_icons` sets both from the exe's own icon once the window exists.
 fn window_icon() -> slint::Image {
     const SIDE: u32 = 64;
     let rgba = include_bytes!("../../assets/crystal-icon-64.rgba");
@@ -513,6 +584,49 @@ fn direction(edge: Edge) -> winit::window::ResizeDirection {
         Edge::SouthEast => ResizeDirection::SouthEast,
         Edge::SouthWest => ResizeDirection::SouthWest,
     }
+}
+
+thread_local! {
+    /// The window `native_icons` last set, and the big and small icons it gave it (ours to
+    /// destroy).
+    static ICONS: Cell<(isize, [isize; 2])> = const { Cell::new((0, [0; 2])) };
+}
+
+/// Alt+Tab, the taskbar and the title bar show the window's big and small icons. winit sets only
+/// the small one, so Alt+Tab fell back to the window class's, which is none: the stock program
+/// icon. Both come from the exe's own icon (crystal.rc, resource 1) at the sizes for the window's
+/// DPI. The native window can come after `show()` returns, so this runs on its events too and
+/// sets them once per window (`again` sets them anew: the DPI changed). Without the resource
+/// (nothing loads) the window keeps what it has.
+fn native_icons(hwnd: isize, again: bool) {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, WM_SETICON,
+    };
+    let (done, mut held) = ICONS.get();
+    if hwnd == 0 || (done == hwnd && !again) { return; }
+    for (slot, (which, cx, cy)) in [(ICON_BIG, SM_CXICON, SM_CYICON), (ICON_SMALL, SM_CXSMICON, SM_CYSMICON)].into_iter().enumerate() {
+        // SAFETY: plain Win32 calls on this process's module and a window this thread owns.
+        let icon = unsafe {
+            let dpi = GetDpiForWindow(hwnd as _).max(96);
+            LoadImageW(GetModuleHandleW(std::ptr::null()), 1 as _, IMAGE_ICON, GetSystemMetricsForDpi(cx, dpi), GetSystemMetricsForDpi(cy, dpi), LR_DEFAULTCOLOR)
+        };
+        if icon.is_null() { continue; }
+        unsafe { SendMessageW(hwnd as _, WM_SETICON, which as usize, icon as isize) };
+        // The one it replaced, if it was ours (winit owns its own small icon).
+        destroy_icon(std::mem::replace(&mut held[slot], icon as isize));
+    }
+    ICONS.set((hwnd, held));
+}
+
+/// The window is gone: the icons it held go too.
+fn drop_native_icons() {
+    ICONS.replace((0, [0; 2])).1.into_iter().for_each(destroy_icon);
+}
+
+fn destroy_icon(icon: isize) {
+    if icon != 0 { unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyIcon(icon as _) }; }
 }
 
 fn native_handle(window: &slint::Window) -> isize {

@@ -54,6 +54,7 @@ const SCENES: &[(&str, &str, bool)] = &[
     // With --preview-modal: the account sheet scrolled to its Launch settings.
     ("--preview-modal-launch", "account-launch", true),
     ("--preview-modal", "account", true),
+    ("--preview-portraits", "portraits", true),
     ("--preview-add", "add", true),
     ("--preview-states", "states", true),
     ("--preview-empty", "accounts-empty", true),
@@ -135,7 +136,7 @@ pub(super) fn boot(mut app: App) -> (App, Effect<Message>) {
         app.friends.connected = false;
         if let Some(snapshot) = &mut app.friends.snapshot {
             snapshot.fetched_at = 0;
-            snapshot.error = Some("PlayOnline closed the connection.".into());
+            snapshot.error = Some(t("The native PlayOnline connection ended.").into());
         }
     }
     // --preview-settings-<tab> opens a Settings tab (graphics, sound, controller, system).
@@ -343,7 +344,7 @@ pub(super) fn boot(mut app: App) -> (App, Effect<Message>) {
                 if complete {
                     draft.pol_id = "ABC12345".into();
                     draft.pol_password = "synthetic".into();
-                    draft.se_id = "preview".into();
+                    draft.se_id = "sample01".into();
                     draft.se_password = "synthetic".into();
                 }
                 draft.notes = notes.iter().map(|n| n.to_string()).collect();
@@ -352,19 +353,34 @@ pub(super) fn boot(mut app: App) -> (App, Effect<Message>) {
             import.batch = Some(ImportBatch {
                 drafts: vec![
                     draft("Main account", &[], true),
-                    draft("Crafting account", &["Launch profile found: Windower."], true),
-                    draft("Old alt", &["No password stored."], false),
+                    draft("Crafting account", &[t("The saved PlayOnline password was imported. Square Enix passwords are not stored in this file.")], true),
+                    draft("Old alt", &[t("This PlayOnline member has no saved PlayOnline password. Square Enix passwords are not stored in this file.")], false),
                 ],
-                warnings: vec!["2 entries use an unsupported format and were skipped.".into()],
+                warnings: Vec::new(),
             });
         }
         if has("--preview-import-error") {
-            import.error = "The file couldn't be read. Check the path and the region.".into();
+            import.error = t("The import file could not be read.").into();
         }
     }
     // The Add account sheet.
     if has("--preview-add") {
         app.editor = Some(Editor::blank());
+    }
+    // --preview-portraits: the portrait picker for the first account, its own portrait marked.
+    if has("--preview-portraits") {
+        if let Some(key) = app.accounts.first().map(|row| row.key.clone()) {
+            // A portrait the Viewer has (the twelfth listed, on the first page).
+            let ids = portraits::available();
+            if let Some(id) = ids.get(11).copied() {
+                app.own_portraits.insert(key.clone(), id);
+            }
+            // Listed at once (the picker's own read runs off the UI thread), so the capture
+            // shows the grid rather than the reading state.
+            let _ = app.update(Message::PortraitPicker(Some(key)));
+            let effect = app.update(Message::PortraitsListed(ids));
+            return (app, effect);
+        }
     }
     if has("--preview-live-news") {
         app.news_loading = true;
@@ -439,9 +455,9 @@ impl App {
         self.friends.connected = true;
         let friend = |slot: u16, name: &str, online: Option<bool>, location: Option<&str>, character: Option<&str>, alternate: bool| friends::Friend {
             name: name.into(), alternate, slot, uid: Some(slot as u64 + 1 + if alternate { 500 } else { 0 }), online,
-            location: location.map(Into::into), character: character.map(Into::into),
+            location: location.map(Into::into), character: character.map(Into::into), portrait: None,
         };
-        let entries = vec![
+        let mut entries = vec![
             friend(0, "Alyria", Some(true), Some("Lyrielle · Port Jeuno"), Some("Lyrielle"), false),
             friend(1, "Balthier", Some(true), Some("PlayOnline"), None, false),
             friend(2, "Celestine", Some(true), Some("FINAL FANTASY XI"), None, false),
@@ -449,6 +465,12 @@ impl App {
             friend(4, "Nocturne", None, None, None, false),
             friend(0, "Mallory", None, None, None, true),
         ];
+        // Stock portraits (drawn where the Viewer install has them); Nocturne keeps the initial.
+        for (entry, portrait) in entries.iter_mut().zip([Some(249), Some(258), Some(251), Some(262), None, Some(253)]) {
+            entry.portrait = portrait;
+        }
+        const OWN_PORTRAIT: u16 = 256;
+        if let Some(key) = self.friends.account.clone() { self.own_portraits.insert(key, OWN_PORTRAIT); }
         // A day ago and today, at fixed clock times, so the capture reads naturally.
         let at = |days_ago: i64, hour: u32, minute: u32| -> u32 {
             let day = chrono::Local::now().date_naive() - chrono::Duration::days(days_ago);
@@ -490,7 +512,7 @@ impl App {
         sent.sort_by_key(|h| std::cmp::Reverse(h.stamp()));
         let mut snapshot = friends::Snapshot {
             entries, fetched_at: friends::now(), game_running: Some(in_game),
-            own_mode: Some(0), social: social::State { ready: true, ..Default::default() }, ..friends::Snapshot::default()
+            own_mode: Some(0), own_portrait: Some(OWN_PORTRAIT), social: social::State { ready: true, ..Default::default() }, ..friends::Snapshot::default()
         };
         snapshot.social.inbox_unread = Some(if mailbox { 2 } else { 1 });
         if mailbox {
@@ -537,7 +559,7 @@ impl App {
                 a.label = label.into();
                 a.pol_id = format!("ABC1234{i}");
                 a.pol_password = "synthetic".into();
-                a.se_id = "preview".into();
+                a.se_id = format!("sample0{i}");
                 a.se_password = "synthetic".into();
                 a
             })

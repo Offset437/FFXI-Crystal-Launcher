@@ -17,11 +17,11 @@ component CaptionButton inherits Rectangle {
     private property <bool> close: root.kind == CaptionKind.close;
     background: !hit.has-hover ? transparent
         : root.close ? (hit.pressed ? Theme.close-pressed : Theme.close-hot)
-        : Theme.select;
+        : hit.pressed ? Theme.fill2 : Theme.fill;
     accessible-role: button;
     accessible-label: root.label;
     accessible-action-default => { root.clicked(); }
-    private property <color> ink: hit.has-hover ? (root.close ? #FFFFFF : Theme.ink) : Theme.sub;
+    private property <color> ink: hit.has-hover ? (root.close ? #FFFFFF : Theme.ink) : Theme.ink2;
     Path {
         x: (parent.width - 16px) / 2;
         y: (parent.height - 16px) / 2;
@@ -41,9 +41,11 @@ component CaptionButton inherits Rectangle {
 }
 
 /// The title bar's chrome strip: whatever reaches it is the title bar itself (its children
-/// take their own presses). `content` goes between the brand and the caption buttons.
+/// take their own presses). Its children go before the caption buttons. `flat` is the inner
+/// pages' bar: the window colour over a hairline; Home's bar is clear over the sky.
 export component ChromeBar inherits Rectangle {
     in property <bool> maximized;
+    in property <bool> flat: true;
     in property <string> minimize-label;
     in property <string> maximize-label;
     in property <string> restore-label;
@@ -54,8 +56,8 @@ export component ChromeBar inherits Rectangle {
     callback title-pressed();
     callback title-moved();
     callback title-released();
-    height: Theme.bar-h + 1px;
-    background: Theme.chrome;
+    height: Theme.bar-h;
+    background: root.flat ? Theme.bg : transparent;
     // The title area: behind everything else in the bar.
     TouchArea {
         pointer-event(event) => {
@@ -78,7 +80,7 @@ export component ChromeBar inherits Rectangle {
         }
         CaptionButton { kind: CaptionKind.close; label: root.close-label; clicked => { root.close-clicked(); } }
     }
-    Rectangle { y: Theme.bar-h; height: 1px; background: Theme.chrome-line; }
+    if root.flat: Rectangle { y: Theme.bar-h - 1px; height: 1px; background: Theme.hairline; }
 }
 
 component Zone inherits TouchArea {

@@ -60,6 +60,30 @@ export component AccountSheet inherits SideSheet {
         scroll-to: Features.sheet-scroll;
         Fieldset {
             legend: View.sheet-strings.account;
+            if View.sheet.portrait-shown: Labelled {
+                caption: View.sheet-strings.portrait;
+                HorizontalLayout {
+                    spacing: Theme.sp-m;
+                    alignment: start;
+                    // The whole 64×96 portrait at five eighths, square-cornered (crisp in the
+                    // software renderer) under a hairline.
+                    Rectangle {
+                        cross-axis-self-alignment: center;
+                        width: 40px;
+                        height: 60px;
+                        background: Theme.fill;
+                        if View.sheet.has-picture: Image { width: parent.width; height: parent.height; source: View.sheet.picture; image-fit: fill; accessible-role: none; }
+                        if !View.sheet.has-picture: Icon { glyph: Glyph.user; size: 20px; tint: Theme.faint; }
+                        Rectangle { border-width: 1px; border-color: Theme.line; }
+                    }
+                    Control {
+                        cross-axis-self-alignment: center;
+                        modal: true;
+                        text: View.sheet-strings.change;
+                        clicked => { View.choose-portrait(); }
+                    }
+                }
+            }
             LabelledField {
                 caption: View.sheet-strings.display-name;
                 placeholder: View.sheet-strings.display-placeholder;
@@ -103,9 +127,13 @@ export component AccountSheet inherits SideSheet {
                 edited(value) => { View.sheet-edited(3, value); }
                 pressed => { View.sheet-flag(View.sheet.password-enabled ? 3 : 4, true); }
             }
+            // Two equal halves, whatever the captions' widths.
             if View.sheet.retail: HorizontalLayout {
                 spacing: Theme.sp-m;
                 LabelledField {
+                    horizontal-stretch: 1;
+                    min-width: 0px;
+                    preferred-width: 0px;
                     caption: View.sheet-strings.se-id;
                     placeholder: View.sheet-strings.se-id-placeholder;
                     text <=> View.sheet-se-id;
@@ -113,6 +141,9 @@ export component AccountSheet inherits SideSheet {
                     edited(value) => { View.sheet-edited(4, value); }
                 }
                 LabelledField {
+                    horizontal-stretch: 1;
+                    min-width: 0px;
+                    preferred-width: 0px;
                     caption: View.sheet-strings.se-password;
                     placeholder: View.sheet-strings.password-placeholder;
                     text <=> View.sheet-se-password;

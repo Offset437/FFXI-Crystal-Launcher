@@ -1,12 +1,14 @@
-// The launcher features' screens (src/features/ui.rs; src/slint_host/features.rs fills them):
-// a side sheet with one section per feature (window layouts, hotkeys, crash recovery, backups,
-// per-client performance and launch profiles, notifications, Discord and play time), the
-// relaunch banner over the play bar, and the background-gamepad line of the account sheet.
+// The launcher features' page (src/features/ui.rs; src/slint_host/features.rs fills it): a
+// two-pane page (a-skyline\features-dark.png) with one section per feature (windows with the
+// monitor map, hotkeys, crash recovery, backups, per-client performance and launch profiles,
+// notifications, Discord and play time), the relaunch banner over the page's foot, and the
+// background-gamepad line of the account sheet.
 // Every string comes from Rust; every control sends a `Message::Feature` (or an existing core
 // message for an account's own settings).
 import { Theme } from "theme.slint";
-import { Glyph, Icon, Dot, SmallButton, Control, Tone, Check, Select, Segmented, Rule, Spinner } from "widgets.slint";
-import { Note, ErrorNote, Fieldset, Labelled, CheckNote, Card, CardRow, SavedField, SideSheet, SheetBody, SheetFooter } from "form.slint";
+import { Glyph, Icon, Dot, SmallButton, Control, Tone, Check, Select, Segmented, Rule, Spinner, Panel } from "widgets.slint";
+import { Note, ErrorNote, SavedField } from "form.slint";
+import { SectionTile, PageTitle, DetailTitle, GroupLabel, ToggleRow, PaneScroll } from "panes.slint";
 
 /// The words that change only with the language.
 export struct FeatureStrings {
@@ -24,10 +26,16 @@ export struct FeatureStrings {
     order-windows: string,
     order-windows-note: string,
     arrange: string,
+    restore-windows: string,
     monitor: string,
+    layout: string,
     grid: string,
     main-large: string,
+    /// The list separator: ", " ("、" in Japanese).
+    list-sep: string,
     arrange-note: string,
+    in-game: string,
+    no-windows: string,
     remembered: string,
     no-layouts: string,
     forget: string,
@@ -76,10 +84,25 @@ export struct FeatureStrings {
     dismiss: string,
 }
 
-/// A remembered window.
+/// A remembered window: its account, its size and its display (`detail` is both, as one line).
 export struct LayoutLine {
     name: string,
     detail: string,
+    size: string,
+    display: string,
+}
+
+/// A game window on the monitor map: its place as fractions of the arranged area.
+export struct MapTile {
+    index: string,
+    name: string,
+    size: string,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    /// The account is in game.
+    live: bool,
 }
 
 /// A hotkey field: what it does, the chord, and why it doesn't work (empty when it does).
@@ -131,7 +154,10 @@ export struct RelaunchLine {
 export global Features {
     in property <FeatureStrings> strings;
     in property <bool> open;
+    /// The section titles, and under each its state in a few words (the first, Windows, is
+    /// worded here from the layout and monitor chosen).
     in property <[string]> sections;
+    in property <[string]> section-notes;
     in property <int> section;
     in property <string> notice;
     in property <bool> notice-error;
@@ -141,8 +167,17 @@ export global Features {
     in property <bool> launch-saved;
     in property <bool> order-windows;
     in property <[string]> monitors;
+    /// The monitors by their short names ("Display 1"), for the section's state line.
+    in property <[string]> monitor-names;
     in-out property <int> monitor;
+    /// The layout the map shows and Arrange all applies: 0 grid, 1 main large.
+    in-out property <int> preset: 1;
+    /// The last Arrange all can be undone: one of the windows it moved is still open.
+    in property <bool> can-restore;
     in property <[LayoutLine]> layouts;
+    in property <[MapTile]> map-tiles;
+    /// Width over height of the area the map draws.
+    in property <float> map-aspect: 1.78;
     // ---- hotkeys: next and previous, then one per account ----
     in property <[HotkeyLine]> cycle-hotkeys;
     in property <[HotkeyLine]> account-hotkeys;
@@ -181,6 +216,8 @@ export global Features {
     in property <string> sheet-gamepad;
     /// Where the account sheet's body scrolls to (previews).
     in property <length> sheet-scroll;
+    /// Where the open section scrolls to (previews).
+    in property <length> page-scroll;
 
     callback open-sheet(bool);
     callback section-picked(int);
@@ -192,6 +229,10 @@ export global Features {
     callback hotkey-entered(int, string);
     /// 0 grid, 1 main large, on `monitor`.
     callback arrange(int);
+    /// Put the windows the last Arrange all moved back where they were.
+    callback restore-windows();
+    /// The layout or the monitor changed: the map is drawn again.
+    callback map-changed();
     callback forget(int);
     callback relaunch-cancel(int);
     callback relaunch-now(int);
@@ -220,121 +261,287 @@ component TwoLines inherits VerticalLayout {
         text: root.name;
         font-family: root.mono-name ? Theme.mono : Theme.sans;
         font-size: root.mono-name ? Theme.type-small : Theme.type-body;
-        font-weight: root.mono-name ? 400 : 600;
+        font-weight: root.mono-name ? 400 : 500;
         color: Theme.ink;
         overflow: elide;
     }
     Text {
         text: root.detail;
         font-family: root.mono-detail ? Theme.mono : Theme.sans;
-        font-size: Theme.type-caption;
+        font-size: Theme.type-note;
         color: Theme.sub;
         overflow: elide;
     }
 }
 
+/// A list row: a hairline above, the content inset 9 px.
+component ListRow inherits Rectangle {
+    in property <bool> closing;
+    min-height: 48px;
+    Rule { y: 0px; width: parent.width; }
+    VerticalLayout {
+        padding-top: Theme.card-row-y;
+        padding-bottom: Theme.card-row-y;
+        @children
+    }
+    if root.closing: Rule { y: parent.height - 1px; width: parent.width; }
+}
+
 /// A hotkey row: what it does, the chord field (applied on Return) with why it doesn't work
 /// under it, and its state.
-component HotkeyRow inherits HorizontalLayout {
+component HotkeyRow inherits Rectangle {
     in property <HotkeyLine> line;
     in property <string> placeholder;
+    in property <bool> closing;
     callback entered(string);
-    spacing: Theme.sp-m;
+    min-height: 48px;
+    Rule { y: 0px; width: parent.width; }
     VerticalLayout {
-        width: 40%;
-        alignment: start;
-        Text {
-            height: Theme.control-h;
-            text: root.line.name;
-            font-size: Theme.type-small;
-            color: Theme.ink2;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        spacing: Theme.sp-xs;
+        HorizontalLayout {
+            spacing: 16px;
+            // The field is narrower in the small window, so the name keeps its words; the fields
+            // stay one column.
+            Text {
+                horizontal-stretch: 1;
+                text: root.line.name;
+                font-size: Theme.type-body;
+                font-weight: 500;
+                color: Theme.ink;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            SavedField {
+                horizontal-stretch: 0;
+                width: Theme.small ? 150px : 200px;
+                font-family: Theme.mono;
+                font-size: 12px;
+                label: root.line.name;
+                placeholder: root.placeholder;
+                saved: root.line.text;
+                commit(text) => { root.entered(text); }
+            }
+            Rectangle {
+                width: 16px;
+                horizontal-stretch: 0;
+                if root.line.text != "": Icon {
+                    x: 0px;
+                    y: (parent.height - self.height) / 2;
+                    glyph: root.line.problem == "" ? Glyph.check-circle : Glyph.alert-circle;
+                    size: 16px;
+                    tint: root.line.problem != "" ? Theme.danger : root.line.active ? Theme.ok : Theme.faint;
+                }
+            }
+        }
+        if root.line.problem != "": ErrorNote { text: root.line.problem; }
+    }
+    if root.closing: Rule { y: parent.height - 1px; width: parent.width; }
+}
+
+/// The monitor map (`.mon`): the arranged area drawn to its aspect, one tile per game window
+/// (the one in game raised and ringed in ice), over a stand bar.
+component MonitorMap inherits Rectangle {
+    in property <[MapTile]> tiles;
+    in property <float> aspect: 1.78;
+    height: 252px;
+    border-radius: Theme.radius;
+    background: Theme.field;
+    border-width: 1px;
+    border-color: Theme.line;
+    private property <length> area-w: root.width - 16px;
+    private property <length> area-h: root.height - 26px;
+    private property <length> fit-w: min(root.area-w, root.area-h * root.aspect);
+    private property <length> fit-h: root.fit-w / root.aspect;
+    private property <length> ox: 8px + (root.area-w - root.fit-w) / 2;
+    private property <length> oy: 8px + (root.area-h - root.fit-h) / 2;
+    Rectangle {
+        x: 8px;
+        y: root.height - 16px;
+        width: root.width - 16px;
+        height: 8px;
+        border-radius: 2px;
+        background: Theme.fill;
+    }
+    if root.tiles.length == 0: Text {
+        x: 8px;
+        y: 8px;
+        width: root.area-w;
+        height: root.area-h;
+        text: Features.strings.no-windows;
+        font-size: Theme.type-note;
+        color: Theme.faint;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    for tile in root.tiles: Rectangle {
+        x: root.ox + tile.x * root.fit-w + 2px;
+        y: root.oy + tile.y * root.fit-h + 2px;
+        width: max(10px, tile.w * root.fit-w - 4px);
+        height: max(10px, tile.h * root.fit-h - 4px);
+        border-radius: 4px;
+        border-width: 1px;
+        border-color: tile.live ? Theme.ice : Theme.line;
+        background: tile.live ? Theme.fill2 : Theme.fill;
+        clip: true;
+        VerticalLayout {
+            padding-left: 9px;
+            padding-right: 9px;
+            padding-top: 7px;
+            spacing: 2px;
+            alignment: start;
+            HorizontalLayout {
+                spacing: 7px;
+                Text {
+                    horizontal-stretch: 0;
+                    height: 16px;
+                    text: tile.index;
+                    font-family: Theme.mono;
+                    font-size: Theme.type-micro;
+                    font-weight: 500;
+                    color: tile.live ? Theme.ice : Theme.faint;
+                    vertical-alignment: center;
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    height: 16px;
+                    text: tile.name;
+                    font-size: Theme.type-note;
+                    font-weight: 600;
+                    color: tile.live ? Theme.ink : Theme.ink2;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+            if tile.h * root.fit-h - 4px > 46px: Text {
+                height: 14px;
+                text: tile.size;
+                font-family: Theme.mono;
+                font-size: 10.5px;
+                font-weight: 500;
+                color: Theme.faint;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+        if tile.live && tile.h * root.fit-h - 4px > 70px: Text {
+            x: 9px;
+            y: parent.height - 24px;
+            width: parent.width - 18px;
+            height: 16px;
+            text: Features.strings.in-game;
+            font-size: Theme.type-caption;
+            font-weight: 600;
+            color: Theme.ice-hi;
             vertical-alignment: center;
             overflow: elide;
         }
     }
+}
+
+/// A label over a control (`.fl`).
+component FieldLabel inherits Text {
+    height: 18px;
+    font-size: Theme.type-note;
+    color: Theme.sub;
+    vertical-alignment: center;
+}
+
+/// The layout, the monitor and Arrange all, beside the map or under it.
+component MapControls inherits VerticalLayout {
     VerticalLayout {
-        horizontal-stretch: 1;
-        alignment: start;
-        spacing: Theme.sp-xs;
-        SavedField {
-            label: root.line.name;
-            placeholder: root.placeholder;
-            saved: root.line.text;
-            commit(text) => { root.entered(text); }
+        spacing: 6px;
+        FieldLabel { text: Features.strings.layout; }
+        Segmented {
+            items: [Features.strings.grid, Features.strings.main-large];
+            current: Features.preset;
+            picked(index) => { Features.preset = index; Features.map-changed(); }
         }
-        if root.line.problem != "": ErrorNote { text: root.line.problem; }
     }
+    Rectangle { height: Theme.sp-l; }
     VerticalLayout {
-        width: 16px;
-        alignment: start;
-        Rectangle {
-            height: Theme.control-h;
-            if root.line.text != "": Icon {
-                y: (parent.height - self.height) / 2;
-                glyph: root.line.problem == "" ? Glyph.check-circle : Glyph.alert-circle;
-                size: 16px;
-                tint: root.line.problem != "" ? Theme.danger : root.line.active ? Theme.ok : Theme.faint;
-            }
+        spacing: 6px;
+        FieldLabel { text: Features.strings.monitor; }
+        Select {
+            label: Features.strings.monitor;
+            items: Features.monitors;
+            current: Features.monitor;
+            picked(index) => { Features.monitor = index; Features.map-changed(); }
         }
+    }
+    Rectangle { vertical-stretch: 1; min-height: Theme.sp-l; }
+    Control {
+        tone: Tone.primary;
+        glyph: Glyph.grid;
+        text: Features.strings.arrange;
+        clicked => { Features.arrange(Features.preset); }
+    }
+    if Features.can-restore: VerticalLayout {
+        padding-top: 8px;
+        Control {
+            tone: Tone.secondary;
+            glyph: Glyph.window;
+            text: Features.strings.restore-windows;
+            clicked => { Features.restore-windows(); }
+        }
+    }
+    Rectangle { height: 10px; }
+    Text {
+        text: Features.strings.arrange-note;
+        font-size: Theme.type-note;
+        color: Theme.faint;
+        wrap: word-wrap;
     }
 }
 
 component WindowsSection inherits VerticalLayout {
-    spacing: Theme.sp-2xl;
-    Fieldset {
-        legend: Features.strings.layouts;
-        CheckNote {
-            text: Features.strings.remember;
-            note: Features.strings.remember-note;
-            checked: Features.remember;
-            toggled(on) => { Features.toggle(0, on); }
-        }
-        CheckNote {
-            text: Features.strings.restore;
-            note: Features.strings.restore-note;
-            checked: Features.restore;
-            toggled(on) => { Features.toggle(1, on); }
-        }
-        CheckNote {
-            text: Features.strings.launch-saved;
-            note: Features.strings.launch-saved-note;
-            checked: Features.launch-saved;
-            toggled(on) => { Features.toggle(2, on); }
-        }
-        CheckNote {
-            text: Features.strings.order-windows;
-            note: Features.strings.order-windows-note;
-            checked: Features.order-windows;
-            toggled(on) => { Features.toggle(13, on); }
-        }
-    }
-    Fieldset {
-        legend: Features.strings.arrange;
-        Labelled {
-            caption: Features.strings.monitor;
-            Select {
-                label: Features.strings.monitor;
-                items: Features.monitors;
-                current: Features.monitor;
-                picked(index) => { Features.monitor = index; }
+    spacing: Theme.sp-3;
+    VerticalLayout {
+        spacing: Theme.sp-l;
+        DetailTitle { text: Features.sections[0]; }
+        // Side by side when the pane has the room, the controls under the map when it has not.
+        if root.width >= 520px: HorizontalLayout {
+            spacing: Theme.sp-2xl;
+            MonitorMap {
+                horizontal-stretch: 3;
+                min-width: 280px;
+                preferred-width: 448px;
+                max-width: 448px;
+                tiles: Features.map-tiles;
+                aspect: Features.map-aspect;
+            }
+            MapControls {
+                horizontal-stretch: 1;
+                min-width: 190px;
             }
         }
-        HorizontalLayout {
-            spacing: Theme.sp-s;
-            alignment: start;
-            Control { text: Features.strings.grid; clicked => { Features.arrange(0); } }
-            Control { text: Features.strings.main-large; clicked => { Features.arrange(1); } }
+        if root.width < 520px: VerticalLayout {
+            spacing: Theme.sp-l;
+            MonitorMap {
+                tiles: Features.map-tiles;
+                aspect: Features.map-aspect;
+            }
+            MapControls { }
         }
-        Note { text: Features.strings.arrange-note; }
+    }    VerticalLayout {
+        ToggleRow { name: Features.strings.remember; on: Features.remember; toggled(on) => { Features.toggle(0, on); } }
+        ToggleRow { name: Features.strings.restore; note: Features.strings.restore-note; on: Features.restore; toggled(on) => { Features.toggle(1, on); } }
+        ToggleRow { name: Features.strings.launch-saved; on: Features.launch-saved; toggled(on) => { Features.toggle(2, on); } }
+        ToggleRow { name: Features.strings.order-windows; note: Features.strings.order-windows-note; on: Features.order-windows; closing: true; toggled(on) => { Features.toggle(13, on); } }
     }
-    Fieldset {
-        legend: Features.strings.remembered;
+    VerticalLayout {
+        spacing: Theme.sp-s;
+        GroupLabel { text: Features.strings.remembered; }
         if Features.layouts.length == 0: Note { text: Features.strings.no-layouts; }
-        if Features.layouts.length > 0: Card {
-            for line[index] in Features.layouts: VerticalLayout {
-                if index > 0: Rule { }
-                CardRow {
-                    TwoLines { name: line.name; detail: line.detail; mono-detail: true; }
+        VerticalLayout {
+            for line[index] in Features.layouts: ListRow {
+                closing: index == Features.layouts.length - 1;
+                HorizontalLayout {
+                    spacing: Theme.sp-s;
+                    Text { width: 176px; text: line.name; font-size: Theme.type-body; font-weight: 500; color: Theme.ink; vertical-alignment: center; overflow: elide; }
+                    Text { width: 104px; text: line.size; font-family: Theme.mono; font-size: Theme.type-caption; font-weight: 500; color: Theme.sub; vertical-alignment: center; }
+                    Text { horizontal-stretch: 1; text: line.display; font-family: Theme.mono; font-size: Theme.type-caption; font-weight: 500; color: Theme.faint; vertical-alignment: center; overflow: elide; }
                     SmallButton {
                         cross-axis-self-alignment: center;
                         scale: 1;
@@ -348,29 +555,41 @@ component WindowsSection inherits VerticalLayout {
 }
 
 component HotkeysSection inherits VerticalLayout {
-    spacing: Theme.sp-2xl;
-    Fieldset {
-        legend: Features.strings.switch-windows;
-        for line[index] in Features.cycle-hotkeys: HotkeyRow {
-            line: line;
-            placeholder: Features.strings.hotkey-placeholder;
-            entered(text) => { Features.hotkey-entered(index, text); }
+    spacing: Theme.sp-3;
+    VerticalLayout {
+        spacing: Theme.sp-l;
+        DetailTitle { text: Features.sections[1]; }
+        VerticalLayout {
+            spacing: Theme.sp-s;
+            GroupLabel { text: Features.strings.switch-windows; }
+            VerticalLayout {
+                for line[index] in Features.cycle-hotkeys: HotkeyRow {
+                    line: line;
+                    placeholder: Features.strings.hotkey-placeholder;
+                    closing: index == Features.cycle-hotkeys.length - 1;
+                    entered(text) => { Features.hotkey-entered(index, text); }
+                }
+            }
+            Note { text: Features.strings.hotkey-note; }
         }
-        Note { text: Features.strings.hotkey-note; }
     }
-    Fieldset {
-        legend: Features.strings.per-account;
+    VerticalLayout {
+        spacing: Theme.sp-s;
+        GroupLabel { text: Features.strings.per-account; }
         if Features.account-hotkeys.length == 0: Note { text: Features.strings.no-accounts; }
-        for line[index] in Features.account-hotkeys: HotkeyRow {
-            line: line;
-            placeholder: Features.strings.hotkey-placeholder;
-            entered(text) => { Features.hotkey-entered(index + 2, text); }
+        VerticalLayout {
+            for line[index] in Features.account-hotkeys: HotkeyRow {
+                line: line;
+                placeholder: Features.strings.hotkey-placeholder;
+                closing: index == Features.account-hotkeys.length - 1;
+                entered(text) => { Features.hotkey-entered(index + 2, text); }
+            }
         }
     }
 }
 
 /// The relaunches waiting: one row each, with its buttons. `scale` is Home's layout scale in
-/// the banner, 1 in the sheet.
+/// the banner, 1 on the page.
 component RelaunchList inherits VerticalLayout {
     in property <float> scale: 1;
     spacing: Theme.sp-s * root.scale;
@@ -392,33 +611,28 @@ component RelaunchList inherits VerticalLayout {
 }
 
 component RecoverySection inherits VerticalLayout {
-    spacing: Theme.sp-2xl;
-    Fieldset {
-        legend: Features.strings.recovery;
-        CheckNote {
-            text: Features.strings.offer;
-            note: Features.strings.offer-note;
-            checked: Features.offer;
-            toggled(on) => { Features.toggle(3, on); }
-        }
-        CheckNote {
-            text: Features.strings.auto-relaunch;
-            note: Features.auto-note;
-            checked: Features.auto-relaunch;
-            toggled(on) => { Features.toggle(4, on); }
+    spacing: Theme.sp-3;
+    VerticalLayout {
+        spacing: Theme.sp-l;
+        DetailTitle { text: Features.sections[2]; }
+        VerticalLayout {
+            ToggleRow { name: Features.strings.offer; note: Features.strings.offer-note; on: Features.offer; toggled(on) => { Features.toggle(3, on); } }
+            ToggleRow { name: Features.strings.auto-relaunch; note: Features.auto-note; on: Features.auto-relaunch; closing: true; toggled(on) => { Features.toggle(4, on); } }
         }
     }
-    Fieldset {
-        legend: Features.strings.pending;
+    VerticalLayout {
+        spacing: Theme.sp-s;
+        GroupLabel { text: Features.strings.pending; }
         if Features.relaunches.length == 0: Note { text: Features.strings.no-pending; }
         if Features.relaunches.length > 0: RelaunchList { }
     }
 }
 
 component BackupsSection inherits VerticalLayout {
-    spacing: Theme.sp-2xl;
-    Fieldset {
-        legend: Features.strings.backups;
+    spacing: Theme.sp-3;
+    VerticalLayout {
+        spacing: Theme.sp-l;
+        DetailTitle { text: Features.sections[3]; }
         HorizontalLayout {
             alignment: start;
             Control {
@@ -430,56 +644,65 @@ component BackupsSection inherits VerticalLayout {
                 clicked => { Features.back-up-now(); }
             }
         }
-        CheckNote {
-            text: Features.strings.before-update;
-            checked: Features.before-update;
-            toggled(on) => { Features.toggle(5, on); }
-        }
-        Labelled {
-            caption: Features.strings.keep;
-            Select {
-                label: Features.strings.keep;
-                items: Features.keep-items;
-                current: Features.keep;
-                picked(index) => { Features.keep-picked(index); }
+        VerticalLayout {
+            ToggleRow { name: Features.strings.before-update; on: Features.before-update; toggled(on) => { Features.toggle(5, on); } }
+            Rectangle {
+                height: 52px;
+                Rule { y: 0px; width: parent.width; }
+                HorizontalLayout {
+                    spacing: 16px;
+                    Text { horizontal-stretch: 1; text: Features.strings.keep; font-size: Theme.type-body; font-weight: 500; color: Theme.ink; vertical-alignment: center; }
+                    Select {
+                        cross-axis-self-alignment: center;
+                        width: 180px;
+                        label: Features.strings.keep;
+                        items: Features.keep-items;
+                        current: Features.keep;
+                        picked(index) => { Features.keep-picked(index); }
+                    }
+                }
+                Rule { y: parent.height - 1px; width: parent.width; }
             }
         }
     }
-    Fieldset {
-        legend: Features.strings.saved-backups;
+    VerticalLayout {
+        spacing: Theme.sp-s;
+        GroupLabel { text: Features.strings.saved-backups; }
         // Nothing while the list loads, so a list that exists never reads as empty.
         if Features.backups-loading: HorizontalLayout {
             alignment: start;
             Spinner { }
         }
         if !Features.backups-loading && Features.backups.length == 0: Note { text: Features.strings.no-backups; }
-        if Features.backups.length > 0: Card {
-            for line[index] in Features.backups: VerticalLayout {
-                if index > 0: Rule { }
-                CardRow {
-                    TwoLines { name: line.date; detail: line.detail; mono-name: true; }
-                    SmallButton {
-                        cross-axis-self-alignment: center;
-                        scale: 1;
-                        text: Features.strings.restore-action;
-                        busy: line.restoring;
-                        enabled: !Features.busy && !line.confirming;
-                        // The confirmation below holds the one Restore while it shows.
-                        visible: !line.confirming;
-                        clicked => { Features.restore-ask(index); }
-                    }
-                }
-                if line.confirming: VerticalLayout {
-                    // The row above already ends in card-row-y.
-                    padding-top: 0px;
-                    padding-bottom: Theme.card-row-y;
+        VerticalLayout {
+            for line[index] in Features.backups: backup := ListRow {
+                closing: index == Features.backups.length - 1;
+                VerticalLayout {
                     spacing: Theme.sp-s;
-                    Note { text: Features.strings.restore-question; color: Theme.ink2; }
                     HorizontalLayout {
+                        spacing: Theme.sp-m;
+                        TwoLines { name: line.date; detail: line.detail; mono-name: true; }
+                        SmallButton {
+                            cross-axis-self-alignment: center;
+                            scale: 1;
+                            text: Features.strings.restore-action;
+                            busy: line.restoring;
+                            enabled: !Features.busy && !line.confirming;
+                            // The confirmation below holds the one Restore while it shows.
+                            visible: !line.confirming;
+                            clicked => { Features.restore-ask(index); }
+                        }
+                    }
+                    if line.confirming: VerticalLayout {
                         spacing: Theme.sp-s;
-                        alignment: end;
-                        SmallButton { scale: 1; text: Features.strings.cancel; enabled: !Features.busy; clicked => { Features.restore-cancel(); } }
-                        SmallButton { scale: 1; danger: true; text: Features.strings.restore-action; enabled: !Features.busy; clicked => { Features.restore-confirm(); } }
+                        // Measured at the row's width, so its wrapped lines push the buttons down.
+                        Note { preferred-width: backup.width; text: Features.strings.restore-question; color: Theme.ink2; }
+                        HorizontalLayout {
+                            spacing: Theme.sp-s;
+                            alignment: end;
+                            SmallButton { scale: 1; text: Features.strings.cancel; enabled: !Features.busy; clicked => { Features.restore-cancel(); } }
+                            SmallButton { scale: 1; danger: true; text: Features.strings.restore-action; enabled: !Features.busy; clicked => { Features.restore-confirm(); } }
+                        }
                     }
                 }
             }
@@ -488,42 +711,62 @@ component BackupsSection inherits VerticalLayout {
 }
 
 component ClientsSection inherits VerticalLayout {
-    spacing: Theme.sp-2xl;
-    Fieldset {
-        legend: Features.strings.background;
-        CheckNote {
-            text: Features.strings.background-priority;
-            note: Features.strings.background-priority-note;
-            checked: Features.background-priority;
-            toggled(on) => { Features.toggle(9, on); }
-        }
-        CheckNote {
-            text: Features.strings.mute-background;
-            note: Features.strings.mute-background-note;
-            checked: Features.mute-background;
-            toggled(on) => { Features.toggle(10, on); }
+    spacing: Theme.sp-3;
+    VerticalLayout {
+        spacing: Theme.sp-l;
+        DetailTitle { text: Features.sections[4]; }
+        VerticalLayout {
+            ToggleRow { name: Features.strings.background-priority; note: Features.strings.background-priority-note; on: Features.background-priority; toggled(on) => { Features.toggle(9, on); } }
+            ToggleRow { name: Features.strings.mute-background; note: Features.strings.mute-background-note; on: Features.mute-background; closing: true; toggled(on) => { Features.toggle(10, on); } }
         }
     }
-    Fieldset {
-        legend: Features.strings.per-account;
+    VerticalLayout {
+        spacing: Theme.sp-s;
+        GroupLabel { text: Features.strings.per-account; }
         if Features.clients.length == 0: Note { text: Features.strings.no-accounts; }
-        for line[index] in Features.clients: Card {
-            VerticalLayout {
-                padding-top: Theme.card-row-y;
-                padding-bottom: Theme.card-row-y;
-                spacing: Theme.sp-m;
-                HorizontalLayout {
-                    spacing: Theme.sp-s;
-                    Text { text: line.name; font-size: Theme.type-body; font-weight: 600; color: Theme.ink; vertical-alignment: center; overflow: elide; }
-                    if line.running: Dot { cross-axis-self-alignment: center; tint: Theme.info; }
-                    if line.running: Text { text: Features.strings.running; font-size: Theme.type-caption; color: Theme.sub; vertical-alignment: center; }
-                    Rectangle { horizontal-stretch: 1; }
-                }
-                HorizontalLayout {
+        VerticalLayout {
+            spacing: Theme.sp-m;
+            for line[index] in Features.clients: Panel {
+                VerticalLayout {
+                    padding: 14px;
                     spacing: Theme.sp-m;
-                    Labelled {
-                        horizontal-stretch: 1;
-                        caption: Features.strings.priority;
+                    HorizontalLayout {
+                        spacing: Theme.sp-s;
+                        Text { text: line.name; font-size: Theme.type-body; font-weight: 600; color: Theme.ink; vertical-alignment: center; overflow: elide; }
+                        if line.running: Dot { cross-axis-self-alignment: center; tint: Theme.info; }
+                        if line.running: Text { text: Features.strings.running; font-size: Theme.type-caption; color: Theme.sub; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    // Side by side; one over the other in the small window, where two columns
+                    // would cut the priority's name.
+                    if !Theme.small: HorizontalLayout {
+                        spacing: Theme.sp-m;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 6px;
+                            FieldLabel { text: Features.strings.priority; }
+                            Select {
+                                label: Features.strings.priority;
+                                items: Features.priorities;
+                                current: line.priority;
+                                picked(choice) => { Features.priority-picked(index, choice); }
+                            }
+                        }
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 6px;
+                            FieldLabel { text: Features.strings.processors; }
+                            SavedField {
+                                label: Features.strings.processors;
+                                placeholder: Features.strings.processors-placeholder;
+                                saved: line.processors;
+                                commit(text) => { Features.processors-entered(index, text); }
+                            }
+                        }
+                    }
+                    if Theme.small: VerticalLayout {
+                        spacing: 6px;
+                        FieldLabel { text: Features.strings.priority; }
                         Select {
                             label: Features.strings.priority;
                             items: Features.priorities;
@@ -531,9 +774,9 @@ component ClientsSection inherits VerticalLayout {
                             picked(choice) => { Features.priority-picked(index, choice); }
                         }
                     }
-                    Labelled {
-                        horizontal-stretch: 1;
-                        caption: Features.strings.processors;
+                    if Theme.small: VerticalLayout {
+                        spacing: 6px;
+                        FieldLabel { text: Features.strings.processors; }
                         SavedField {
                             label: Features.strings.processors;
                             placeholder: Features.strings.processors-placeholder;
@@ -541,28 +784,38 @@ component ClientsSection inherits VerticalLayout {
                             commit(text) => { Features.processors-entered(index, text); }
                         }
                     }
-                }
-                if line.processors-error != "": ErrorNote { text: line.processors-error; }
-                Check {
-                    text: Features.strings.mute-client;
-                    checked: line.mute;
-                    toggled(on) => { Features.mute-client(index, on); }
-                }
-                Rule { }
-                HorizontalLayout {
-                    spacing: Theme.sp-m;
-                    VerticalLayout {
-                        horizontal-stretch: 1;
-                        spacing: 2px;
-                        Text { text: line.profile; font-size: Theme.type-small; color: line.profile-missing ? Theme.danger : Theme.ink2; wrap: word-wrap; }
-                        if line.gamepad != "": Note { text: line.gamepad; }
+                    if line.processors-error != "": ErrorNote { text: line.processors-error; }
+                    Check {
+                        text: Features.strings.mute-client;
+                        checked: line.mute;
+                        toggled(on) => { Features.mute-client(index, on); }
                     }
-                    SmallButton {
-                        cross-axis-self-alignment: center;
-                        scale: 1;
-                        glyph: Glyph.edit;
-                        text: Features.strings.edit-account;
-                        clicked => { Features.edit-account(index); }
+                    Rule { }
+                    HorizontalLayout {
+                        spacing: Theme.sp-m;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 2px;
+                            Text { text: line.profile; font-size: Theme.type-small; color: line.profile-missing ? Theme.danger : Theme.ink2; wrap: word-wrap; }
+                            if line.gamepad != "": Note { text: line.gamepad; }
+                        }
+                        if !Theme.small: SmallButton {
+                            cross-axis-self-alignment: center;
+                            scale: 1;
+                            glyph: Glyph.edit;
+                            text: Features.strings.edit-account;
+                            clicked => { Features.edit-account(index); }
+                        }
+                    }
+                    // Under the summary in the small window.
+                    if Theme.small: HorizontalLayout {
+                        alignment: start;
+                        SmallButton {
+                            scale: 1;
+                            glyph: Glyph.edit;
+                            text: Features.strings.edit-account;
+                            clicked => { Features.edit-account(index); }
+                        }
                     }
                 }
             }
@@ -571,30 +824,27 @@ component ClientsSection inherits VerticalLayout {
 }
 
 component ActivitySection inherits VerticalLayout {
-    spacing: Theme.sp-2xl;
-    Fieldset {
-        legend: Features.strings.notifications;
-        CheckNote {
-            text: Features.strings.notify;
-            checked: Features.notify;
-            toggled(on) => { Features.toggle(6, on); }
-        }
+    spacing: Theme.sp-3;
+    VerticalLayout {
+        spacing: Theme.sp-l;
+        DetailTitle { text: Features.sections[5]; }
         VerticalLayout {
-            padding-left: 26px;
-            spacing: 10px;
-            Check { text: Features.strings.notify-mail; checked: Features.notify-mail; enabled: Features.notify; toggled(on) => { Features.toggle(7, on); } }
-            Check { text: Features.strings.notify-friends; checked: Features.notify-friends; enabled: Features.notify; toggled(on) => { Features.toggle(8, on); } }
+            spacing: Theme.sp-s;
+            GroupLabel { text: Features.strings.notifications; }
+            VerticalLayout {
+                ToggleRow { name: Features.strings.notify; on: Features.notify; toggled(on) => { Features.toggle(6, on); } }
+                ToggleRow { inset: Theme.sp-l; name: Features.strings.notify-mail; on: Features.notify-mail; enabled: Features.notify; toggled(on) => { Features.toggle(7, on); } }
+                ToggleRow { inset: Theme.sp-l; name: Features.strings.notify-friends; on: Features.notify-friends; enabled: Features.notify; closing: true; toggled(on) => { Features.toggle(8, on); } }
+            }
         }
     }
-    Fieldset {
-        legend: Features.strings.discord;
-        CheckNote {
-            text: Features.strings.discord-switch;
-            checked: Features.discord;
-            toggled(on) => { Features.toggle(12, on); }
+    VerticalLayout {
+        spacing: Theme.sp-s;
+        GroupLabel { text: Features.strings.discord; }
+        VerticalLayout {
+            ToggleRow { name: Features.strings.discord-switch; on: Features.discord; closing: true; toggled(on) => { Features.toggle(12, on); } }
         }
         if Features.discord-status != "": HorizontalLayout {
-            padding-left: 26px;
             spacing: Theme.sp-s;
             Dot {
                 cross-axis-self-alignment: center;
@@ -603,74 +853,96 @@ component ActivitySection inherits VerticalLayout {
             Note { horizontal-stretch: 1; text: Features.discord-status; vertical-alignment: center; }
         }
     }
-    Fieldset {
-        legend: Features.strings.playtime;
-        CheckNote {
-            text: Features.strings.record;
-            checked: Features.record;
-            toggled(on) => { Features.toggle(11, on); }
+    VerticalLayout {
+        spacing: Theme.sp-s;
+        GroupLabel { text: Features.strings.playtime; }
+        VerticalLayout {
+            ToggleRow { name: Features.strings.record; on: Features.record; closing: Features.playtime.length == 0; toggled(on) => { Features.toggle(11, on); } }
+            for line[index] in Features.playtime: played := ListRow {
+                closing: index == Features.playtime.length - 1;
+                // The total on the name's line; the detail under them has the row's width.
+                VerticalLayout {
+                    spacing: 2px;
+                    HorizontalLayout {
+                        spacing: Theme.sp-m;
+                        Text { horizontal-stretch: 1; min-width: 0px; text: line.name; font-size: Theme.type-body; font-weight: 500; color: Theme.ink; vertical-alignment: center; overflow: elide; }
+                        Text { text: line.total; font-family: Theme.mono; font-size: Theme.type-small; color: Theme.ink2; vertical-alignment: center; }
+                    }
+                    Text { preferred-width: played.width; text: line.detail; font-size: Theme.type-note; color: Theme.sub; wrap: word-wrap; }
+                }
+            }
         }
         if Features.playtime.length == 0: Note { text: Features.strings.no-playtime; }
-        if Features.playtime.length > 0: Card {
-            for line[index] in Features.playtime: VerticalLayout {
-                if index > 0: Rule { }
-                CardRow {
-                    TwoLines { name: line.name; detail: line.detail; }
-                    Text { text: line.total; font-family: Theme.mono; font-size: Theme.type-small; color: Theme.ink2; vertical-alignment: center; }
+    }
+}
+
+/// The Features page: its title (and the last outcome at the right), the section tiles, and the
+/// open section's detail.
+export component FeaturesPage inherits Rectangle {
+    private property <string> windows-note: (Features.preset == 0 ? Features.strings.grid : Features.strings.main-large)
+        + (Features.monitor >= 0 && Features.monitor < Features.monitor-names.length ? Features.strings.list-sep + Features.monitor-names[Features.monitor] : "");
+    VerticalLayout {
+        padding-top: Theme.sp-3;
+        padding-left: Theme.page-x;
+        // The detail scroller keeps its lane beyond the page margin.
+        padding-right: Theme.page-x - 12px;
+        spacing: Theme.sp-3;
+        HorizontalLayout {
+            height: 32px;
+            padding-right: 12px;
+            spacing: Theme.sp-m;
+            PageTitle { horizontal-stretch: 0; text: Features.strings.title; }
+            Rectangle { horizontal-stretch: 1; }
+            if Features.notice != "": HorizontalLayout {
+                horizontal-stretch: 0;
+                spacing: Theme.sp-s;
+                Icon {
+                    cross-axis-self-alignment: center;
+                    glyph: Features.notice-error ? Glyph.alert-circle : Glyph.check-circle;
+                    size: 16px;
+                    tint: Features.notice-error ? Theme.danger : Theme.ok;
                 }
+                Text {
+                    max-width: 420px;
+                    text: Features.notice;
+                    font-size: Theme.type-small;
+                    color: Features.notice-error ? Theme.danger : Theme.ink2;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+        }
+        HorizontalLayout {
+            vertical-stretch: 1;
+            spacing: Theme.small ? 28px : Theme.page-x;
+            VerticalLayout {
+                horizontal-stretch: 0;
+                width: Theme.small ? 232px : 288px;
+                spacing: 4px;
+                alignment: start;
+                for title[i] in Features.sections: SectionTile {
+                    glyph: i == 0 ? Glyph.window : i == 1 ? Glyph.keyboard : i == 2 ? Glyph.shield : i == 3 ? Glyph.archive : i == 4 ? Glyph.cpu : Glyph.clock;
+                    title: title;
+                    note: i == 0 ? root.windows-note : Features.section-notes[i];
+                    active: i == Features.section;
+                    clicked => { Features.section-picked(i); }
+                }
+            }
+            PaneScroll {
+                horizontal-stretch: 1;
+                scroll-to: Features.page-scroll;
+                if Features.section == 0: WindowsSection { }
+                if Features.section == 1: HotkeysSection { }
+                if Features.section == 2: RecoverySection { }
+                if Features.section == 3: BackupsSection { }
+                if Features.section == 4: ClientsSection { }
+                if Features.section == 5: ActivitySection { }
             }
         }
     }
 }
 
-/// The features sheet: wider than the account sheet (its lists carry several controls a row),
-/// with a tab per section between its header and its body.
-export component FeaturesSheet inherits SideSheet {
-    panel-width: Theme.sheet-wide-w;
-    caption: Features.strings.caption;
-    title: Features.strings.title;
-    close-label: Features.strings.close;
-    header-pad-bottom: Theme.sp-l;
-    close => { Features.open-sheet(false); }
-    HorizontalLayout {
-        padding-left: Theme.sheet-pad-x;
-        padding-right: Theme.sheet-pad-x;
-        padding-bottom: Theme.sp-l;
-        Segmented {
-            items: Features.sections;
-            current: Features.section;
-            picked(index) => { Features.section-picked(index); }
-        }
-    }
-    SheetBody {
-        if Features.section == 0: WindowsSection { }
-        if Features.section == 1: HotkeysSection { }
-        if Features.section == 2: RecoverySection { }
-        if Features.section == 3: BackupsSection { }
-        if Features.section == 4: ClientsSection { }
-        if Features.section == 5: ActivitySection { }
-    }
-    SheetFooter {
-        gap: Theme.sp-m;
-        if Features.notice != "": Icon {
-            cross-axis-self-alignment: center;
-            glyph: Features.notice-error ? Glyph.alert-circle : Glyph.check-circle;
-            size: 16px;
-            tint: Features.notice-error ? Theme.danger : Theme.ok;
-        }
-        Text {
-            horizontal-stretch: 1;
-            text: Features.notice;
-            font-size: Theme.type-small;
-            color: Features.notice-error ? Theme.danger : Theme.ink2;
-            vertical-alignment: center;
-            wrap: word-wrap;
-        }
-        Control { text: Features.strings.close; clicked => { Features.open-sheet(false); } }
-    }
-}
-
-/// Over the play bar while a relaunch is scheduled or offered; it scales with Home.
+/// Over the page's foot while a relaunch is scheduled or offered; it scales with Home.
 export component RelaunchBanner inherits VerticalLayout {
     Rule { tint: Theme.chrome-line; }
     Rectangle {
@@ -680,7 +952,7 @@ export component RelaunchBanner inherits VerticalLayout {
             padding-right: Theme.page-x * Theme.scale;
             padding-top: 10px * Theme.scale;
             padding-bottom: 10px * Theme.scale;
-            RelaunchList { scale: Theme.scale; }
+            RelaunchList { scale: Features.open ? 1 : Theme.scale; }
         }
     }
 }

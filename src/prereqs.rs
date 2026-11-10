@@ -333,6 +333,13 @@ pub(crate) struct BannerText {
     pub button: &'static str,
 }
 
+/// How many components are ready, of how many (Home's first-run check); None until detected.
+pub(crate) fn ready_count(state: &State) -> Option<(usize, usize)> {
+    state.report.as_ref()?;
+    let ready = Component::ALL.into_iter().filter(|c| matches!(state.status(*c), Some(Status::Installed { .. }))).count();
+    Some((ready, Component::ALL.len()))
+}
+
 /// What the Windows components banner says, if it shows.
 pub(crate) fn banner_text(state: &State) -> Option<BannerText> {
     let missing = state.missing();

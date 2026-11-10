@@ -17,7 +17,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering},
         mpsc, OnceLock,
     },
     thread::JoinHandle,
@@ -35,6 +35,13 @@ const VISIBLE: u8 = 4;
 const AWAY: u8 = 5;
 const INVISIBLE: u8 = 6;
 const SOCIAL_REQUEST: u8 = 7;
+/// Change the selected handle's portrait to [`PORTRAIT_REQUEST`].
+const PORTRAIT: u8 = 8;
+/// Held by one request from its claim until the owner takes it (or the request is refused):
+/// a second request can never overwrite a value a running PORTRAIT command has yet to read.
+static PORTRAIT_REQUEST: AtomicU16 = AtomicU16::new(NO_PORTRAIT);
+/// No portrait is waiting (above `wire::PORTRAIT_MASK`, so `set_own` refuses it).
+const NO_PORTRAIT: u16 = u16::MAX;
 /// Status command flag: the dialog's "apply to groups" (app 10031b2b).
 const GROUPS: u8 = 0x10;
 static CONTROL: AtomicU8 = AtomicU8::new(GAME);
@@ -229,6 +236,23 @@ pub fn request_status(mode: i32, groups: bool) {
         _ => {},
     }
 }
+/// A portrait the user picked. Refused at once, without a core call, until
+/// the portrait field is confirmed (`wire::PORTRAIT_FIELD_CONFIRMED`).
+pub fn request_portrait(portrait: u16) {
+    if !crate::wire::PORTRAIT_FIELD_CONFIRMED || portrait > crate::wire::PORTRAIT_MASK {
+        return control_result("portrait", crate::native_portrait::NOT_CONFIRMED);
+    }
+    control_result("portrait", claim_portrait(&PORTRAIT_REQUEST, portrait, || accept_control(&CONTROL, &PLAY_LATCH, PORTRAIT)));
+}
+/// Claims the empty slot for `portrait` (published before the owner can observe PORTRAIT),
+/// then asks for the command; a refused command gives the slot back. A slot still held by an
+/// accepted command the owner has not read yet refuses at once, leaving that value intact.
+fn claim_portrait(slot: &AtomicU16, portrait: u16, accept: impl FnOnce() -> i32) -> i32 {
+    if slot.compare_exchange(NO_PORTRAIT, portrait, Ordering::AcqRel, Ordering::Acquire).is_err() { return BUSY; }
+    let code = accept();
+    if code != 0 { slot.store(NO_PORTRAIT, Ordering::Release); }
+    code
+}
 fn request_control(command: u8, name: &str) {
     control_result(name, accept_control(&CONTROL, &PLAY_LATCH, command));
 }
@@ -242,7 +266,7 @@ fn accept_control(control: &AtomicU8, latch: &AtomicBool, command: u8) -> i32 {
 fn accept_play(control: &AtomicU8, latch: &AtomicBool) -> i32 {
     if latch.load(Ordering::Acquire) { return BUSY; }
     if control.compare_exchange(SOCIAL, START_GAME, Ordering::AcqRel, Ordering::Acquire).is_ok() { return 0; }
-    let user_command = matches!(control.load(Ordering::Acquire) & !GROUPS, SOCIAL_REQUEST | VISIBLE | AWAY | INVISIBLE);
+    let user_command = matches!(control.load(Ordering::Acquire) & !GROUPS, SOCIAL_REQUEST | VISIBLE | AWAY | INVISIBLE | PORTRAIT);
     if user_command && latch.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() { 0 } else { BUSY }
 }
 /// The owner finished a user command: a latched Play starts now.
@@ -693,6 +717,7 @@ impl NativeSession {
         }
         crate::native_handles::ensure(&api, &c.handle_names, &mut || owner_frame(&api, &mut self.pushes))
             .map_err(|error| startup_stop(LAUNCHER_CLOSED).unwrap_or(error))?;
+        crate::native_portrait::probe_own(&api); // local reads only (190, 173)
         events::send("{\"type\":\"authenticated\"}\n".into());
         log!("native POL authenticated; all game service callbacks are original");
         // Main menu entry: the mail list, then the Viewer presence about a
@@ -1054,6 +1079,13 @@ impl NativeSession {
                     }
                     release_command(&CONTROL, &PLAY_LATCH);
                 }
+                PORTRAIT => {
+                    let portrait = PORTRAIT_REQUEST.swap(NO_PORTRAIT, Ordering::AcqRel);
+                    let code = crate::native_portrait::set_own(&api, portrait,
+                        &mut || idle_owner_frame(&api, &mut self.pushes, &mut self.auto_away, &mut self.viewer_status, idle_time()));
+                    control_result("portrait", code);
+                    release_command(&CONTROL, &PLAY_LATCH);
+                }
                 START_GAME => break self.settle_for_play(),
                 SIGN_OUT => break Ok(false),
                 action @ (VISIBLE | AWAY | INVISIBLE) => {
@@ -1377,6 +1409,7 @@ fn run_friend_observer(api: Api, stopping: mpsc::Receiver<()>, send: impl Fn(Str
     let mut location_counts = None;
     let mut own_presence = None;
     let mut health = None;
+    let mut portrait_probed = false;
     loop {
         let catalog = crate::native_social::CATALOG_ACCESS.lock().unwrap_or_else(|e| e.into_inner());
         let connected = api.zero(838) == 3;
@@ -1404,6 +1437,9 @@ fn run_friend_observer(api: Api, stopping: mpsc::Receiver<()>, send: impl Fn(Str
                 let out = &mut blob[8 + index * proto::FRIEND_RECORD_LEN..]
                     [..proto::FRIEND_RECORD_LEN];
                 api.two(getter, index_in_table, out.as_mut_ptr() as usize);
+            }
+            if !std::mem::replace(&mut portrait_probed, true) {
+                log!("{}", crate::native_portrait::probe_friends(&blob));
             }
             let locations = game_friends.snapshot(&blob);
             if *blob != *before || locations != locations_before || connection_changed {

@@ -10,7 +10,7 @@ The optional Windows installer is built with [NSIS](https://nsis.sourceforge.io/
 
 ## Square Enix materials
 
-The `assets/portal-art-*` and `assets/portal-wordmark-*` images contain FINAL FANTASY XI artwork and logos belonging to Square Enix. These assets and news text and images loaded from PlayOnline at runtime are excluded from Crystal's code license. News parser test fixtures contain independently authored fictional material. The copyright and trademark notices appear in README.md and in the launcher. Square Enix's [FFXI Materials Usage License](https://support.na.square-enix.com/rule.php?id=20&la=1&tag=authc) describes its conditions for community uses; it is not a blanket license for software redistribution.
+The `assets/portal-wordmark-*` images and `assets/sky/crowd-mask.png` (the party silhouette cut from the FFXI portal art) contain FINAL FANTASY XI artwork and logos belonging to Square Enix. These assets and news text and images loaded from PlayOnline at runtime are excluded from Crystal's code license. News parser test fixtures contain independently authored fictional material. The copyright and trademark notices appear in README.md and in the launcher. Square Enix's [FFXI Materials Usage License](https://support.na.square-enix.com/rule.php?id=20&la=1&tag=authc) describes its conditions for community uses; it is not a blanket license for software redistribution.
 
 FFXI and PlayOnline executables, DLLs, DAT files, installer archives, music, and account data are not supplied in this repository. Crystal downloads official installation and update files directly from Square Enix to the user's chosen installation. Those files remain subject to Square Enix's terms.
 

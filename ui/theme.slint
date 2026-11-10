@@ -1,7 +1,9 @@
-// Crystal's "Refined" design tokens:
-// the palette of the approved renders (2026-10-22) in both themes, and the spacing, radius,
-// control and type scales at the 1440 px design width. Every page takes its sizes and colours
-// from here.
+// Crystal's "Skyline" design tokens (v1.2, crystal-design-v12b\a-skyline): the palette in both
+// themes, and the spacing, radius, control and type scales at the 1440 px design width. Every
+// page takes its sizes and colours from here. The software renderer draws no shadows, so
+// elevation is a fill step (bg < rail < fill < fill2) and a border (hairline < line), never a shadow.
+// The renders' CSS names map as: --line = hairline, --line2 = line, --bd = badge; --rail, --fill,
+// --fill2, --ice, --ice-hi, --ice-ink, --seg, --look, --pic-edge, --chk keep their names.
 export global Theme {
     /// The light theme is showing.
     in-out property <bool> light;
@@ -9,51 +11,114 @@ export global Theme {
     in-out property <bool> animate;
     /// Layout scale: window width / 1440, clamped to 0.8..1.
     in-out property <float> scale: 1;
+    /// The small window (narrower than 1180 px): the account rail narrows and its rows tighten.
+    in-out property <bool> small;
 
-    // ---- palette ----
-    out property <color> bg: root.light ? #F2F5F8 : #0C131B;
-    out property <color> panel: root.light ? #FFFFFF : #0A1017;
-    out property <color> card: root.light ? #FFFFFF : #111A24;
-    out property <color> field: root.light ? #FFFFFF : #0A1017;
-    out property <color> line: root.light ? #C8D3DD : #2A3A49;
-    out property <color> ink: root.light ? #142130 : #E9EFF5;
-    out property <color> sub: root.light ? #52657A : #9DADBD;
-    out property <color> accent: root.light ? #1F6F9C : #8FCDEB;
-    out property <color> select: root.light ? #E3F0F8 : #1B3344;
-    out property <color> play: root.light ? #1F6F9C : #9DD6F0;
-    out property <color> play-text: root.light ? #FFFFFF : #07202C;
-    out property <color> hairline: root.light ? #D9E1E8 : #22303D;
-    out property <color> well: root.light ? #F7F9FB : #0C131B;
-    out property <color> tint: root.light ? #EEF2F6 : #111A24;
+    // ---- Skyline palette ----
+    /// The window and the main column.
+    out property <color> bg: root.light ? #F4F7FA : #0A0F18;
+    /// The account rail, one step above the window.
+    out property <color> rail: root.light ? #FFFFFF : #0C121C;
+    /// A hovered or chosen row, a section's tile.
+    out property <color> fill: root.light ? #EEF3F8 : #111B29;
+    /// Raised: the chosen segment, a dragged row, a card on a fill.
+    out property <color> fill2: root.light ? #FFFFFF : #1A2738;
+    /// Hairline between regions and rows (the renders' --line).
+    out property <color> hairline: root.light ? #DFE6ED : #1A2433;
+    /// A control's border, a track (the renders' --line2).
+    out property <color> line: root.light ? #C9D4DE : #2A384B;
+    out property <color> ink: root.light ? #122031 : #EAF0F7;
+    out property <color> ink2: root.light ? #2C3E52 : #C4CFDC;
+    out property <color> sub: root.light ? #56697E : #8FA0B3;
+    out property <color> faint: root.light ? #7D8EA1 : #6B7C92;
+    /// The crystal's ice: links, the active tab, ticks, primary fills.
+    out property <color> ice: root.light ? #1B6A97 : #9DD6F0;
+    out property <color> ice-hi: root.light ? #14587F : #D2EEFB;
+    /// Text on an ice fill.
+    out property <color> ice-ink: root.light ? #FFFFFF : #06202C;
+    out property <color> ok: root.light ? #1E8A55 : #7AD1A3;
+    out property <color> warn: root.light ? #96650A : #F2BC62;
+    /// Coral: errors and Maintenance.
+    out property <color> danger: root.light ? #B4472F : #F2A090;
+    out property <color> violet: root.light ? #7C52C8 : #B892F2;
+    /// A segmented control's track.
+    out property <color> seg: root.light ? #1220310F : #FFFFFF0D;
+    /// The look-up bar over the sky.
+    out property <color> look: root.light ? #FFFFFFEB : #090E17E0;
+    /// The edge drawn over a picture.
+    out property <color> pic-edge: root.light ? #1220311A : #FFFFFF12;
+    /// The tick inside a checked box, the knob of a switched-on toggle.
+    out property <color> chk: root.light ? #FFFFFF : #06202C;
+    /// A count badge's fill (the Friends tab).
+    out property <color> badge: root.light ? #1B6A971F : #9DD6F029;
+    /// The Play button: a two-tone diagonal (stops at 0, 34, 34 and 100%), its edge, and the
+    /// keycap border on it. The attention variant is amber.
+    out property <color> play-0: root.light ? #2A80AE : #C6E9FA;
+    out property <color> play-1: root.light ? #2379A8 : #ABDDF5;
+    out property <color> play-2: root.light ? #1A6893 : #93D0EF;
+    out property <color> play-3: root.light ? #1B6A97 : #9FD7F1;
+    out property <color> play-edge: root.light ? #FFFFFF2E : #FFFFFF4D;
+    out property <color> play-key: root.light ? #FFFFFF75 : #06202C5C;
+    out property <color> att-0: #F8D58F;
+    out property <color> att-1: #F5C873;
+    out property <color> att-2: #EFB95A;
+    out property <color> att-3: #F2BC62;
+    out property <color> att-ink: #2B1A00;
+
+    // ---- crystal states (the account lamp, the gauge) ----
+    /// Lamp halo while in game.
+    out property <color> halo: root.light ? #3C8CE633 : #78BEFF57;
+    /// The state words beside each lamp.
+    out property <color> lamp-off: root.faint;
+    out property <color> lamp-rising: root.ink2;
+    out property <color> lamp-ready: root.ink2;
+    out property <color> lamp-game: root.ice-hi;
+    out property <color> lamp-code: root.warn;
+    out property <color> lamp-error: root.danger;
+    /// The gauge's unlit part: a flat tone over the lit crystal (facets show through).
+    out property <color> crystal-unlit: root.light ? #C9D4DE : #1C2A3D;
+
+    // ---- the earlier names, mapped onto Skyline (every page keeps compiling and inherits the look) ----
+    out property <color> panel: root.rail;
+    out property <color> card: root.light ? #FFFFFF : #111B29;
+    out property <color> field: root.light ? #FFFFFF : #0A1019;
+    out property <color> accent: root.ice;
+    out property <color> select: root.light ? #E3EFF7 : #1A2738;
+    out property <color> select-ink: root.ice-hi;
+    out property <color> play: root.ice;
+    out property <color> play-text: root.ice-ink;
+    out property <color> well: root.field;
+    out property <color> tint: root.fill;
     out property <color> shadow: root.light ? #1421301A : #00000059;
-    out property <color> chrome: root.light ? #FFFFFF : #0A1017;
-    out property <color> chrome-line: root.light ? #D9E1E8 : #1E2A36;
-    out property <color> divider: root.light ? #DCE4EB : #16212C;
-    out property <color> ink2: root.light ? #2A3D50 : #C6D1DD;
-    out property <color> faint: root.light ? #5B6D80 : #7F90A3;
-    out property <color> quiet: root.light ? #3E5165 : #B8C5D3;
-    out property <color> select-ink: root.light ? #0F4F72 : #BDE4F6;
-    out property <color> thumb: root.light ? #E3E9EF : #1A2633;
-    out property <color> ok: root.light ? #1E7A48 : #62CC93;
-    out property <color> info: root.light ? #19678F : #8FCDEB;
-    out property <color> warn: root.light ? #8A5A00 : #E8B85C;
-    out property <color> danger: root.light ? #A33F27 : #F2A58E;
-    out property <color> ok-fill: root.light ? #DDF3E6 : #153226;
-    out property <color> track: root.light ? #DCE4EB : #22303D;
-    out property <color> warn-bar: root.light ? #B8780A : #E8B85C;
+    out property <color> chrome: root.rail;
+    out property <color> chrome-line: root.hairline;
+    out property <color> divider: root.hairline;
+    out property <color> quiet: root.ink2;
+    out property <color> thumb: root.fill;
+    out property <color> info: root.ice;
+    out property <color> ok-fill: root.light ? #DDF1E6 : #14302A;
+    out property <color> track: root.line;
+    out property <color> warn-bar: root.warn;
     out property <color> scrim: root.light ? #14213075 : #04080DBD;
     /// Status tones readable on either theme.
-    out property <color> ok-tone: root.light ? #2E7A5E : #82CBA8;
-    out property <color> warn-tone: root.light ? #9A6519 : #E2B866;
-    out property <color> danger-tone: root.light ? #B24A4A : #E59494;
+    out property <color> ok-tone: root.ok;
+    out property <color> warn-tone: root.warn;
+    out property <color> danger-tone: root.danger;
     /// The caption Close button's hover and press fills (as Windows' own).
     out property <color> close-hot: #C42B1C;
     out property <color> close-pressed: #941E13;
 
     // ---- radii, borders ----
+    /// The Play button.
+    out property <length> radius-lg: 12px;
+    /// A rail row, a card, a news picture's frame (cards), the look-up bar.
     out property <length> radius: 10px;
+    /// A field, a dropdown, a primary button, a picture.
     out property <length> radius-mid: 8px;
-    out property <length> radius-inner: 6px;
+    /// A small button, an icon button.
+    out property <length> radius-inner: 7px;
+    /// A checkbox, a code box, a keycap.
+    out property <length> radius-sm: 5px;
     out property <length> border: 1px;
 
     // ---- spacing (4-pt) ----
@@ -65,15 +130,31 @@ export global Theme {
     out property <length> sp-3: 24px;
     out property <length> sp-2xl: 32px;
     out property <length> gutter: 24px;
-    out property <length> page-x: 40px;
+    /// The main column's side margin (32 in the small window).
+    out property <length> page-x: root.small ? 32px : 40px;
+
+    // ---- shell ----
+    /// The account rail's width.
+    out property <length> rail-w: root.small ? 300px : 356px;
+    /// One rail row, and the gap between rows.
+    out property <length> rail-row-h: root.small ? 66px : 80px;
+    out property <length> rail-row-gap: 2px;
+    /// The lamp: a 22 x 66 crystal (18 x 55 small).
+    out property <length> lamp-w: root.small ? 18px : 22px;
+    out property <length> lamp-h: root.small ? 55px : 66px;
+    /// The top bar and the rail's brand row.
+    out property <length> bar-h: 44px;
+    out property <length> caption-w: 46px;
+    /// The Play button.
+    out property <length> play-h: root.small ? 50px : 56px;
+    /// Home's sky band.
+    out property <length> sky-h: root.small ? 300px : 404px;
 
     // ---- controls ----
     out property <length> control-h: 36px;
     out property <length> control-sm-h: 28px;
     out property <length> control-pad-x: 14px;
     out property <length> control-sm-pad-x: 11px;
-    out property <length> bar-h: 48px;
-    out property <length> caption-w: 46px;
     out property <length> sheet-w: 464px;
     /// The features sheet: its lists carry several controls a row.
     out property <length> sheet-wide-w: 600px;
@@ -83,6 +164,7 @@ export global Theme {
     /// A bordered list card's side inset and each row's top and bottom inset.
     out property <length> card-pad-x: 14px;
     out property <length> card-row-y: 9px;
+    /// A list row (news headlines, settings rows).
     out property <length> row-h: 40px;
     out property <length> footer-h: 76px;
 
@@ -90,20 +172,29 @@ export global Theme {
     out property <string> sans: "Source Sans 3";
     out property <string> serif: "Source Serif 4";
     out property <string> mono: "JetBrains Mono";
+    /// Home's greeting (Source Serif italic; 23 in the small window).
+    out property <length> type-greeting: root.small ? 23px : 27px;
+    /// A page's title (Features, Settings...).
     out property <length> type-display: 24px;
     out property <length> type-title: 22px;
-    /// A settings section's title (prereqs::view's header).
+    /// The Play button's label.
+    out property <length> type-play: root.small ? 18px : 19px;
+    /// A settings section's title, a detail pane's heading.
     out property <length> type-section: 18px;
+    /// A section header, a card's headline, an account name.
     out property <length> type-heading: 16px;
     /// A lead line: Downloads' idle Activity line and the known overall percent.
     out property <length> type-lead: 15px;
     out property <length> type-body: 14px;
+    /// An account row's state.
+    out property <length> type-state: 13.5px;
     out property <length> type-small: 13px;
-    /// A note under a settings section header (prereqs::view's intro).
+    /// A note under a header, a rail label, a small button's text.
     out property <length> type-note: 12.5px;
     out property <length> type-caption: 12px;
-    /// Status chips and evidence lines (prereqs::chip).
+    /// Status chips, evidence lines, a session clock.
     out property <length> type-fine: 11.5px;
+    /// Keycaps, the row index.
     out property <length> type-micro: 11px;
     /// The in-between sizes: a dialog's title, a settings card's
     /// heading and its detail lines (its fine print is type-fine).
