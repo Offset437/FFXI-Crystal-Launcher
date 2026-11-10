@@ -4,7 +4,7 @@
 
 <p align="center">
   Sign in, update, multibox and set up the game from one native Windows app.<br>
-  Vanilla, Windower 4 or Ashita v4. Opens in a fraction of a second. No telemetry.
+  Vanilla, Windower 4 or Ashita v4. Already signed in when you press Play. No telemetry.
 </p>
 
 <p align="center">
@@ -27,13 +27,20 @@
   <sub>Every screenshot in this README uses sample accounts and friends.</sub>
 </p>
 
-## Built to feel instant
+## From Play to Vana'diel in seconds
 
-| 0.1–0.2 s | ~50 MB | ~30 ms | 2–5 MB |
-|:---:|:---:|:---:|:---:|
-| to the first window<br><sub>previous UI: 0.7–1.3 s</sub> | with the window open<br><sub>previous UI: ~190 MB</sub> | to reopen from the tray<br><sub>&nbsp;</sub> | in the tray<br><sub>near-zero idle CPU</sub> |
+Crystal signs your accounts in to PlayOnline when it opens, and again a few seconds after a game closes. When you press **Play**, the sign-in is already done and the game starts straight away.
 
-<sub>Measured on the 1.1.0 build with the software renderer (working set; about 23 MB private memory with the window open). Written in Rust with a native Slint interface: no embedded browser, so the launcher is never what eats your RAM next to a full party of clients.</sub>
+| 0.4 s | 10–13 s | 2–3 s |
+|:---:|:---:|:---:|
+| Play to game start<br><sub>account already signed in</sub> | Play to game start<br><sub>signing in from scratch</sub> | game start to the license screen<br><sub>FFXI's controller scan runs during sign-in, or not at all</sub> |
+
+- **Warm sign-in** is on by default (*Settings → Sign accounts in when Crystal opens*). It is the same PlayOnline sign-in, done before you click instead of after.
+- **Accounts with a one-time password** sign in when you press Play, since the code is needed then.
+- **Even a cold Play is quick.** Each account's game host is started and waiting before you click, so most of those 10–13 s are Square Enix's sign-in servers.
+- **A light footprint.** About 2–5 MB in the notification area and near-zero idle CPU, so Crystal never competes with a full party of clients.
+
+<sub>Times measured on the 1.1.0 build with Windower 4. Server-side sign-in time varies with Square Enix's servers and your connection.</sub>
 
 ## The short answers
 
