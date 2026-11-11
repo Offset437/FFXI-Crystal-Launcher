@@ -2,7 +2,7 @@
 //! caller-owned buffer so secrets never pass through an intermediate allocation.
 //!
 //! The one base64 codec of the launcher <-> loader wire contract: the
-//! launcher (`src/main.rs`) and `crates/pol-auth` include this file via
+//! launcher (`src/main.rs`) and the loader itself include this file via
 //! `#[path]`, so it depends on `core`/`std` only.
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

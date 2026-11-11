@@ -67,9 +67,10 @@ impl Gate {
 }
 
 /// The Tick timer at `every` (the window's tick rate: fast while busy, 1 s idle), on the
-/// shared runtime: `deliver` sends one Tick, and the loop ends once it returns false (the
-/// front end restarts it whenever the rate changes). Front-end independent.
-pub(crate) async fn run<F, D>(every: Duration, mut deliver: F)
+/// shared runtime: `deliver` sends one Tick, and the loop ends once it returns false or`alive`
+/// does (checked first thing every turn: the front end starts a new loop whenever the rate
+/// changes, and the superseded one must not linger). Front-end independent.
+pub(crate) async fn run<F, D>(every: Duration, alive: impl Fn() -> bool, mut deliver: F)
 where
     F: FnMut() -> D,
     D: std::future::Future<Output = bool>,
@@ -79,6 +80,7 @@ where
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         timer.tick().await;
+        if !alive() { return; }
         let quiet = QUIET.load(Ordering::Acquire);
         if gate.due(Instant::now(), quiet, EVENTS.load(Ordering::Acquire), quiet && watched_changed(), if quiet { next_due() } else { None })
             && !deliver().await {

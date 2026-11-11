@@ -1,8 +1,8 @@
-//! DNS for the stock version checks and the POL login host (pol-spec 07d §2;
-//! 08 §4 items 2-3). Lookups only, through the user's own resolver: nothing
-//! here reaches Square Enix. Real lookups never run in unit tests (offline).
+//! DNS for the stock version checks (pol-spec 07d §2; 08 §4 item 2). Lookups
+//! only, through the user's own resolver: nothing here reaches Square Enix.
+//! Real lookups never run in unit tests (offline).
 //!
-//! Owner: S2 (round 2). Callers: patch.rs (W2U retry), pol_less / main.rs (warm-ups).
+//! Callers: patch.rs (both checks, the W2U retry) and main.rs (the W20 host at Play).
 
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
@@ -18,9 +18,6 @@ pub(crate) const VIEWER_PATCH_HOST: &str = "pt008.pol.com";
 /// same captures show a `pc001W2U.pol.com` query (this case) 0.2 s before each W20. Both
 /// names resolve to 124.150.156.107, the address `pc001.pol.com` (used before) has too.
 pub(crate) const GAME_PATCH_HOST: &str = "pc001W2U.pol.com";
-/// The member-login host the loader hands polcore at member select
-/// (crystal-loader native_auth.rs select_member: 868 → 853 "ci000.pol.com").
-pub(crate) const POL_LOGIN_HOST: &str = "ci000.pol.com";
 
 /// Where an exchange failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,9 +219,8 @@ fn query_a(_host: &str) -> Result<Vec<Ipv4Addr>, i32> {
 /// dnsapi.dll; local only, nothing is sent). The negative-cache rule of 07d §2.1:
 /// whether a DNS_QUERY_BYPASS_CACHE answer replaces the client's cache entry cannot
 /// be verified offline (no live lookups, round-2 hard rules), so after a W2U that
-/// needed a retry the entries for ci000.pol.com and the patch hosts are flushed
-/// instead. That works either way: polcore's own lookup at Open(1) and the W20's
-/// then go to the resolver. Best effort; failures are ignored.
+/// needed a retry the patch hosts' entries are flushed instead. That works either
+/// way: the W20's lookup then goes to the resolver. Best effort; failures are ignored.
 pub(crate) fn forget(hosts: &[&str]) {
     #[cfg(not(test))]
     flush_entries(hosts);

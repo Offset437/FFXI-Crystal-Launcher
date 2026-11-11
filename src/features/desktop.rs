@@ -8,11 +8,18 @@
 //! to that game's processes; the one global hook is the foreground change, which only fires when
 //! the user switches windows. That hook also arms the in-game hotkeys (the cycle keys): they are
 //! registered while a tracked game's window is in front and released on any other change, and
-//! for the same span the low-level keyboard hook (`keyhook`) takes exactly those chords, since a
-//! game reading the keyboard through DirectInput keeps registered hotkeys from arriving.
+//! for the same span the low-level keyboard hook (`keyhook`) takes exactly those chords and the
+//! account hotkeys Windows registered for Crystal, since a game reading the keyboard through
+//! DirectInput keeps registered hotkeys from arriving.
+//!
+//! Registrations are the window's own: they last through sleep, a lock and an Explorer
+//! restart, and while the launcher's window is closed to the notification area (this thread
+//! does not depend on it). Windows does not say which program owns a chord it refuses
+//! (ERROR_HOTKEY_ALREADY_REGISTERED), only that one does; `probe` asks that for a chord before
+//! it is needed.
 
 use super::hotkeys::{Gate, Hotkey, Registrar};
-use super::keyhook::{Fired, KeyHook, WM_HOOK_HOTKEY, WM_HOOK_RELEASE};
+use super::keyhook::{Fired, KeyHook, OWN_INPUT, WM_HOOK_HOTKEY, WM_HOOK_RELEASE};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -60,7 +67,8 @@ pub(crate) enum Command {
     GameHotkeys(Vec<(i32, Hotkey)>),
     /// Watch these processes' windows (replaces the set).
     Track(Vec<u32>),
-    /// Run on the desktop thread (window calls that need its input state).
+    /// Tests: run on the desktop thread.
+    #[cfg(test)]
     Run(Box<dyn FnOnce() + Send>),
 }
 
@@ -91,6 +99,9 @@ struct State {
     /// The message-only window the hotkeys belong to.
     window: HWND,
     hotkeys: Vec<i32>,
+    /// The `Hotkeys` Windows registered, with their chords: the keyboard hook takes these too
+    /// while a game is in front. One another program owns stays that program's.
+    always: Vec<(i32, Hotkey)>,
     /// What registering `Hotkeys` returned, reported together with the gate's results.
     results: Vec<(i32, Result<(), u32>)>,
     /// The in-game hotkeys, armed by the foreground hook.
@@ -148,11 +159,6 @@ impl Desktop {
         // SAFETY: posting to our own window; fails harmlessly once it is gone.
         unsafe { windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(self.hwnd as HWND, WM_COMMANDS, 0, 0) };
     }
-
-    /// Whether the caller is the desktop thread.
-    pub(crate) fn is_current(&self) -> bool {
-        self.thread.as_ref().is_some_and(|t| t.thread().id() == std::thread::current().id())
-    }
 }
 
 impl Drop for Desktop {
@@ -183,7 +189,7 @@ fn run(sink: Sink, queue: Arc<Mutex<VecDeque<Command>>>, ready: std::sync::mpsc:
         let hwnd = CreateWindowExW(0, class.as_ptr(), std::ptr::null(), 0, 0, 0, 0, 0, HWND_MESSAGE, std::ptr::null_mut(), instance, std::ptr::null());
         if hwnd.is_null() { let _ = ready.send(None); return; }
         STATE.with(|s| *s.borrow_mut() = Some(State {
-            sink, queue, window: hwnd, hotkeys: Vec::new(), results: Vec::new(), gate: Gate::default(),
+            sink, queue, window: hwnd, hotkeys: Vec::new(), always: Vec::new(), results: Vec::new(), gate: Gate::default(),
             tracked: BTreeMap::new(), pids: Arc::new(Mutex::new(Vec::new())), foreground_hook: None, in_game: false, keyhook: None,
             timers: Vec::new(), next_timer: 0,
         }));
@@ -203,7 +209,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         WM_HOTKEY => { hotkey(wparam as i32, (lparam >> 16) as u16); 0 }
         WM_HOOK_HOTKEY => { emit(Event::Hotkey { id: wparam as i32, via: Via::Hook, key: Some(Fired::unpack(lparam)) }); 0 }
         WM_HOOK_RELEASE => {
-            emit(Event::Log(format!("hotkeys: chord key released after {} ms, {} repeats swallowed", lparam as u32, wparam as u32)));
+            // A per-press line for debugging the key hook; release builds leave it out.
+            if cfg!(debug_assertions) {
+                emit(Event::Log(format!("hotkeys: chord key released after {} ms, {} repeats swallowed", lparam as u32, wparam as u32)));
+            }
             0
         }
         WM_TIMER => {
@@ -251,13 +260,15 @@ fn report() {
     if let Some(results) = results { emit(Event::Registered(results)); }
 }
 
-/// RegisterHotKey on the desktop thread's window.
+/// RegisterHotKey on the desktop thread's window. A chord only the keyboard hook can tell
+/// (`Hotkey::registration`) is not registered, and reads as fine.
 struct Windows(HWND);
 impl Registrar for Windows {
     fn register(&mut self, id: i32, hotkey: Hotkey) -> Result<(), u32> {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::RegisterHotKey;
+        let Some((modifiers, vk)) = hotkey.registration() else { return Ok(()) };
         // SAFETY: a hotkey on our own window.
-        let ok = unsafe { RegisterHotKey(self.0, id, u32::from(hotkey.modifiers) | MOD_NOREPEAT, u32::from(hotkey.key)) } != 0;
+        let ok = unsafe { RegisterHotKey(self.0, id, modifiers | MOD_NOREPEAT, vk) } != 0;
         if ok { Ok(()) } else { Err(unsafe { windows_sys::Win32::Foundation::GetLastError() }) }
     }
     fn unregister(&mut self, id: i32) {
@@ -265,6 +276,25 @@ impl Registrar for Windows {
         unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::UnregisterHotKey(self.0, id) };
     }
 }
+
+/// Whether Windows would register `hotkey` now: it is registered for the calling thread and
+/// released at once. `Err(1409)` (ERROR_HOTKEY_ALREADY_REGISTERED) when a program owns it;
+/// Crystal's own registrations count as one, so ask only for a chord Crystal does not hold.
+pub(crate) fn probe(hotkey: Hotkey) -> Result<(), u32> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
+    const ID: i32 = 0xBFFE;
+    let Some((modifiers, vk)) = hotkey.registration() else { return Ok(()) };
+    // SAFETY: a hotkey of this thread's own, released before returning.
+    unsafe {
+        if RegisterHotKey(std::ptr::null_mut(), ID, modifiers | MOD_NOREPEAT, vk) == 0 { return Err(windows_sys::Win32::Foundation::GetLastError()); }
+        UnregisterHotKey(std::ptr::null_mut(), ID);
+    }
+    Ok(())
+}
+
+/// The chords the keyboard hook takes while a game is in front: the in-game ones, and the
+/// others Windows registered for Crystal.
+fn hook_keys(state: &State) -> Vec<(i32, Hotkey)> { state.gate.keys().iter().chain(&state.always).copied().collect() }
 
 /// Whether `pid` is one of the tracked games' processes.
 fn is_game(state: &State, pid: Option<u32>) -> bool { pid.is_some_and(|pid| state.tracked.contains_key(&pid)) }
@@ -287,14 +317,14 @@ fn gate_focus(pid: Option<u32>) -> bool {
 }
 
 /// Whether a game is in front changed to `game`: arm or disarm the keyboard hook to match the
-/// registered keys, and describe the change for the history (nothing while no in-game key is set).
+/// chords set, and describe the change for the history (nothing while no hotkey is set).
 fn set_in_game(state: &mut State, game: bool) -> Option<String> {
     if game && state.in_game {
         // Game to game: that game takes the keyboard (and DirectInput's own hook) as it comes in
         // front, so the hook is installed again to stay ahead of it. The key that made the switch
         // is usually still down: the hook keeps its press (`keyhook::Matcher`), so its repeats
         // switch nothing. Quietly: only a failure is told.
-        let keys = state.gate.keys().to_vec();
+        let keys = hook_keys(state);
         let result = state.keyhook.as_ref().filter(|_| !keys.is_empty()).map(|hook| hook.arm(keys));
         return match result {
             Some(Err(code)) => Some(format!("hotkeys: game to game: hook failed (error {code})")),
@@ -305,17 +335,18 @@ fn set_in_game(state: &mut State, game: bool) -> Option<String> {
     state.in_game = game;
     if !game {
         if let Some(hook) = &state.keyhook { hook.disarm(); }
-        return (!state.gate.keys().is_empty()).then(|| "hotkeys: game left: cycle keys unregistered, hook off".to_owned());
+        return (!hook_keys(state).is_empty()).then(|| "hotkeys: game left: cycle keys unregistered, hook off".to_owned());
     }
-    let keys = state.gate.keys().to_vec();
+    let keys = hook_keys(state);
     if keys.is_empty() { return None; }
-    let registered: Vec<String> = keys.iter().map(|(id, hotkey)| {
+    let mut registered: Vec<String> = state.gate.keys().iter().map(|(id, hotkey)| {
         match state.gate.results().iter().find(|(i, _)| i == id).map(|(_, r)| *r) {
             Some(Ok(())) => format!("{hotkey} registered"),
             Some(Err(code)) => format!("{hotkey} not registered (error {code})"),
             None => format!("{hotkey} not tried"),
         }
     }).collect();
+    if !state.always.is_empty() { registered.push(format!("{} account hotkeys", state.always.len())); }
     if state.keyhook.is_none() {
         match KeyHook::start(state.window as isize, state.pids.clone()) {
             Ok(hook) => state.keyhook = Some(hook),
@@ -349,7 +380,8 @@ fn hotkey(id: i32, key: u16) {
     emit(Event::Log(format!("hotkeys: WM_HOTKEY id {id} after the game left the front: unregistered, key passed on")));
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP};
     // The modifiers are still held: only the key itself is sent again.
-    let input = |flags| INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: key, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } } };
+    // Marked as Crystal's own, so the keyboard hook (still in for a moment) lets it through.
+    let input = |flags| INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: key, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: OWN_INPUT } } };
     let tap = [input(0), input(KEYEVENTF_KEYUP)];
     // SAFETY: a sized array of keyboard inputs.
     unsafe { SendInput(tap.len() as u32, tap.as_ptr(), std::mem::size_of::<INPUT>() as i32) };
@@ -357,31 +389,38 @@ fn hotkey(id: i32, key: u16) {
 
 fn drain(hwnd: HWND) {
     let mut changed = false;
+    // The chords changed: the hook follows them, once for the whole batch.
+    let mut rearm = false;
     loop {
         let Some(command) = STATE.with(|s| s.borrow().as_ref().and_then(|state| state.queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front())) else { break };
         match command {
-            Command::Hotkeys(list) => { register(hwnd, &list); changed = true; }
+            Command::Hotkeys(list) => { register(hwnd, &list); changed = true; rearm = true; }
             Command::GameHotkeys(list) => {
                 let game = is_game_now();
-                let line = STATE.with(|s| {
-                    let mut state = s.borrow_mut();
-                    let state = state.as_mut()?;
-                    state.gate.set_keys(list, game, &mut Windows(hwnd));
-                    // New keys: the hook follows them (re-armed now when a game is in front).
-                    if let Some(hook) = &state.keyhook { hook.disarm(); }
-                    state.in_game = false;
-                    set_in_game(state, game)
-                });
-                if let Some(line) = line { emit(Event::Log(line)); }
+                STATE.with(|s| if let Some(state) = s.borrow_mut().as_mut() { state.gate.set_keys(list, game, &mut Windows(hwnd)); });
                 changed = true;
+                rearm = true;
             }
             Command::Track(pids) => {
                 track(&pids);
                 // A game that ended in front, or one whose window is already in front.
                 changed |= gate_focus(foreground_pid());
             }
+            #[cfg(test)]
             Command::Run(work) => work(),
         }
+    }
+    if rearm {
+        let game = is_game_now();
+        let line = STATE.with(|s| {
+            let mut state = s.borrow_mut();
+            let state = state.as_mut()?;
+            // Off, then armed again now when a game is in front.
+            if let Some(hook) = &state.keyhook { hook.disarm(); }
+            state.in_game = false;
+            set_in_game(state, game)
+        });
+        if let Some(line) = line { emit(Event::Log(line)); }
     }
     if changed { report(); }
 }
@@ -396,8 +435,12 @@ fn register(hwnd: HWND, list: &[(i32, Hotkey)]) {
     let mut windows = Windows(hwnd);
     for id in previous { windows.unregister(id); }
     let results: Vec<_> = list.iter().map(|(id, hotkey)| (*id, windows.register(*id, *hotkey))).collect();
-    let registered: Vec<i32> = results.iter().filter(|(_, r)| r.is_ok()).map(|(id, _)| *id).collect();
-    STATE.with(|s| if let Some(state) = s.borrow_mut().as_mut() { state.hotkeys = registered; state.results = results; });
+    let always: Vec<(i32, Hotkey)> = list.iter().filter(|(id, _)| results.iter().any(|(i, r)| i == id && r.is_ok())).copied().collect();
+    STATE.with(|s| if let Some(state) = s.borrow_mut().as_mut() {
+        state.hotkeys = always.iter().map(|(id, _)| *id).collect();
+        state.always = always;
+        state.results = results;
+    });
 }
 
 fn track(pids: &[u32]) {
@@ -528,6 +571,64 @@ mod tests {
         assert_eq!(rx2.recv_timeout(wait).unwrap(), Event::Registered(vec![(5, Ok(()))]));
         drop(other);
         drop(desktop);
+    }
+
+    /// Every modifier with a high function key: a chord nothing else should own.
+    fn rare(vk: u16) -> Hotkey {
+        use super::super::hotkeys::{MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN};
+        Hotkey::new(MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN, vk)
+    }
+
+    /// A desktop thread standing in for another program, with `chord` registered.
+    fn another_program(chord: Hotkey) -> Desktop {
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let other = Desktop::start(Arc::new(move |e| { let _ = tx.lock().unwrap().send(e); })).unwrap();
+        other.send(Command::Hotkeys(vec![(1, chord)]));
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), Event::Registered(vec![(1, Ok(()))]));
+        other
+    }
+
+    #[test]
+    fn a_chord_another_program_owns_is_found_before_it_is_needed() {
+        let (chord, free) = (rare(0x83), rare(0x80)); // F20, F17
+        assert_eq!(probe(chord), Ok(()));
+        let other = another_program(chord);
+        assert_eq!(probe(chord), Err(1409), "ERROR_HOTKEY_ALREADY_REGISTERED");
+        // Asking registers nothing for good: a free chord is free again the next time.
+        assert_eq!(probe(free), Ok(()));
+        assert_eq!(probe(free), Ok(()));
+        // The number pad's Enter is never registered, so there is nothing to ask.
+        assert_eq!(probe(Hotkey::new(super::super::hotkeys::MOD_CONTROL, super::super::hotkeys::NUM_ENTER)), Ok(()));
+        drop(other);
+        assert_eq!(probe(chord), Ok(()), "released with the program");
+    }
+
+    /// Over a game the keyboard hook takes the cycle keys and the account hotkeys Windows
+    /// registered for Crystal; a chord another program owns stays that program's.
+    #[test]
+    fn the_keyboard_hook_is_given_the_account_hotkeys_windows_registered() {
+        let (mine, taken, cycle) = (rare(0x7E), rare(0x7F), rare(0x7D)); // F15, F16, F14
+        let other = another_program(taken);
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let desktop = Desktop::start(Arc::new(move |e| { let _ = tx.lock().unwrap().send(e); })).unwrap();
+        let wait = std::time::Duration::from_secs(5);
+        desktop.send(Command::Hotkeys(vec![(1, mine), (2, taken)]));
+        desktop.send(Command::GameHotkeys(vec![(3, cycle)]));
+        assert_eq!(rx.recv_timeout(wait).unwrap(), Event::Registered(vec![(1, Ok(())), (2, Err(1409)), (3, Ok(()))]));
+        let (done, finished) = mpsc::channel();
+        desktop.send(Command::Run(Box::new(move || { let _ = done.send(STATE.with(|s| s.borrow().as_ref().map(|st| (hook_keys(st), st.keyhook.is_some())))); })));
+        // No game is in front: the chords are known, and there is no hook at all.
+        assert_eq!(finished.recv_timeout(wait).unwrap(), Some((vec![(3, cycle), (1, mine)], false)));
+        // Clearing the account hotkeys takes them from the hook's list too.
+        desktop.send(Command::Hotkeys(vec![]));
+        assert_eq!(rx.recv_timeout(wait).unwrap(), Event::Registered(vec![(3, Ok(()))]));
+        let (done, finished) = mpsc::channel();
+        desktop.send(Command::Run(Box::new(move || { let _ = done.send(STATE.with(|s| s.borrow().as_ref().map(hook_keys))); })));
+        assert_eq!(finished.recv_timeout(wait).unwrap(), Some(vec![(3, cycle)]));
+        drop(desktop);
+        drop(other);
     }
 
     #[test]

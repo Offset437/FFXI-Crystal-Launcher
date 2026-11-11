@@ -251,6 +251,14 @@ fn clean_stale(data: &Path, exe: Option<&Path>, failed: bool, keep: Option<&Path
             }
         }
     }
+    // Finished update helpers' folders (`apply::start`); only an elevated launcher can remove them.
+    if let Ok(entries) = crate::prereqs::program_data().and_then(fs::read_dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(apply::WORK_PREFIX) {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
     let Some(folder) = exe.and_then(Path::parent) else {
         return;
     };
@@ -262,9 +270,26 @@ fn clean_stale(data: &Path, exe: Option<&Path>, failed: bool, keep: Option<&Path
             if entry.file_name().to_string_lossy().starts_with(".crystal-previous-")
                 && entry.file_type().is_ok_and(|t| t.is_dir())
                 && !entry.path().join(apply::RESTORE_FAILED).exists()
+                && !entry.path().join(apply::AWAITING_START).exists()
             {
                 let _ = fs::remove_dir_all(entry.path());
             }
+        }
+    }
+}
+
+/// Once the window loop has run: this version starts, so an update helper waiting to roll it
+/// back keeps nothing (`apply::AWAITING_START`).
+pub(crate) fn started() {
+    if std::env::args().any(|a| a.starts_with("--preview")) {
+        return;
+    }
+    let Some(folder) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_owned)) else {
+        return;
+    };
+    for entry in fs::read_dir(folder).into_iter().flatten().flatten() {
+        if entry.file_name().to_string_lossy().starts_with(".crystal-previous-") {
+            let _ = fs::remove_file(entry.path().join(apply::AWAITING_START));
         }
     }
 }
@@ -1072,9 +1097,12 @@ pub(crate) mod tests {
         assert!(matches!(take_last_error(&data), State::Idle));
         fs::create_dir_all(install.join(".crystal-previous-3-4")).unwrap();
         fs::write(install.join(".crystal-previous-3-4").join(apply::RESTORE_FAILED), "").unwrap();
+        fs::create_dir_all(install.join(".crystal-previous-5-6")).unwrap();
+        fs::write(install.join(".crystal-previous-5-6").join(apply::AWAITING_START), "").unwrap();
         clean_stale(&data, Some(&exe), false, None);
         assert!(!install.join(".crystal-previous-1-2").exists());
         assert!(install.join(".crystal-previous-3-4").exists(), "its restore failed: the only old copy");
+        assert!(install.join(".crystal-previous-5-6").exists(), "the helper may still roll back to it");
         assert!(install.join("keep").exists());
         fs::remove_dir_all(root).unwrap();
     }

@@ -142,6 +142,18 @@ pub(crate) fn ask_running_instance_to_open() -> Option<OpenAnswer> {
     }
 }
 
+/// The running Crystal's own window, found through its hidden window's class and the process
+/// that owns it (never by a title another program could share).
+pub(crate) fn running_instance_window() -> Option<isize> {
+    use crate::features::game_window::{find_main_window, window_process};
+    use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW;
+    let class = wide(CLASS);
+    // SAFETY: a lookup by class name.
+    let hidden = unsafe { FindWindowW(class.as_ptr(), std::ptr::null()) };
+    if hidden.is_null() { return None; }
+    find_main_window(&[window_process(hidden as isize)?.0])
+}
+
 use crate::win::wide;
 
 static UI_THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

@@ -329,17 +329,8 @@ pub(crate) mod sys {
         GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
     };
 
-    pub(crate) fn windows_dir() -> PathBuf {
-        std::env::var_os("SystemRoot")
-            .or_else(|| std::env::var_os("windir"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
-    }
     pub(crate) fn syswow64() -> PathBuf {
-        windows_dir().join("SysWOW64")
-    }
-    pub(crate) fn system32() -> PathBuf {
-        windows_dir().join("System32")
+        crate::win::system32().with_file_name("SysWOW64")
     }
 
     /// `a.b.c.d` from a file's fixed version resource; `None` when the file is

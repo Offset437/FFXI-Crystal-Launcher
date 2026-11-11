@@ -685,6 +685,60 @@ async fn install_staged_with(staged: Staged, operation: &Operation, guard: Guard
     Ok(report)
 }
 
+/// What a PlayOnline update says when its files stay in use.
+pub(crate) fn viewer_in_use() -> &'static str {
+    t("PlayOnline is in use. Close FINAL FANTASY XI and PlayOnline Viewer, then press Play.")
+}
+
+/// How long PlayOnline's own update waits for its folder to be free before it gives up
+/// (`viewer_in_use`): the hosts of the sign-ins the W2U stopped are still exiting when their
+/// refusal reaches the window (each has polcore.dll loaded from PlayOnline's folder).
+const VIEWER_FREE_WAIT: Duration = Duration::from_secs(15);
+
+/// Play is the PlayOnline update too: the update a sign-in's W2U asked for (`official`, the
+/// version that W2U's reply named). Stock's Viewer updates itself at Connect, before any
+/// credentials go out, with the patch client FFXI's update uses (capture
+/// stock-update-20261013-004932): no second version request, the idle prompt connection,
+/// the file list, one stop-and-wait download connection, then the install. The sign-in that
+/// follows asks its own W2U, as the restarted stock Viewer does at its next Connect.
+/// Nothing is sent while PlayOnline's files are in use (`viewer_in_use`).
+pub(crate) async fn update_viewer_after_connect(viewer: PathBuf, official: String, operation: Operation) -> Result<CombinedReport, CombinedFailure> {
+    let play = AfterPlay { official, prompt: crate::stock_socket::uniform(PROMPT_HOLD) };
+    update_viewer_after_connect_at(viewer, play, operation, Product::Viewer.server(), ensure_idle, VIEWER_FREE_WAIT).await
+}
+
+/// `update_viewer_after_connect` with the patch server, the liveness guard and the wait for a
+/// free folder as test seams.
+async fn update_viewer_after_connect_at(viewer: PathBuf, play: AfterPlay, operation: Operation, server: &str, guard: Guard,
+    free_wait: Duration) -> Result<CombinedReport, CombinedFailure> {
+    ensure_plain(&viewer)?;
+    let viewer = fs::canonicalize(viewer).map_err(|e| e.to_string())?;
+    operation.check_cancelled()?;
+    operation.begin_update();
+    wait_until_idle(&viewer, guard, free_wait, &operation).await?;
+    let failure = |message| CombinedFailure { message, viewer_version: Some(play.official.clone()) };
+    let pol = prepare_with(Product::Viewer, viewer, Mode::Update, &operation.component(t("PlayOnline")), server, guard, Some(&play))
+        .await.map_err(failure)?;
+    let reports = execute(vec![pol], &operation, true, guard).await.map_err(failure)?;
+    Ok(CombinedReport { viewer: reports.into_iter().next(), game: None })
+}
+
+/// Until `guard` finds nothing using `root`, looking again every 250 ms for up to `limit`.
+async fn wait_until_idle(root: &Path, guard: Guard, limit: Duration, operation: &Operation) -> Result<(), String> {
+    let deadline = Instant::now() + limit;
+    loop {
+        operation.check_cancelled()?;
+        let scanned = root.to_path_buf();
+        if tokio::task::spawn_blocking(move || guard(&scanned)).await.map_err(|e| e.to_string())?.is_ok() { return Ok(()); }
+        if Instant::now() >= deadline { return Err(viewer_in_use().into()); }
+        operation.progress(Stage::Waiting, 0, 0, t("Waiting for PlayOnline to close"));
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            cancelled = operation.cancelled_wait() => return Err(cancelled),
+        }
+    }
+}
+
 /// Stage every planned download of `updates`, in order, into each install's verified cache.
 async fn stage_updates(updates: Vec<PreparedUpdate>, operation: &Operation) -> Result<Vec<(PreparedUpdate, Vec<Ready>)>, String> {
     let groups: Vec<Vec<StageGroup>> = updates.iter().map(|u| stage_groups(u.product, &u.manifest, &u.planned)).collect();

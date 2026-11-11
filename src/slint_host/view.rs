@@ -40,6 +40,11 @@ const FIELDS: [Field; 8] = [Field::Label, Field::Server, Field::PolId, Field::Po
 /// A one-time code's digits.
 const CODE_LEN: usize = 6;
 
+/// What an OTP box keeps of its text: digits only, six at most.
+pub(super) fn otp_digits(value: &str) -> String {
+    value.chars().filter(char::is_ascii_digit).take(CODE_LEN).collect()
+}
+
 /// What the callbacks act on, as of the last sync, and the models the window draws from.
 struct State {
     lang: Option<Lang>,
@@ -150,6 +155,7 @@ pub(super) fn wire(ui: &MainWindow) {
     view.on_navigate(|i| { if let Some(page) = index(i).and_then(|i| PAGES.get(i)) { send(Message::Navigate(*page)); } });
     view.on_toggle_privacy(|| act(|s| Some(Message::SetPrivacy(!s.privacy))));
     view.on_toggle_theme(|| act(|s| Some(Message::SetLightTheme(!s.light))));
+    view.on_open_discord(|| send(Message::OpenUrl(crate::DISCORD_INVITE.into())));
     view.on_banner_clicked(|| send(Message::OpenSettingsTab(crate::settings_page::Tab::System)));
 
     // ---- news ----
@@ -169,7 +175,7 @@ pub(super) fn wire(ui: &MainWindow) {
     view.on_otp_edited(|i, value| {
         // The boxes take digits only, six at most; the sixth signs in (the row's Sign in, when
         // the core offers it for that code).
-        let code: String = value.chars().filter(char::is_ascii_digit).take(CODE_LEN).collect();
+        let code = otp_digits(value.as_str());
         let full = code.len() == CODE_LEN;
         act(|s| s.row_keys.get(index(i)?).map(|key| Message::OtpChanged(key.clone(), code)));
         if full {
@@ -315,6 +321,7 @@ fn strings() -> Strings {
         privacy_off_tip: t("Blur names, IDs and messages").into(),
         light_theme: t("Light theme").into(),
         dark_theme: t("Dark theme").into(),
+        discord: t("Join our Discord").into(),
         greeting: t("Welcome back to Vana’diel.").into(),
         greeting_first: t("Welcome to Vana’diel.").into(),
         news: t("PlayOnline news").into(),
@@ -802,7 +809,8 @@ fn setup(view: &View, app: &App, state: &mut State) {
 }
 fn row_ink(state: RowState) -> Ink {
     match state {
-        RowState::Closing | RowState::Waiting | RowState::Updating | RowState::ViewerConfirm | RowState::Starting | RowState::SigningIn => Ink::Warn,
+        RowState::Closing | RowState::Waiting | RowState::Updating | RowState::ViewerConfirm | RowState::ViewerUpdating
+            | RowState::Starting | RowState::SigningIn => Ink::Warn,
         RowState::Playing => Ink::Info,
         RowState::SignedIn => Ink::Ok,
         RowState::Private | RowState::Idle => Ink::Sub,
@@ -816,7 +824,7 @@ fn row_lamp(state: RowState) -> LampState {
     match state {
         RowState::Playing => LampState::Game,
         RowState::SignedIn => LampState::Ready,
-        RowState::Starting | RowState::SigningIn | RowState::Updating => LampState::Rising,
+        RowState::Starting | RowState::SigningIn | RowState::Updating | RowState::ViewerUpdating => LampState::Rising,
         RowState::NeedsCode | RowState::ViewerConfirm => LampState::Code,
         RowState::Problem => LampState::Error,
         RowState::Closing | RowState::Waiting | RowState::Private | RowState::Idle => LampState::Off,
@@ -963,6 +971,9 @@ fn footer(view: &View, app: &App, state: &mut State) {
         (maintenance_status(app), String::new(), 2)
     } else if let Some(update) = &play_update {
         (update.headline.clone(), String::new(), 2)
+    } else if let Some(update) = targets.iter().find_map(|a| crate::play_update::viewer_line(app, &a.key)) {
+        // A sign-in waits for PlayOnline's update to start (running, the file operation above says so).
+        (update.headline, String::new(), 2)
     } else if let Some(update) = (main_action == MainAction::Maintenance)
         .then(|| targets.iter().find_map(|a| crate::play_update::watch_line(app, &a.key))).flatten() {
         (t("Maintenance").into(), update.headline, 2)
@@ -975,11 +986,11 @@ fn footer(view: &View, app: &App, state: &mut State) {
     } else if main_action == MainAction::Offline {
         (t("Worlds offline").into(), t("View official world status").into(), 1)
     } else if let (PlayState::Playing, Some(row)) = (play_state, playing_row) {
-        let who = if running > 1 { tf("{running} accounts", &[("running", &running)]) } else { row.account.label.clone() };
+        let who = if running > 1 { tf("{running} accounts", &[("running", &running)]) } else { crate::privacy::mask(&row.account.label) };
         (tf("Playing · {who}", &[("who", &who)]), String::new(), 0)
     } else if let (PlayState::Starting, Some(row)) = (play_state, starting_row) {
         let step = if row.status.is_empty() { t("Signing in").into() } else { row.status_text().into_owned() };
-        (tf("Starting · {name}", &[("name", &row.account.label)]), step, 2)
+        (tf("Starting · {name}", &[("name", &crate::privacy::mask(&row.account.label))]), step, 2)
     } else {
         let verified = app.patch.as_ref().is_some_and(|p| p.files_verified == Some(true));
         let (s, d, tone) = match app.patch.as_ref().map(|p| p.state) {

@@ -75,7 +75,9 @@ pub(crate) fn split(text: &str, names: &[&str]) -> Vec<(String, bool)> {
     needles.extend(user.as_deref());
     needles.sort_by_key(|n| std::cmp::Reverse(n.chars().count()));
     needles.dedup();
-    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    // Kana, kanji and hangul run together without spaces, so they bound a name instead of joining it.
+    let cjk = |c: char| matches!(c, '\u{3040}'..='\u{30FF}' | '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{AC00}'..='\u{D7AF}' | '\u{FF66}'..='\u{FF9F}');
+    let word = |c: Option<char>| c.is_some_and(|c| (c.is_alphanumeric() && !cjk(c)) || c == '_');
     let mut parts: Vec<(String, bool)> = Vec::new();
     let mut plain = String::new();
     let mut rest = text;
@@ -154,6 +156,17 @@ mod tests {
         let hidden: Vec<_> = parts.iter().filter(|(_, h)| *h).map(|(p, _)| p.as_str()).collect();
         assert_eq!(hidden, ["Al", "jane", "Alyria"]);
         assert_eq!(parts.iter().map(|(p, _)| p.as_str()).collect::<String>(), r"Al: log at C:\users\jane\x.log. Also Alyria.");
+    }
+
+    #[test]
+    fn names_next_to_japanese_text_are_split_out() {
+        set_profile_dir_for_test(r"C:\Users\Jane");
+        let text = "\u{30A2}\u{30EA}\u{30B9}\u{3092}\u{524A}\u{9664}\u{3057}\u{307E}\u{3059}\u{304B}\u{FF1F} Alyria\u{3055}\u{3093}";
+        let parts = split(text, &["\u{30A2}\u{30EA}\u{30B9}", "Alyria"]);
+        let hidden: Vec<_> = parts.iter().filter(|(_, h)| *h).map(|(p, _)| p.as_str()).collect();
+        assert_eq!(hidden, ["\u{30A2}\u{30EA}\u{30B9}", "Alyria"]);
+        // Latin letters still join: "Alyriax" is another word.
+        assert!(split("Alyriax", &["Alyria"]).iter().all(|(_, h)| !h));
     }
 
     #[test]

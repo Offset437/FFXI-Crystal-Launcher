@@ -23,7 +23,7 @@
 - Launch with vanilla FFXI, Windower 4 or Ashita v4, with a profile picker and optional character auto-login per account.
 - Native PlayOnline sign-in, including one-time codes. Save an account's authenticator key and Crystal fills in the code for you.
 - Accounts are signed in when Crystal opens, so Play starts the game right away.
-- Multibox: per-account window layouts, Arrange all and Restore windows, Ctrl+Tab to cycle characters, crash and disconnect recovery, per-client priority and CPU affinity.
+- Multibox: a window layout editor (drag each account's window on a map of your monitors; it snaps to edges, halves, thirds, quarters and the other windows), Restore windows, hotkeys to cycle characters, crash and disconnect recovery, per-client priority and CPU affinity.
 - PlayOnline friends, status and mail, with a privacy mode for streams and screenshots.
 - FFXI and PlayOnline updater with file check, repair and resumable downloads. Supports POL 1.18.15f.
 - Controller setup for Xbox, DualSense and ROG Xbox Ally, with a live input test.
@@ -54,15 +54,15 @@ Get the latest build from [Releases](https://github.com/Offset437/FFXI-Crystal-L
 
 | File | Use it when |
 |---|---|
-| `Crystal-Launcher-1.2.4-Setup.exe` | You want Desktop and Start menu shortcuts. Installs per user, no admin prompt. |
-| `Crystal-Launcher-1.2.4.zip` | You want a portable copy. Unzip and run. |
+| `Crystal-Launcher-1.2.5-Setup.exe` | You want Desktop and Start menu shortcuts. Installs per user, no admin prompt. |
+| `Crystal-Launcher-1.2.5.zip` | You want a portable copy. Unzip and run. |
 | `SHA256SUMS` | You want to verify the download. |
 | `launcher-update.json` | Never. The built-in updater reads it. |
 
 If SmartScreen warns you, choose **More info**, then **Run anyway**. To check the file first, compare its hash with `SHA256SUMS`:
 
 ```powershell
-Get-FileHash .\Crystal-Launcher-1.2.4-Setup.exe -Algorithm SHA256
+Get-FileHash .\Crystal-Launcher-1.2.5-Setup.exe -Algorithm SHA256
 ```
 
 Crystal updates itself. Every update is signed (Ed25519) and verified before it installs.
@@ -98,6 +98,8 @@ tools\build-release.ps1 -InstallerCompiler "C:\Program Files (x86)\NSIS\makensis
 This builds the 32-bit game host, then the launcher with the host embedded. `-InstallerCompiler` is optional and builds Setup.exe with NSIS. Run `cargo test` for the tests.
 
 ## Support
+
+[Join the Discord](https://discord.gg/b344cmuy7y) for help and discussion.
 
 [Open an issue](https://github.com/Offset437/FFXI-Crystal-Launcher/issues) with your Crystal version, launch method, what happened and how to reproduce it. Hide account details and private messages in screenshots and logs. For account or billing problems, contact [Square Enix support](https://support.na.square-enix.com/main.php?id=20&la=1).
 

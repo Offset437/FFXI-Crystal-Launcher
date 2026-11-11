@@ -65,7 +65,10 @@ fn answer(product: Product, conn: usize, mut stream: TcpStream, log: &Mutex<Vec<
                 body.extend((version.len() as u32 + 1).to_le_bytes());
                 body.extend(version.as_bytes());
                 body.push(0);
-                (What::Request { kind: 7, path: String::new(), offset: 0, count: 0 }, polp::seal(polp::kind::VERSION_REPLY, &body))
+                // `path`: the installed version the request carries (none for a fresh install).
+                let installed: Vec<u8> = frame.body.get(8..).unwrap_or_default().iter().copied().take_while(|byte| *byte != 0).collect();
+                if packet != polp::version(&tags, &installed) { push(What::Wrong("version".into())); }
+                (What::Request { kind: 7, path: String::from_utf8_lossy(&installed).into_owned(), offset: 0, count: 0 }, polp::seal(polp::kind::VERSION_REPLY, &body))
             }
             polp::kind::HELLO => {
                 if packet != polp::hello(&tags) { push(What::Wrong("hello".into())); }
@@ -328,6 +331,120 @@ async fn a_combined_update_finishes_playonline_before_ffxis_patch_service_hears_
     assert!(viewer_last < game_first, "FFXI's patch service was contacted before PlayOnline's update finished");
     fs::remove_dir_all(pol).unwrap();
     fs::remove_dir_all(game).unwrap();
+}
+
+const VIEWER_OLD: &str = "20110829_E";
+const VIEWER_NEW: &str = "20261022_0";
+
+/// A PlayOnline install at VIEWER_OLD (its record included) and a patch service at VIEWER_NEW
+/// whose update replaces app.dll and polcore.dll.
+fn viewer_fixture(label: &str) -> (PathBuf, FakeServer) {
+    let pol = root(label);
+    fs::create_dir_all(pol.join("viewer/com")).unwrap();
+    let mut files = HashMap::new();
+    let mut list = Manifest::default();
+    for name in ["app", "polcore"] {
+        let path = format!("viewer/com/{name}.dll");
+        let (old, new) = (format!("old {name} build").into_bytes(), format!("new official {name} build").into_bytes());
+        fs::write(pol.join(&path), &old).unwrap();
+        list.files.push(FileHistory { path: path.clone(), optional: false, versions: vec![
+            version(VIEWER_OLD, &old, &path, old.len() as u64 + 1, None),
+            version(VIEWER_NEW, &new, &path, new.len() as u64 + 1, None)] });
+        files.insert(format!("{VIEWER_NEW}/Direct/{path}.slc"), [&[1u8][..], &new].concat());
+    }
+    let seed = crate::patch::applied_seed_for(&pol, Product::Viewer).unwrap();
+    fs::write(pol.join("patch.ver"), crate::patch::encode_applied_record_for(VIEWER_OLD, seed, Product::Viewer).unwrap()).unwrap();
+    let server = serve_for(Product::Viewer, VIEWER_NEW, manifest_text(&list).as_bytes(), files);
+    (pol, server)
+}
+
+/// Play is the PlayOnline update too. A sign-in's W2U (the stock version frame with the
+/// installed version) is answered "outdated" and stops that sign-in; PlayOnline's update then
+/// sends what stock's patch client sends after a version check that asked for an update
+/// (stock-update-20261013-004932): no version request of its own, an idle prompt connection
+/// a gap after the W2U's FIN, the file list, one stop-and-wait download connection. The
+/// sign-in that follows asks its own W2U, which now says "current".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_w2u_that_asks_for_an_update_is_followed_by_playonlines_update_then_a_current_w2u() {
+    use crate::viewer::ConnectVerdict;
+    let (pol, server) = viewer_fixture("viewer-after-connect");
+    let address = server.addr.clone();
+    let folder = pol.clone();
+    let verdict = tokio::task::spawn_blocking(move || crate::patch::viewer_connect_at(&folder, &address)).await.unwrap();
+    assert_eq!(verdict, ConnectVerdict::Outdated { local: VIEWER_OLD.into(), remote: VIEWER_NEW.into() });
+    let ConnectVerdict::Outdated { remote, .. } = verdict else { unreachable!() };
+    // The W2U closed before its verdict came back; the window notes that when it hears of it.
+    let w2u_fin = Instant::now();
+    note_server_closed(&server.addr, w2u_fin);
+    let op = Operation::new();
+    let hold = Duration::from_millis(400);
+    let report = match update_viewer_after_connect_at(pol.clone(), AfterPlay { official: remote, prompt: hold }, op.clone(),
+        &server.addr, |_| Ok(()), Duration::ZERO).await {
+        Ok(report) => report,
+        Err(failure) => panic!("{}", failure.message),
+    };
+    let viewer = report.viewer.expect("PlayOnline's report");
+    assert!(viewer.verified && viewer.version == VIEWER_NEW && report.game.is_none(), "{viewer:?}");
+    for name in ["app", "polcore"] {
+        assert_eq!(fs::read(pol.join(format!("viewer/com/{name}.dll"))).unwrap(), format!("new official {name} build").into_bytes());
+    }
+    assert_eq!(crate::patch::installed_for_request_for(&pol, Product::Viewer), VIEWER_NEW);
+    assert!(op.snapshot().overall.unwrap().complete);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while server.seen().iter().filter(|s| s.what == What::Close).count() < 4 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The sign-in that follows: its own W2U, with the version just installed.
+    let (address, folder) = (server.addr.clone(), pol.clone());
+    let verdict = tokio::task::spawn_blocking(move || crate::patch::viewer_connect_at(&folder, &address)).await.unwrap();
+    assert_eq!(verdict, ConnectVerdict::Current { version: VIEWER_NEW.into() });
+    let seen = server.seen();
+    assert!(!seen.iter().any(|s| matches!(s.what, What::Overlap | What::Wrong(_))), "{seen:#?}");
+    assert_eq!(seen.iter().filter(|s| s.what == What::Connect).count(), 5, "W2U, prompt, list, downloads, W2U: {seen:#?}");
+    let requests = |conn: usize| seen.iter().filter_map(|s| match &s.what {
+        What::Request { kind, path, offset, count } if s.conn == conn => Some((*kind, path.clone(), *offset, *count)),
+        _ => None }).collect::<Vec<_>>();
+    assert_eq!(requests(0), [(7, VIEWER_OLD.to_owned(), 0, 0)], "the sign-in's W2U");
+    assert!(requests(1).is_empty(), "the prompt connection carries nothing");
+    assert_eq!(requests(2), [(1, String::new(), 0, 0)]);
+    assert_eq!(requests(3), ["app", "polcore"].map(|name|
+        (3, format!("{VIEWER_NEW}/Direct/viewer/com/{name}.dll.slc"), 0, format!("new official {name} build").len() as u32 + 1)));
+    assert_eq!(requests(4), [(7, VIEWER_NEW.to_owned(), 0, 0)], "the next sign-in's W2U");
+    // W2U FIN → prompt SYN, the prompt held open, its FIN → list SYN: never within 100 ms.
+    let prompt_syn = seen_at(&seen, 1, &What::Connect);
+    let prompt_fin = seen_at(&seen, 1, &What::Close);
+    assert!(prompt_syn - w2u_fin >= NEXT_CONNECTION_GAP.0, "{:?}", prompt_syn - w2u_fin);
+    assert!(prompt_fin - prompt_syn >= hold, "{:?}", prompt_fin - prompt_syn);
+    assert!(seen_at(&seen, 2, &What::Connect) - prompt_fin >= Duration::from_millis(100));
+    assert!(seen_at(&seen, 3, &What::Connect) - seen_at(&seen, 2, &What::Close) >= Duration::from_millis(100));
+    for conn in [2, 3] {
+        let quiet = seen_at(&seen, conn, &What::Close) - seen_at(&seen, conn, &What::Replied);
+        assert!(quiet >= crate::stock_socket::CLOSE_AFTER_REPLY.0, "reply → FIN {quiet:?}");
+    }
+    fs::remove_dir_all(pol).unwrap();
+}
+
+/// PlayOnline's files in use (a game, the Viewer, a host still exiting): the update waits a
+/// moment for them, and sends nothing at all when they stay in use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn playonlines_update_waits_for_its_files_and_sends_nothing_while_they_stay_in_use() {
+    static SCANS: AtomicUsize = AtomicUsize::new(0);
+    let (pol, server) = viewer_fixture("viewer-in-use");
+    let play = || AfterPlay { official: VIEWER_NEW.into(), prompt: Duration::from_millis(50) };
+    let busy: Guard = |_| Err("Close the game using this install before updating files".into());
+    let started = Instant::now();
+    let failure = update_viewer_after_connect_at(pol.clone(), play(), Operation::new(), &server.addr, busy, Duration::from_millis(600)).await.err().unwrap();
+    assert_eq!(failure.message, viewer_in_use());
+    assert!(started.elapsed() >= Duration::from_millis(600), "it looked again before giving up");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(server.seen().is_empty(), "nothing is sent for an update that cannot install: {:?}", server.seen());
+    assert_eq!(crate::patch::installed_for_request_for(&pol, Product::Viewer), VIEWER_OLD);
+    // A host that was still exiting: gone at the third look, the update goes ahead.
+    let exiting: Guard = |_| if SCANS.fetch_add(1, Ordering::SeqCst) < 2 { Err("still exiting".into()) } else { Ok(()) };
+    let report = update_viewer_after_connect_at(pol.clone(), play(), Operation::new(), &server.addr, exiting, Duration::from_secs(10)).await;
+    assert!(report.is_ok_and(|report| report.viewer.is_some_and(|viewer| viewer.verified)));
+    assert_eq!(crate::patch::installed_for_request_for(&pol, Product::Viewer), VIEWER_NEW);
+    fs::remove_dir_all(pol).unwrap();
 }
 
 #[test]

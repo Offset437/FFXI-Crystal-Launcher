@@ -3,9 +3,9 @@
 //! signed-in sessions, privacy, account order) and reporting back through `Event`s.
 //!
 //! What runs when, and nothing else:
-//! - the desktop thread (`desktop`) while an account hotkey is set, or while a game runs and a
-//!   window feature (remember, restore, background priority, window ordering, the cycle keys) is
-//!   on;
+//! - the desktop thread (`desktop`) while an account hotkey is set, or while a game runs (its
+//!   window is found, remembered and restored, and marked for the taskbar when it covers its
+//!   monitor);
 //! - the notification watcher (`notify`) while notifications are on and a session is signed in;
 //! - the Discord presence thread while presence is on and a game runs;
 //! - a one-shot sleeper while an automatic relaunch is scheduled.
@@ -15,33 +15,22 @@
 
 use super::game_window::{self, Monitor};
 use super::hotkeys::{self, Action, Hotkey, Problem};
-use super::layouts::{self, Preset};
+use super::layouts;
 use super::recovery::{self, Decision, EndKind};
-use super::{backups, desktop, discord, keyhook, notify, order, perf, playtime, store, ClientKey, FeatureSettings};
+use super::{backups, desktop, discord, keyhook, notify, perf, playtime, store, ClientKey, FeatureSettings};
 use crate::backend::Config;
 use crate::launch_log::ExitReport;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// How long a switching hotkey waits for an ordering pass on another thread to stop.
-const ORDER_YIELD: Duration = Duration::from_millis(700);
-/// How long after a hotkey's switch the foreground and the stacking are read again for the
-/// history: whatever undoes a switch (a game or a tool taking the foreground back) shows there.
-const AFTER_SWITCH_MS: u32 = 300;
-/// How long the window a hotkey gave the foreground gets to come to the top of the game windows
-/// by itself (its thread handles the activation between frames) before it is moved there.
-const RAISE_SETTLE: Duration = Duration::from_millis(150);
-
-/// The window-ordering flag (`Shared::ordering`), held: released when dropped.
-struct OrderingHeld<'a>(&'a AtomicBool);
-impl<'a> OrderingHeld<'a> {
-    /// None while another holds it. (Built only once taken: dropping one releases the flag.)
-    fn take(flag: &'a AtomicBool) -> Option<Self> { (!flag.swap(true, Ordering::AcqRel)).then(|| Self(flag)) }
-}
-impl Drop for OrderingHeld<'_> { fn drop(&mut self) { self.0.store(false, Ordering::Release); } }
-
+/// How long after a game's window is found a flash of its taskbar button is ended (a game
+/// started behind another window asks for attention, and a flashing button keeps the taskbar
+/// up over the game in front).
+const FLASH_SETTLE_MS: u32 = 1500;
 /// What the runtime tells the interface.
 #[derive(Clone, Debug)]
 pub(crate) enum Event {
@@ -52,8 +41,6 @@ pub(crate) enum Event {
     Recovery { account: String, decision: Decision },
     /// Start this account's ordinary Play now (a scheduled automatic relaunch is due).
     RelaunchDue(String),
-    /// A desktop notification was shown, suppressed, or failed.
-    Notification(notify::Report),
     /// Something a feature could not do (saving its settings, applying priority).
     Error(String),
 }
@@ -98,6 +85,10 @@ struct Game {
     character: Option<String>,
     /// The priority last applied, so a foreground change costs no call when nothing changes.
     priority: Option<perf::Priority>,
+    /// The processor mask last applied (None: the system's own), likewise.
+    affinity: Option<u64>,
+    /// Whether the taskbar was last told this game's window is full screen (`mark_step`).
+    marked: Option<bool>,
 }
 
 struct Inner {
@@ -111,15 +102,6 @@ struct Inner {
     /// What each registered hotkey id does.
     hotkeys: Vec<(i32, Action, Hotkey)>,
     hotkey_status: Vec<hotkeys::Status>,
-    /// A Play is still bringing up games (the interface says): windows are ordered after it.
-    launching: bool,
-    /// The windows need ordering (a game started, or the Home order changed with games running).
-    order_pending: bool,
-    /// The windows as last ordered, in Home order: an automatic pass with nothing new is skipped.
-    last_ordered: Vec<isize>,
-    /// Windows refused an activation of the ordering pass while these games ran: automatic passes
-    /// only stack the windows (`order::Plan::stack_only`) until the last game ends.
-    alt_tab_refused: bool,
     recovery: recovery::Policy,
     wake_generation: u64,
     playtime: playtime::Tracker,
@@ -136,12 +118,22 @@ struct Shared {
     privacy: Arc<AtomicBool>,
     /// Moves whenever what the interface reads changes (`Runtime::revision`).
     revision: AtomicU64,
-    /// A window-ordering pass is running (one at a time, whichever thread asked), or a hotkey is
-    /// switching windows: neither starts while the other is at it.
-    ordering: AtomicBool,
-    /// Counts the switching hotkeys pressed. An ordering pass that sees it move stops: its own
-    /// activations, and the foreground it gives back at the end, would undo the hotkey's switch.
-    switches: AtomicU64,
+    /// Tests: what the taskbar was told (window, full screen), in place of telling it.
+    #[cfg(test)]
+    marks: Mutex<Vec<(isize, bool)>>,
+    /// Tests of the layout editor: the monitors and open game windows it is shown instead of
+    /// this desktop's (`Runtime::stand_in`).
+    #[cfg(test)]
+    stand_in: Mutex<Option<StandInDesktop>>,
+}
+
+/// A desktop for tests of the layout editor: its monitors, and the open game windows (account,
+/// rectangle, and whether Apply may move it).
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StandInDesktop {
+    pub monitors: Vec<Monitor>,
+    pub windows: Vec<(String, game_window::Rect, bool)>,
 }
 
 /// The features' runtime. Cheap to clone (one shared state).
@@ -156,10 +148,13 @@ impl Runtime {
     /// Load the saved feature settings and play time. Starts nothing that isn't configured: with
     /// no hotkey set, no thread runs until a game starts or a session signs in.
     pub(crate) fn new(config: Config, sink: Sink) -> Self {
-        let (settings, load_error) = match store::load(&config) {
-            Ok(settings) => (settings, None),
-            Err(error) => (FeatureSettings::default(), Some(error)),
+        let (settings, cleared, load_error) = match store::load_noting(&store::path(&config)) {
+            Ok((settings, cleared)) => (settings, cleared, None),
+            Err(error) => (FeatureSettings::default(), false, Some(error)),
         };
+        // 1.2.5: the cycle keys an older Crystal set by itself were just cleared. Saved now, so
+        // it happens once and a chord chosen later is the user's.
+        let cleared = cleared.then(|| store::save(&config, &settings));
         let pids = Mutex::new(Vec::new());
         let privacy = Arc::new(AtomicBool::new(false));
         let shared = Arc::new_cyclic(|weak: &std::sync::Weak<Shared>| {
@@ -167,8 +162,7 @@ impl Runtime {
             let foreground: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
                 foreground_weak.upgrade().is_some_and(|shared| foreground_is_game(&lock(&shared.pids)))
             });
-            let notify_sink = sink.clone();
-            let notify = notify::Watcher::start(Arc::new(move |report| notify_sink(Event::Notification(report))),
+            let notify = notify::Watcher::start(Arc::new(|_| {}),
                 notify::Hooks::system(foreground, privacy.clone()), settings.notify.clone());
             Shared {
                 inner: Mutex::new(Inner {
@@ -182,10 +176,6 @@ impl Runtime {
                     desktop: None,
                     hotkeys: Vec::new(),
                     hotkey_status: Vec::new(),
-                    launching: false,
-                    order_pending: false,
-                    last_ordered: Vec::new(),
-                    alt_tab_refused: false,
                     recovery: recovery::Policy::default(),
                     wake_generation: 0,
                     notify,
@@ -195,11 +185,18 @@ impl Runtime {
                 pids,
                 privacy,
                 revision: AtomicU64::new(0),
-                ordering: AtomicBool::new(false),
-                switches: AtomicU64::new(0),
+                #[cfg(test)]
+                marks: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                stand_in: Mutex::new(None),
             }
         });
         let runtime = Self { shared };
+        match cleared {
+            Some(Ok(())) => runtime.diag("hotkeys: the default cycle keys of earlier versions were cleared; none is set until one is chosen"),
+            Some(Err(error)) => runtime.diag(&format!("hotkeys: the default cycle keys of earlier versions were cleared, not saved yet: {error}")),
+            None => {}
+        }
         runtime.refresh_desktop();
         runtime
     }
@@ -212,6 +209,14 @@ impl Runtime {
     fn diag(&self, line: &str) {
         crate::launch_log::append_history(&self.shared.config.history_path(), "Crystal", line, None);
     }
+
+    /// A line about a hotkey field's recording (`hotkeys: record: ...`): what happened, and of
+    /// keys only the codes of the one that ended it.
+    pub(crate) fn record_note(&self, text: &str) { self.diag(&format!("hotkeys: record: {text}")); }
+
+    /// Where this runtime's launch history is (tests read what was noted).
+    #[cfg(test)]
+    pub(crate) fn history_path(&self) -> std::path::PathBuf { self.shared.config.history_path() }
 
     fn changed(&self) { self.shared.revision.fetch_add(1, Ordering::AcqRel); }
 
@@ -250,18 +255,9 @@ impl Runtime {
         self.update_presence();
     }
 
-    /// The launcher's account order: hotkey cycling, arrange-all and window ordering follow it. A
-    /// change while games run puts their windows in the new order (`order_windows` on).
-    pub(crate) fn set_order(&self, order: Vec<String>) {
-        {
-            let mut inner = self.inner();
-            if inner.order == order { return; }
-            inner.order = order;
-            if !inner.games.is_empty() { inner.order_pending = true; }
-        }
-        self.order_if_due("Home order changed");
-    }
-
+    /// The launcher's account order: hotkey cycling and the next launch follow it at once. No
+    /// running game's window, taskbar button or place in Alt+Tab is touched.
+    pub(crate) fn set_order(&self, order: Vec<String>) { self.inner().order = order; }
     /// Whether `order` differs from the account order the runtime has (no allocation: the
     /// interface may ask on every observation).
     pub(crate) fn order_differs<'a>(&self, order: impl IntoIterator<Item = &'a str>) -> bool {
@@ -271,13 +267,6 @@ impl Runtime {
             if have.next().map(String::as_str) != Some(key) { return true; }
         }
         have.next().is_some()
-    }
-
-    /// A Play is still bringing up games (sign-in, queue, or a game not yet started). When the
-    /// last one is up, their windows are put in Home order once each has its window.
-    pub(crate) fn set_launching(&self, on: bool) {
-        if std::mem::replace(&mut self.inner().launching, on) == on || on { return; }
-        self.order_if_due("Play finished");
     }
 
     /// FFXI is down for maintenance or an outage, or an Update runs: no automatic relaunch.
@@ -299,9 +288,8 @@ impl Runtime {
             let error = perf::apply(start.pid, priority, client.affinity).err();
             inner.games.insert(start.account.clone(), Game {
                 key, label: start.label, pids, hwnd: None, started: Instant::now(), started_unix: now_unix(),
-                started_wall: SystemTime::now(), restored: false, first_title: None, character: None, priority,
+                started_wall: SystemTime::now(), restored: false, first_title: None, character: None, priority, affinity: client.affinity, marked: None,
             });
-            inner.order_pending = true;
             error
         };
         if let Some(error) = error { self.emit(Event::Error(error)); }
@@ -312,7 +300,6 @@ impl Runtime {
             self.on_window(&start.account, hwnd);
         }
         self.update_presence();
-        self.order_if_due("game started");
     }
 
     /// A game ended. Records its play time and decides about recovery: the decision is returned
@@ -320,9 +307,8 @@ impl Runtime {
     pub(crate) fn game_ended(&self, end: GameEnd) -> Decision {
         let decision = {
             let mut inner = self.inner();
-            // Its Arrange all undo stays: Restore windows still puts its remembered window back.
+            // Its Apply undo stays: Restore windows still puts its remembered window back.
             let Some(game) = inner.games.remove(&end.account) else { return Decision::None };
-            if inner.games.is_empty() { inner.alt_tab_refused = false; }
             inner.playtime.stop(&game.key, now_unix());
             self.changed();
             let clean = end.user_closed || end.report.as_ref().is_some_and(|r| r.kind == crate::launch_log::ExitKind::Normal);
@@ -396,19 +382,22 @@ impl Runtime {
     // ---- windows -------------------------------------------------------------------------
 
     /// Start, adjust or end the desktop thread for what is configured now.
-    /// The cycle keys are registered only while a game window is in front (`hotkeys::Gate`), so
-    /// they need the thread only while games run; account hotkeys need it while they are set.
+    /// The in-game hotkeys (`hotkeys::in_game_only`: the cycle keys, and an account's hotkey
+    /// with no Ctrl, Alt or Win) are registered only while a game window is in front
+    /// (`hotkeys::Gate`), so they need the thread only while games run; the others need it
+    /// while they are set.
+    /// Any hotkey has the games watched: over a game it arrives through the keyboard hook, which
+    /// is armed by the foreground changes of the watched games.
     fn refresh_desktop(&self) {
         let (plan, refused) = hotkeys::plan(&self.inner().settings.hotkeys);
         let mut report: Option<Vec<hotkeys::Status>> = None;
         let (track, dropped) = {
             let mut inner = self.inner();
-            let s = &inner.settings;
-            let in_game_keys = plan.iter().any(|(_, a, _)| a.in_game_only());
-            let windows = s.layouts.remember || s.layouts.restore || s.perf.background || s.layouts.order_windows || in_game_keys;
-            let track: Vec<u32> = if windows { inner.games.values().flat_map(|g| g.pids.iter().copied()).collect() } else { Vec::new() };
-            let needed = plan.iter().any(|(_, a, _)| !a.in_game_only()) || !track.is_empty();
-            let refused_before = inner.hotkey_status.iter().filter(|s| matches!(s.problem, Some(Problem::Duplicate | Problem::NeedsModifier | Problem::Reserved)));
+            // Every running game is watched: its window is found, remembered, restored and
+            // marked for the taskbar when it covers its monitor.
+            let track: Vec<u32> = inner.games.values().flat_map(|g| g.pids.iter().copied()).collect();
+            let needed = plan.iter().any(|(_, a, h)| !hotkeys::in_game_only(a, *h)) || !track.is_empty();
+            let refused_before = inner.hotkey_status.iter().filter(|s| s.problem.is_some_and(|p| p.refused()));
             let changed = inner.hotkeys.iter().map(|(_, a, h)| (a.clone(), *h)).ne(plan.iter().map(|(_, a, h)| (a.clone(), *h)))
                 || refused_before.ne(refused.iter());
             inner.hotkeys = plan.clone();
@@ -475,7 +464,7 @@ impl Runtime {
                         };
                         hotkeys::Status { action: action.clone(), hotkey: *hotkey, problem }
                     }).collect();
-                    all.extend(inner.hotkey_status.iter().filter(|s| s.problem.is_some_and(|p| matches!(p, Problem::Duplicate | Problem::NeedsModifier | Problem::Reserved))).cloned());
+                    all.extend(inner.hotkey_status.iter().filter(|s| s.problem.is_some_and(|p| p.refused())).cloned());
                     inner.hotkey_status = all.clone();
                     all
                 };
@@ -496,7 +485,11 @@ impl Runtime {
             }
             desktop::Event::MoveSizeEnd { hwnd, pid } | desktop::Event::Minimized { hwnd, pid, .. } => {
                 if let Some(account) = self.account_of(pid) {
-                    if self.with_game(&account, |g| g.hwnd == Some(hwnd)).unwrap_or(false) { self.remember(&account, hwnd); }
+                    if self.with_game(&account, |g| g.hwnd == Some(hwnd)).unwrap_or(false) {
+                        self.remember(&account, hwnd);
+                        // Moved by hand: the taskbar hears when it no longer covers its monitor.
+                        self.mark_full_screen(&account, hwnd, false);
+                    }
                 }
             }
             desktop::Event::Shown { hwnd, pid } => {
@@ -532,12 +525,70 @@ impl Runtime {
             let fallback = ClientKey::new(game.key.account.clone(), None).id();
             (restore, inner.settings.layouts.saved.get(&id).or_else(|| inner.settings.layouts.saved.get(&fallback)).cloned(), adopted)
         };
+        let found = adopted.then(|| game_window::describe(hwnd)).flatten();
+        let mut restored = "nothing remembered to restore".to_owned();
         if let (true, Some(saved)) = (restore, saved) {
             if let Some((rect, shown)) = layouts::restore_rect(&saved, &game_window::monitors()) {
-                game_window::apply(hwnd, rect, shown);
+                // A window the game itself opened over its whole monitor, that belongs there, is
+                // left exactly as the game made it: a move could only take a pixel from it.
+                if game_window::capture(hwnd).is_some_and(|now| layouts::stays_full_screen(&now, &rect)) {
+                    restored = "covers its monitor, left as the game made it".to_owned();
+                } else {
+                    let ok = game_window::apply(hwnd, rect, shown);
+                    let landed = game_window::capture(hwnd).map_or_else(|| "?".to_owned(), |p| show(p.rect));
+                    restored = format!("restored to {}: {}", show(rect), if ok { format!("landed at {landed}") } else { "failed".to_owned() });
+                }
             }
         }
-        if adopted { self.order_if_due("game window found"); }
+        if let Some(found) = found {
+            let place = {
+                let inner = self.inner();
+                home_order(&inner).iter().position(|k| k == account).map_or(0, |i| i + 1)
+            };
+            // One line per game window, so a taskbar that stays over a game can be explained from
+            // the history: what the game made, and what Crystal did to it.
+            self.diag(&format!("features: window #{place}: {found}; {restored}"));
+        }
+        if adopted {
+            self.mark_full_screen(account, hwnd, true);
+            // A game started behind another window asks for attention with a flashing taskbar
+            // button, which keeps the taskbar up over the game in front: the flash is ended once
+            // the game has settled (on the desktop thread's timer; nothing else is touched).
+            desktop::later(FLASH_SETTLE_MS, Box::new(move || {
+                if game_window::foreground().is_none_or(|(front, _)| front != hwnd) { game_window::stop_flash(hwnd); }
+            }));
+        }
+    }
+
+    /// Tells the taskbar whether `account`'s game window is a full-screen one, when that is
+    /// news (`mark_step`): yes while it covers its whole monitor, as FFXI's borderless and
+    /// full-screen modes do at the monitor's size, so the taskbar stays behind it; no once it
+    /// has been moved to a tile. Called when the window is found (`found`: one history line
+    /// either way) and after every move of it, Crystal's (Apply, Restore windows, the restore
+    /// at launch) or the user's own.
+    fn mark_full_screen(&self, account: &str, hwnd: isize, found: bool) {
+        let covers = game_window::capture(hwnd).is_some_and(|p| layouts::covers(&p.rect, &p.monitor.rect).is_some());
+        let (call, place) = {
+            let mut inner = self.inner();
+            let place = home_order(&inner).iter().position(|k| k == account).map_or(0, |i| i + 1);
+            let Some(game) = inner.games.get_mut(account) else { return };
+            let call = mark_step(game.marked, covers);
+            game.marked = Some(covers);
+            (call, place)
+        };
+        let refused = call.is_some_and(|on| !self.tell_taskbar(hwnd, on));
+        if found || call.is_some() {
+            self.diag(&format!("features: window #{place} marked full screen: {}{}", if covers { "yes" } else { "no" },
+                if refused { " (the taskbar did not take it)" } else { "" }));
+        }
+    }
+
+    /// ITaskbarList2::MarkFullscreenWindow for `hwnd` (tests note the call instead).
+    fn tell_taskbar(&self, hwnd: isize, on: bool) -> bool {
+        #[cfg(test)]
+        { lock(&self.shared.marks).push((hwnd, on)); true }
+        #[cfg(not(test))]
+        { game_window::mark_fullscreen(hwnd, on) }
     }
 
     fn remember(&self, account: &str, hwnd: isize) {
@@ -574,22 +625,8 @@ impl Runtime {
     /// have a window, in Home order: one still loading (no window yet) or closed is skipped, and a
     /// minimised one is restored, as Alt+Tab does (`hotkeys::cycle`). One history line: the press,
     /// where it went (places in Home order, never names) and each foreground step's result.
-    ///
-    /// The window given the foreground is also put in front of the other game windows when it is
-    /// not (`game_window::raise`): the games cover each other exactly, so the one seen is the one
-    /// on top of the stack, whichever has the keyboard. An ordering pass on another thread stops
-    /// for the switch and none starts during it (`Shared::switches`, `Shared::ordering`). The
-    /// history line ends with the game windows' stacking, and a second line reads the foreground
-    /// and the stacking again a moment later (`after_switch`).
+    /// Crystal never changes the z-order itself: the window comes up as Windows brings it.
     fn run_action(&self, action: &Action, via: desktop::Via, key: Option<keyhook::Fired>) {
-        let switches = self.shared.switches.fetch_add(1, Ordering::AcqRel) + 1;
-        let asked = Instant::now();
-        let held = loop {
-            if let Some(held) = OrderingHeld::take(&self.shared.ordering) { break Some(held); }
-            if asked.elapsed() >= ORDER_YIELD { break None; }
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        let waited = asked.elapsed();
         let front = game_window::foreground();
         let (games, in_front) = {
             let inner = self.inner();
@@ -605,12 +642,7 @@ impl Runtime {
             on_top.and_then(|hwnd| games.iter().find(|g| g.window == Some(hwnd)).map(|g| g.account.clone()))
         };
         let switch = hotkeys::cycle(action, &games, current.as_deref());
-        let result = switch.as_ref().map(|s| game_window::activate(s.hwnd, s.restore, true));
-        let raised = match (&switch, &result) {
-            (Some(s), Some(r)) if r.ok() => Some(game_window::raise(s.hwnd, &windows.iter().map(|(_, h)| *h).collect::<Vec<_>>(), RAISE_SETTLE)),
-            _ => None,
-        };
-        drop(held);
+        let result = switch.as_ref().map(|s| game_window::activate(s.hwnd, s.restore, via == desktop::Via::Hotkey));
         let name = match action {
             Action::Next => "next".to_owned(),
             Action::Previous => "previous".to_owned(),
@@ -620,141 +652,115 @@ impl Runtime {
         let from = current.as_ref().and_then(|c| games.iter().position(|g| &g.account == c)).map_or("-".to_owned(), |i| format!("#{}", i + 1));
         let from = if front.is_none() { format!("{from} (no window in front)") } else { from };
         let open = games.iter().filter(|g| g.window.is_some()).count();
-        let mut line = match (&switch, &result) {
-            (Some(s), Some(r)) => format!("hotkeys: {name} via {how}: {from} -> #{} of {} ({open} with a window): {}; {}{}; z {}",
-                s.index, games.len(), r.describe(), if r.ok() { "in front" } else { "NOT in front" }, describe_raise(raised), stack_line(&windows)),
+        let line = match (&switch, &result) {
+            (Some(s), Some(r)) => format!("hotkeys: {name} via {how}: {from} -> #{} of {} ({open} with a window): {}; {}",
+                s.index, games.len(), r.describe(), if r.ok() { "in front" } else { "NOT in front" }),
             _ => format!("hotkeys: {name} via {how}: from {from}, no window to switch to ({} running, {open} with a window)", games.len()),
         };
-        if waited >= Duration::from_millis(20) {
-            line.push_str(&format!("; waited {} ms for an ordering pass{}", waited.as_millis(), if waited >= ORDER_YIELD { ", which did not stop" } else { "" }));
-        }
         self.diag(&line);
-        if let Some(s) = &switch {
-            let weak = Arc::downgrade(&self.shared);
-            let (index, target) = (s.index, s.hwnd);
-            desktop::later(AFTER_SWITCH_MS, Box::new(move || {
-                if let Some(shared) = weak.upgrade() { Runtime { shared }.after_switch(index, target, switches, &windows); }
-            }));
-        }
     }
 
-    /// The history's second look at a hotkey's switch to `target` (place `index` in Home order),
-    /// `AFTER_SWITCH_MS` later: which window is in front now, and the game windows' stacking.
-    fn after_switch(&self, index: usize, target: isize, switches: u64, windows: &[(usize, isize)]) {
-        let front = match game_window::foreground() {
-            None => "no window".to_owned(),
-            Some((hwnd, _)) if hwnd == target => format!("#{index}"),
-            Some((hwnd, pid)) => {
-                let who = match windows.iter().find(|(_, h)| *h == hwnd) {
-                    Some((other, _)) => format!("#{other}"),
-                    None if lock(&self.shared.pids).contains(&pid) => "another window of a game".to_owned(),
-                    None => "not a game".to_owned(),
-                };
-                // Another hotkey since explains it; anything else took the foreground back.
-                let why = if self.shared.switches.load(Ordering::Acquire) != switches { "a later hotkey" } else { "NOT the target" };
-                format!("{who} ({why})")
-            }
-        };
-        self.diag(&format!("hotkeys: {AFTER_SWITCH_MS} ms after -> #{index}: in front {front}; z {}", stack_line(windows)));
+    /// The monitors now (the layout editor's map, and where its tiles are remembered).
+    pub(crate) fn monitors(&self) -> Vec<Monitor> {
+        #[cfg(test)]
+        { if let Some(desktop) = lock(&self.shared.stand_in).as_ref() { return desktop.monitors.clone(); } }
+        game_window::monitors()
     }
 
-    /// Put the game windows' taskbar buttons and Alt+Tab order in Home order now (the "Order
-    /// windows" button). Returns how many game windows there are; `Err` when there is none, or
-    /// when Windows refused the Alt+Tab part (the taskbar part is still done).
-    pub(crate) fn order_windows(&self) -> Result<usize, String> { self.order(None).unwrap_or(Ok(0)) }
-
-    /// The automatic pass: when on, something changed, no Play is still bringing up games, every
-    /// running game has its window (games coming up one by one get one pass, not one per window),
-    /// and the windows differ from the last pass. It stays due while a game has no window yet.
-    /// `why` names what made it due, for the history.
-    fn order_if_due(&self, why: &'static str) {
-        {
-            let mut inner = self.inner();
-            if !inner.settings.layouts.order_windows || !inner.order_pending || inner.launching || inner.games.is_empty() { return; }
-            if !inner.games.values().all(|g| g.hwnd.is_some_and(game_window::exists)) { return; }
-            inner.order_pending = false;
-        }
-        match self.order(Some(why)) {
-            // Another pass is running, or a hotkey is switching: due again at the next change.
-            None => self.inner().order_pending = true,
-            Some(Err(error)) => self.emit(Event::Error(error)),
-            Some(Ok(_)) => {}
-        }
+    /// Tests: show the layout editor `desktop` instead of this PC's monitors and game windows.
+    #[cfg(test)]
+    pub(crate) fn stand_in(&self, desktop: StandInDesktop) {
+        *lock(&self.shared.stand_in) = Some(desktop);
+        self.changed();
     }
 
-    /// One ordering pass, asked for (`why` is None) or automatic (`why` names its cause); `None`
-    /// when another is running or a hotkey is switching windows. Every pass leaves one history
-    /// line with its cause. An automatic pass whose activations Windows refuses still sets the
-    /// order by stacking (`order::apply`), and later automatic passes only stack. A switching
-    /// hotkey pressed meanwhile stops the pass (it would undo the switch): it is then due again.
-    fn order(&self, why: Option<&'static str>) -> Option<Result<usize, String>> {
-        let asked = why.is_none();
-        // One pass at a time: two interleaved activation sequences would undo each other.
-        let _running = OrderingHeld::take(&self.shared.ordering)?;
-        let switches = self.shared.switches.load(Ordering::Acquire);
-        let (hwnds, refused_before) = {
+    /// The running games' windows as the layout editor shows them, in Home order: the account,
+    /// where its window is now, and whether Apply may move it (a game that may hold its display
+    /// is left alone, `game_window::holds_display`). A game with no window yet, or whose window
+    /// can't be read, is not in it.
+    pub(crate) fn layout_windows(&self) -> Vec<(String, game_window::Rect, bool)> {
+        #[cfg(test)]
+        { if let Some(desktop) = lock(&self.shared.stand_in).as_ref() { return desktop.windows.clone(); } }
+        let found = {
             let inner = self.inner();
-            (home_windows(&inner).into_iter().map(|(_, h)| h).collect::<Vec<isize>>(), inner.alt_tab_refused)
-        };
-        if hwnds.is_empty() {
-            return Some(if asked { Err(crate::i18n::t("No game window to order.").into()) } else { Ok(0) });
-        }
-        if !asked && self.inner().last_ordered == hwnds { return Some(Ok(hwnds.len())); }
-        let windows: Vec<order::Window> = hwnds.iter().map(|h| order::Window { hwnd: *h, minimized: game_window::is_minimized(*h) }).collect();
-        let mut plan = order::plan(&windows, game_window::foreground().map(|(h, _)| h));
-        plan.stack_only = !asked && refused_before;
-        let outcome = order::apply(&plan, &|| self.shared.switches.load(Ordering::Acquire) != switches);
-        {
-            let mut inner = self.inner();
-            if outcome.stopped { inner.order_pending = true; } else { inner.last_ordered = hwnds.clone(); }
-            if outcome.refused { inner.alt_tab_refused = true; }
-        }
-        if outcome.taskbar > 0 || !plan.activate.is_empty() {
-            let kind = match (why, plan.stack_only) {
-                (None, _) => "asked".to_owned(),
-                (Some(why), false) => why.to_owned(),
-                (Some(why), true) => format!("{why}, stack only"),
-            };
-            self.diag(&format!("hotkeys: order ({kind}): {}", outcome.describe(hwnds.len())));
-        }
-        if asked && !outcome.stopped && !outcome.alt_tab_set() {
-            return Some(Err(crate::i18n::t("Windows did not allow changing the Alt+Tab order.").into()));
-        }
-        Some(Ok(hwnds.len()))
-    }
-
-    /// The monitors now (for choosing where to arrange).
-    pub(crate) fn monitors(&self) -> Vec<Monitor> { game_window::monitors() }
-
-    /// Arrange every running game window with `preset` on the monitors named in `devices` (all,
-    /// in Windows' order with the primary first, when empty), in the launcher's account order,
-    /// and remember the result. Games that may hold their display (fullscreen) are left alone; a
-    /// borderless game at its monitor's size is arranged (`game_window::holds_display`). Returns
-    /// how many were placed.
-    pub(crate) fn arrange(&self, preset: Preset, devices: &[String]) -> Result<usize, String> {
-        let monitors = game_window::monitors();
-        let chosen: Vec<&Monitor> = if devices.is_empty() { monitors.iter().collect() }
-            else { devices.iter().filter_map(|d| monitors.iter().find(|m| &m.device == d)).collect() };
-        let areas: Vec<_> = if chosen.is_empty() { monitors.iter().filter(|m| m.primary).map(|m| m.work).collect() } else { chosen.iter().map(|m| m.work).collect() };
-        let (found, aspect) = {
-            let inner = self.inner();
-            (home_windows(&inner), inner.settings.layouts.aspect)
+            if inner.games.is_empty() { return Vec::new(); }
+            home_windows(&inner)
         };
         let front = game_window::foreground().map(|(hwnd, _)| hwnd);
+        found.into_iter().filter_map(|(account, hwnd)| {
+            let placement = game_window::capture(hwnd)?;
+            let movable = !game_window::holds_display(&placement, front == Some(hwnd));
+            Some((account, placement.rect, movable))
+        }).collect()
+    }
+
+    /// Whether `account`'s game runs and has its window (the layout editor's Apply moves it;
+    /// with none, a tile is the client's remembered window).
+    pub(crate) fn has_window(&self, account: &str) -> bool {
+        #[cfg(test)]
+        { if let Some(desktop) = lock(&self.shared.stand_in).as_ref() { return desktop.windows.iter().any(|(a, ..)| a == account); } }
+        let inner = self.inner();
+        inner.games.get(account).is_some_and(|game| window_of(game).is_some())
+    }
+
+    /// Remember each tile the layout editor placed for a client whose game is not running, as
+    /// that client's window, and its size as the size the game starts at, for its next start
+    /// (`layouts::place`): the only way a game's start size is chosen.
+    pub(crate) fn place_windows(&self, places: &[(ClientKey, game_window::Rect)]) -> Result<(), String> {
+        let monitors = self.monitors();
+        self.update(|s| {
+            for (key, rect) in places { layouts::place(&mut s.layouts, key, *rect, &monitors); }
+        })
+    }
+
+    /// The layout editor's Apply: move each running game's window to its tile (`targets`, by
+    /// account) and remember where it is. The size its game starts at is not changed (a tile is
+    /// a stretched picture of the game; `layouts::remember`), so a game restarted after Apply
+    /// starts at its own resolution and is put back on its tile. Every window goes by
+    /// `game_window::apply`, the move
+    /// the launch-time restore uses: to the pixel, never activating a window and never changing
+    /// the z-order or a taskbar button. Games that may hold their display are left alone, and
+    /// so is one that covers its monitor and is to cover it (`layouts::stays_full_screen`).
+    /// What each window was before the first Apply is kept for Restore windows (`next_undo`).
+    /// Returns the accounts whose windows are where their tiles are.
+    pub(crate) fn apply_layout(&self, targets: &[(String, game_window::Rect)]) -> Result<Vec<String>, String> {
+        let found = {
+            let inner = self.inner();
+            home_windows(&inner)
+        };
+        self.apply_layout_to(&found, targets)
+    }
+
+    /// `apply_layout` for the game windows `found` (account and window, in Home order).
+    fn apply_layout_to(&self, found: &[(String, isize)], targets: &[(String, game_window::Rect)]) -> Result<Vec<String>, String> {
+        let found: Vec<(String, isize)> = found.iter().filter(|(account, _)| targets.iter().any(|(a, _)| a == account)).cloned().collect();
+        let front = game_window::foreground().map(|(hwnd, _)| hwnd);
         let placements: Vec<Option<game_window::Placement>> = found.iter().map(|(_, hwnd)| game_window::capture(*hwnd)).collect();
-        let windows = arrangeable(&found, &placements, front);
-        if windows.is_empty() {
-            let text = if found.is_empty() { crate::i18n::t("No game window to arrange.") } else { crate::i18n::t("Fullscreen games are left alone.") };
+        let steps = layout_steps(&found, &placements, front, targets);
+        if !steps.iter().any(|(_, _, step)| *step != LayoutStep::Held) {
+            let text = if found.is_empty() { crate::i18n::t("No game window to move.") } else { crate::i18n::t("Fullscreen games are left alone.") };
             return Err(text.into());
         }
-        let rects = layouts::arrange(preset, windows.len(), &areas, aspect);
-        let mut placed = 0;
+        let mut done = Vec::new();
         let mut moved = Vec::new();
-        for ((account, hwnd), rect) in windows.iter().zip(rects) {
+        let mut count = 0;
+        for (account, hwnd, step) in &steps {
+            let rect = match step {
+                LayoutStep::Held => continue,
+                LayoutStep::Stays => {
+                    done.push(account.clone());
+                    self.mark_full_screen(account, *hwnd, false);
+                    continue;
+                }
+                LayoutStep::Move(rect) => *rect,
+            };
             let before = found.iter().position(|(_, h)| h == hwnd).and_then(|i| placements[i].clone());
             if game_window::apply(*hwnd, rect, game_window::Shown::Normal) {
-                placed += 1;
+                count += 1;
+                done.push(account.clone());
                 self.remember(account, *hwnd);
+                // On a tile it is no full-screen window any more; over its monitor it is one again.
+                self.mark_full_screen(account, *hwnd, false);
                 // Where it landed (a game may adjust the size it is given).
                 let arranged = game_window::capture(*hwnd).map_or(rect, |p| p.rect);
                 let id = self.with_game(account, |g| g.key.id());
@@ -773,11 +779,11 @@ impl Runtime {
             };
             if let Some(Err(error)) = saved { self.emit(Event::Error(error)); }
         }
-        self.diag(&format!("features: arrange: {placed} of {} windows moved, {undone} can be restored", windows.len()));
-        Ok(placed)
+        self.diag(&format!("features: layout: {count} of {} windows moved, {undone} can be restored", steps.len()));
+        Ok(done)
     }
 
-    /// Whether Restore windows has something to do: an Arrange all moved a window of a game that
+    /// Whether Restore windows has something to do: an Apply moved a window of a game that
     /// runs now and has its window.
     pub(crate) fn can_restore_windows(&self) -> bool {
         let inner = self.inner();
@@ -785,20 +791,20 @@ impl Runtime {
         !undo.is_empty() && inner.games.values().any(|g| g.hwnd.is_some_and(game_window::exists) && undo.contains_key(&g.key.id()))
     }
 
-    /// Undo the last Arrange all (the first of several in a row, `next_undo`), also after Crystal
+    /// Undo the last Apply (the first of several in a row, `next_undo`), also after Crystal
     /// or the games restarted: each running game's window goes back exactly as it was (rectangle,
     /// show state and frame; `restore_step`), by the move the launch-time restore uses, and each
     /// client's remembered window goes back to that placement too, so its next start is the
-    /// original one (Arrange all remembered the arranged one). A window that may hold its display
+    /// original one (Apply remembered the arranged one). A window that may hold its display
     /// now is left alone and stays restorable. One history line per window. Returns how many
     /// windows were put back.
     pub(crate) fn restore_windows(&self) -> Result<usize, String> {
-        struct Target { place: usize, hwnd: isize }
+        struct Target { place: usize, hwnd: isize, account: String }
         let (undo, targets) = {
             let mut inner = self.inner();
             let undo = std::mem::take(&mut inner.settings.layouts.undo);
             let targets: BTreeMap<String, Target> = home_candidates(&inner).into_iter().enumerate()
-                .filter_map(|(i, c)| Some((inner.games[&c.account].key.id(), Target { place: i + 1, hwnd: c.window? })))
+                .filter_map(|(i, c)| Some((inner.games[&c.account].key.id(), Target { place: i + 1, hwnd: c.window?, account: c.account })))
                 .collect();
             (undo, targets)
         };
@@ -839,6 +845,7 @@ impl Runtime {
                     };
                     self.diag(&format!("features: restore #{}: {from} -> {}: {result}", target.place, show(rect)));
                     if ok {
+                        self.mark_full_screen(&target.account, target.hwnd, false);
                         restored += 1;
                         put_back.push((id, entry.before));
                     } else {
@@ -849,7 +856,7 @@ impl Runtime {
         }
         let saved = {
             let mut inner = self.inner();
-            // An Arrange all meanwhile (another thread) recorded its own undo: it wins.
+            // An Apply meanwhile (another thread) recorded its own undo: it wins.
             for (id, entry) in keep { inner.settings.layouts.undo.entry(id).or_insert(entry); }
             if inner.settings.layouts.remember {
                 for (id, before) in put_back { inner.settings.layouts.saved.insert(id, before); }
@@ -865,15 +872,15 @@ impl Runtime {
         Ok(restored)
     }
 
-    /// Forget a client's remembered window.
+    /// Forget a client's remembered window and the size its game starts at.
     pub(crate) fn forget_layout(&self, key: &ClientKey) -> Result<(), String> {
-        self.update(|s| { s.layouts.saved.remove(&key.id()); })
+        self.update(|s| layouts::forget(&mut s.layouts, key))
     }
 
     /// Apply each running game's priority for the current foreground process.
     fn apply_priorities(&self, foreground_pid: Option<u32>) {
         let foreground_pid = foreground_pid.or_else(|| game_window::foreground().map(|(_, pid)| pid));
-        let changes: Vec<(u32, perf::Priority)> = {
+        let changes: Vec<(u32, Option<perf::Priority>, Option<u64>)> = {
             let mut inner = self.inner();
             let perf = inner.settings.perf.clone();
             inner.games.iter_mut().filter_map(|(account, game)| {
@@ -881,13 +888,16 @@ impl Runtime {
                 let want = perf.priority_for(account, front);
                 // Background priority turned off: back to the account's own choice, or Normal.
                 let want = want.or(game.priority.map(|_| perf::Priority::Normal));
-                if want == game.priority { return None; }
-                game.priority = want;
-                Some((*game.pids.first()?, want?))
+                let priority = if want != game.priority { game.priority = want; want } else { None };
+                // Processors cleared: the running game goes back to all of them.
+                let wanted = perf.client(account).affinity;
+                let affinity = if wanted != game.affinity { game.affinity = wanted; Some(wanted.unwrap_or_else(perf::system_mask)) } else { None };
+                if priority.is_none() && affinity.is_none() { return None; }
+                Some((*game.pids.first()?, priority, affinity))
             }).collect()
         };
-        for (pid, priority) in changes {
-            if let Err(error) = perf::apply(pid, Some(priority), None) { self.emit(Event::Error(error)); }
+        for (pid, priority, affinity) in changes {
+            if let Err(error) = perf::apply(pid, priority, affinity) { self.emit(Event::Error(error)); }
         }
     }
 
@@ -978,35 +988,9 @@ fn home_order(inner: &Inner) -> Vec<String> {
 fn home_candidates(inner: &Inner) -> Vec<hotkeys::Candidate> {
     home_order(inner).into_iter().map(|account| {
         let game = &inner.games[&account];
-        let window = game.hwnd.filter(|h| game_window::exists(*h)).or_else(|| game_window::find_main_window(&game.pids));
+        let window = window_of(game);
         hotkeys::Candidate { minimized: window.is_some_and(game_window::is_minimized), window, account }
     }).collect()
-}
-
-/// The game windows' stacking for the history (`hotkeys::describe_z`): `windows` is each one with
-/// its place in Home order.
-fn stack_line(windows: &[(usize, isize)]) -> String {
-    let hwnds: Vec<isize> = windows.iter().map(|(_, hwnd)| *hwnd).collect();
-    let z: Vec<hotkeys::Stacked> = game_window::z_order(&hwnds).into_iter().filter_map(|hwnd| {
-        let index = windows.iter().find(|(_, h)| *h == hwnd)?.0;
-        let minimized = game_window::is_minimized(hwnd);
-        Some(hotkeys::Stacked { index, minimized, hidden: !minimized && !game_window::is_shown(hwnd), topmost: game_window::is_topmost(hwnd) })
-    }).collect();
-    hotkeys::describe_z(&z)
-}
-
-/// What putting a hotkey's window in front of the other game windows took, for the history:
-/// nothing to say when it was in front at once (or was not given the foreground); how long it
-/// took to get there by itself; or how many were still in front of it when it was moved.
-fn describe_raise(raised: Option<game_window::Raise>) -> String {
-    match raised {
-        Some(raise) if raise.over > 0 => {
-            let lowered = if raise.lowered > 0 { format!(", {} always on top put behind it", raise.lowered) } else { String::new() };
-            format!("; {} in front of it after {} ms: {}{lowered}", raise.over, raise.waited, if raise.top { "raised" } else { "NOT raised" })
-        }
-        Some(raise) if raise.waited > 0 => format!("; on top after {} ms", raise.waited),
-        _ => String::new(),
-    }
 }
 
 /// The running games that have a window now, in Home order, with that window.
@@ -1014,7 +998,51 @@ fn home_windows(inner: &Inner) -> Vec<(String, isize)> {
     home_candidates(inner).into_iter().filter_map(|c| Some((c.account, c.window?))).collect()
 }
 
-/// The game windows Arrange all may move: `found` (Home order) with each one's placement now
+/// Whether the taskbar is to be told about a game window, and what: `was` is what it was last
+/// told (nothing yet for a window just found), `covers` whether the window covers its monitor
+/// now. Told once when a covering window is found, again when it stops covering (moved to a
+/// tile) and when it covers again (Restore windows, Full screen); never told the same twice,
+/// and never about a window that was no full-screen one to begin with.
+fn mark_step(was: Option<bool>, covers: bool) -> Option<bool> {
+    match was {
+        Some(told) if told == covers => None,
+        None if !covers => None,
+        _ => Some(covers),
+    }
+}
+
+/// `game`'s window now: the one it was seen with while that exists, else its main window.
+fn window_of(game: &Game) -> Option<isize> {
+    game.hwnd.filter(|h| game_window::exists(*h)).or_else(|| game_window::find_main_window(&game.pids))
+}
+
+/// What the layout editor's Apply does with one window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutStep {
+    /// It may hold its display now (`game_window::holds_display`): left alone, its tile kept.
+    Held,
+    /// It covers its monitor as the game made it and its tile covers that monitor too: left
+    /// exactly as it is (`layouts::stays_full_screen`).
+    Stays,
+    /// Move it here.
+    Move(game_window::Rect),
+}
+
+/// What Apply does with each game window that has a tile in `targets` (by account): `found`
+/// (Home order) with each one's placement now (`None` when it could not be read) and the window
+/// in front.
+fn layout_steps(found: &[(String, isize)], placements: &[Option<game_window::Placement>], front: Option<isize>, targets: &[(String, game_window::Rect)]) -> Vec<(String, isize, LayoutStep)> {
+    let movable = arrangeable(found, placements, front);
+    found.iter().zip(placements).filter_map(|((account, hwnd), placement)| {
+        let rect = targets.iter().find(|(a, _)| a == account)?.1;
+        let step = if !movable.iter().any(|(_, h)| h == hwnd) { LayoutStep::Held }
+            else if placement.as_ref().is_some_and(|now| layouts::stays_full_screen(now, &rect)) { LayoutStep::Stays }
+            else { LayoutStep::Move(rect) };
+        Some((account.clone(), *hwnd, step))
+    }).collect()
+}
+
+/// The game windows that may be moved now: `found` (Home order) with each one's placement now
 /// (`None` when it could not be read) and the window in front. A game that may hold its display
 /// is left alone; every other one is kept, in order.
 fn arrangeable(found: &[(String, isize)], placements: &[Option<game_window::Placement>], front: Option<isize>) -> Vec<(String, isize)> {
@@ -1024,8 +1052,8 @@ fn arrangeable(found: &[(String, isize)], placements: &[Option<game_window::Plac
         .collect()
 }
 
-/// The undo after an Arrange all that moved `moved` (by `ClientKey::id`). A window still where
-/// the previous Arrange all left it keeps its earlier `before`, so a restore after several in a
+/// The undo after an Apply that moved `moved` (by `ClientKey::id`). A window still where
+/// the previous Apply left it keeps its earlier `before`, so a restore after several in a
 /// row returns to the placement before the first; so does a game restarted since, which its
 /// remembered window put back in the arranged place. One the user moved since starts again from
 /// where it is now. A client this pass left alone (in front, or not running) keeps its entry.
@@ -1043,7 +1071,7 @@ fn next_undo(old: &BTreeMap<String, layouts::Arranged>, moved: Vec<(String, layo
 /// What Restore windows does with one window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
-    /// It may hold its display now (`game_window::holds_display`), as Arrange all also leaves alone.
+    /// It may hold its display now (`game_window::holds_display`), as Apply also leaves alone.
     Held,
     /// Put it here, shown so, with this frame (`None`: leave the frame as it is).
     Move { rect: game_window::Rect, shown: game_window::Shown, frame: Option<game_window::Frame> },
@@ -1071,10 +1099,10 @@ fn restore_step(entry: &layouts::Arranged, now: Option<&game_window::Placement>,
 /// `(x,y wxh)` for the history.
 fn show(r: game_window::Rect) -> String { format!("({},{} {}x{})", r.x, r.y, r.w, r.h) }
 
-/// The cycle keys go to the gate (registered only while a game is in front), the rest are
+/// The in-game hotkeys go to the gate (registered only while a game is in front), the rest are
 /// registered for as long as they are set.
 fn send_hotkeys(desktop: &desktop::Desktop, plan: &[(i32, Action, Hotkey)]) {
-    let (in_game, always): (Vec<_>, Vec<_>) = plan.iter().partition(|(_, action, _)| action.in_game_only());
+    let (in_game, always): (Vec<_>, Vec<_>) = plan.iter().partition(|(_, action, hotkey)| hotkeys::in_game_only(action, *hotkey));
     desktop.send(desktop::Command::Hotkeys(always.iter().map(|(id, _, h)| (*id, *h)).collect()));
     desktop.send(desktop::Command::GameHotkeys(in_game.iter().map(|(id, _, h)| (*id, *h)).collect()));
 }
@@ -1088,6 +1116,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> { mutex.lock().unwrap_or_else(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::layouts::Preset;
 
     fn runtime() -> (Runtime, std::path::PathBuf, Arc<Mutex<Vec<Event>>>) {
         let dir = std::env::temp_dir().join(format!("xi-features-runtime-{}", crate::backend::unique_id().unwrap()));
@@ -1101,14 +1130,22 @@ mod tests {
     #[test]
     fn nothing_runs_until_something_needs_it() {
         let (runtime, dir, _) = runtime();
-        assert!(runtime.inner().desktop.is_none(), "the default cycle keys and no game: no desktop thread");
-        assert!(runtime.inner().hotkeys.iter().any(|(_, a, h)| *a == Action::Next && *h == hotkeys::DEFAULT_CYCLE));
-        assert!(runtime.hotkey_status().iter().all(|s| s.problem.is_none()), "the cycle keys wait for a game");
+        assert!(runtime.inner().desktop.is_none(), "nothing set and no game: no desktop thread");
+        assert!(runtime.inner().hotkeys.is_empty() && runtime.hotkey_status().is_empty(), "no hotkey is set by default");
         assert!(!runtime.inner().notify.is_running());
         assert_eq!(runtime.discord_status(), discord::Status::Off);
         // A cycle key never starts the thread on its own: it is only registered over a game.
         runtime.update(|s| s.hotkeys.cycle = Hotkey::parse("Ctrl+Alt+Shift+F22")).unwrap();
         assert!(runtime.inner().desktop.is_none());
+        assert!(runtime.hotkey_status().iter().all(|s| s.problem.is_none()), "the cycle key waits for a game");
+        // Nor does an account's hotkey with no Ctrl, Alt or Win: a bare key is taken only over
+        // a game, so nothing is registered (and no program's typing touched) until one runs.
+        runtime.update(|s| { s.hotkeys.accounts.insert("a".into(), Hotkey::parse("F5").unwrap()); }).unwrap();
+        runtime.update(|s| { s.hotkeys.accounts.insert("b".into(), Hotkey::parse("Shift+A").unwrap()); }).unwrap();
+        assert!(runtime.inner().desktop.is_none());
+        assert_eq!(runtime.hotkey_status().len(), 3);
+        assert!(runtime.hotkey_status().iter().all(|s| s.problem.is_none()), "{:?}", runtime.hotkey_status());
+        runtime.update(|s| s.hotkeys.accounts.clear()).unwrap();
         // An account hotkey (registered for as long as it is set) starts it; clearing it ends it.
         runtime.update(|s| { s.hotkeys.accounts.insert("a".into(), Hotkey::parse("Ctrl+Alt+Shift+F21").unwrap()); }).unwrap();
         assert!(runtime.inner().desktop.is_some());
@@ -1122,10 +1159,45 @@ mod tests {
     #[test]
     fn hotkey_problems_are_reported_as_events() {
         let (runtime, dir, events) = runtime();
-        runtime.update(|s| s.hotkeys.cycle = Hotkey::parse("F2")).unwrap();
-        let reported = events.lock().unwrap().iter().any(|e| matches!(e, Event::Hotkeys(list) if list.iter().any(|s| s.problem == Some(Problem::NeedsModifier))));
+        runtime.update(|s| s.hotkeys.cycle = Hotkey::parse("Win+L")).unwrap();
+        let reported = events.lock().unwrap().iter().any(|e| matches!(e, Event::Hotkeys(list) if list.iter().any(|s| s.problem == Some(Problem::Reserved))));
         assert!(reported);
         assert!(runtime.inner().desktop.is_none(), "an unusable hotkey starts nothing");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An account hotkey is registered at once, so a chord another program owns is known at
+    /// once: reported in use, and reported fine when it is replaced by a free one.
+    #[test]
+    fn an_account_hotkey_another_program_owns_is_reported_in_use() {
+        let chord = Hotkey::parse("Ctrl+Alt+Shift+Win+F13").unwrap();
+        // Another desktop thread stands in for the other program.
+        let other = desktop::Desktop::start(Arc::new(|_| {})).unwrap();
+        other.send(desktop::Command::Hotkeys(vec![(1, chord)]));
+        let (done, registered) = std::sync::mpsc::channel();
+        other.send(desktop::Command::Run(Box::new(move || { let _ = done.send(()); })));
+        registered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (runtime, dir, events) = runtime();
+        let account = Action::Account("a".into());
+        let reported = |problem: Option<Problem>| {
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let seen = events.lock().unwrap().iter().rev().find_map(|e| match e { Event::Hotkeys(list) => Some(list.clone()), _ => None });
+                if seen.is_some_and(|list| list.iter().any(|s| s.action == account && s.problem == problem)) { return true; }
+                if Instant::now() > until { return false; }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        runtime.update(|s| { s.hotkeys.accounts.insert("a".into(), chord); }).unwrap();
+        assert!(reported(Some(Problem::InUse)), "{:?}", runtime.hotkey_status());
+        assert!(runtime.hotkey_status().iter().any(|s| s.action == account && s.problem == Some(Problem::InUse)));
+        // The other program lets it go; set again, it is Crystal's.
+        drop(other);
+        runtime.update(|s| s.hotkeys.accounts.clear()).unwrap();
+        events.lock().unwrap().clear();
+        runtime.update(|s| { s.hotkeys.accounts.insert("a".into(), chord); }).unwrap();
+        assert!(reported(None), "{:?}", runtime.hotkey_status());
+        runtime.update(|s| s.hotkeys.accounts.clear()).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1154,28 +1226,44 @@ mod tests {
     }
 
     #[test]
-    fn window_ordering_waits_for_the_play_and_for_windows() {
+    fn the_home_order_is_kept_for_the_hotkeys_and_moves_nothing() {
+        // The Home order is what the cycle keys follow, at once; a change to it while games
+        // run touches no window. Every running game is watched, whatever is switched on.
         let (runtime, dir, events) = runtime();
-        assert!(runtime.settings().layouts.order_windows, "on by default");
         assert!(runtime.order_differs(["a", "b"]));
         runtime.set_order(vec!["a".into(), "b".into()]);
         assert!(!runtime.order_differs(["a", "b"]));
         assert!(runtime.order_differs(["b", "a"]) && runtime.order_differs(["a"]) && runtime.order_differs(["a", "b", "c"]));
-        assert!(runtime.order_windows().is_err(), "no game window to order");
-        // A game with no window (a windowless stand-in) during a Play: the pass stays due.
-        runtime.set_launching(true);
-        runtime.game_started(GameStart { account: "a".into(), slot: None, label: String::new(), pid: std::process::id() });
-        assert!(runtime.inner().order_pending && runtime.inner().desktop.is_some(), "ordering watches for the window");
-        runtime.set_launching(false);
-        assert!(runtime.inner().order_pending, "still due until the game has its window");
-        assert!(runtime.inner().last_ordered.is_empty(), "nothing to order yet");
-        // A Home order change while it runs keeps it due; turning the setting off stops it.
+        runtime.update(|s| { s.layouts.remember = false; s.layouts.restore = false; }).unwrap();
+        for account in ["b", "a"] {
+            runtime.game_started(GameStart { account: account.into(), slot: None, label: String::new(), pid: std::process::id() });
+        }
+        assert!(runtime.inner().desktop.is_some(), "a running game is watched: its window is found and marked");
+        assert_eq!(home_order(&runtime.inner()), ["a", "b"]);
         runtime.set_order(vec!["b".into(), "a".into()]);
-        assert!(runtime.inner().order_pending);
-        runtime.update(|s| s.layouts.order_windows = false).unwrap();
-        runtime.game_ended(GameEnd { account: "a".into(), report: None, user_closed: true, maintenance: false });
+        assert_eq!(home_order(&runtime.inner()), ["b", "a"], "the next press of a cycle key follows it");
+        assert!(lock(&runtime.shared.marks).is_empty(), "no window was touched");
+        for account in ["a", "b"] {
+            runtime.game_ended(GameEnd { account: account.into(), report: None, user_closed: true, maintenance: false });
+        }
         assert!(!events.lock().unwrap().iter().any(|e| matches!(e, Event::Error(_))));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The taskbar is told about a full-screen game window once, when it is found; that it is
+    /// none when Crystal moves it to a tile; and that it is one again when a restore or Full
+    /// screen puts it back over its monitor. Never the same thing twice.
+    #[test]
+    fn the_taskbar_is_told_when_a_game_window_starts_or_stops_covering_its_monitor() {
+        // Found covering (FFXI borderless at the monitor's size): told yes. Found windowed: nothing.
+        assert_eq!(mark_step(None, true), Some(true));
+        assert_eq!(mark_step(None, false), None);
+        // Arranged to a tile: told no. Still on a tile after another Apply: nothing.
+        assert_eq!(mark_step(Some(true), false), Some(false));
+        assert_eq!(mark_step(Some(false), false), None);
+        // Restore windows, or Full screen: told yes again. Left covering: nothing.
+        assert_eq!(mark_step(Some(false), true), Some(true));
+        assert_eq!(mark_step(Some(true), true), None);
     }
 
     #[test]
@@ -1193,41 +1281,18 @@ mod tests {
     }
 
     #[test]
-    fn the_history_says_what_raising_a_window_took_and_how_the_games_are_stacked() {
-        let raise = |waited, over, lowered, top| Some(game_window::Raise { waited, over, lowered, top });
-        assert_eq!(describe_raise(None), "");
-        assert_eq!(describe_raise(raise(0, 0, 0, true)), "", "in front at once: nothing to say");
-        assert_eq!(describe_raise(raise(35, 0, 0, true)), "; on top after 35 ms", "the game's own activation got it there");
-        assert_eq!(describe_raise(raise(150, 2, 0, true)), "; 2 in front of it after 150 ms: raised");
-        assert_eq!(describe_raise(raise(150, 1, 1, true)), "; 1 in front of it after 150 ms: raised, 1 always on top put behind it");
-        assert_eq!(describe_raise(raise(150, 1, 0, false)), "; 1 in front of it after 150 ms: NOT raised");
-        // Windows that are gone are in no stacking.
-        assert_eq!(stack_line(&[(1, 0x7FFF_FFF1), (2, 0x7FFF_FFF3)]), "no game window");
-        assert_eq!(stack_line(&[]), "no game window");
-    }
-
-    #[test]
-    fn a_hotkey_with_no_game_window_switches_nothing_and_holds_ordering_only_meanwhile() {
+    fn a_hotkey_with_no_game_window_switches_nothing() {
         let (runtime, dir, _) = runtime();
         runtime.game_started(GameStart { account: "a".into(), slot: None, label: String::new(), pid: std::process::id() });
-        // No window to switch to: nothing is activated, and the press is still counted (an
-        // ordering pass running on another thread stops for it).
+        // No window to switch to: nothing is activated.
         runtime.run_action(&Action::Next, desktop::Via::Hook, None);
-        assert_eq!(runtime.shared.switches.load(Ordering::Acquire), 1);
-        assert!(!runtime.shared.ordering.load(Ordering::Acquire), "released after the switch");
-        // While a pass (or another switch) holds the flag, an ordering pass does not start.
-        let held = OrderingHeld::take(&runtime.shared.ordering).unwrap();
-        assert!(OrderingHeld::take(&runtime.shared.ordering).is_none());
-        assert_eq!(runtime.order(Some("test")), None);
-        drop(held);
-        assert_eq!(runtime.order(Some("test")), Some(Ok(0)), "no window: nothing to order");
         runtime.game_ended(GameEnd { account: "a".into(), report: None, user_closed: true, maintenance: false });
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The owner's five clients as Windows reported them (2026-11-10): FFXI borderless (`0034` =
     /// 3) at the monitor's 3840x2160, each an unowned WS_POPUP window covering DISPLAY1 exactly,
-    /// and Crystal's own window in front while Arrange all is clicked.
+    /// and Crystal's own window in front while Apply is clicked.
     fn covering(shown: game_window::Shown) -> game_window::Placement {
         let monitor = game_window::Monitor {
             device: r"\\.\DISPLAY1".into(), rect: game_window::Rect::new(0, 0, 3840, 2160),
@@ -1261,6 +1326,154 @@ mod tests {
         assert_eq!(arrangeable(&found[..3], &mixed[..3], Some(0x1001)), found[1..3].to_vec());
     }
 
+    #[test]
+    fn apply_moves_windows_to_their_tiles_and_leaves_fullscreen_and_covering_ones() {
+        use game_window::{Rect, Shown};
+        let found: Vec<(String, isize)> = (1..=5).map(|i| (format!("acct{i}"), 0x1000 + i as isize)).collect();
+        let monitor = covering(Shown::Normal).monitor;
+        let tile = Rect::new(2896, 0, 928, 522);
+        let placements = vec![
+            Some(covering(Shown::Normal)),
+            Some(covering(Shown::Normal)),
+            Some(windowed(Rect::new(100, 80, 1296, 759), Shown::Normal)),
+            None,
+            Some(covering(Shown::Minimized)),
+        ];
+        let targets: Vec<(String, Rect)> = vec![
+            ("acct1".into(), tile), ("acct2".into(), tile), ("acct3".into(), monitor.rect), ("acct4".into(), tile), ("acct5".into(), tile),
+            ("gone".into(), tile),
+        ];
+        // Crystal in front, except that the second game is: it may be fullscreen and is left
+        // alone, and so is the minimised one covering its monitor. An unreadable window is
+        // tried (its move fails on its own). A tile for a game that is not running moves nothing.
+        let steps = layout_steps(&found, &placements, Some(0x1002), &targets);
+        assert_eq!(steps, vec![
+            ("acct1".to_owned(), 0x1001, LayoutStep::Move(tile)),
+            ("acct2".to_owned(), 0x1002, LayoutStep::Held),
+            ("acct3".to_owned(), 0x1003, LayoutStep::Move(monitor.rect)),
+            ("acct4".to_owned(), 0x1004, LayoutStep::Move(tile)),
+            ("acct5".to_owned(), 0x1005, LayoutStep::Held),
+        ]);
+        // A game with no tile is not touched.
+        assert_eq!(layout_steps(&found, &placements, None, &targets[2..3]).len(), 1);
+        // A window the game opened over its whole monitor, whose tile is that monitor (or covers
+        // it): left exactly as the game made it, never moved a pixel.
+        for over in [monitor.rect, Rect::new(-1, -1, 3842, 2162)] {
+            let steps = layout_steps(&found[..1], &placements[..1], None, &[("acct1".into(), over)]);
+            assert_eq!(steps, vec![("acct1".to_owned(), 0x1001, LayoutStep::Stays)], "{over:?}");
+        }
+        // The work area does not cover the monitor: that is a move.
+        let steps = layout_steps(&found[..1], &placements[..1], None, &[("acct1".into(), monitor.work)]);
+        assert_eq!(steps[0].2, LayoutStep::Move(monitor.work));
+    }
+
+    /// A hidden stand-in for a game window (WS_POPUP, never shown), owned by this test's thread.
+    struct StandIn(isize);
+    impl StandIn {
+        fn at(r: game_window::Rect) -> Self {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, WS_POPUP};
+            let class = crate::win::wide("Static");
+            let _dpi = game_window::PhysicalDpi::enter();
+            // SAFETY: a window of a system class, owned and destroyed by this test's thread.
+            let hwnd = unsafe { CreateWindowExW(0, class.as_ptr(), std::ptr::null(), WS_POPUP, r.x, r.y, r.w, r.h, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) };
+            assert!(!hwnd.is_null());
+            Self(hwnd as isize)
+        }
+    }
+    impl Drop for StandIn {
+        fn drop(&mut self) {
+            // SAFETY: this thread's own window.
+            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(self.0 as _) };
+        }
+    }
+
+    /// The layout editor's Apply on real (hidden) windows: each lands on its tile to the pixel,
+    /// none is activated, shown, made always on top or moved in the z-order, the result is
+    /// remembered, and what each was before the first Apply is kept for Restore windows.
+    #[test]
+    fn apply_puts_real_windows_on_their_tiles_without_activating_them() {
+        use game_window::{Mode, Rect, Shown};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongW, GWL_STYLE};
+        let Some(monitor) = game_window::monitors().into_iter().next() else { return }; // a service session has no monitor
+        let (runtime, dir, events) = runtime();
+        for account in ["a", "b"] {
+            runtime.game_started(GameStart { account: account.into(), slot: None, label: String::new(), pid: std::process::id() });
+        }
+        let start_b = Rect::new(monitor.work.x + 40, monitor.work.y + 40, 800, 600);
+        let (a, b) = (StandIn::at(monitor.rect), StandIn::at(start_b));
+        let found = vec![("a".to_owned(), a.0), ("b".to_owned(), b.0)];
+        let stacking = game_window::z_order(&[a.0, b.0]);
+        let front = game_window::foreground();
+        let tile = Rect::new(monitor.work.x + 3, monitor.work.y + 5, 641, 479);
+        let told = || std::mem::take(&mut *lock(&runtime.shared.marks));
+        // As each window is found: the one over its monitor is a full-screen window, the other not.
+        runtime.mark_full_screen("a", a.0, true);
+        runtime.mark_full_screen("b", b.0, true);
+        assert_eq!(told(), vec![(a.0, true)]);
+        // The game over its whole monitor goes to a tile; the other one over the whole monitor.
+        let done = runtime.apply_layout_to(&found, &[("a".into(), tile), ("b".into(), monitor.rect)]).unwrap();
+        assert_eq!(done, ["a", "b"]);
+        assert_eq!(told(), vec![(a.0, false), (b.0, true)], "the taskbar hears of both changes");
+        let (now_a, now_b) = (game_window::capture(a.0).unwrap(), game_window::capture(b.0).unwrap());
+        assert_eq!((now_a.rect, now_a.mode), (tile, Mode::Borderless), "pixel for pixel");
+        assert_eq!((now_b.rect, now_b.mode), (monitor.rect, Mode::Fullscreen), "exactly the monitor: borderless full screen");
+        for hwnd in [a.0, b.0] {
+            assert!(!game_window::is_topmost(hwnd), "never always on top");
+            // SAFETY: read-only.
+            assert_eq!(unsafe { GetWindowLongW(hwnd as _, GWL_STYLE) } as u32 & 0x1000_0000, 0, "never shown (WS_VISIBLE untouched)");
+        }
+        assert_eq!(game_window::foreground(), front, "nothing was activated");
+        assert_eq!(game_window::z_order(&[a.0, b.0]), stacking, "the z-order is as it was");
+        // Remembered, so each game goes back there; and the first placement is what a restore returns to.
+        let layouts = runtime.settings().layouts;
+        assert_eq!((layouts.saved["a"].rect, layouts.saved["b"].rect), (tile, monitor.rect));
+        // Apply never chooses a resolution: the game on the 641x479 tile still starts at its own.
+        assert!(layouts.start.is_empty(), "{:?}", layouts.start);
+        assert!(layouts::launch_values(&layouts, &ClientKey::new("a", None)).is_empty());
+        assert_eq!((layouts.undo["a"].before.rect, layouts.undo["a"].arranged), (monitor.rect, tile));
+        assert_eq!((layouts.undo["b"].before.rect, layouts.undo["b"].arranged), (start_b, monitor.rect));
+        // Applied again somewhere else: still the placement before the first Apply.
+        let other = Rect::new(monitor.work.x + 700, monitor.work.y + 9, 640, 480);
+        assert_eq!(runtime.apply_layout_to(&found, &[("a".into(), other)]).unwrap(), ["a"]);
+        assert_eq!(told(), Vec::new(), "from tile to tile: nothing new for the taskbar");
+        assert_eq!(game_window::capture(a.0).unwrap().rect, other);
+        assert_eq!(game_window::capture(b.0).unwrap().rect, monitor.rect, "a window with no tile is not touched");
+        let layouts = runtime.settings().layouts;
+        assert_eq!((layouts.undo["a"].before.rect, layouts.undo["a"].arranged), (monitor.rect, other));
+        // The one over its monitor, asked to be over its monitor: in place, and not moved.
+        assert_eq!(runtime.apply_layout_to(&found, &[("b".into(), monitor.rect)]).unwrap(), ["b"]);
+        // Full screen for the first again: the taskbar is told it is a full-screen window again.
+        assert_eq!(runtime.apply_layout_to(&found, &[("a".into(), monitor.rect)]).unwrap(), ["a"]);
+        assert_eq!(told(), vec![(a.0, true)]);
+        let history = std::fs::read_to_string(runtime.history_path()).unwrap();
+        for line in ["features: window #1 marked full screen: yes", "features: window #2 marked full screen: no", "features: window #1 marked full screen: no", "features: window #2 marked full screen: yes"] {
+            assert!(history.contains(line), "{line}: {history}");
+        }
+        // No running game has a tile: said, and nothing moves.
+        assert!(runtime.apply_layout_to(&found, &[("gone".into(), tile)]).is_err());
+        assert!(runtime.apply_layout_to(&[], &[("a".into(), tile)]).is_err());
+        assert!(!events.lock().unwrap().iter().any(|e| matches!(e, Event::Error(_))));
+        // A tile placed while its game is not running is its remembered window, and the size
+        // its game starts at: chosen by the user, for the next start.
+        runtime.place_windows(&[(ClientKey::new("c", Some(3)), tile)]).unwrap();
+        let placed = runtime.settings().layouts;
+        let saved = placed.saved["c#3"].clone();
+        assert_eq!((saved.rect, saved.mode, saved.client), (tile, Mode::Borderless, (641, 479)));
+        assert_eq!(layouts::restore_rect(&saved, &game_window::monitors()), Some((tile, Shown::Normal)));
+        assert_eq!(layouts::launch_values(&placed, &ClientKey::new("c", Some(3))), vec![("0001", 641), ("0002", 479), ("0034", 3)]);
+        assert!(layouts::launch_values(&placed, &ClientKey::new("a", None)).is_empty(), "the running games' start sizes are untouched");
+        // Forgotten: the window and its start size both go.
+        runtime.forget_layout(&ClientKey::new("c", Some(3))).unwrap();
+        let forgotten = runtime.settings().layouts;
+        assert!(!forgotten.saved.contains_key("c#3") && forgotten.start.is_empty());
+        assert!(!runtime.has_window("c") && !runtime.has_window("a"), "a game with no visible window has none");
+        assert!(runtime.layout_windows().is_empty());
+        for account in ["a", "b"] {
+            runtime.game_ended(GameEnd { account: account.into(), report: None, user_closed: true, maintenance: false });
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A windowed game at `rect` on the owner's DISPLAY1.
     fn windowed(rect: game_window::Rect, shown: game_window::Shown) -> game_window::Placement {
         game_window::Placement {
@@ -1269,12 +1482,12 @@ mod tests {
         }
     }
 
-    /// A borderless window at `rect` (where Arrange all leaves a borderless game).
+    /// A borderless window at `rect` (where Apply leaves a borderless game).
     fn tiled(rect: game_window::Rect) -> game_window::Placement {
         game_window::Placement { rect, client: (rect.w, rect.h), mode: game_window::Mode::Borderless, ..covering(game_window::Shown::Normal) }
     }
 
-    /// Arrange all moving clients `ids` (each now at `now`) to `to`: what it records.
+    /// Apply moving clients `ids` (each now at `now`) to `to`: what it records.
     fn arranged(ids: &[&str], now: &[game_window::Placement], to: &[game_window::Rect]) -> Vec<(String, layouts::Arranged)> {
         ids.iter().zip(now).zip(to)
             .map(|((id, before), arranged)| (id.to_string(), layouts::Arranged { before: layouts::Saved::from_placement(before), arranged: *arranged }))
@@ -1294,7 +1507,7 @@ mod tests {
         let original = vec![covering(Shown::Normal); 5];
         let rects = layouts::arrange(Preset::MainLarge, 5, &[original[0].monitor.work], 16.0 / 9.0);
         let undo = next_undo(&BTreeMap::new(), arranged(&ids, &original, &rects));
-        // The tiles as the live windows showed them after Arrange all, Crystal in front.
+        // The tiles as the live windows showed them after Apply, Crystal in front.
         assert_eq!(rects[0], game_window::Rect::new(0, 234, 2880, 1620));
         assert_eq!(rects[1], game_window::Rect::new(2896, 0, 928, 522));
         for (id, rect) in ids.iter().zip(&rects) {
@@ -1348,7 +1561,7 @@ mod tests {
         assert_eq!(second["acct1"].before.rect, original[0].rect);
         assert_eq!(second["acct2"].before.rect, original[1].rect);
         assert_eq!(second["acct1"].arranged, grid[0]);
-        // The user moved the second one after the first Arrange all: it starts again from there.
+        // The user moved the second one after the first Apply: it starts again from there.
         let dragged = windowed(Rect::new(40, 40, 1296, 759), Shown::Normal);
         let third = next_undo(&first, arranged(&ids, &[at_large[0].clone(), dragged.clone()], &grid));
         assert_eq!((third["acct1"].before.rect, third["acct2"].before.rect), (original[0].rect, dragged.rect));
@@ -1378,13 +1591,14 @@ mod tests {
         let (runtime, dir, _) = runtime();
         let original = covering(game_window::Shown::Normal);
         let tile = game_window::Rect::new(2896, 0, 928, 522);
-        // What Arrange all leaves behind: the tile remembered (so the game would start there, at
-        // 928x522), and the undo, saved.
+        // What Apply leaves behind: the tile remembered (so the game would go back there), and
+        // the undo, saved. The tile is never the game's resolution: restarted, it starts at its
+        // own (1.2.0 to 1.2.4 started it at 928x522, and FFXIDB's minimap with it).
         runtime.update(|s| {
             layouts::remember(&mut s.layouts, &ClientKey::new("a", None), &tiled(tile));
             s.layouts.undo = next_undo(&BTreeMap::new(), arranged(&["a"], &[original.clone()], &[tile]));
         }).unwrap();
-        assert_eq!(layouts::launch_values(&runtime.settings().layouts, &ClientKey::new("a", None)), vec![("0001", 928), ("0002", 522), ("0034", 3)]);
+        assert!(layouts::launch_values(&runtime.settings().layouts, &ClientKey::new("a", None)).is_empty(), "a tile is not a resolution");
         // Crystal restarts: the undo is still there.
         let config = Config { experiment: dir.clone(), ..Config::default() };
         let again = Runtime::new(config.clone(), Arc::new(|_| {}));
@@ -1404,7 +1618,7 @@ mod tests {
     #[test]
     fn restore_windows_is_offered_only_while_an_arranged_window_is_open() {
         let (runtime, dir, _) = runtime();
-        assert!(!runtime.can_restore_windows(), "no Arrange all yet");
+        assert!(!runtime.can_restore_windows(), "no Apply yet");
         assert!(runtime.restore_windows().is_err());
         // A game running without a window (a windowless stand-in) offers nothing either.
         runtime.game_started(GameStart { account: "a".into(), slot: None, label: String::new(), pid: std::process::id() });
@@ -1417,10 +1631,12 @@ mod tests {
     }
 
     #[test]
-    fn launch_values_combine_the_remembered_size_and_background_mute() {
+    fn launch_values_combine_the_chosen_start_size_and_background_mute() {
         let (runtime, dir, _) = runtime();
         let config = Config { experiment: dir.clone(), ..Config::default() };
         assert!(launch_values(&config, "a", None).is_empty());
+        // A remembered window alone (as Crystal 1.2.0 to 1.2.4 saved it, after Arrange all or a
+        // resize by hand) passes no resolution to the game: only background mute is served.
         runtime.update(|s| {
             s.perf.mute_background = true;
             s.layouts.saved.insert("a".into(), layouts::Saved {
@@ -1429,6 +1645,9 @@ mod tests {
                 monitor: layouts::MonitorRef { device: "x".into(), rect: game_window::Rect::new(0, 0, 1920, 1080), work: game_window::Rect::new(0, 0, 1920, 1040), dpi: 96 },
             });
         }).unwrap();
+        assert_eq!(launch_values(&config, "a", Some(4)), vec![("0035", 0)]);
+        // The start size the user chose is served, to a client with a slot too.
+        runtime.update(|s| { s.layouts.start.insert("a".into(), layouts::Start { client: (1280, 720), mode: game_window::Mode::Windowed }); }).unwrap();
         assert_eq!(launch_values(&config, "a", Some(4)), vec![("0001", 1280), ("0002", 720), ("0034", 1), ("0035", 0)]);
         std::fs::remove_dir_all(dir).unwrap();
     }

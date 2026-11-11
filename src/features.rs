@@ -12,6 +12,7 @@
 //! needs it), or when a session's published file changes.
 
 pub(crate) mod backups;
+pub(crate) mod capture;
 pub(crate) mod desktop;
 pub(crate) mod discord;
 pub(crate) mod game_window;
@@ -19,12 +20,13 @@ pub(crate) mod hotkeys;
 pub(crate) mod keyhook;
 pub(crate) mod layouts;
 pub(crate) mod notify;
-pub(crate) mod order;
+
 pub(crate) mod perf;
 pub(crate) mod playtime;
 pub(crate) mod profiles;
 pub(crate) mod recovery;
 pub(crate) mod runtime;
+pub(crate) mod snap;
 pub(crate) mod store;
 pub(crate) mod ui;
 mod wiring;
@@ -79,5 +81,44 @@ mod tests {
         assert_eq!(ClientKey::new("abc", Some(0)).slot, None);
         assert_eq!(ClientKey::parse("abc#99"), None);
         assert_eq!(ClientKey::parse(""), None);
+    }
+
+    /// Crystal does not order the game windows. Their taskbar buttons are in Home order because
+    /// the games are started in Home order (`session_batch`); nothing adds, removes, moves or
+    /// activates a taskbar button, and no window is given the foreground except the game a
+    /// hotkey the user pressed names (`game_window::activate`, from `Runtime::run_action` alone).
+    #[test]
+    fn nothing_reorders_taskbar_buttons_or_gives_a_game_the_foreground_unasked() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() { sources(&path, out); } else if path.extension().is_some_and(|e| e == "rs") { out.push(path); }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        assert!(!src.join("features").join("order.rs").exists(), "the ordering pass is gone");
+        let mut files = Vec::new();
+        sources(&src, &mut files);
+        assert!(files.len() > 50);
+        // The needles are put together here so this file does not hold them itself.
+        let taskbar = ["Add", "Delete", "Activate"].map(|verb| format!("{verb}Tab"));
+        let foreground = ["SetForeground", "SwitchToThis"].map(|call| format!("{call}Window")).into_iter()
+            .chain(["BringWindowTo".to_owned() + "Top", "AttachThread".to_owned() + "Input"]).collect::<Vec<_>>();
+        let (pass, switch) = (format!("{}_windows", "order"), format!("game_window::{}(", "activate"));
+        let mut switches = 0;
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            let name = file.strip_prefix(&src).unwrap().to_string_lossy().replace('\\', "/");
+            for needle in &taskbar {
+                assert!(!text.contains(needle.as_str()) && !text.contains(&needle.to_lowercase()), "{name} names {needle}");
+            }
+            // Only the remembered-windows file reads past the old switch (a test of old files).
+            assert!(!text.contains(&pass) || name == "features/layouts.rs", "{name} still has the window-ordering switch");
+            if name.starts_with("features/") && name != "features/game_window.rs" {
+                for needle in &foreground { assert!(!text.contains(needle.as_str()), "{name} calls {needle}"); }
+            }
+            switches += text.matches(&switch).count();
+        }
+        assert_eq!(switches, 1, "a game is given the foreground in one place: the hotkey's switch");
     }
 }

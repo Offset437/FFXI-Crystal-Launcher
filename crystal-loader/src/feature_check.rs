@@ -354,13 +354,8 @@ mod tests {
             features.push(feature("Private Windower startup", &crate::windower_bootstrap_contract::hook_startup(&file).map_err(str::to_string)));
             hooks.push((r.timestamp, row(&format!("{name} {}", r.known.unwrap_or("unknown")), &features)));
         }
-        let windower = std::env::var_os("CRYSTAL_SURVEY_WINDOWER").map(std::path::PathBuf::from)
-            .unwrap_or_else(|| r"C:\Games\Final Fantasy XI Programs\Windower 4".into());
-        if windower.is_dir() {
-            eprintln!("Windower plugins (installed in {}):", windower.display());
-            let plugin = crate::windower_plugin_settings::ffxidb_file_supported(&windower.join("plugins").join("FFXIDB.dll"));
-            row("FFXIDB.dll", &[feature("FFXIDB shared-settings protection (plugin side)", &plugin)]);
-        }
+        // FFXIDB.dll needs no row: its protection uses only Hook's plugin
+        // interface (the Hook side above) and the plugin's file imports.
         eprintln!("Ashita: no Ashita-specific resolvers (background shutdown accepts an Ashita.dll hook on the command entry).");
         // PlayOnline: each core build (CRYSTAL_POL_LEGACY_CORE / CRYSTAL_POL_UPDATED_CORE)
         // through the production structural checks, as data.

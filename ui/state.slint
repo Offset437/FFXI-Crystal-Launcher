@@ -19,6 +19,8 @@ export struct Strings {
     privacy-off-tip: string,
     light-theme: string,
     dark-theme: string,
+    /// The top bar's Discord button.
+    discord: string,
     greeting: string,
     news: string,
     refresh-news: string,
@@ -269,6 +271,8 @@ export global View {
     callback navigate(int);
     callback toggle-privacy();
     callback toggle-theme();
+    /// Open the Crystal Discord's invite in the browser.
+    callback open-discord();
 
     // ---- hero (the clock is the Sky global's) ----
     /// Japanese keeps the interface face upright (Source Serif has no Japanese).

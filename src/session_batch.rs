@@ -1,5 +1,11 @@
 //! A detached coordinator for a multi-account Play or a Play during sign-in. Workers
 //! still own authentication, keepalive, and independent game/session exits.
+//!
+//! The games start in Home order (the order of the batch's accounts): everything before the
+//! start runs together as before, and then each game is released to its GameStart only once
+//! the one before it has shown its window (`release_prepared`). The taskbar adds a window's
+//! button when the window shows, so the buttons are in Home order by construction; nothing
+//! moves a button, a window or the foreground afterwards.
 use super::*;
 use std::{collections::HashSet, sync::mpsc};
 
@@ -345,11 +351,16 @@ fn coordinate(
     let timed_out = Arc::new(AtomicBool::new(false));
     for mut job in jobs {
         job.timed_out = timed_out.clone();
-        let sender = sender.clone(); let key = job.key.clone();
-        let _ = std::thread::Builder::new().name("batch-sign-in".into()).spawn(move || {
+        let (thread_sender, key) = (sender.clone(), job.key.clone());
+        let thread_key = key.clone();
+        let spawned = std::thread::Builder::new().name("batch-sign-in".into()).spawn(move || {
             let result = prepare(job, clicked);
-            let _ = sender.send((key, result));
+            let _ = thread_sender.send((thread_key, result));
         });
+        // No thread, no result: report it now rather than at the batch's deadline.
+        if let Err(error) = spawned {
+            let _ = sender.send((key, Err(format!("{} {error}", t("Could not start the sign-in.")))));
+        }
     }
     drop(sender);
     coordinate_results(keys, ownership, receiver, &timed_out, PREPARE_LIMIT, STRAGGLER_LIMIT, emit);
@@ -393,8 +404,10 @@ fn coordinate_results(
     }
     if error.is_none() {
         std::thread::scope(|scope| { for item in prepared.iter_mut() { scope.spawn(move || verify(item)); } });
-        // Each W20 verdict is that account's own: the accounts whose check passed start.
-        let starts: Vec<_> = prepared.iter().filter(|item| item.start_game && item.check.is_ok()).collect();
+        // Each W20 verdict is that account's own: the accounts whose check passed start, in
+        // the batch's own order (Home order) whichever finished preparing first.
+        let mut starts: Vec<_> = prepared.iter().filter(|item| item.start_game && item.check.is_ok()).collect();
+        starts.sort_by_key(|item| keys.iter().position(|key| *key == item.job.key));
         if !starts.is_empty() {
             if let Err(reason) = release_prepared(&starts) { error = Some((None, reason)); }
         }
@@ -467,46 +480,122 @@ fn others_failure(error: &str) -> String {
     }
 }
 
+/// Releases the prepared games to their GameStart, in the order given (Home order).
+///
+/// Each game has a gate of its own (the loader waits on the token it is handed, so nothing in
+/// it changes). As before, no game is released until every one is ready. Then they go one at a
+/// time: a game is released, says it started, and the next waits until that game's window
+/// shows (`game_window_shown`: the taskbar adds its button then), it has ended, or
+/// `WINDOW_LIMIT` has passed, so one stuck game holds the others up by that much and no more.
+/// No game is held past what its own wait allows (`start_gate::LIMIT`, less `HOLD_MARGIN`).
+/// A game that fails at its turn does not stop the ones after it; the first failure is
+/// returned once every game has had its turn. How long the order took goes to the launch
+/// history.
 fn release_prepared(prepared: &[&Prepared]) -> Result<(), String> {
-    let id = crate::pol_less::pipe::random_hex().map_err(|_| "Could not create the batch gate.")?;
-    let (gate, tokens) = start_gate::Coordinator::new(&id, prepared.len())?;
     let mut members: Vec<_> = prepared.iter().map(|item| Member::new(item)).collect();
-    // File controls are bound to exact worker lifetimes. The native gate itself
-    // belongs to this detached coordinator, not the UI or any one game.
-    for (member, token) in members.iter_mut().zip(tokens) {
+    // File controls are bound to exact worker lifetimes. The native gates themselves
+    // belong to this detached coordinator, not the UI or any one game: dropping one (an
+    // early return) cancels its game's start.
+    let mut gates = Vec::with_capacity(members.len());
+    for member in members.iter_mut() {
         if !member.healthy() { return Err("A batch session ended before preparation.".into()); }
-        save_json(&member.directory.join("native-batch.json"), &BatchControl { worker: member.item.session.worker, token })?;
+        let id = crate::pol_less::pipe::random_hex().map_err(|_| "Could not create the batch gate.")?;
+        let (gate, mut tokens) = start_gate::Coordinator::new(&id, 1)?;
+        save_json(&member.directory.join("native-batch.json"), &BatchControl { worker: member.item.session.worker, token: tokens.remove(0) })?;
         super::wake::signal(member.item.session.worker);
+        gates.push(gate);
     }
     let until = Instant::now() + start_gate::LIMIT;
-    while !gate.ready() {
-        if gate.canceled() { return Err("A prepared game canceled the batch.".into()); }
+    // When each game was first seen ready: its own wait for the release runs from then.
+    let mut ready: Vec<Option<Instant>> = vec![None; gates.len()];
+    loop {
+        for (gate, at) in gates.iter().zip(ready.iter_mut()) {
+            if at.is_none() && gate.ready() { *at = Some(Instant::now()); }
+        }
+        if ready.iter().all(Option::is_some) { break; }
+        if gates.iter().any(start_gate::Coordinator::canceled) { return Err("A prepared game canceled the batch.".into()); }
         if !members.iter_mut().all(Member::healthy) { return Err("A batch session ended while preparing its game.".into()); }
         if Instant::now() >= until { return Err("Timed out preparing all games; the batch was canceled.".into()); }
         std::thread::sleep(RELEASE_POLL);
     }
     if !members.iter_mut().all(Member::healthy) { return Err("A batch session ended before release.".into()); }
-    gate.release()?;
-    // Released: the participants signal `started` within their own 10 ms poll. This wait has
-    // its own bound, and the gate stays open through it: dropping it cancels a participant
-    // that has not seen the release yet.
-    let started_until = Instant::now() + RELEASED_LIMIT;
-    while !gate.started() {
-        // A timeout keeps the existing release-failure message (no new user-facing text).
-        if !members.iter_mut().all(Member::healthy) || Instant::now() >= started_until {
-            return Err("A prepared game ended during batch release.".into());
+    let began = Instant::now();
+    let mut failure: Option<String> = None;
+    // For each game but the last: how long the next one waited for its window, and whether it showed.
+    let mut waits: Vec<(Duration, bool)> = Vec::new();
+    for index in 0..gates.len() {
+        // Released: the participant signals `started` within its own 10 ms poll. This wait has
+        // its own bound, and the gate stays open through it: dropping it cancels a participant
+        // that has not seen the release yet.
+        let started_until = Instant::now() + RELEASED_LIMIT;
+        let mut started = gates[index].release().is_ok();
+        while started && !gates[index].started() {
+            // A timeout keeps the existing release-failure message (no new user-facing text).
+            if !members[index].healthy() || Instant::now() >= started_until { started = false; }
+            std::thread::sleep(Duration::from_millis(1));
         }
-        std::thread::sleep(Duration::from_millis(1));
+        if !started {
+            failure.get_or_insert_with(|| "A prepared game ended during batch release.".into());
+            continue;
+        }
+        if index + 1 == gates.len() { break; }
+        // The games still held wait on their own clocks: none is kept past its limit.
+        let latest = ready[index + 1..].iter().flatten().min().map(|at| *at + start_gate::LIMIT.saturating_sub(HOLD_MARGIN));
+        let limit = latest.map_or(Instant::now() + WINDOW_LIMIT, |latest| latest.min(Instant::now() + WINDOW_LIMIT));
+        let asked = Instant::now();
+        let pid = members[index].item.launch.pid;
+        let key = members[index].item.job.key.clone();
+        let member = &mut members[index];
+        let shown = wait_for_window(|| game_window_shown(&key, pid), || member.healthy(), limit);
+        waits.push((asked.elapsed(), shown));
     }
-    drop(gate);
-    Ok(())
+    drop(gates);
+    if let Some(line) = order_line(members.len(), began.elapsed(), &waits) {
+        crate::launch_log::append_history(&members[0].item.job.config.history_path(), "Crystal", &line, None);
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+/// The launch history's line about a batch's start order: how many games, how long releasing
+/// them one after another took, and what each wait for a window was. None for a single game.
+fn order_line(games: usize, total: Duration, waits: &[(Duration, bool)]) -> Option<String> {
+    if games < 2 { return None; }
+    let each: Vec<String> = waits.iter().map(|(wait, shown)| format!("{}{}", wait.as_millis(), if *shown { "" } else { " (no window)" })).collect();
+    Some(format!("launch order: {games} games started in Home order in {} ms; waited for each window: {} ms", total.as_millis(), each.join(", ")))
+}
+
+/// Waits until the game just released shows its window (`shown`), ends (`alive` says no) or
+/// `until` comes, whichever is first. Whether its window showed.
+fn wait_for_window(mut shown: impl FnMut() -> bool, mut alive: impl FnMut() -> bool, until: Instant) -> bool {
+    loop {
+        if shown() { return true; }
+        if !alive() || Instant::now() >= until { return false; }
+        std::thread::sleep(WINDOW_POLL);
+    }
+}
+
+/// Whether the game in host `pid` (or a process it started: Ashita and Windower start the game
+/// from the host) has its window on the desktop: what the features runtime adopts as the
+/// game's window, and what the taskbar has a button for.
+fn game_window_shown(key: &str, pid: u32) -> bool {
+    #[cfg(test)]
+    { if let Some(shown) = tests::WINDOWS.with(|probe| probe.borrow().as_ref().map(|probe| probe(key))) { return shown; } }
+    let _ = key;
+    crate::features::game_window::find_main_window(&crate::features::game_window::process_family(pid)).is_some()
 }
 
 /// How often the release wait looks at the gate and at each member's processes.
 const RELEASE_POLL: Duration = Duration::from_millis(25);
 /// How long released games have to report `started`.
 const RELEASED_LIMIT: Duration = Duration::from_secs(5);
-
+/// How long the next game's start waits for the one before it to show its window. A game
+/// shows its window within about a second of its GameStart (the owner's history,
+/// 2026-11-11: five games, every window found within a second of the starts).
+const WINDOW_LIMIT: Duration = if cfg!(test) { Duration::from_millis(60) } else { Duration::from_secs(3) };
+/// How often that wait looks for the window.
+const WINDOW_POLL: Duration = Duration::from_millis(10);
+/// A held game is released this long before its own wait for the release would end.
+const HOLD_MARGIN: Duration = Duration::from_secs(5);
 /// One released account: its directory resolved once, its friends cache read again only
 /// when the file changes.
 struct Member<'a> { item: &'a Prepared, directory: PathBuf, friends: Option<std::time::SystemTime>, session_error: bool }
@@ -529,6 +618,12 @@ impl<'a> Member<'a> {
 mod tests {
     use super::*;
     static FIXTURE_STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    thread_local! {
+        /// Whether an account's game has shown its window, for the batch this thread
+        /// coordinates (`game_window_shown`); unset, the desktop is asked, where a fixture
+        /// has no window.
+        pub(super) static WINDOWS: std::cell::RefCell<Option<Box<dyn Fn(&str) -> bool>>> = const { std::cell::RefCell::new(None) };
+    }
     fn root() -> PathBuf {
         let path = std::env::temp_dir().join(format!("crystal-batch-{}", crate::pol_less::pipe::random_hex().unwrap()));
         fs::create_dir_all(&path).unwrap(); path
@@ -544,6 +639,7 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let stop = job.config.experiment.join("stop-fixture");
         let started = job.config.experiment.join(format!("{}-started", job.key));
+        let key = job.key.clone();
         std::thread::spawn(move || {
             let until = Instant::now() + Duration::from_secs(5);
             while Instant::now() < until && !stop.exists() {
@@ -551,6 +647,10 @@ mod tests {
                     let request: BatchControl = serde_json::from_slice(&bytes).unwrap();
                     // The actual native owners signal this only after all setup.
                     if start_gate::Participant::open(&request.token).and_then(|gate| gate.wait()).is_ok() {
+                        // The order the games were released in, one key a line.
+                        use std::io::Write;
+                        let order = started.with_file_name("release-order");
+                        fs::OpenOptions::new().create(true).append(true).open(order).unwrap().write_all(format!("{key}\n").as_bytes()).unwrap();
                         fs::write(started, []).unwrap();
                         FIXTURE_STARTED.fetch_add(1, Ordering::SeqCst);
                     }
@@ -582,6 +682,65 @@ mod tests {
         assert_eq!(events.iter().filter(|e| e.contains("Ready")).count(), 2);
         assert!(!events.iter().any(|e| e.contains("Failed")));
         assert!(!batch_pending(&job(&root,"warm").config, &job(&root,"warm").account));
+    }
+
+    /// The games are released to their GameStart in the batch's order (Home order), whichever
+    /// finished signing in first, each once the one before it has shown its window.
+    #[test]
+    fn games_start_in_home_order_each_after_the_window_of_the_one_before() {
+        let root = root(); let mut events = Vec::new();
+        // A game's window shows 30 ms after its start.
+        let shown = root.clone();
+        WINDOWS.with(|probe| *probe.borrow_mut() = Some(Box::new(move |key| {
+            fs::metadata(shown.join(format!("{key}-started"))).and_then(|m| m.modified()).is_ok_and(|at| at.elapsed().is_ok_and(|age| age >= Duration::from_millis(30)))
+        })));
+        // "cold" signs in last and is first in Home order.
+        let began = Instant::now();
+        coordinate(vec![job(&root, "cold"), job(&root, "warm"), job(&root, "third")], Instant::now(), fixture_prepare, |e| events.push(serde_json::to_string(e).unwrap()));
+        let took = began.elapsed();
+        WINDOWS.with(|probe| probe.borrow_mut().take());
+        assert!(!events.iter().any(|e| e.contains("Failed")), "{events:?}");
+        assert_eq!(fs::read_to_string(root.join("release-order")).unwrap(), "cold\nwarm\nthird\n");
+        let started = |key: &str| fs::metadata(root.join(format!("{key}-started"))).unwrap().modified().unwrap();
+        for (before, after) in [("cold", "warm"), ("warm", "third")] {
+            let gap = started(after).duration_since(started(before)).unwrap();
+            assert!(gap >= Duration::from_millis(25), "{after} started {gap:?} after {before}: not before its window");
+        }
+        assert!(took < Duration::from_secs(2), "the order cost two window waits, not a limit: {took:?}");
+        // What it cost is in the launch history.
+        let history = fs::read_to_string(job(&root, "cold").config.history_path()).unwrap();
+        assert!(history.contains("launch order: 3 games started in Home order in ") && !history.contains("no window"), "{history}");
+    }
+
+    /// A game whose window never shows holds the next one up by the limit and no longer, and
+    /// one that has ended by nothing at all.
+    #[test]
+    fn a_game_with_no_window_delays_the_next_start_only_by_the_limit() {
+        let root = root(); let mut events = Vec::new();
+        WINDOWS.with(|probe| *probe.borrow_mut() = Some(Box::new(|key| key != "stuck")));
+        let began = Instant::now();
+        coordinate(vec![job(&root, "first"), job(&root, "stuck"), job(&root, "last")], Instant::now(), fixture_prepare, |e| events.push(serde_json::to_string(e).unwrap()));
+        let took = began.elapsed();
+        WINDOWS.with(|probe| probe.borrow_mut().take());
+        assert!(!events.iter().any(|e| e.contains("Failed")), "{events:?}");
+        assert_eq!(fs::read_to_string(root.join("release-order")).unwrap(), "first\nstuck\nlast\n", "still in order, and every game started");
+        assert!(took >= WINDOW_LIMIT && took < WINDOW_LIMIT + Duration::from_secs(2), "{took:?}");
+        let history = fs::read_to_string(job(&root, "first").config.history_path()).unwrap();
+        assert!(history.contains("(no window)"), "{history}");
+        // The wait itself: over at once when the window is there or the game has ended, at the
+        // limit otherwise.
+        let far = Instant::now() + Duration::from_secs(30);
+        assert!(wait_for_window(|| true, || true, far));
+        assert!(!wait_for_window(|| false, || false, far));
+        let asked = Instant::now();
+        assert!(!wait_for_window(|| false, || true, asked + Duration::from_millis(40)));
+        assert!(asked.elapsed() >= Duration::from_millis(40) && asked.elapsed() < Duration::from_secs(2));
+        let mut looks = 0;
+        assert!(wait_for_window(|| { looks += 1; looks == 3 }, || true, far));
+        // One game has no order to wait for; the line names the waits.
+        assert_eq!(order_line(1, Duration::ZERO, &[]), None);
+        assert_eq!(order_line(3, Duration::from_millis(412), &[(Duration::from_millis(203), true), (Duration::from_millis(3000), false)]).unwrap(),
+            "launch order: 3 games started in Home order in 412 ms; waited for each window: 203, 3000 (no window) ms");
     }
 
     #[test]

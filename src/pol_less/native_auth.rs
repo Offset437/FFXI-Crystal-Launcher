@@ -16,6 +16,23 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+/// The Square Enix password as the game's settings editor transforms it (app.dll 1019ab29): the
+/// low byte of each UTF-16 unit, SHA-1, its lower-case hex, then SHA-1 of that with "playonline".
+fn editor_secret(input: &[u16]) -> Zeroizing<[u8; 20]> {
+    use ring::digest::{digest, Context, SHA1_FOR_LEGACY_USE_ONLY as SHA1};
+    let bytes = Zeroizing::new(input.iter().map(|v| *v as u8).collect::<Vec<_>>());
+    let first = digest(&SHA1, &bytes);
+    let mut hex = Zeroizing::new([0u8; 40]);
+    for (i, b) in first.as_ref().iter().enumerate() {
+        hex[i * 2] = b"0123456789abcdef"[(b >> 4) as usize];
+        hex[i * 2 + 1] = b"0123456789abcdef"[(b & 15) as usize];
+    }
+    let mut second = Context::new(&SHA1);
+    second.update(&*hex);
+    second.update(b"playonline");
+    Zeroizing::new(second.finish().as_ref().try_into().expect("SHA-1 is 20 bytes"))
+}
+
 struct Input {
     pol_id: Zeroizing<String>,
     pol_password: Zeroizing<String>,
@@ -30,6 +47,8 @@ struct Input {
 }
 pub(super) struct NativeAuth {
     input: Mutex<Option<Input>>,
+    /// The authenticator code in the credentials line, recorded once that line is sent.
+    code_sent: Mutex<Option<crate::totp::Sent>>,
     directory: PathBuf,
     snapshot: Mutex<Snapshot>,
     control_errors: Mutex<BTreeMap<&'static str, String>>,
@@ -101,8 +120,7 @@ impl NativeAuth {
             None
         };
         let utf16 = Zeroizing::new(account.se_password.encode_utf16().collect::<Vec<_>>());
-        let se_secret =
-            crystal_pol::credential::EditorSecret::from_utf16(&utf16).into_native_secret();
+        let se_secret = editor_secret(&utf16);
         Ok(Self {
             input: Mutex::new(Some(Input {
                 pol_id,
@@ -114,6 +132,7 @@ impl NativeAuth {
                 key: backend::account_key(account),
                 handle_names: Zeroizing::new(account.pol_handle_names.clone()),
             })),
+            code_sent: Mutex::new(None),
             directory,
             snapshot: Mutex::new(Snapshot::default()),
             control_errors: Mutex::new(BTreeMap::new()),
@@ -160,6 +179,9 @@ impl NativeAuth {
     }
 }
 impl SignedIn for NativeAuth {
+    fn credentials_sent(&self) {
+        if let Some(sent) = self.code_sent.lock().unwrap_or_else(|e| e.into_inner()).take() { sent.record(); }
+    }
     fn social_only(&self) -> bool { self.social_only }
     fn start_pending(&self) -> bool { self.start_pending.load(Ordering::Acquire) }
     fn idle_first(&self) -> bool { self.social_only || self.start_pending() }
@@ -427,7 +449,8 @@ impl NativeAuth {
             .ok_or(t("Native POL credentials were already handed to the game host."))?;
         // An authenticator account's code is made here, as the credentials leave for the host:
         // the same six digits a typed code would be, in the same field.
-        let generated = input.authenticator.as_ref().map(crate::totp::Authenticator::code);
+        let (generated, sent) = input.authenticator.as_ref().map(crate::totp::Authenticator::code).unzip();
+        *self.code_sent.lock().unwrap_or_else(|e| e.into_inner()) = sent;
         let otp = generated.as_ref().unwrap_or(&input.otp);
         // Preallocate all secret fields, preventing discarded allocation copies.
         let fields: [(&str, &[u8]); 6] = [
@@ -471,6 +494,14 @@ impl NativeAuth {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_editor_secret_matches_independent_vectors() {
+        let hex = |s: &[u8; 20]| s.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let units = "synthetic".encode_utf16().collect::<Vec<_>>();
+        assert_eq!(hex(&super::editor_secret(&units)), "e8a29df64156bd20570e809e22cc55f153f1b830");
+        // Only each unit's low byte counts.
+        assert_eq!(hex(&super::editor_secret(&[0x0061, 0x00ff, 0xd83d, 0xde00])), "ad5036546a7614e56fc929e7ef85c95488dd81c8");
+    }
     use super::*;
 
     #[test]
@@ -739,7 +770,7 @@ mod tests {
                 "crystal-native-refresh-{}", backend::unique_id().unwrap()
             ));
             Self { auth: NativeAuth {
-                input: Mutex::new(None), directory,
+                input: Mutex::new(None), code_sent: Mutex::new(None), directory,
                 snapshot: Mutex::new(Snapshot::default()),
                 control_errors: Mutex::new(BTreeMap::new()),
                 cache_dirty: AtomicBool::new(false),
@@ -767,7 +798,7 @@ mod tests {
         }
     }
     fn friend_blob() -> Vec<u8> {
-        use crystal_pol::friends::{BLOB_LEN, MAGIC};
+        use crate::wire::{FRIENDS_LEN as BLOB_LEN, FRIENDS_MAGIC as MAGIC};
         let mut blob = vec![0; BLOB_LEN];
         blob[..8].copy_from_slice(MAGIC);
         blob[8 + 0x98] = 1;
@@ -887,6 +918,8 @@ mod tests {
             let auth = NativeAuth::new(&account, Zeroizing::new(otp.into()), directory.clone()).unwrap();
             assert!(crate::totp::recorded_step(&directory).is_none() || !otp.is_empty(), "no code is made before the line");
             let line = auth.credentials_line().unwrap();
+            assert!(crate::totp::recorded_step(&directory).is_none() || !otp.is_empty(), "recorded only once the line is sent");
+            auth.credentials_sent();
             let value: serde_json::Value = serde_json::from_slice(&line).unwrap();
             assert!(!String::from_utf8_lossy(&line).contains(key), "the key never leaves");
             String::from_utf8(pipe::base64_decode(value["native_auth"]["otp"].as_str().unwrap()).unwrap()).unwrap()

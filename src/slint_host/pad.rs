@@ -224,19 +224,6 @@ pub(crate) fn modal_rect(window: &slint::Window) -> Option<(f32, f32, f32, f32)>
     None
 }
 
-/// The text of each editable field the walker can reach, in Tab order (tests of pages).
-#[cfg(test)]
-pub(crate) fn field_texts(window: &slint::Window) -> Vec<String> {
-    stops(window).iter().filter_map(|(item, _)| item.downcast::<TextInput>().map(|t| t.as_pin_ref().text().to_string())).collect()
-}
-
-/// Focuses the `n`-th editable field the walker can reach (tests of pages).
-#[cfg(test)]
-pub(crate) fn focus_field(window: &slint::Window, n: usize) {
-    let found: Vec<ItemRc> = stops(window).into_iter().filter(|(item, _)| item.downcast::<TextInput>().is_some()).map(|(item, _)| item).collect();
-    WindowInner::from_pub(window).set_focus_item(&found[n], true, FocusReason::TabNavigation);
-}
-
 /// Where each stop the walker can reach now starts: (x, y), for tests of pages.
 #[cfg(test)]
 pub(crate) fn stop_origins(window: &slint::Window) -> Vec<(f32, f32)> { stops(window).iter().map(|(_, r)| (r.x, r.y)).collect() }

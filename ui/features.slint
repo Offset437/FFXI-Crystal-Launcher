@@ -1,12 +1,13 @@
 // The launcher features' page (src/features/ui.rs; src/slint_host/features.rs fills it): a
 // two-pane page (a-skyline\features-dark.png) with one section per feature (windows with the
-// monitor map, hotkeys, crash recovery, backups, per-client performance and launch profiles,
+// monitor map, which is the window layout editor; hotkeys, crash recovery, backups, per-client
+// performance and launch profiles,
 // notifications, Discord and play time), the relaunch banner over the page's foot, and the
 // background-gamepad line of the account sheet.
 // Every string comes from Rust; every control sends a `Message::Feature` (or an existing core
 // message for an account's own settings).
 import { Theme } from "theme.slint";
-import { Glyph, Icon, Dot, SmallButton, Control, Tone, Check, Select, Segmented, Rule, Spinner, Panel } from "widgets.slint";
+import { Glyph, Icon, Dot, SmallButton, Control, Tone, Check, Select, Segmented, Rule, Spinner, Panel, KeyCap, Nav } from "widgets.slint";
 import { Note, ErrorNote, SavedField } from "form.slint";
 import { SectionTile, PageTitle, DetailTitle, GroupLabel, ToggleRow, PaneScroll } from "panes.slint";
 
@@ -23,25 +24,22 @@ export struct FeatureStrings {
     restore-note: string,
     launch-saved: string,
     launch-saved-note: string,
-    order-windows: string,
-    order-windows-note: string,
-    arrange: string,
+
+    apply: string,
     restore-windows: string,
     monitor: string,
-    layout: string,
     grid: string,
     main-large: string,
-    /// The list separator: ", " ("、" in Japanese).
-    list-sep: string,
-    arrange-note: string,
+    full-screen: string,
+    map-note: string,
     in-game: string,
-    no-windows: string,
     remembered: string,
     no-layouts: string,
     forget: string,
     switch-windows: string,
     per-account: string,
-    hotkey-placeholder: string,
+    /// A hotkey field with no hotkey.
+    hotkey-none: string,
     hotkey-note: string,
     no-accounts: string,
     recovery: string,
@@ -92,7 +90,22 @@ export struct LayoutLine {
     display: string,
 }
 
-/// A game window on the monitor map: its place as fractions of the arranged area.
+/// A monitor on the map: its rectangle and its work area (the part the taskbar leaves), as
+/// fractions of the map (the rectangle around every monitor).
+export struct MapMonitor {
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    work-x: float,
+    work-y: float,
+    work-w: float,
+    work-h: float,
+    /// Its number ("2"); empty with one monitor.
+    name: string,
+}
+
+/// An account's window on the map: its place as fractions of the map.
 export struct MapTile {
     index: string,
     name: string,
@@ -103,15 +116,33 @@ export struct MapTile {
     h: float,
     /// The account is in game.
     live: bool,
+    /// It has a place: an open window, or a remembered one. One with none is drawn faintly
+    /// where Grid would put it.
+    placed: bool,
+    /// Moved on the map since its open window was: Apply moves the window.
+    pending: bool,
 }
 
-/// A hotkey field: what it does, the chord, and why it doesn't work (empty when it does).
+/// A snap line shown while it holds the dragged tile, as fractions of the map.
+export struct MapGuide {
+    vertical: bool,
+    at: float,
+    from: float,
+    to: float,
+}
+/// A hotkey field: what it does, the chord, and what to know about it (empty when nothing):
+/// why it doesn't work, or (`warn`) what it clashes with while it does.
 export struct HotkeyLine {
     name: string,
     text: string,
+    /// Where it works, when that is not everywhere (an account's hotkey with no Ctrl, Alt or
+    /// Win): said quietly, the hotkey is fine.
+    note: string,
     problem: string,
     /// Registered and working.
     active: bool,
+    /// `problem` is a warning: the hotkey works.
+    warn: bool,
 }
 
 /// One account's client settings.
@@ -165,22 +196,44 @@ export global Features {
     in property <bool> remember;
     in property <bool> restore;
     in property <bool> launch-saved;
-    in property <bool> order-windows;
+
+    /// The monitors the presets can fill: every monitor, then each one.
     in property <[string]> monitors;
-    /// The monitors by their short names ("Display 1"), for the section's state line.
-    in property <[string]> monitor-names;
     in-out property <int> monitor;
-    /// The layout the map shows and Arrange all applies: 0 grid, 1 main large.
-    in-out property <int> preset: 1;
-    /// The last Arrange all can be undone: one of the windows it moved is still open.
+    /// The last Apply can be undone: one of the windows it moved is still open.
     in property <bool> can-restore;
     in property <[LayoutLine]> layouts;
+    // The monitor map (the window layout editor): every monitor to scale, a tile per account.
+    in property <[MapMonitor]> map-monitors;
     in property <[MapTile]> map-tiles;
-    /// Width over height of the area the map draws.
+    /// The snap lines holding the tile being dragged.
+    in property <[MapGuide]> map-guides;
+    /// Width over height of the map (the rectangle around every monitor).
     in property <float> map-aspect: 1.78;
+    /// The selected tile, or -1.
+    in property <int> map-selected: -1;
+    /// Moves when the selected tile is to take the keyboard focus (it was pressed).
+    in property <int> map-focus;
+    /// The pointer over the map: 0 arrow, 1 move, 2 left-right, 3 up-down, 4 and 5 the diagonals.
+    in property <int> map-cursor;
+    /// The selected tile in words: its account, size and place.
+    in property <string> map-readout;
+    /// A game window is open (Apply shows), and a tile of one waits to be applied.
+    in property <bool> can-apply;
+    in property <bool> apply-pending;
     // ---- hotkeys: next and previous, then one per account ----
     in property <[HotkeyLine]> cycle-hotkeys;
     in property <[HotkeyLine]> account-hotkeys;
+    /// The hotkey field that is recording (0 next window, 1 previous window, 2 + n the n-th
+    /// account), or -1.
+    in property <int> recording: -1;
+    /// What it shows meanwhile: the prompt, or the modifiers held ("Ctrl+Alt+…").
+    in property <string> recording-text;
+    /// `recording-text` is the prompt (no modifier is held).
+    in property <bool> recording-prompt;
+    /// The host's keyboard hook took the key that ended the last recording: the field never
+    /// saw its press, so that key's repeats arrive looking like new presses.
+    in property <bool> recording-taken;
     // ---- recovery ----
     in property <bool> offer;
     in property <bool> auto-relaunch;
@@ -223,16 +276,33 @@ export global Features {
     callback section-picked(int);
     /// 0 remember, 1 restore, 2 launch at saved size, 3 offer relaunch, 4 automatic relaunch,
     /// 5 back up before updates, 6 notifications, 7 mail, 8 friends online, 9 background
-    /// priority, 10 mute background clients, 11 record play time, 12 Discord, 13 order game windows.
+    /// priority, 10 mute background clients, 11 record play time, 12 Discord.
     callback toggle(int, bool);
-    /// 0 next window, 1 previous window, 2 + n the n-th account.
-    callback hotkey-entered(int, string);
-    /// 0 grid, 1 main large, on `monitor`.
-    callback arrange(int);
-    /// Put the windows the last Arrange all moved back where they were.
+    /// A hotkey field starts recording: 0 next window, 1 previous window, 2 + n the n-th account.
+    callback hotkey-record(int);
+    /// The pointer went down on that field (a press anywhere else ends a recording).
+    callback hotkey-pointer(int);
+    /// That field lost the focus.
+    callback hotkey-blur(int);
+    /// A key event in the recording field, for when the host's keyboard hook is not in: the
+    /// key's text, Ctrl, Alt, Shift and the Windows key held, and pressed or released. Whether
+    /// the key was the recording's.
+    callback hotkey-key(string, bool, bool, bool, bool, bool) -> bool;
+    /// The pointer on the map: 0 pressed, 1 moved, 2 released, 3 the press was taken away; where
+    /// it is as fractions of the map, how wide the map is drawn, and whether Alt is held.
+    callback map-pointer(int, float, float, length, bool);
+    /// A tile took or lost the keyboard focus.
+    callback tile-focused(int);
+    callback tile-blurred(int);
+    /// A key on the focused tile: its text, Shift held, and pressed or released. Whether the
+    /// tile used it (the arrows move it, Return goes to the next tile under it).
+    callback tile-key(int, string, bool, bool) -> bool;
+    /// Fill the tiles: 0 grid, 1 main large, 2 full screen, on `monitor`.
+    callback preset(int);
+    /// Move the open game windows to their tiles.
+    callback apply-layout();
+    /// Put the windows the last Apply moved back where they were.
     callback restore-windows();
-    /// The layout or the monitor changed: the map is drawn again.
-    callback map-changed();
     callback forget(int);
     callback relaunch-cancel(int);
     callback relaunch-now(int);
@@ -287,13 +357,126 @@ component ListRow inherits Rectangle {
     if root.closing: Rule { y: parent.height - 1px; width: parent.width; }
 }
 
-/// A hotkey row: what it does, the chord field (applied on Return) with why it doesn't work
-/// under it, and its state.
+/// A hotkey, set by pressing it. A click, Return or Space starts recording: the field shows
+/// `live` (the prompt, then the modifiers as they are held) and the next key pressed with them
+/// is the hotkey. The host's keyboard hook takes the keys while it records; a key that
+/// reaches the field all the same (the hook is not in, or was not called) goes to `key`.
+component HotkeyField inherits Rectangle {
+    in property <string> label;
+    /// The hotkey ("" for none: `none` shows).
+    in property <string> chord;
+    in property <string> none;
+    in property <bool> recording;
+    in property <string> live;
+    in property <bool> prompt;
+    callback record();
+    callback pointer();
+    callback blur();
+    callback key(string, bool, bool, bool, bool, bool) -> bool;
+    /// A recording just ended and the key that ended it is still down: until a key is let go,
+    /// its repeats are nobody's, and Return or Space starts no new recording (a repeat of a key
+    /// the host's hook took is not marked as one).
+    private property <bool> settling;
+    height: Theme.control-h;
+    horizontal-stretch: 0;
+    border-radius: Theme.radius-mid;
+    border-width: 1px;
+    background: root.recording ? Theme.select : Theme.field;
+    border-color: root.recording || focus.has-focus ? Theme.accent : hit.has-hover ? Theme.line.mix(Theme.accent, 0.5) : Theme.line;
+    animate background { duration: Theme.quick; }
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-description: root.recording ? root.live : root.chord == "" ? root.none : root.chord;
+    accessible-action-default => { root.record(); }
+    forward-focus: focus;
+    changed recording => {
+        if !root.recording && Features.recording-taken { root.settling = true; }
+    }
+    focus := FocusScope {
+        focus-on-click: false;
+        focus-gained(reason) => { Nav.keyboard = reason == FocusReason.tab-navigation; }
+        focus-lost => {
+            root.settling = false;
+            root.blur();
+        }
+        key-pressed(event) => {
+            if root.recording {
+                if event.repeat { return accept; }
+                if root.key(event.text, event.modifiers.control, event.modifiers.alt, event.modifiers.shift, event.modifiers.meta, true) {
+                    root.settling = true;
+                    return accept;
+                }
+                return reject;
+            }
+            if event.repeat { return root.settling ? accept : reject; }
+            if event.text == Key.Return || event.text == " " {
+                if !root.settling { root.record(); }
+                return accept;
+            }
+            root.settling = false;
+            return reject;
+        }
+        key-released(event) => {
+            root.settling = false;
+            if root.recording {
+                root.key(event.text, event.modifiers.control, event.modifiers.alt, event.modifiers.shift, event.modifiers.meta, false);
+                return accept;
+            }
+            return reject;
+        }
+    }
+    hit := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down { root.pointer(); }
+        }
+        clicked => {
+            focus.focus();
+            root.record();
+        }
+    }
+    HorizontalLayout {
+        padding-left: 11px;
+        padding-right: 8px;
+        spacing: Theme.sp-s;
+        Text {
+            horizontal-stretch: 1;
+            text: root.recording ? root.live : root.chord == "" ? root.none : root.chord;
+            font-family: (root.recording && root.prompt) || (!root.recording && root.chord == "") ? Theme.sans : Theme.mono;
+            font-size: (root.recording && root.prompt) || (!root.recording && root.chord == "") ? Theme.type-small : 12px;
+            font-weight: root.recording ? 500 : 400;
+            color: root.recording ? Theme.select-ink : root.chord == "" ? Theme.faint : Theme.ink;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        if root.recording: KeyCap {
+            cross-axis-self-alignment: center;
+            text: "Esc";
+            ink: Theme.select-ink;
+            edge: Theme.select-ink.with-alpha(0.4);
+        }
+    }
+    if focus.has-focus && Nav.keyboard && !root.recording: Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: root.border-radius + 3px;
+        border-width: 2px;
+        border-color: Theme.accent;
+    }
+}
+
+/// A hotkey row: what it does, the hotkey's field with what to know about it under it, and its
+/// state.
 component HotkeyRow inherits Rectangle {
     in property <HotkeyLine> line;
-    in property <string> placeholder;
+    in property <string> none;
+    in property <bool> recording;
     in property <bool> closing;
-    callback entered(string);
+    callback record();
+    callback pointer();
+    callback blur();
     min-height: 48px;
     Rule { y: 0px; width: parent.width; }
     VerticalLayout {
@@ -313,122 +496,98 @@ component HotkeyRow inherits Rectangle {
                 vertical-alignment: center;
                 overflow: elide;
             }
-            SavedField {
-                horizontal-stretch: 0;
+            HotkeyField {
                 width: Theme.small ? 150px : 200px;
-                font-family: Theme.mono;
-                font-size: 12px;
                 label: root.line.name;
-                placeholder: root.placeholder;
-                saved: root.line.text;
-                commit(text) => { root.entered(text); }
+                chord: root.line.text;
+                none: root.none;
+                recording: root.recording;
+                live: Features.recording-text;
+                prompt: Features.recording-prompt;
+                record => { root.record(); }
+                pointer => { root.pointer(); }
+                blur => { root.blur(); }
+                key(text, control, alt, shift, meta, down) => { return Features.hotkey-key(text, control, alt, shift, meta, down); }
             }
-            Rectangle {
+            VerticalLayout {
                 width: 16px;
                 horizontal-stretch: 0;
-                if root.line.text != "": Icon {
-                    x: 0px;
-                    y: (parent.height - self.height) / 2;
+                alignment: center;
+                if root.line.text != "" || root.line.problem != "": Icon {
                     glyph: root.line.problem == "" ? Glyph.check-circle : Glyph.alert-circle;
                     size: 16px;
-                    tint: root.line.problem != "" ? Theme.danger : root.line.active ? Theme.ok : Theme.faint;
+                    tint: root.line.problem != "" ? (root.line.warn ? Theme.warn : Theme.danger) : root.line.active ? Theme.ok : Theme.faint;
                 }
             }
         }
-        if root.line.problem != "": ErrorNote { text: root.line.problem; }
+        if root.line.note != "" && !root.recording: Note { text: root.line.note; }
+        if root.line.problem != "" && !root.recording: ErrorNote {
+            text: root.line.problem;
+            color: root.line.warn ? Theme.warn : Theme.danger;
+        }
     }
     if root.closing: Rule { y: parent.height - 1px; width: parent.width; }
 }
 
-/// The monitor map (`.mon`): the arranged area drawn to its aspect, one tile per game window
-/// (the one in game raised and ringed in ice), over a stand bar.
-component MonitorMap inherits Rectangle {
-    in property <[MapTile]> tiles;
-    in property <float> aspect: 1.78;
-    height: 252px;
-    border-radius: Theme.radius;
-    background: Theme.field;
+/// A tile's face on the monitor map (`.mon`): its number, its account and its size, and In game
+/// under them when there is room. The selected one is ringed in ice; one with no place yet is
+/// drawn faintly; one whose open window Apply has not moved yet carries an amber dot.
+component TileFace inherits Rectangle {
+    in property <MapTile> tile;
+    in property <bool> selected;
+    border-radius: 3px;
     border-width: 1px;
-    border-color: Theme.line;
-    private property <length> area-w: root.width - 16px;
-    private property <length> area-h: root.height - 26px;
-    private property <length> fit-w: min(root.area-w, root.area-h * root.aspect);
-    private property <length> fit-h: root.fit-w / root.aspect;
-    private property <length> ox: 8px + (root.area-w - root.fit-w) / 2;
-    private property <length> oy: 8px + (root.area-h - root.fit-h) / 2;
-    Rectangle {
-        x: 8px;
-        y: root.height - 16px;
-        width: root.width - 16px;
-        height: 8px;
-        border-radius: 2px;
-        background: Theme.fill;
-    }
-    if root.tiles.length == 0: Text {
-        x: 8px;
-        y: 8px;
-        width: root.area-w;
-        height: root.area-h;
-        text: Features.strings.no-windows;
-        font-size: Theme.type-note;
-        color: Theme.faint;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-    for tile in root.tiles: Rectangle {
-        x: root.ox + tile.x * root.fit-w + 2px;
-        y: root.oy + tile.y * root.fit-h + 2px;
-        width: max(10px, tile.w * root.fit-w - 4px);
-        height: max(10px, tile.h * root.fit-h - 4px);
-        border-radius: 4px;
-        border-width: 1px;
-        border-color: tile.live ? Theme.ice : Theme.line;
-        background: tile.live ? Theme.fill2 : Theme.fill;
-        clip: true;
-        VerticalLayout {
-            padding-left: 9px;
-            padding-right: 9px;
-            padding-top: 7px;
-            spacing: 2px;
-            alignment: start;
-            HorizontalLayout {
-                spacing: 7px;
-                Text {
-                    horizontal-stretch: 0;
-                    height: 16px;
-                    text: tile.index;
-                    font-family: Theme.mono;
-                    font-size: Theme.type-micro;
-                    font-weight: 500;
-                    color: tile.live ? Theme.ice : Theme.faint;
-                    vertical-alignment: center;
-                }
-                Text {
-                    horizontal-stretch: 1;
-                    height: 16px;
-                    text: tile.name;
-                    font-size: Theme.type-note;
-                    font-weight: 600;
-                    color: tile.live ? Theme.ink : Theme.ink2;
-                    vertical-alignment: center;
-                    overflow: elide;
-                }
-            }
-            if tile.h * root.fit-h - 4px > 46px: Text {
-                height: 14px;
-                text: tile.size;
+    border-color: root.selected ? Theme.ice : !root.tile.placed ? Theme.line.with-alpha(0.6) : Theme.line;
+    background: !root.tile.placed ? Theme.fill.with-alpha(0.35) : root.selected ? Theme.fill2 : Theme.fill;
+    clip: true;
+    VerticalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        padding-top: 6px;
+        spacing: 1px;
+        alignment: start;
+        HorizontalLayout {
+            spacing: 6px;
+            Text {
+                horizontal-stretch: 0;
+                height: 16px;
+                text: root.tile.index;
                 font-family: Theme.mono;
-                font-size: 10.5px;
+                font-size: Theme.type-micro;
                 font-weight: 500;
-                color: Theme.faint;
+                color: root.tile.live || root.selected ? Theme.ice : Theme.faint;
+                vertical-alignment: center;
+            }
+            Text {
+                horizontal-stretch: 1;
+                min-width: 0px;
+                height: 16px;
+                text: root.tile.name;
+                font-size: Theme.type-note;
+                font-weight: 600;
+                color: !root.tile.placed ? Theme.faint : root.tile.live || root.selected ? Theme.ink : Theme.ink2;
                 vertical-alignment: center;
                 overflow: elide;
             }
+            if root.tile.pending: Dot { cross-axis-self-alignment: center; size: 6px; tint: Theme.warn; }
         }
-        if tile.live && tile.h * root.fit-h - 4px > 70px: Text {
-            x: 9px;
-            y: parent.height - 24px;
-            width: parent.width - 18px;
+        if root.height > 42px: Text {
+            height: 14px;
+            text: root.tile.size;
+            font-family: Theme.mono;
+            font-size: 10.5px;
+            font-weight: 500;
+            color: Theme.faint;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+    if root.tile.live && root.height > 66px: VerticalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        padding-bottom: 6px;
+        alignment: end;
+        Text {
             height: 16px;
             text: Features.strings.in-game;
             font-size: Theme.type-caption;
@@ -436,6 +595,151 @@ component MonitorMap inherits Rectangle {
             color: Theme.ice-hi;
             vertical-alignment: center;
             overflow: elide;
+        }
+    }
+}
+
+/// The monitor map, which is the window layout editor: every monitor to scale where Windows has
+/// it, its taskbar's strip a shade apart, and a tile per account where its game window is or
+/// will open. A tile is dragged to move it and by an edge or corner to resize it (the host
+/// snaps it and says which lines hold it); the arrow keys move the selected one a pixel.
+/// Everything is drawn on whole pixels.
+component MonitorMap inherits Rectangle {
+    height: Theme.small ? 252px : 300px;
+    border-radius: Theme.radius;
+    background: Theme.field;
+    border-width: 1px;
+    border-color: Theme.line;
+    clip: true;
+    accessible-role: none;
+    private property <length> pad: 14px;
+    private property <length> fit-w: floor(min(root.width - 2 * root.pad, (root.height - 2 * root.pad) * Features.map-aspect) / 1px) * 1px;
+    private property <length> fit-h: root.fit-w / Features.map-aspect;
+    private property <length> ox: round((root.width - root.fit-w) / 2px) * 1px;
+    private property <length> oy: round((root.height - root.fit-h) / 2px) * 1px;
+    /// Where the fraction `f` of the map's width (height) is, on a whole pixel.
+    pure function at-x(f: float) -> length { return round((root.ox + f * root.fit-w) / 1px) * 1px; }
+    pure function at-y(f: float) -> length { return round((root.oy + f * root.fit-h) / 1px) * 1px; }
+    function point(kind: int, alt: bool) {
+        Features.map-pointer(kind, (area.mouse-x - root.ox) / root.fit-w, (area.mouse-y - root.oy) / root.fit-h, root.fit-w, alt);
+    }
+    if Features.map-tiles.length == 0: Text {
+        text: Features.strings.no-accounts;
+        font-size: Theme.type-note;
+        color: Theme.faint;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    for monitor in Features.map-monitors: Rectangle {
+        x: root.at-x(monitor.x);
+        y: root.at-y(monitor.y);
+        width: root.at-x(monitor.x + monitor.w) - self.x;
+        height: root.at-y(monitor.y + monitor.h) - self.y;
+        // The taskbar's strip shows as what the work area leaves of the monitor.
+        background: Theme.line;
+        Rectangle {
+            x: root.at-x(monitor.work-x) - parent.x;
+            y: root.at-y(monitor.work-y) - parent.y;
+            width: root.at-x(monitor.work-x + monitor.work-w) - root.at-x(monitor.work-x);
+            height: root.at-y(monitor.work-y + monitor.work-h) - root.at-y(monitor.work-y);
+            background: Theme.bg;
+        }
+        Rectangle {
+            border-width: 1px;
+            border-color: Theme.line;
+        }
+        if monitor.name != "": HorizontalLayout {
+            padding-right: 7px;
+            padding-bottom: 5px;
+            alignment: end;
+            VerticalLayout {
+                alignment: end;
+                Text {
+                    text: monitor.name;
+                    font-family: Theme.mono;
+                    font-size: Theme.type-micro;
+                    font-weight: 500;
+                    color: Theme.faint;
+                }
+            }
+        }
+    }
+    for tile[index] in Features.map-tiles: Rectangle {
+        // A pixel inside its rectangle all round, so tiles that abut show a hairline between
+        // them and a full-screen one leaves its monitor's outline.
+        x: root.at-x(tile.x) + 1px;
+        y: root.at-y(tile.y) + 1px;
+        width: max(6px, root.at-x(tile.x + tile.w) - 1px - self.x);
+        height: max(6px, root.at-y(tile.y + tile.h) - 1px - self.y);
+        accessible-role: button;
+        accessible-label: tile.name;
+        accessible-description: tile.size;
+        property <int> take-focus: Features.map-focus;
+        changed take-focus => {
+            if Features.map-selected == index { scope.focus(); }
+        }
+        TileFace { tile: tile; }
+        scope := FocusScope {
+            focus-on-click: false;
+            focus-gained(reason) => {
+                Nav.keyboard = reason == FocusReason.tab-navigation;
+                Features.tile-focused(index);
+            }
+            focus-lost => { Features.tile-blurred(index); }
+            key-pressed(event) => { return Features.tile-key(index, event.text, event.modifiers.shift, true) ? accept : reject; }
+            key-released(event) => { return Features.tile-key(index, event.text, event.modifiers.shift, false) ? accept : reject; }
+        }
+        if scope.has-focus && Nav.keyboard: Rectangle {
+            x: -3px;
+            y: -3px;
+            width: parent.width + 6px;
+            height: parent.height + 6px;
+            border-radius: 6px;
+            border-width: 2px;
+            border-color: Theme.accent;
+        }
+    }
+    // The selected tile again, over the others, with its corner handles.
+    if Features.map-selected >= 0 && Features.map-selected < Features.map-tiles.length: Rectangle {
+        property <MapTile> tile: Features.map-tiles[Features.map-selected];
+        x: root.at-x(self.tile.x) + 1px;
+        y: root.at-y(self.tile.y) + 1px;
+        width: max(6px, root.at-x(self.tile.x + self.tile.w) - 1px - self.x);
+        height: max(6px, root.at-y(self.tile.y + self.tile.h) - 1px - self.y);
+        TileFace { tile: parent.tile; selected: true; }
+        for corner in 4: Rectangle {
+            x: mod(corner, 2) == 0 ? -2px : parent.width - 3px;
+            y: corner < 2 ? -2px : parent.height - 3px;
+            width: 5px;
+            height: 5px;
+            border-radius: 1px;
+            background: Theme.ice;
+        }
+    }
+    for guide in Features.map-guides: Rectangle {
+        x: guide.vertical ? root.at-x(guide.at) : root.at-x(guide.from);
+        y: guide.vertical ? root.at-y(guide.from) : root.at-y(guide.at);
+        width: guide.vertical ? 1px : root.at-x(guide.to) - self.x;
+        height: guide.vertical ? root.at-y(guide.to) - self.y : 1px;
+        background: Theme.ice-hi;
+    }
+    area := TouchArea {
+        mouse-cursor: Features.map-cursor == 1 ? MouseCursor.move
+            : Features.map-cursor == 2 ? MouseCursor.ew-resize
+            : Features.map-cursor == 3 ? MouseCursor.ns-resize
+            : Features.map-cursor == 4 ? MouseCursor.nwse-resize
+            : Features.map-cursor == 5 ? MouseCursor.nesw-resize
+            : MouseCursor.default;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                root.point(0, event.modifiers.alt);
+            } else if event.kind == PointerEventKind.move {
+                root.point(1, event.modifiers.alt);
+            } else if event.kind == PointerEventKind.up && event.button == PointerEventButton.left {
+                root.point(2, event.modifiers.alt);
+            } else if event.kind == PointerEventKind.cancel {
+                root.point(3, false);
+            }
         }
     }
 }
@@ -448,87 +752,80 @@ component FieldLabel inherits Text {
     vertical-alignment: center;
 }
 
-/// The layout, the monitor and Arrange all, beside the map or under it.
-component MapControls inherits VerticalLayout {
-    VerticalLayout {
-        spacing: 6px;
-        FieldLabel { text: Features.strings.layout; }
-        Segmented {
-            items: [Features.strings.grid, Features.strings.main-large];
-            current: Features.preset;
-            picked(index) => { Features.preset = index; Features.map-changed(); }
-        }
-    }
-    Rectangle { height: Theme.sp-l; }
-    VerticalLayout {
-        spacing: 6px;
-        FieldLabel { text: Features.strings.monitor; }
-        Select {
-            label: Features.strings.monitor;
-            items: Features.monitors;
-            current: Features.monitor;
-            picked(index) => { Features.monitor = index; Features.map-changed(); }
-        }
-    }
-    Rectangle { vertical-stretch: 1; min-height: Theme.sp-l; }
-    Control {
-        tone: Tone.primary;
-        glyph: Glyph.grid;
-        text: Features.strings.arrange;
-        clicked => { Features.arrange(Features.preset); }
-    }
-    if Features.can-restore: VerticalLayout {
-        padding-top: 8px;
-        Control {
-            tone: Tone.secondary;
-            glyph: Glyph.window;
-            text: Features.strings.restore-windows;
-            clicked => { Features.restore-windows(); }
-        }
-    }
-    Rectangle { height: 10px; }
-    Text {
-        text: Features.strings.arrange-note;
-        font-size: Theme.type-note;
-        color: Theme.faint;
-        wrap: word-wrap;
-    }
+/// The layouts the tiles start from: one press fills them.
+component PresetButtons inherits HorizontalLayout {
+    spacing: Theme.sp-s;
+    SmallButton { cross-axis-self-alignment: center; scale: 1; glyph: Glyph.grid; text: Features.strings.grid; clicked => { Features.preset(0); } }
+    SmallButton { cross-axis-self-alignment: center; scale: 1; glyph: Glyph.window; text: Features.strings.main-large; clicked => { Features.preset(1); } }
+    SmallButton { cross-axis-self-alignment: center; scale: 1; glyph: Glyph.monitor; text: Features.strings.full-screen; clicked => { Features.preset(2); } }
 }
 
 component WindowsSection inherits VerticalLayout {
     spacing: Theme.sp-3;
     VerticalLayout {
-        spacing: Theme.sp-l;
+        spacing: Theme.sp-m;
         DetailTitle { text: Features.sections[0]; }
-        // Side by side when the pane has the room, the controls under the map when it has not.
+        // The presets and the monitor they fill on one line when the pane has the room.
         if root.width >= 520px: HorizontalLayout {
-            spacing: Theme.sp-2xl;
-            MonitorMap {
-                horizontal-stretch: 3;
-                min-width: 280px;
-                preferred-width: 448px;
-                max-width: 448px;
-                tiles: Features.map-tiles;
-                aspect: Features.map-aspect;
-            }
-            MapControls {
-                horizontal-stretch: 1;
-                min-width: 190px;
+            spacing: Theme.sp-s;
+            PresetButtons { }
+            Rectangle { horizontal-stretch: 1; }
+            Select {
+                width: 232px;
+                label: Features.strings.monitor;
+                items: Features.monitors;
+                current: Features.monitor;
+                picked(index) => { Features.monitor = index; }
             }
         }
         if root.width < 520px: VerticalLayout {
-            spacing: Theme.sp-l;
-            MonitorMap {
-                tiles: Features.map-tiles;
-                aspect: Features.map-aspect;
+            spacing: Theme.sp-s;
+            HorizontalLayout {
+                PresetButtons { }
+                Rectangle { horizontal-stretch: 1; }
             }
-            MapControls { }
+            Select {
+                label: Features.strings.monitor;
+                items: Features.monitors;
+                current: Features.monitor;
+                picked(index) => { Features.monitor = index; }
+            }
         }
-    }    VerticalLayout {
+        MonitorMap { }
+        HorizontalLayout {
+            spacing: Theme.sp-s;
+            min-height: Theme.control-h;
+            // The selected tile in words; how the map is used while none is selected.
+            Text {
+                horizontal-stretch: 1;
+                min-width: 0px;
+                text: Features.map-readout != "" ? Features.map-readout : Features.strings.map-note;
+                font-size: Theme.type-note;
+                color: Features.map-readout != "" ? Theme.sub : Theme.faint;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            if Features.can-restore: Control {
+                cross-axis-self-alignment: center;
+                tone: Tone.secondary;
+                glyph: Glyph.window;
+                text: Features.strings.restore-windows;
+                clicked => { Features.restore-windows(); }
+            }
+            if Features.can-apply: Control {
+                cross-axis-self-alignment: center;
+                tone: Tone.primary;
+                glyph: Glyph.check;
+                text: Features.strings.apply;
+                enabled: Features.apply-pending;
+                clicked => { Features.apply-layout(); }
+            }
+        }
+    }
+    VerticalLayout {
         ToggleRow { name: Features.strings.remember; on: Features.remember; toggled(on) => { Features.toggle(0, on); } }
         ToggleRow { name: Features.strings.restore; note: Features.strings.restore-note; on: Features.restore; toggled(on) => { Features.toggle(1, on); } }
-        ToggleRow { name: Features.strings.launch-saved; on: Features.launch-saved; toggled(on) => { Features.toggle(2, on); } }
-        ToggleRow { name: Features.strings.order-windows; note: Features.strings.order-windows-note; on: Features.order-windows; closing: true; toggled(on) => { Features.toggle(13, on); } }
+        ToggleRow { name: Features.strings.launch-saved; on: Features.launch-saved; closing: true; toggled(on) => { Features.toggle(2, on); } }
     }
     VerticalLayout {
         spacing: Theme.sp-s;
@@ -565,9 +862,12 @@ component HotkeysSection inherits VerticalLayout {
             VerticalLayout {
                 for line[index] in Features.cycle-hotkeys: HotkeyRow {
                     line: line;
-                    placeholder: Features.strings.hotkey-placeholder;
+                    none: Features.strings.hotkey-none;
+                    recording: Features.recording == index;
                     closing: index == Features.cycle-hotkeys.length - 1;
-                    entered(text) => { Features.hotkey-entered(index, text); }
+                    record => { Features.hotkey-record(index); }
+                    pointer => { Features.hotkey-pointer(index); }
+                    blur => { Features.hotkey-blur(index); }
                 }
             }
             Note { text: Features.strings.hotkey-note; }
@@ -580,9 +880,12 @@ component HotkeysSection inherits VerticalLayout {
         VerticalLayout {
             for line[index] in Features.account-hotkeys: HotkeyRow {
                 line: line;
-                placeholder: Features.strings.hotkey-placeholder;
+                none: Features.strings.hotkey-none;
+                recording: Features.recording == index + 2;
                 closing: index == Features.account-hotkeys.length - 1;
-                entered(text) => { Features.hotkey-entered(index + 2, text); }
+                record => { Features.hotkey-record(index + 2); }
+                pointer => { Features.hotkey-pointer(index + 2); }
+                blur => { Features.hotkey-blur(index + 2); }
             }
         }
     }
@@ -879,8 +1182,6 @@ component ActivitySection inherits VerticalLayout {
 /// The Features page: its title (and the last outcome at the right), the section tiles, and the
 /// open section's detail.
 export component FeaturesPage inherits Rectangle {
-    private property <string> windows-note: (Features.preset == 0 ? Features.strings.grid : Features.strings.main-large)
-        + (Features.monitor >= 0 && Features.monitor < Features.monitor-names.length ? Features.strings.list-sep + Features.monitor-names[Features.monitor] : "");
     VerticalLayout {
         padding-top: Theme.sp-3;
         padding-left: Theme.page-x;
@@ -923,7 +1224,7 @@ export component FeaturesPage inherits Rectangle {
                 for title[i] in Features.sections: SectionTile {
                     glyph: i == 0 ? Glyph.window : i == 1 ? Glyph.keyboard : i == 2 ? Glyph.shield : i == 3 ? Glyph.archive : i == 4 ? Glyph.cpu : Glyph.clock;
                     title: title;
-                    note: i == 0 ? root.windows-note : Features.section-notes[i];
+                    note: Features.section-notes[i];
                     active: i == Features.section;
                     clicked => { Features.section-picked(i); }
                 }
@@ -931,6 +1232,8 @@ export component FeaturesPage inherits Rectangle {
             PaneScroll {
                 horizontal-stretch: 1;
                 scroll-to: Features.page-scroll;
+                // A drag on the monitor map moves a tile: the wheel scrolls the pane.
+                drag-pan: false;
                 if Features.section == 0: WindowsSection { }
                 if Features.section == 1: HotkeysSection { }
                 if Features.section == 2: RecoverySection { }

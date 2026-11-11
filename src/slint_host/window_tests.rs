@@ -793,3 +793,103 @@ fn settings_and_features_screenshots() {
     shot("settings-graphics-privacy", &mut settings, 1440, 900, false);
     crate::privacy::set(false);
 }
+/// CRYSTAL_SHOTS=<dir>: the Hotkeys page with a number pad chord set, a field recording (the
+/// prompt, then the modifiers held), and the notes under refused and clashing chords, into <dir>.
+#[test]
+fn hotkey_recording_screenshots() {
+    use crate::features::hotkeys::Hotkey;
+    use crate::features::ui::{Msg, Section, Target};
+    use slint::platform::{Key, WindowEvent};
+    use slint::Model;
+    let Some(dir) = std::env::var_os("CRYSTAL_SHOTS").map(std::path::PathBuf::from) else { return };
+    let (ui, window) = main_window();
+    let shot = |name: &str, app: &mut App, light: bool| {
+        let (width, height) = (1440, 900);
+        window.set_size(slint::PhysicalSize::new(width, height));
+        app.viewport = crate::effect::Size::new(width as f32, height as f32);
+        let theme = ui.global::<super::Theme>();
+        theme.set_light(light);
+        theme.set_scale(super::scale(app));
+        theme.set_small(super::small(app));
+        render(&ui, &window, app);
+        save_png(&window, width, height, &dir.join(format!("{name}.png")));
+    };
+    let key = |key: Key, down: bool| {
+        let text: slint::SharedString = key.into();
+        ui.window().dispatch_event(if down { WindowEvent::KeyPressed { text } } else { WindowEvent::KeyReleased { text } });
+    };
+    crate::privacy::set(false);
+    for (suffix, lang, light) in [("dark", Lang::En, false), ("light", Lang::En, true), ("ja", Lang::Ja, false)] {
+        crate::i18n::set(lang);
+        let mut app = app(Page::Home, None, false, false);
+        app.load_features_sample(Section::Hotkeys, false);
+        drop(app.feature_update(Msg::Hotkey(Target::Next, Hotkey::parse("Ctrl+Num0"))));
+        shot(&format!("hotkeys-set-{suffix}"), &mut app, light);
+        // The second field records: the prompt, then Ctrl and Alt held.
+        let name = ui.global::<super::Features>().get_cycle_hotkeys().row_data(1).unwrap().name;
+        assert!(super::pad::focus_named(ui.window(), &name));
+        drop(app.feature_update(Msg::HotkeyRecord(Target::Previous)));
+        shot(&format!("hotkeys-recording-{suffix}"), &mut app, light);
+        key(Key::Control, true);
+        key(Key::Alt, true);
+        shot(&format!("hotkeys-recording-held-{suffix}"), &mut app, light);
+        key(Key::Alt, false);
+        key(Key::Control, false);
+        // A chord refused for an account, the game's macro keys and a chord set twice.
+        drop(app.feature_update(Msg::HotkeyCancel));
+        let account = app.accounts[0].key.clone();
+        drop(app.feature_update(Msg::Hotkey(Target::Account(account), Hotkey::parse("Ctrl+C"))));
+        drop(app.feature_update(Msg::Hotkey(Target::Previous, Hotkey::parse("Ctrl+1"))));
+        shot(&format!("hotkeys-notes-{suffix}"), &mut app, light);
+    }
+    crate::i18n::set(Lang::En);
+}
+
+/// CRYSTAL_TOPBAR_SHOTS=<dir>: the top bar's tools (Discord, Privacy mode, the theme switch) at
+/// 1x, 150 % and 2x, dark and light, at rest and with the pointer over the Discord button; each
+/// as the bar's right end, and that again enlarged four times.
+#[test]
+fn top_bar_screenshots() {
+    let Some(dir) = std::env::var_os("CRYSTAL_TOPBAR_SHOTS").map(std::path::PathBuf::from) else { return };
+    crate::privacy::set(false);
+    crate::i18n::set(Lang::En);
+    let (ui, window) = main_window();
+    let mut home = app(Page::Home, None, false, false);
+    for (suffix, scale) in [("1x", 1.0f32), ("1.5x", 1.5), ("2x", 2.0)] {
+        for (theme, light) in [("dark", false), ("light", true)] {
+            for hover in [false, true] {
+                let (width, height) = (1440u32, 900u32);
+                window.dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged { scale_factor: scale });
+                let (pw, ph) = ((width as f32 * scale) as u32, (height as f32 * scale) as u32);
+                window.set_size(slint::PhysicalSize::new(pw, ph));
+                home.viewport = crate::effect::Size::new(width as f32, height as f32);
+                let look = ui.global::<super::Theme>();
+                look.set_light(light);
+                look.set_scale(super::scale(&home));
+                look.set_small(super::small(&home));
+                render(&ui, &window, &home);
+                let at = super::pad::names(ui.window()).iter().position(|name| name == "Join our Discord").expect("the Discord button");
+                let [x, y, w, h] = super::pad::stop_rects(ui.window())[at];
+                let at = if hover { slint::LogicalPosition::new(x + w / 2.0, y + h / 2.0) } else { slint::LogicalPosition::new(700.0, 500.0) };
+                ui.window().dispatch_event(slint::platform::WindowEvent::PointerMoved { position: at });
+                render(&ui, &window, &home);
+                let mut pixels = vec![slint::Rgb8Pixel::default(); (pw * ph) as usize];
+                window.request_redraw();
+                window.draw_if_needed(|renderer| { renderer.render(&mut pixels, pw as usize); });
+                // The three tools and the separator: from a little left of Discord to the caption buttons.
+                let (left, top) = (((x - 20.0) * scale) as u32, 0u32);
+                let (cw, ch) = ((170.0 * scale) as u32, (44.0 * scale) as u32);
+                let mut crop = imagecrate::RgbImage::new(cw, ch);
+                for (cx, cy, pixel) in crop.enumerate_pixels_mut() {
+                    let p = pixels[((top + cy) * pw + left + cx) as usize];
+                    *pixel = imagecrate::Rgb([p.r, p.g, p.b]);
+                }
+                std::fs::create_dir_all(&dir).unwrap();
+                let name = format!("discord-{theme}-{suffix}{}", if hover { "-hover" } else { "" });
+                crop.save(dir.join(format!("{name}.png"))).unwrap();
+                imagecrate::imageops::resize(&crop, cw * 4, ch * 4, imagecrate::imageops::FilterType::Nearest).save(dir.join(format!("{name}-zoom.png"))).unwrap();
+            }
+        }
+    }
+    window.dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged { scale_factor: 1.0 });
+}

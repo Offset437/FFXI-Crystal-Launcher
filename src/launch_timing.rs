@@ -56,12 +56,6 @@ fn performance_counter() -> Option<(u64, u64)> {
     Some((ticks as u64, frequency as u64))
 }
 
-/// Content-free cross-process timestamp for temporary startup diagnostics.
-pub(crate) fn diagnostic_host_micros() -> Option<u64> {
-    let (ticks, frequency) = performance_counter()?;
-    u64::try_from(u128::from(ticks) * 1_000_000 / u128::from(frequency)).ok()
-}
-
 /// The points every launch path reports (each path reports the ones that exist for it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Milestone {

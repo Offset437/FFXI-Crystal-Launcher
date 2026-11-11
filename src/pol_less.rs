@@ -215,6 +215,9 @@ pub(crate) trait SignedIn: Send + Sync + 'static {
     /// per-Play flags and credentials without the host fields the `park` line carried.
     /// One use, like `session_line`.
     fn credentials_line(&self) -> Result<Zeroizing<Vec<u8>>, String>;
+    /// The line from `session_line` / `credentials_line` reached the loader: an authenticator
+    /// code in it now counts as used (`totp::Sent`).
+    fn credentials_sent(&self) {}
     fn sign_out(self) -> String where Self: Sized { "Session closed.".into() }
 }
 
@@ -253,17 +256,13 @@ pub(crate) fn launch(
 }
 
 /// The native sign-in for `account` with `plan`'s flags, shared by a cold launch and a parked
-/// Play: the region check and credential/code validation, then DNS warm-up, so an invalid
-/// entry fails with no lookup at all. The W2U at Connect comes seconds later (after the tool
-/// and polcore start): resolving its server now spares that check a cold lookup on the
-/// sign-in's path, and the member-login host polcore resolves at Open(1) (08 §4 item 3).
+/// Play: the region check and credential/code validation. No lookup runs ahead of the W2U
+/// and polcore's own, as with the stock Viewer.
 fn native_auth_for(config: &Config, plan: &Plan, account: &Account, otp: Zeroizing<String>) -> Result<native_auth::NativeAuth, String> {
     if account.region != 0 {
         return Err(t("Retail login currently supports the verified US install only. EU and JP protocol region values are not verified yet.").into());
     }
     let mut auth = native_auth::NativeAuth::new(account, otp, config.account_directory(account))?;
-    crate::patch::warm_dns();
-    crate::dns::warm(crate::dns::POL_LOGIN_HOST);
     configure(&mut auth, plan);
     Ok(auth)
 }
@@ -1010,6 +1009,12 @@ fn handle_event(event: LoaderEvent, auth: &impl SignedIn, log: &mut SessionLog) 
             log.line(&format!("Loader reported an error: {message}"));
             Step::End(LoaderEnd::Error(message))
         }
+        // Something the host could not provide (FFXIDB's settings protection on a build it
+        // does not know): said in the history, and the game goes on.
+        LoaderEvent::Notice(message) => {
+            log.line(&message);
+            Step::Continue
+        }
         LoaderEvent::Closed => {
             log.line("The session pipe closed.");
             Step::End(LoaderEnd::Closed)
@@ -1293,30 +1298,14 @@ fn ashita_start_errors(logs: &Path, ini_name: &str, since: std::time::SystemTime
 
 type Spawner<'a> = dyn FnMut(&Prepared, &str, &mut SessionLog) -> Result<Injector, String> + 'a;
 
-struct HandoffTiming {
-    publication: Duration,
-    transfer: Duration,
-    to_session: Duration,
-    total: Duration,
-}
-
 /// Publish capabilities before transferring the session to the verified loader.
 fn deliver_handoff(
     log: &mut SessionLog,
     mut publish: impl FnMut(&mut SessionLog),
-    send: impl FnOnce(&mut SessionLog) -> Result<Instant, String>,
-) -> Result<HandoffTiming, String> {
-    let began = Instant::now();
+    send: impl FnOnce(&mut SessionLog) -> Result<(), String>,
+) -> Result<(), String> {
     publish(log);
-    let publication = began.elapsed();
-    let transfer_started = Instant::now();
-    let sent_at = send(log)?;
-    Ok(HandoffTiming {
-        publication,
-        transfer: sent_at.saturating_duration_since(transfer_started),
-        to_session: sent_at.saturating_duration_since(began),
-        total: began.elapsed(),
-    })
+    send(log)
 }
 
 /// The launch log's opening lines: `first` (the park's `park start` line), else the launch
@@ -1663,7 +1652,7 @@ fn run<A: SignedIn>(
         log.line(&format!("crystal-loader connected: PID {pid}, image verified."));
         log.reached(&mut timing, Milestone::Hello);
         let native_batch = pipe.supports_native_batch();
-        let measured = deliver_handoff(&mut log, |log| publish_batch_capability(&p, native_batch, log), |log| {
+        deliver_handoff(&mut log, |log| publish_batch_capability(&p, native_batch, log), |log| {
             if p.tool == Tool::Windower && p.private_bootstrap.is_none() {
                 let hello = Instant::now();
                 observe_windower_exit(injector, hello, hello + limits.injector_exit, log_path.clone())?;
@@ -1680,17 +1669,11 @@ fn run<A: SignedIn>(
             let sent = pipe.send(&line, Instant::now() + limits.send);
             drop(line);
             sent.map_err(|_| t("crystal-loader did not accept the session.").to_owned())?;
-            let sent_at = Instant::now();
+            auth.credentials_sent();
             log.line("Session sent; launcher copy cleared.");
             log.reached(&mut timing, Milestone::SessionSent);
-            Ok(sent_at)
+            Ok(())
         })?;
-        if cfg!(feature = "launcher-startup-diagnostics") {
-            log.line(&format!("startup handoff: worker={} loader={pid} publication_us={} transfer_us={} to_session_us={} total_us={} end_host_us={}",
-                std::process::id(), measured.publication.as_micros(),
-                measured.transfer.as_micros(), measured.to_session.as_micros(), measured.total.as_micros(),
-                crate::launch_timing::diagnostic_host_micros().unwrap_or(0)));
-        }
         Ok((pipe, pid))
     })();
     drop(auth);
@@ -1901,6 +1884,10 @@ mod tests {
             returned(true), completed(0), LoaderEvent::Exit(-14)]), LoaderEnd::Exit(-14));
         assert_eq!(end(vec![idle(), sign_out(0), LoaderEvent::Closed]), LoaderEnd::Closed);
         assert_eq!(end(vec![idle(), sign_out(0), LoaderEvent::Error("sign-out failed".into())]), LoaderEnd::Error("sign-out failed".into()));
+        // A notice (FFXIDB running without its settings protection) never ends or changes a session.
+        let notice = || LoaderEvent::Notice("FFXIDB minimap settings protection is off: this FFXIDB.dll is not a build Crystal has verified.".into());
+        assert_eq!(end(vec![started(), notice(), returned(true), completed(0), LoaderEvent::Exit(-14)]), LoaderEnd::SignedOut);
+        assert_eq!(end(vec![idle(), sign_out(0), notice(), completed(0), LoaderEvent::Exit(0)]), LoaderEnd::SignedOut);
     }
 
     /// Finding: when Windower's updater relaunched it, the profile guard must follow the
@@ -2081,7 +2068,7 @@ mod tests {
         assert!(pipe.supports_native_auth() && pipe.supports_native_social() && pipe.supports_viewer_check());
         let (publishing_tx, publishing_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let measured = std::thread::scope(|scope| {
+        std::thread::scope(|scope| {
             let (pipe_ref, log_ref) = (&mut pipe, &mut log);
             let handoff = scope.spawn(move || deliver_handoff(log_ref, |_| {
                 publishing_tx.send(()).unwrap();
@@ -2090,8 +2077,7 @@ mod tests {
                 let line = Zeroizing::new(b"private synthetic session\n".to_vec());
                 let sent = pipe_ref.send(&line, Instant::now() + FAST.send);
                 drop(line);
-                sent.map_err(|error| error.to_string())?;
-                Ok(Instant::now())
+                sent.map_err(|error| error.to_string())
             }));
             publishing_rx.recv_timeout(FAST.hello).unwrap();
             let early = received_rx.recv_timeout(Duration::from_millis(30));
@@ -2104,7 +2090,6 @@ mod tests {
         });
         loader.join().unwrap();
         assert!(matches!(pipe.next_event(Some(Instant::now() + FAST.hello)).unwrap().unwrap(), LoaderEvent::Authenticated));
-        assert!(measured.total >= measured.publication);
         assert!(!fs::read_to_string(&prepared.session.log).unwrap().contains("private synthetic session"));
         drop(log);
         drop(pipe);
@@ -2128,7 +2113,7 @@ mod tests {
         let result = deliver_handoff(&mut log, |log| {
             let error = crate::session_worker::publish_native_batch(&directory, true).unwrap_err();
             log.line(&error);
-        }, |_| Ok(Instant::now()));
+        }, |_| Ok(()));
         assert!(result.is_ok());
         assert!(fs::read_to_string(&prepared.session.log).unwrap().contains("session status"));
         drop(log);

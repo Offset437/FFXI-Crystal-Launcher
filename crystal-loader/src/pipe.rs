@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA,
     ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-    WAIT_TIMEOUT,
+    WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
@@ -240,8 +240,10 @@ impl Pipe {
             let code = unsafe { GetLastError() };
             if code != ERROR_IO_PENDING { return Err(io_error(code, "reading from the pipe")); }
             let ms = timeout.map_or(INFINITE, |t| t.as_millis().min(u128::from(INFINITE - 1)) as u32);
-            // SAFETY: the operation's own event.
-            if unsafe { WaitForSingleObject(op.event, ms) } == WAIT_TIMEOUT {
+            // SAFETY: the operation's own event. Anything but completion (a
+            // timeout, or a failed wait) cancels, so the blocking collect below
+            // always ends.
+            if unsafe { WaitForSingleObject(op.event, ms) } != WAIT_OBJECT_0 {
                 // SAFETY: cancels only this read; the result is collected below.
                 unsafe { CancelIoEx(self.h, &op.ov) };
             }

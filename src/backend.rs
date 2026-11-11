@@ -1,7 +1,7 @@
 //! Account storage and launch validation. DPAPI protects the saved vault;
 //! retail credentials cross private pipes to the installed POL core.
 
-use sha1::{Digest, Sha1};
+use ring::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY as SHA1};
 use std::{
     fs::{self, File},
     io::Read,
@@ -89,9 +89,9 @@ impl Config {
     fn legacy_directory_key(&self, account: &Account) -> String {
         let mut hash = mode_hasher(account.mode);
         hash.update(account.server.as_bytes());
-        hash.update([0]);
+        hash.update(&[0]);
         hash.update(account.pol_id.as_bytes());
-        format!("{:x}", hash.finalize())
+        hex(hash)
     }
     fn preserve_legacy_directories(&self, accounts: &[Account]) -> Result<(), String> {
         let path = self.experiment.join("iced-launcher/directories.json");
@@ -186,8 +186,8 @@ pub struct LaunchResult {
 }
 
 /// The account keys' hash, started with the account mode's 8-byte prefix.
-fn mode_hasher(mode: AccountMode) -> Sha1 {
-    let mut hash = Sha1::new();
+fn mode_hasher(mode: AccountMode) -> Context {
+    let mut hash = Context::new(&SHA1);
     hash.update(match mode {
         AccountMode::Private => b"private\0",
         AccountMode::Retail => b"retail\0\0",
@@ -198,15 +198,19 @@ fn mode_hasher(mode: AccountMode) -> Sha1 {
 pub fn account_key(account: &Account) -> String {
     let mut hash = mode_hasher(account.mode);
     if account.mode == AccountMode::Private {
-        hash.update(account.server.trim().to_ascii_lowercase());
+        hash.update(account.server.trim().to_ascii_lowercase().as_bytes());
     }
-    hash.update([0]);
+    hash.update(&[0]);
     hash.update(if account.mode == AccountMode::Retail {
         account.pol_id.to_ascii_uppercase()
     } else {
         account.pol_id.clone()
-    });
-    format!("{:x}", hash.finalize())
+    }.as_bytes());
+    hex(hash)
+}
+
+fn hex(hash: Context) -> String {
+    crate::pol_less::tools::embedded::hex(hash.finish().as_ref())
 }
 
 /// Deliberately has no Debug implementation. Login fields are cleared on drop.

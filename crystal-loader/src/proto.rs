@@ -713,6 +713,13 @@ pub fn error_line(message: &str) -> String {
     format!("{{\"type\":\"error\",\"message\":{}}}\n", json_string(message))
 }
 
+/// One line for the launcher's launch history: a protection this host could
+/// not provide, and why. Never an error (the game goes on) and never user
+/// data. An older launcher ignores the type.
+pub fn notice_line(message: &str) -> String {
+    format!("{{\"type\":\"notice\",\"message\":{}}}\n", json_string(message))
+}
+
 /// Ask the launcher for the Viewer's W2U (:54000) check of this Connect: sent
 /// once per sign-in, after Open(0) reached 838 == 2 and before Open(1)
 /// (pol-spec 07a w2u-at-connect F3/F4, 07c §1). The answer is

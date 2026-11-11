@@ -10,9 +10,8 @@
 //! Layers, each testable alone: `Differ` (snapshots to causes), `Policy` (throttle and
 //! coalesce, driven by an injected clock), text builders, and `Hooks` (foreground test,
 //! privacy flag, delivery) so tests never show a real notification.
-#![allow(dead_code)]
-
 use crate::i18n::{t, tf};
+use crate::win::wide;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -263,6 +262,7 @@ impl Watcher {
 
     pub(crate) fn stop(&self) { self.set_accounts(Vec::new()); }
 
+    #[cfg(test)]
     pub(crate) fn is_running(&self) -> bool { lock(&self.shared.state).running }
 
     /// Starts the thread if there is something to watch, otherwise wakes it so it can end.
@@ -368,7 +368,6 @@ fn poll(slot: &mut Slot, engine: &mut Engine, now: u64, settings: &Settings) {
 
 // ---- delivery -------------------------------------------------------------------------
 
-fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(Some(0)).collect() }
 
 /// A one-off balloon outside the friends notices (the launcher-update restart notice), shown
 /// off the calling thread; a failure only loses the balloon.

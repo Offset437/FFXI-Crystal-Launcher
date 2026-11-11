@@ -176,8 +176,7 @@ pub(crate) fn ensure(exe: &Path, user: &str, scratch: &Path, run: &mut Run<'_>) 
 /// schtasks.exe itself, without a console window.
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn schtasks(args: &[String]) -> Result<(bool, String), String> {
-    let system = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap_or_else(|| "C:\\Windows".into());
-    let mut command = std::process::Command::new(system.join("System32").join("schtasks.exe"));
+    let mut command = std::process::Command::new(crate::win::system32().join("schtasks.exe"));
     command.args(args).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     use std::os::windows::process::CommandExt;
     command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);

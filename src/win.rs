@@ -29,6 +29,20 @@ pub(crate) fn from_wide(units: &[u16]) -> OsString {
     OsString::from_wide(units)
 }
 
+/// System32 as Windows reports it, never from %SystemRoot% or %windir%: an elevated Crystal
+/// inherits the user's environment, which user-level code can point anywhere.
+pub(crate) fn system32() -> std::path::PathBuf {
+    let mut buffer = [0u16; 260];
+    // SAFETY: the buffer and its length in characters.
+    let len = unsafe {
+        windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32)
+    } as usize;
+    if len == 0 || len >= buffer.len() {
+        return r"C:\Windows\System32".into();
+    }
+    from_wide(&buffer[..len]).into()
+}
+
 /// Windows code pages used by more than one module.
 pub(crate) mod codepage {
     /// The system ANSI code page.

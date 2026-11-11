@@ -55,7 +55,6 @@ pub(crate) struct Tracker {
     path: PathBuf,
     data: File,
     open: HashMap<ClientKey, u64>,
-    save_error: Option<String>,
 }
 
 /// A single session counts for at most this long, so a clock jump cannot add months.
@@ -85,7 +84,7 @@ impl Tracker {
                 File::default()
             }
         };
-        Self { path: path.to_owned(), data, open: HashMap::new(), save_error: None }
+        Self { path: path.to_owned(), data, open: HashMap::new() }
     }
 
     fn set_aside(path: &Path) {
@@ -136,6 +135,7 @@ impl Tracker {
     }
 
     /// The sessions open now, with their start times.
+    #[cfg(test)]
     pub(crate) fn running(&self) -> Vec<(ClientKey, u64)> {
         let mut list: Vec<_> = self.open.iter().map(|(k, s)| (k.clone(), *s)).collect();
         list.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
@@ -151,10 +151,8 @@ impl Tracker {
         crate::fsutil::write_atomic(&self.path, &data).map_err(|_| crate::i18n::t("Could not save play time.").into())
     }
 
-    /// The last start/stop save failure, cleared by the next success.
-    pub(crate) fn save_error(&self) -> Option<&str> { self.save_error.as_deref() }
-
-    fn persist(&mut self) { self.save_error = self.save().err(); }
+    /// Saves after a start or stop; a failure is not fatal and the next save tries again.
+    fn persist(&self) { let _ = self.save(); }
 }
 
 #[cfg(test)]
@@ -181,7 +179,6 @@ mod tests {
         let e = &t.entries()[0];
         assert_eq!((e.total_secs, e.sessions, e.last_played), (650, 2, 2000));
         assert!(t.running().is_empty());
-        assert_eq!(t.save_error(), None);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

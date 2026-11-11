@@ -240,14 +240,8 @@ fn module_image(m: HMODULE) -> (usize, usize, u32) {
 /// POL uses its registered viewer, with a direct-DLL fallback for portable installs.
 fn create(clsid: &GUID, iid: &GUID, dll: &Path, what: &str) -> Result<Com, String> {
     let mut p: *mut c_void = std::ptr::null_mut();
-    #[cfg(feature = "native-login-diagnostics")]
-    let started = (what == "polcore").then(crate::startup_timing::Stamp::capture);
     // SAFETY: valid GUIDs and out pointer.
     let hr = unsafe { CoCreateInstance(clsid, std::ptr::null_mut(), CLSCTX_INPROC_SERVER, iid, &mut p) };
-    #[cfg(feature = "native-login-diagnostics")]
-    if let Some(started) = started {
-        crate::startup_timing::report("polcore-registered-com", started, crate::startup_timing::Stamp::capture());
-    }
     if hr >= 0 && !p.is_null() {
         log!("{what}: created through COM");
         return Ok(Com(p));
@@ -304,6 +298,7 @@ fn create_from_dll_with_outer(clsid: &GUID, iid: &GUID, outer: *mut c_void, dll:
         let hr = get(clsid, &IID_ICLASSFACTORY, &mut factory);
         log!("local launch timing: {what} class factory {:.3}s", factory_started.elapsed().as_secs_f64());
         if hr < 0 || factory.is_null() {
+            if !counted { FreeLibrary(m); }
             return Err(format!("{what}: DllGetClassObject failed (hr={hr:#010x})"));
         }
         let factory = Com(factory);
@@ -312,6 +307,8 @@ fn create_from_dll_with_outer(clsid: &GUID, iid: &GUID, outer: *mut c_void, dll:
         let hr = create(factory.0, outer, iid, &mut p);
         log!("local launch timing: {what} instance creation {:.3}s", instance_started.elapsed().as_secs_f64());
         if hr < 0 || p.is_null() {
+            drop(factory); // released before its module goes
+            if !counted { FreeLibrary(m); }
             return Err(format!("{what}: CreateInstance failed (hr={hr:#010x})"));
         }
     }
@@ -469,12 +466,8 @@ pub fn run_parked(mut cfg: GameConfig, ready: std::sync::mpsc::Sender<std::time:
 type ParkHook<'a> = &'a mut dyn FnMut(&mut GameConfig, std::time::Duration) -> bool;
 
 fn run_with(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<GameOutcome, String> {
-    #[cfg(feature = "native-login-diagnostics")]
-    let started = crate::startup_timing::Stamp::capture();
     // SAFETY: plain COM init on this thread.
     let hr = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
-    #[cfg(feature = "native-login-diagnostics")]
-    crate::startup_timing::report("com-apartment", started, crate::startup_timing::Stamp::capture());
     if hr < 0 {
         return Err(format!("CoInitializeEx failed (hr={hr:#010x})"));
     }
@@ -528,8 +521,6 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
     if pmod.is_null() {
         return Err(format!("{polcore_name} is not loaded after creating polcore"));
     }
-    #[cfg_attr(not(feature = "native-login-diagnostics"), allow(unused_variables))]
-    let (pbase, _psize, _) = module_image(pmod);
     // SAFETY: a live core interface; only its vtable and methods are read.
     let layout = match unsafe { check_core_interface(&polcore, pmod) } {
         Ok(layout) => layout,
@@ -576,15 +567,6 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
     let table = unsafe { table_slice(tbl, pmod)? };
     log!("stage: polcore SetAreaCode/SetParamInit done; function table at {:#x}", tbl as usize);
 
-    // A pilot records socket metadata only during native sign-in/idle. The
-    // forwarding imports stay valid for the process lifetime, including error
-    // teardown and native worker calls; dropping this guard only stops logging.
-    #[cfg(feature = "native-login-diagnostics")]
-    let socket_trace = match unsafe { crate::native_socket_trace::Recording::install(pbase, _psize) } {
-        Ok(trace) => Some(trace),
-        Err(error) => { log!("native POL socket trace unavailable: {error}"); None }
-    };
-
     // --- park end point (07d §1.3 step 3): polcore and its validated table
     // only. No restore_viewer_policy, no bootstrap, no member select, no Open
     // and no entry call of any kind until the credentials arrive.
@@ -597,17 +579,11 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
     let Some(credentials) = cfg.native_auth.take() else { return Err("The game host received no credentials.".into()) };
 
     // --- native: the Viewer's own startup and sign-in (pol-spec 01 §8) ---
-    #[cfg(feature = "native-login-diagnostics")]
-    let bootstrap_started = crate::startup_timing::Stamp::capture();
     // SAFETY: the supported core owns this table and outlives the session's
     // scope; the leaked strings outlive the core.
     let mut session = unsafe { crate::native_auth::NativeSession::bootstrap(table, &checked, &viewer, viewer_c, regkey, area, pol_language(area, lang), cfg.auto_away_minutes)? };
-    #[cfg(feature = "native-login-diagnostics")]
-    crate::startup_timing::report("native-bootstrap-complete", bootstrap_started, crate::startup_timing::Stamp::capture());
     session.set_viewer_gaps(cfg.viewer_gaps);
     let signed_in = session.sign_in(credentials);
-    #[cfg(feature = "native-login-diagnostics")]
-    if let Some(trace) = &socket_trace { trace.stop(); }
     if let Err(error) = signed_in {
         // The launcher's startup sign-out is the user's choice, not a
         // failure: end cleanly (exit 0) after the session's sign-out.
@@ -618,13 +594,6 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
         return Err(error);
     }
     log!("stage: original POL service table retained (0 overrides)");
-    #[cfg(feature = "native-backup-diagnostics")]
-    // Pilot-only transparent forwarding; native arguments/results and all
-    // other entries stay unchanged. Restore after every game caller exits.
-    let backup_trace = match unsafe { crate::native_backup::BackupTrace::install(table, &layout) } {
-        Ok(trace) => Some(trace),
-        Err(error) => { log!("note: {error}"); None }
-    };
 
     #[cfg(target_arch = "x86")]
     // A protection that cannot be installed is switched off with its reason;
@@ -632,15 +601,13 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
     match crate::windower_plugin_settings::install() {
         Ok(true) => log!("stage: Windower plugin settings coordinator prepared"),
         Ok(false) => {}
-        Err(reason) => log!("note: FFXIDB shared-settings protection unavailable: {reason}"),
+        Err(reason) => crate::windower_plugin_settings::report_unprotected(&reason),
     }
     let mut play = cfg.start_game;
     let outcome = loop {
         if !play && !session.wait_for_game()? {
             break GameOutcome { code: 0, message: String::new(), game_returned: false, modules_released: false };
         }
-        #[cfg(feature = "native-login-diagnostics")]
-        if let Some(trace) = &socket_trace { trace.stop(); }
         // A batch must release every signed-in owner before any takes this turn.
         // Windower saves on the first main window, so protect game DLL loading and
         // COM construction too, rather than waiting until the GameStart call.
@@ -652,7 +619,10 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
             play = false;
             continue;
         }
-        let outcome = run_game(&polcore, &ffxi_dir, table, &mut session, cfg.auto_login)?;
+        let Some(outcome) = run_game(&polcore, &ffxi_dir, table, &mut session, cfg.auto_login)? else {
+            log!("stage: the launcher signed out before the game started; no game");
+            break GameOutcome { code: 0, message: String::new(), game_returned: false, modules_released: false };
+        };
         events_game_ended(&outcome);
         if !retain_native_session(cfg.keep_session, &outcome) {
             if cfg.keep_session && outcome.game_returned && !outcome.modules_released {
@@ -662,8 +632,6 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
         }
         play = false;
     };
-    #[cfg(feature = "native-backup-diagnostics")]
-    drop(backup_trace);
     log!("stage: native POL session cleanup starting");
     drop(session); // Viewer sign-out and close teardown, file worker last
     log!("stage: native POL session cleanup finished");
@@ -687,7 +655,9 @@ fn retain_native_session(enabled: bool, outcome: &GameOutcome) -> bool {
     enabled && outcome.game_returned && outcome.modules_released && matches!(outcome.code, 0 | -14)
 }
 
-fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], session: &mut crate::native_auth::NativeSession, auto_login: proto::AutoLogin) -> Result<GameOutcome, String> {
+/// `None`: the launcher's startup sign-out (acknowledged to it) came before the game took over.
+fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], session: &mut crate::native_auth::NativeSession, auto_login: proto::AutoLogin) -> Result<Option<GameOutcome>, String> {
+    if crate::native_auth::sign_in_cancelled() { return Ok(None); }
     #[cfg(target_arch = "x86")]
     crate::windower_start::coordinate(&mut || session.startup_frame())?;
     // A game never starts on an earlier game's memory: both game DLLs must be
@@ -718,7 +688,7 @@ fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], session: &mut crate
     // Keep Viewer push ownership until all local waits have finished. Pumping
     // while waiting for Windower must happen before the game takes that over.
     let handoff_started = Instant::now();
-    session.attach_game();
+    if !session.attach_game() { return Ok(None); }
     log!("local launch timing: native POL handoff {:.3}s", handoff_started.elapsed().as_secs_f64());
     crate::events::send(proto::started_line(std::process::id()));
     let auto_login = crate::auto_login::Worker::start(auto_login);
@@ -788,7 +758,7 @@ fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], session: &mut crate
     // The launcher additionally requires GameStarted and native sign-out before
     // it can present -14 as a normal close. Other errors retain their meaning.
     let game_returned = successful_native_return(hr, has_message_object, &msg);
-    Ok(GameOutcome { code, message: msg, game_returned, modules_released })
+    Ok(Some(GameOutcome { code, message: msg, game_returned, modules_released }))
 }
 
 #[cfg(test)]
@@ -964,7 +934,6 @@ mod tests {
             crate::native_auth::smoke_message_files(table);
             crate::native_social::smoke_builders(table);
             // Never 814/815/816/818: no connect, pump or close step runs here.
-            crate::native_backup::smoke_entrypoints(table,&layout);
             assert_eq!(table,before,"native login must not patch any POL callback");
             drop(core);CoUninitialize();
         }

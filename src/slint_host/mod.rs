@@ -90,6 +90,8 @@ pub(crate) fn run() -> Result<(), slint::PlatformError> {
     }
     host.run(effect);
     host.drain();
+    // A launcher update restarted into this version keeps its backup until the loop has run.
+    slint::Timer::single_shot(Duration::from_secs(2), crate::self_update::started);
     let result = slint::run_event_loop_until_quit();
     HOST.with(|slot| slot.borrow_mut().take());
     result
@@ -290,10 +292,11 @@ impl Host {
         if self.tick.replace(Some(every)) == Some(every) { return; }
         let generation = self.tick_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let current = self.tick_generation.clone();
-        crate::runtime::spawn(crate::tick_gate::run(every, move || {
-            let alive = current.load(Ordering::Acquire) == generation;
-            async move { alive && slint::invoke_from_event_loop(|| send(Message::Tick)).is_ok() }
-        }));
+        crate::runtime::spawn(crate::tick_gate::run(
+            every,
+            move || current.load(Ordering::Acquire) == generation,
+            || async { slint::invoke_from_event_loop(|| send(Message::Tick)).is_ok() },
+        ));
     }
 
     fn window_op(&self, id: WindowId, op: WindowOp<Message>) -> Effect<Message> {
@@ -370,9 +373,13 @@ impl Host {
                         // account_order::input: losing the focus cancels a drag.
                         if !focused && host.account_drag.get() { post(Message::AccountDragCancel); }
                     }
+                    // A hotkey field records only while the window is in front.
+                    if !focused && features::recording() { let _ = slint::invoke_from_event_loop(features::window_left); }
                 }
                 // The icons at the new DPI's sizes.
                 WindowEvent::ScaleFactorChanged { .. } => native_icons(native_handle(window), true),
+                // A press anywhere but on the hotkey field that is recording ends its recording.
+                WindowEvent::MouseInput { state: ElementState::Pressed, .. } => features::pointer_pressed(),
                 // account_order::input: a left release anywhere ends a drag.
                 WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                     if host().is_some_and(|host| host.account_drag.get()) { post(Message::AccountDragFinish); }

@@ -166,16 +166,10 @@ pub(crate) fn ashita_profiles_with(ashita_dir: &Path, registry: Option<&str>) ->
         .collect()
 }
 
-pub(crate) fn ashita_profiles(ashita_dir: &Path) -> Vec<ProfileEntry> {
-    ashita_profiles_with(ashita_dir, ffxi_settings::registry_padmode().as_deref())
-}
-
 /// Everything the picker lists, read once.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Lists {
     pub windower: Vec<ProfileEntry>,
-    /// Why `windower` is empty when settings.xml could not be read.
-    pub windower_error: Option<String>,
     pub ashita: Vec<ProfileEntry>,
     /// The registry's `padmode000`; what the native client and stock launches use.
     pub registry_padmode: Option<String>,
@@ -187,13 +181,9 @@ impl Lists {
     }
 
     pub(crate) fn load_with(windower_dir: Option<&Path>, ashita_dir: Option<&Path>, registry_padmode: Option<String>) -> Self {
-        let (windower, windower_error) = match windower_dir.map(windower_profiles) {
-            Some(Ok(list)) => (list, None),
-            Some(Err(e)) => (Vec::new(), Some(e)),
-            None => (Vec::new(), None),
-        };
+        let windower = windower_dir.map(windower_profiles).and_then(Result::ok).unwrap_or_default();
         let ashita = ashita_dir.map(|dir| ashita_profiles_with(dir, registry_padmode.as_deref())).unwrap_or_default();
-        Self { windower, windower_error, ashita, registry_padmode }
+        Self { windower, ashita, registry_padmode }
     }
 
     fn find<'a>(list: &'a [ProfileEntry], name: &str) -> Option<&'a ProfileEntry> {
@@ -269,6 +259,7 @@ pub(crate) fn account_profile(account: &Account, defaults: &Defaults, lists: &Li
 /// Sets the account's own choice. `None` clears it (follows the global default). The name is
 /// stored as the list spells it, so a differently-cased entry doesn't create a second spelling.
 /// Windower's `""` is a valid choice: the default profile.
+#[cfg(test)]
 pub(crate) fn set_selection(account: &mut Account, tool: Tool, name: Option<String>, lists: &Lists) -> Result<(), String> {
     let slot = match tool {
         Tool::Windower => &mut account.windower_profile,

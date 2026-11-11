@@ -49,7 +49,7 @@ impl std::fmt::Debug for Snapshot {
 /// Snapshot copied by POL's original, locked getters. A catalog entry without
 /// a received status timestamp does not establish that someone is offline.
 pub(crate) fn native_snapshot(blob:&[u8])->Result<Snapshot,String> {
-    use crystal_pol::friends::{BLOB_LEN,MAGIC,RECORD_LEN};
+    use crate::wire::{FRIENDS_LEN as BLOB_LEN,FRIENDS_MAGIC as MAGIC,FRIEND_RECORD_LEN as RECORD_LEN};
     if blob.len()!=BLOB_LEN || &blob[..8]!=MAGIC { return Err("Invalid native POL friend snapshot.".into()); }
     let mut entries=Vec::new();
     for (slot,rec) in blob[8..].as_chunks::<RECORD_LEN>().0.iter().enumerate() {
@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn native_friends_keep_unknown_status_until_a_received_update() {
-        use crystal_pol::friends::{BLOB_LEN,MAGIC,RECORD_LEN};
+        use crate::wire::{FRIENDS_LEN as BLOB_LEN,FRIENDS_MAGIC as MAGIC,FRIEND_RECORD_LEN as RECORD_LEN};
         let mut blob=vec![0;BLOB_LEN];blob[..8].copy_from_slice(MAGIC);
         let record=&mut blob[8..8+RECORD_LEN];record[0x98]=1;record[0xa0..0xa5].copy_from_slice(b"Alice");
         let snapshot=native_snapshot(&blob).unwrap();assert_eq!(snapshot.entries[0].online,None);

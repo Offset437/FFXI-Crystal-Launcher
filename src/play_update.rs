@@ -112,6 +112,10 @@ pub(crate) struct Jobs {
     /// Tests: jobs that would have started (folder, official, W20 FIN).
     #[cfg(test)]
     pub spawned: Vec<(PathBuf, String, Option<Instant>)>,
+    /// Tests: PlayOnline updates started for sign-ins, each with the official version its
+    /// W2U named (`None`: the update asks the server itself).
+    #[cfg(test)]
+    pub viewer_started: Vec<Option<String>>,
 }
 
 impl Jobs {
@@ -344,6 +348,29 @@ pub(crate) fn line(app: &crate::App, key: &str) -> Option<Line> {
     let fraction = job.blocked.is_none().then(|| percent.map(|p| p as f32 / 100.0)).flatten();
     Some(Line { headline, cancel: (!job.cancelled).then_some(job.generation), label, fraction })
 }
+/// What a row (and the footer) says while `key`'s sign-in waits for PlayOnline's own update
+/// (its W2U asked for it): "Updating PlayOnline · 43% · 40 sec left" while it runs, or that it
+/// waits to start (other sign-ins are finishing, or a row asks to sign accounts out). Its
+/// Cancel is the file operation's (`Message::CancelMaintenance`), not a job's.
+pub(crate) fn viewer_line(app: &crate::App, key: &str) -> Option<Line> {
+    if !app.viewer_update_of(key)? {
+        let label = t("Waiting to update PlayOnline…").to_owned();
+        return Some(Line { headline: label.clone(), cancel: None, label, fraction: None });
+    }
+    let progress = &app.maintenance_progress;
+    let percent = maintenance_percent(progress);
+    let label = match percent {
+        Some(percent) => tf("{label} · {percent}%", &[("label", &t("Updating PlayOnline")), ("percent", &percent)]),
+        None => t("Updating PlayOnline").to_owned(),
+    };
+    let headline = if app.maintenance_cancelled { t("Pausing the update…").to_owned() } else {
+        let mut parts = vec![label.clone()];
+        parts.extend(time_left(progress));
+        parts.join(" · ")
+    };
+    Some(Line { headline, cancel: None, label, fraction: percent.map(|p| p as f32 / 100.0) })
+}
+
 /// What maintenance's update (patch_watch) says for `key`'s game folder: its version check,
 /// its download with progress (and Cancel), or that it installed while the worlds stay closed.
 pub(crate) fn watch_line(app: &crate::App, key: &str) -> Option<Line> {

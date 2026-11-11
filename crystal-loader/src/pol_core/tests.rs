@@ -130,22 +130,6 @@ fn the_com_vtable_must_be_data_and_its_methods_code() {
 }
 
 #[test]
-fn the_backup_context_is_found_by_the_shape_of_service_463() {
-    let l = layout(BASE);
-    let mut code = vec![0x90u8; 16];
-    code.extend_from_slice(&[0x68]);
-    code.extend_from_slice(&((BASE + 0x50360) as u32).to_le_bytes());
-    code.extend_from_slice(&[0xE8, 1, 2, 3, 4, 0x59, 0xC3]);
-    assert_eq!(backup_state(&l, &code), Ok(BASE + 0x50360));
-    let mut in_code = code.clone();
-    in_code[17..21].copy_from_slice(&((BASE + 0x2000) as u32).to_le_bytes());
-    assert!(backup_state(&l, &in_code).is_err());
-    assert!(backup_state(&l, &code[..20]).is_err(), "truncated");
-    let twice = [code.clone(), code.clone()].concat();
-    assert!(backup_state(&l, &twice).unwrap_err().contains("2 matches"));
-}
-
-#[test]
 fn this_executable_has_no_viewer_ticker_import() {
     let me = std::fs::read(std::env::current_exe().unwrap()).unwrap();
     if cfg!(target_arch = "x86") {
@@ -242,11 +226,6 @@ fn both_real_builds_pass_the_production_checks_and_agree_with_the_hand_verified_
         for s in SERVICES {
             assert!(build.services.iter().any(|&(slot, _)| slot == usize::from(s.slot)), "{}: service {} not cross-checked", build.name, s.slot);
         }
-        // The backup context by shape, at the hand-verified place in the legacy core.
-        let entry = |slot: usize| u32::from_le_bytes(pe.image[build.table_rva + 4 * slot..][..4].try_into().unwrap()) as usize;
-        let code = &pe.image[entry(463) - pe.image_base..][..48];
-        let state = backup_state(&layout, code).unwrap();
-        if build.name == "1.18.15e" { assert_eq!(state - pe.image_base, 0x9aab8); }
         // The Viewer's frame from its app.dll.
         let app = std::fs::read(&build.app).unwrap_or_else(|e| panic!("{}: {e}", build.app.display()));
         assert_eq!(viewer_ticker(&app), Ok(build.frame_us), "{} app.dll", build.name);

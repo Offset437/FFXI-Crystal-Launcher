@@ -872,47 +872,24 @@ impl NativeSession {
         // 07d §4.7: start/end, one attempt, one poll per 815.
         let mut request = native_jobs::RequestLog::start(name);
         request.attempts = 1;
-        #[cfg(feature = "native-login-diagnostics")]
-        let open_started = crate::startup_timing::Stamp::capture();
         let code = api.call(814, &[mode, connection]);
-        #[cfg(feature = "native-login-diagnostics")]
-        let open_finished = crate::startup_timing::Stamp::capture();
         request.result = code;
         if code < 0 {
-            #[cfg(feature = "native-login-diagnostics")]
-            crate::startup_timing::report(if mode == 0 { "open-network-call-failed" } else { "open-member-call-failed" }, open_started, open_finished);
             return Err(format!("Native PlayOnline login could not start (mode {mode}, POL result {code})."));
         }
         let started = Instant::now();
         let mut aborted: Option<Instant> = None;
         let mut previous = i32::MIN;
-        #[cfg(feature = "native-login-diagnostics")]
-        let (mut first_poll, mut state17_seen) = (true, false);
         loop {
             cadence.tick();
             pump_idle_messages();
             api.zero(818);
             let state = api.zero(815);
             (request.polls, request.result) = (request.polls + 1, state);
-            #[cfg(feature = "native-login-diagnostics")]
-            let polled = (first_poll || state == 17 && !state17_seen).then(crate::startup_timing::Stamp::capture);
             if state != previous {
                 log!("native POL sign-in state {state} (mode {mode}, +{:.2}s)", started.elapsed().as_secs_f64());
                 events::send(format!("{{\"type\":\"native_auth_stage\",\"code\":{state}}}\n"));
                 previous = state;
-            }
-            #[cfg(feature = "native-login-diagnostics")]
-            if let Some(polled) = polled {
-                // Capture before logging; no extra writes between Open and its first poll.
-                if first_poll {
-                    crate::startup_timing::report(if mode == 0 { "open-network-call" } else { "open-member-call" }, open_started, open_finished);
-                    crate::startup_timing::report(if mode == 0 { "open-network-first-poll" } else { "open-member-first-poll" }, open_finished, polled);
-                    first_poll = false;
-                }
-                if state == 17 && !state17_seen {
-                    crate::startup_timing::report(if mode == 0 { "open-network-first-state17" } else { "open-member-first-state17" }, open_started, polled);
-                    state17_seen = true;
-                }
             }
             match connection_result(state, || api.zero(838), linked) {
                 Some(Ok(())) => {
@@ -949,10 +926,11 @@ impl NativeSession {
     /// Retire the owned status job before the game takes its place, without a
     /// cancel: 337/328/199 would stamp the core's 10 s request freeze over the
     /// game's first status (07a presign-no-cancel-freeze). Its ticket, if any,
-    /// was polled to its end by `settle_for_play`.
-    pub fn attach_game(&mut self) {
+    /// was polled to its end by `settle_for_play`. False, and nothing handed
+    /// over, when the launcher's startup sign-out came first.
+    pub fn attach_game(&mut self) -> bool {
         CONTROL.store(GAME, Ordering::Release);
-        finish_startup();
+        if !finish_startup() { return false; }
         let api = self.api.clone();
         self.viewer_status.retire();
         // Answer messages pushed during the last idle frames before the game
@@ -981,6 +959,7 @@ impl NativeSession {
         self.unregister_host();
         crate::native_social::set_listening(false);
         events::send("{\"type\":\"native_session_state\",\"game\":true}\n".into());
+        true
     }
 
     /// GameStart has returned and all game callbacks/observers have joined.

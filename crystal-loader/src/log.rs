@@ -56,7 +56,11 @@ fn open_rotating(path: &Path, max_bytes: u64) -> Option<File> {
         let candidate = generation(path, n);
         let full = std::fs::metadata(&candidate).is_ok_and(|m| m.len() > max_bytes);
         if full && !held(&candidate) {
-            let _ = std::fs::rename(&candidate, candidate.with_extension("log.old"));
+            // A previous generation that can't be replaced (a reader holds it):
+            // start this log over rather than append past the cap.
+            if std::fs::rename(&candidate, candidate.with_extension("log.old")).is_err() {
+                let _ = OpenOptions::new().write(true).truncate(true).open(&candidate);
+            }
         } else if full && candidate != last {
             continue;
         }
@@ -183,6 +187,24 @@ mod tests {
         // Under the limit: unchanged.
         drop(open_rotating(&path, 4).unwrap());
         assert_eq!(std::fs::read(&old).unwrap(), b"running host\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_full_log_whose_previous_generation_is_held_starts_over() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("crystal-loader-held-old-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(LOG_NAME);
+        let old = path.with_extension("log.old");
+        std::fs::write(&old, b"previous\n").unwrap();
+        std::fs::write(&path, b"full log\n").unwrap();
+        // A reader without delete sharing: the rename cannot replace it.
+        let reader = OpenOptions::new().read(true).share_mode(1).open(&old).unwrap();
+        drop(open_rotating(&path, 4).unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        assert_eq!(std::fs::read(&old).unwrap(), b"previous\n");
+        drop(reader);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

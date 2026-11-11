@@ -131,10 +131,6 @@ pub(crate) fn extract_outcome(code: u32) -> Result<(), String> {
     }
 }
 
-pub(crate) fn system32() -> PathBuf {
-    super::detect::sys::system32()
-}
-
 /// Whether a download's final (post-redirect) host is Microsoft's.
 pub(crate) fn trusted_host(host: &str) -> bool {
     let host = host.to_ascii_lowercase();
@@ -166,13 +162,7 @@ impl Scratch {
             // a folder in the user's %TEMP% could be changed by any program the user runs.
             // The root comes from the system, not %ProgramData%: an elevated process inherits
             // the user's environment, which that same user-level code could point anywhere.
-            let root = program_data().map_err(failed)?;
-            if !owned_by_admins(&root) {
-                return Err(failed(std::io::Error::other(format!("{} isn't owned by Administrators or SYSTEM", root.display()))));
-            }
-            let dir = root.join(name);
-            create_admin_only_dir(&dir).map_err(failed)?;
-            return Ok(Self(dir));
+            return admin_scratch(&name).map(Self).map_err(failed);
         }
         // Known gap, left as is: a launcher built without `elevated-ui` (release builds always
         // have it) runs the installers through "runas" from this user-writable %TEMP% folder,
@@ -183,9 +173,21 @@ impl Scratch {
     }
 }
 
+/// A new folder `name` in ProgramData that only Administrators and SYSTEM can change, for files
+/// an elevated process runs.
+pub(crate) fn admin_scratch(name: &str) -> std::io::Result<PathBuf> {
+    let root = program_data()?;
+    if !owned_by_admins(&root) {
+        return Err(std::io::Error::other(format!("{} isn't owned by Administrators or SYSTEM", root.display())));
+    }
+    let dir = root.join(name);
+    create_admin_only_dir(&dir)?;
+    Ok(dir)
+}
+
 /// The machine's ProgramData folder as the system records it (FOLDERID_ProgramData, read from
 /// HKLM), never from the environment.
-fn program_data() -> std::io::Result<PathBuf> {
+pub(crate) fn program_data() -> std::io::Result<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath, KF_FLAG_DONT_VERIFY};
@@ -205,7 +207,7 @@ fn program_data() -> std::io::Result<PathBuf> {
 
 /// Whether `dir` is owned by Administrators or SYSTEM, so no standard user can swap what is
 /// created inside it.
-fn owned_by_admins(dir: &Path) -> bool {
+pub(crate) fn owned_by_admins(dir: &Path) -> bool {
     use crate::win::wide_os;
     use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
     use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
@@ -235,6 +237,97 @@ fn owned_by_admins(dir: &Path) -> bool {
             LocalFree(descriptor as _);
         }
         ok
+    }
+}
+
+/// Whether `dir`'s DACL grants no write, append, delete, delete-child, write-DAC or take-ownership
+/// right to Users, Authenticated Users, Everyone, INTERACTIVE or the current user, so none of them
+/// can swap a file inside. An unreadable or empty (null) DACL counts as not safe. Deny entries are
+/// ignored: any such allow entry fails the check.
+pub(crate) fn no_standard_user_writes(dir: &Path) -> bool {
+    use crate::win::wide_os;
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE};
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetTokenInformation, IsWellKnownSid, TokenUser,
+        WinAuthenticatedUserSid, WinBuiltinUsersSid, WinInteractiveSid, WinWorldSid, ACCESS_ALLOWED_ACE, ACL,
+        ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TOKEN_USER, WELL_KNOWN_SID_TYPE,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    // FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER
+    // | GENERIC_WRITE | GENERIC_ALL
+    const WRITES: u32 = 0x2 | 0x4 | 0x40 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x4000_0000 | 0x1000_0000;
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const GROUPS: [WELL_KNOWN_SID_TYPE; 4] =
+        [WinBuiltinUsersSid, WinAuthenticatedUserSid, WinWorldSid, WinInteractiveSid];
+
+    let path = wide_os(dir.as_os_str());
+    // SAFETY: NUL-terminated path; `dacl` and every SID read below point into `descriptor` (freed
+    // after the last use) or into `user_buf`, both alive for the whole walk.
+    unsafe {
+        // The current user's SID, in a buffer that outlives the walk.
+        let mut user_buf: Vec<u64> = Vec::new();
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) != 0 {
+            let mut len = 0u32;
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
+            if len > 0 {
+                user_buf = vec![0u64; (len as usize).div_ceil(8)];
+                if GetTokenInformation(token, TokenUser, user_buf.as_mut_ptr().cast(), len, &mut len) == 0 {
+                    user_buf.clear();
+                }
+            }
+            CloseHandle(token);
+        }
+        if user_buf.is_empty() {
+            return false;
+        }
+        let user_sid: PSID = (*user_buf.as_ptr().cast::<TOKEN_USER>()).User.Sid;
+
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        let status = GetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        let mut safe = status == ERROR_SUCCESS && !dacl.is_null();
+        if safe {
+            let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+            safe = GetAclInformation(
+                dacl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            ) != 0;
+            if safe {
+                for index in 0..info.AceCount {
+                    let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+                    if GetAce(dacl, index, &mut ace) == 0 {
+                        safe = false;
+                        break;
+                    }
+                    let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+                    if (*ace).Header.AceType != ACCESS_ALLOWED_ACE_TYPE || (*ace).Mask & WRITES == 0 {
+                        continue;
+                    }
+                    let sid: PSID = std::ptr::addr_of_mut!((*ace).SidStart).cast();
+                    if EqualSid(sid, user_sid) != 0 || GROUPS.iter().any(|&group| IsWellKnownSid(sid, group) != 0) {
+                        safe = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if !descriptor.is_null() {
+            LocalFree(descriptor as _);
+        }
+        safe
     }
 }
 
@@ -297,7 +390,7 @@ async fn run(component: Component, out: &mut Out) -> Result<Outcome, String> {
         Component::DirectPlay => {
             let _ = out.send(Event::Phase(Phase::Installing)).await;
             blocking(|| {
-                let dism = system32().join("dism.exe");
+                let dism = crate::win::system32().join("dism.exe");
                 run_hidden(&dism, "/online /enable-feature /featurename:DirectPlay /all /norestart", None)
                     .and_then(dism_outcome)
             })
@@ -500,6 +593,20 @@ mod tests {
         assert!(dxsetup_outcome((-9i32) as u32).unwrap_err().contains("-9"));
         assert_eq!(extract_outcome(0), Ok(()));
         assert!(extract_outcome(5).is_err());
+    }
+
+    #[test]
+    fn folder_write_rights() {
+        // A fresh temp folder is writable by the current user; the Windows folder is not.
+        let dir = std::env::temp_dir().join(format!("crystal-acl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user_writable = no_standard_user_writes(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!user_writable);
+        if let Some(windows) = std::env::var_os("SystemRoot") {
+            assert!(no_standard_user_writes(Path::new(&windows)));
+        }
+        assert!(!no_standard_user_writes(Path::new("C:\\no\\such\\folder")));
     }
 
     #[test]

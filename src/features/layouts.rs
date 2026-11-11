@@ -3,10 +3,23 @@
 //!
 //! How Crystal avoids fighting FFXI: the game sizes its window from its own resolution values
 //! (`0001`/`0002`, `0034` for the mode), which Crystal already serves to each game in-process
-//! (`ffxi_settings`). With `launch_at_saved_size` on, a client with a remembered windowed or
-//! borderless layout starts with those values set to its remembered client size and mode
-//! (`launch_values`), so the game itself opens at that size and Crystal only moves the window
-//! into place. A fullscreen game is never resized: at most it is moved to its monitor.
+//! (`ffxi_settings`). With `launch_at_saved_size` on, a client whose start size the user chose
+//! (`start`) starts with those values set to that size and mode (`launch_values`), so the game
+//! itself opens at that size and Crystal only moves the window into place. A fullscreen game is
+//! never resized: at most it is moved to its monitor.
+//!
+//! A game's resolution changes only when the user chose it for the next start: by placing a
+//! tile for a client whose game is not running (`place`). A running game's window that is
+//! moved, resized by hand, arranged or put on a tile by Apply is remembered for where it goes
+//! back (`remember`, `restore_rect`), and its game still starts at its own resolution: the
+//! window is a stretched picture of it, and everything the game and its add-ons place by
+//! pixel (FFXIDB's minimap, the HUD) stays where it was saved. Crystal 1.2.0 to 1.2.4 served
+//! every remembered window's size as the resolution, so a game restarted after Arrange all
+//! came back at its tile's resolution with those positions off.
+//!
+//! The layout editor (the monitor map of Features, Windows) edits these same remembered windows:
+//! a tile placed for a client whose game is not running is its remembered window and its start
+//! size (`place`), and the presets are where the editor starts from (`arrange`).
 //!
 //! Everything here is pure (monitors in, rectangles out) and unit-tested; `runtime` applies it.
 
@@ -22,18 +35,21 @@ pub(crate) struct Settings {
     pub remember: bool,
     /// Put each client's window back where it was when its game starts.
     pub restore: bool,
-    /// Serve the remembered client size and mode as the game's own resolution at launch.
+    /// Serve the chosen start size and mode (`start`) as the game's own resolution at launch.
     pub launch_at_saved_size: bool,
     /// The aspect ratio presets keep for each window (width / height).
     pub aspect: f32,
-    /// Put the game windows' taskbar buttons and Alt+Tab order in Home order when a Play has
-    /// brought its windows up, and when the Home order changes while games run (`order`).
-    pub order_windows: bool,
-    /// Remembered windows by `ClientKey::id`.
+
+    /// Remembered windows by `ClientKey::id`: where each goes back. Never a resolution.
     pub saved: BTreeMap<String, Saved>,
+    /// The size and mode each client's game starts at, by `ClientKey::id`: only what the user
+    /// chose for the next start (`place`). Windows remembered by Crystal 1.2.0 to 1.2.4 have
+    /// none, so those games start at their own resolution again.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub start: BTreeMap<String, Start>,
     /// What Restore windows puts back, by `ClientKey::id`: kept here, not in memory, because
-    /// Arrange all also changes the remembered windows, so a game restarted after it starts
-    /// arranged (and at the arranged size, `launch_values`); Restore windows still undoes it.
+    /// Apply also changes the remembered windows, so a game restarted after it starts
+    /// arranged (stretched to its tile, at its own resolution); Restore windows still undoes it.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub undo: BTreeMap<String, Arranged>,
 }
@@ -41,14 +57,33 @@ pub(crate) struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            remember: true, restore: true, launch_at_saved_size: true, aspect: 16.0 / 9.0, order_windows: true,
-            saved: BTreeMap::new(), undo: BTreeMap::new(),
+            remember: true, restore: true, launch_at_saved_size: true, aspect: 16.0 / 9.0,
+            saved: BTreeMap::new(), start: BTreeMap::new(), undo: BTreeMap::new(),
         }
     }
 }
 
-/// A client's window Arrange all moved: where it was before (before the first of several in a
-/// row), and where the last Arrange all left it.
+/// The resolution and window mode a client's game starts at, chosen by the user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Start {
+    /// The client (render) size: the game's resolution.
+    pub client: (i32, i32),
+    pub mode: Mode,
+}
+
+impl Start {
+    /// The start size a placed window gives its game, if any: none for a fullscreen one, one
+    /// that covers its whole monitor (its own resolution wins: a window larger than the screen
+    /// is what Windows reports for a game it scales) or one smaller than the game can be.
+    fn of(saved: &Saved) -> Option<Self> {
+        let (w, h) = saved.client;
+        let sized = saved.mode != Mode::Fullscreen && covers(&saved.rect, &saved.monitor.rect).is_none() && w >= 320 && h >= 240;
+        sized.then_some(Self { client: saved.client, mode: saved.mode })
+    }
+}
+
+/// A client's window Apply moved: where it was before (before the first of several in a
+/// row), and where the last Apply left it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Arranged {
     pub before: Saved,
@@ -91,7 +126,9 @@ impl Saved {
     }
 }
 
-/// Remember `placement` for `key`. Whether anything changed (nothing is saved for no change). A
+/// Remember `placement` for `key`: where its window goes back. Its start size (`start`) is not
+/// touched, so a window Crystal or the user moved or resized never changes the resolution its
+/// game starts at. Whether anything changed (nothing is saved for no change). A
 /// minimised window keeps its remembered normal rectangle and only notes that it was minimised
 /// when that rectangle is known; a client is never remembered as starting minimised otherwise.
 pub(crate) fn remember(settings: &mut Settings, key: &ClientKey, placement: &Placement) -> bool {
@@ -119,29 +156,104 @@ pub(crate) fn find_monitor<'a>(saved: &MonitorRef, monitors: &'a [Monitor]) -> O
         .or_else(|| monitors.first())
 }
 
-/// Where to put a remembered window now. On its own unchanged monitor it goes back exactly.
-/// On a monitor that changed (resolution, DPI, or a missing monitor replaced by the primary) the
-/// position and size scale with the work area, are clamped inside it, and a fullscreen window is
-/// placed over its new monitor whole.
+/// Where to put a remembered window now. On its own unchanged monitor it goes back exactly, to
+/// the pixel, wherever it was (a window that covered the taskbar's strip covers it again). On a
+/// monitor that changed (resolution, DPI, or a missing monitor replaced by the primary) the
+/// position and size scale with the work area and are clamped inside it; a fullscreen window is
+/// placed over its new monitor whole, and one that covered its whole monitor and more (`covers`)
+/// covers the new one by the same margins.
+///
+/// The taskbar stays on top of a game whose window (its client area, with a caption) no longer
+/// covers the monitor, by one pixel or by the taskbar's own height: a window that covered its
+/// monitor is never put inside the work area.
 pub(crate) fn restore_rect(saved: &Saved, monitors: &[Monitor]) -> Option<(Rect, Shown)> {
     let monitor = find_monitor(&saved.monitor, monitors)?;
-    let shown = if saved.shown == Shown::Minimized { Shown::Normal } else { saved.shown };
+    // A restore never minimises or maximises: the remembered rectangle is the normal one.
+    let shown = Shown::Normal;
     if saved.mode == Mode::Fullscreen { return Some((monitor.rect, Shown::Normal)); }
     let same = monitor.rect == saved.monitor.rect && monitor.work == saved.monitor.work && monitor.dpi == saved.monitor.dpi;
-    let rect = if same { saved.rect } else {
-        let (from, to) = (saved.monitor.work, monitor.work);
-        let sx = f64::from(to.w) / f64::from(from.w.max(1));
-        let sy = f64::from(to.h) / f64::from(from.h.max(1));
-        // Uniform scale keeps the game's aspect; position keeps its share of the work area.
-        let scale = sx.min(sy);
-        Rect::new(
-            to.x + (f64::from(saved.rect.x - from.x) * sx).round() as i32,
-            to.y + (f64::from(saved.rect.y - from.y) * sy).round() as i32,
-            (f64::from(saved.rect.w) * scale).round() as i32,
-            (f64::from(saved.rect.h) * scale).round() as i32,
-        )
-    };
+    if same { return Some((saved.rect, shown)); }
+    if let Some((left, top, right, bottom)) = covers(&saved.rect, &saved.monitor.rect) {
+        let m = monitor.rect;
+        return Some((Rect::new(m.x - left, m.y - top, m.w + left + right, m.h + top + bottom), shown));
+    }
+    let (from, to) = (saved.monitor.work, monitor.work);
+    let sx = f64::from(to.w) / f64::from(from.w.max(1));
+    let sy = f64::from(to.h) / f64::from(from.h.max(1));
+    // Uniform scale keeps the game's aspect; position keeps its share of the work area.
+    let scale = sx.min(sy);
+    let rect = Rect::new(
+        to.x + (f64::from(saved.rect.x - from.x) * sx).round() as i32,
+        to.y + (f64::from(saved.rect.y - from.y) * sy).round() as i32,
+        (f64::from(saved.rect.w) * scale).round() as i32,
+        (f64::from(saved.rect.h) * scale).round() as i32,
+    );
     Some((clamp_into(rect, &monitor.work), shown))
+}
+
+/// Whether a game window as it is `now` should be left alone instead of being put at `target`:
+/// it covers the whole of its monitor (as the game opened it) and `target` covers that same
+/// monitor too. Moving it would at best change nothing, and for a game whose coordinates Windows
+/// scales (a process that is not DPI aware on a scaled display) the move can land a pixel off,
+/// which is enough for the taskbar to stay on top of it.
+pub(crate) fn stays_full_screen(now: &Placement, target: &Rect) -> bool {
+    now.shown == Shown::Normal && covers(&now.rect, &now.monitor.rect).is_some() && covers(target, &now.monitor.rect).is_some()
+}
+
+/// How far `rect` reaches past each side of `monitor` (left, top, right, bottom) when it covers
+/// the whole of it: a borderless window a pixel larger than the screen, or a windowed game whose
+/// frame is pushed off it so its picture fills the screen. `None` when any of the monitor shows.
+pub(crate) fn covers(rect: &Rect, monitor: &Rect) -> Option<(i32, i32, i32, i32)> {
+    let (left, top) = (monitor.x - rect.x, monitor.y - rect.y);
+    let (right, bottom) = (rect.right() - monitor.right(), rect.bottom() - monitor.bottom());
+    (monitor.w > 0 && monitor.h > 0 && left >= 0 && top >= 0 && right >= 0 && bottom >= 0).then_some((left, top, right, bottom))
+}
+
+/// The monitor `rect` belongs on: the one it is mostly on, else the nearest. `None` with no monitors.
+pub(crate) fn monitor_for<'a>(rect: &Rect, monitors: &'a [Monitor]) -> Option<&'a Monitor> {
+    let screens: Vec<super::snap::Screen> = monitors.iter().map(super::snap::Screen::from).collect();
+    super::snap::screen_of(rect, &screens).map(|index| &monitors[index])
+}
+
+/// The remembered window of a client whose tile the layout editor put at `rect`, given what was
+/// remembered for it (`old`). Only the place changes: a window with a caption keeps it, and its
+/// frame's share of the rectangle, so the game starts at the size that fits `rect`; any other
+/// is borderless, and exactly over its monitor it is that monitor's full screen. `None` with no
+/// monitors.
+pub(crate) fn placed(old: Option<&Saved>, rect: Rect, monitors: &[Monitor]) -> Option<Saved> {
+    if rect.w <= 0 || rect.h <= 0 { return None; }
+    let monitor = monitor_for(&rect, monitors)?;
+    let windowed = old.is_some_and(|s| s.mode == Mode::Windowed);
+    let border = old.filter(|_| windowed).map_or((0, 0), |s| ((s.rect.w - s.client.0).max(0), (s.rect.h - s.client.1).max(0)));
+    let mode = if windowed { Mode::Windowed } else if rect == monitor.rect { Mode::Fullscreen } else { Mode::Borderless };
+    Some(Saved {
+        rect, client: ((rect.w - border.0).max(1), (rect.h - border.1).max(1)), shown: Shown::Normal, mode,
+        frame: old.and_then(|s| s.frame), monitor: MonitorRef::from(monitor),
+    })
+}
+
+/// Remember `rect` as `key`'s window (`placed`; a client with a slot starts from its account's
+/// slotless window when it has none of its own), and its size as the size its game starts at
+/// (`Start::of`): the one place a start size is chosen. Whether anything changed.
+pub(crate) fn place(settings: &mut Settings, key: &ClientKey, rect: Rect, monitors: &[Monitor]) -> bool {
+    let id = key.id();
+    let old = settings.saved.get(&id).or_else(|| settings.saved.get(&ClientKey::new(key.account.clone(), None).id()));
+    let Some(saved) = placed(old, rect, monitors) else { return false };
+    let start = Start::of(&saved);
+    if settings.saved.get(&id) == Some(&saved) && settings.start.get(&id) == start.as_ref() { return false; }
+    match start {
+        Some(start) => settings.start.insert(id.clone(), start),
+        None => settings.start.remove(&id),
+    };
+    settings.saved.insert(id, saved);
+    true
+}
+
+/// Forget `key`'s remembered window and its start size.
+pub(crate) fn forget(settings: &mut Settings, key: &ClientKey) {
+    let id = key.id();
+    settings.saved.remove(&id);
+    settings.start.remove(&id);
 }
 
 /// `rect` moved (and shrunk only if larger) so it lies inside `area`.
@@ -153,15 +265,18 @@ pub(crate) fn clamp_into(rect: Rect, area: &Rect) -> Rect {
     Rect::new(x, y, w, h)
 }
 
-/// The resolution values a client's game should start with, from its remembered window: the
-/// client size (`0001`/`0002`) and mode (`0034`: 1 window, 3 borderless). Empty when nothing is
-/// remembered, the setting is off, or the game was fullscreen (its own resolution wins).
+/// The resolution values a client's game should start with, from the start size the user chose
+/// for it (`start`; a client with a slot and none of its own uses its account's): the client
+/// size (`0001`/`0002`) and mode (`0034`: 1 window, 3 borderless). Empty when none was chosen
+/// or the setting is off: the game then starts at its own resolution, whatever window is
+/// remembered for it. A remembered window is never a resolution: it may be a tile Apply
+/// stretched a running game to, or a size Windows scaled.
 pub(crate) fn launch_values(settings: &Settings, key: &ClientKey) -> Vec<(&'static str, u32)> {
     if !settings.launch_at_saved_size { return Vec::new(); }
-    let Some(saved) = settings.saved.get(&key.id()).or_else(|| settings.saved.get(&ClientKey::new(key.account.clone(), None).id())) else { return Vec::new() };
-    let (w, h) = saved.client;
+    let Some(start) = settings.start.get(&key.id()).or_else(|| settings.start.get(&ClientKey::new(key.account.clone(), None).id())) else { return Vec::new() };
+    let (w, h) = start.client;
     if w < 320 || h < 240 { return Vec::new(); }
-    let mode = match saved.mode { Mode::Windowed => 1, Mode::Borderless => 3, Mode::Fullscreen => return Vec::new() };
+    let mode = match start.mode { Mode::Windowed => 1, Mode::Borderless => 3, Mode::Fullscreen => return Vec::new() };
     vec![("0001", w as u32), ("0002", h as u32), ("0034", mode)]
 }
 
@@ -172,16 +287,29 @@ pub(crate) enum Preset {
     Grid,
     /// The first client large, the others tiled beside it (or on the other monitors).
     MainLarge,
+    /// Every client over the whole of a monitor (borderless full screen), one on top of the
+    /// other where several share a monitor.
+    FullScreen,
 }
 
-/// The rectangles for `count` clients on `areas` (work areas, in the order chosen), first client
-/// first. Each window keeps `aspect`, as large as its cell allows, centred in the cell.
+impl Preset {
+    /// The part of `monitor` this preset arranges: all of it for full screen (the taskbar's
+    /// strip too, so a borderless game covers it to the pixel), else its work area.
+    pub(crate) fn area(self, monitor: &Monitor) -> Rect {
+        if self == Preset::FullScreen { monitor.rect } else { monitor.work }
+    }
+}
+
+/// The rectangles for `count` clients on `areas` (`Preset::area` of each monitor, in the order
+/// chosen), first client first. Each window keeps `aspect`, as large as its cell allows, centred
+/// in the cell; a full-screen one is its area exactly.
 pub(crate) fn arrange(preset: Preset, count: usize, areas: &[Rect], aspect: f32) -> Vec<Rect> {
     let aspect = if aspect.is_finite() && aspect > 0.2 && aspect < 5.0 { aspect } else { 16.0 / 9.0 };
     if count == 0 || areas.is_empty() { return Vec::new(); }
     match preset {
         Preset::Grid => grid(count, areas, aspect),
         Preset::MainLarge => main_large(count, areas, aspect),
+        Preset::FullScreen => areas.iter().zip(share(count, areas)).flat_map(|(area, n)| std::iter::repeat_n(*area, n)).collect(),
     }
 }
 
@@ -322,22 +450,101 @@ mod tests {
     }
 
     #[test]
-    fn launch_values_serve_the_remembered_client_size_and_mode() {
+    fn a_window_that_covers_its_monitor_goes_back_to_the_pixel() {
+        // The taskbar stays on top of a game that no longer covers the screen: none of these may
+        // come back a pixel off, or inside the work area (the screen less the taskbar).
+        let key = ClientKey::new("acct", None);
+        // Monitors left of and above the primary have negative coordinates.
+        for rect in [Rect::new(0, 0, 3840, 2160), Rect::new(-2560, -200, 2560, 1440), Rect::new(1920, 0, 1920, 1080), Rect::new(0, -1080, 1920, 1080)] {
+            let mon = monitor(r"\\.\DISPLAY2", rect, false);
+            assert!(mon.work != mon.rect, "this monitor has a taskbar");
+            // FFXI's borderless window at the monitor's size.
+            let mut settings = Settings::default();
+            let mut full = placement(mon.rect, &mon);
+            (full.mode, full.client) = (Mode::Fullscreen, (rect.w, rect.h));
+            remember(&mut settings, &key, &full);
+            assert_eq!(restore_rect(&settings.saved["acct"], &[mon.clone()]), Some((mon.rect, Shown::Normal)), "{rect:?}");
+            // A borderless window one pixel larger all round, and a windowed game with its frame
+            // pushed off the screen so its picture fills it: both reach under the taskbar.
+            for over in [Rect::new(rect.x - 1, rect.y - 1, rect.w + 2, rect.h + 2), Rect::new(rect.x - 8, rect.y - 31, rect.w + 16, rect.h + 39)] {
+                let mut p = placement(over, &mon);
+                (p.mode, p.client) = (Mode::Borderless, (rect.w, rect.h));
+                remember(&mut settings, &key, &p);
+                assert_eq!(restore_rect(&settings.saved["acct"], &[mon.clone()]), Some((over, Shown::Normal)), "{over:?} on {rect:?}");
+                assert!(covers(&over, &mon.rect).is_some());
+                // Its size is not served back as the game's resolution (a game Windows scales
+                // reads larger than the screen, and would start larger still each time).
+                assert!(launch_values(&settings, &key).is_empty(), "{over:?}");
+                // As the game opens it over its whole monitor it is left alone, whatever covering
+                // rectangle is remembered; a remembered tile, or another monitor, still moves it.
+                assert!(stays_full_screen(&full, &over) && stays_full_screen(&p, &mon.rect) && stays_full_screen(&p, &over));
+                assert!(!stays_full_screen(&p, &Rect::new(rect.x + 16, rect.y + 16, 928, 522)));
+                assert!(!stays_full_screen(&p, &Rect::new(rect.x + 10_000, rect.y, rect.w, rect.h)));
+                assert!(!stays_full_screen(&placement(Rect::new(rect.x + 16, rect.y + 16, 928, 522), &mon), &mon.rect), "a tile goes back to full screen");
+                assert!(!stays_full_screen(&Placement { shown: Shown::Minimized, ..p.clone() }, &over));
+                // The monitor changed (another resolution, the taskbar moved): the window still
+                // covers all of it, by the same margins.
+                let changed = monitor(r"\\.\DISPLAY2", Rect::new(rect.x, rect.y, 2560, 1600), false);
+                let (back, _) = restore_rect(&settings.saved["acct"], &[changed.clone()]).unwrap();
+                assert_eq!(covers(&back, &changed.rect), covers(&over, &mon.rect), "{back:?} on {:?}", changed.rect);
+            }
+        }
+        // An ordinary window reaching under the taskbar also goes back exactly on its unchanged
+        // monitor; only on a changed one is it brought inside the work area.
+        let mon = monitor(r"\\.\DISPLAY1", Rect::new(0, 0, 1920, 1080), true);
+        let mut settings = Settings::default();
+        let low = Rect::new(600, 500, 1296, 580);
+        remember(&mut settings, &key, &placement(low, &mon));
+        assert_eq!(restore_rect(&settings.saved["acct"], &[mon.clone()]), Some((low, Shown::Normal)));
+        assert_eq!(covers(&low, &mon.rect), None);
+        assert_eq!(covers(&mon.work, &mon.rect), None, "the work area does not cover the monitor");
+        assert_eq!(covers(&mon.rect, &mon.rect), Some((0, 0, 0, 0)));
+        let smaller = monitor(r"\\.\DISPLAY1", Rect::new(0, 0, 1280, 720), true);
+        let (inside, _) = restore_rect(&settings.saved["acct"], &[smaller.clone()]).unwrap();
+        assert_eq!(smaller.work.intersection(&inside), Some(inside));
+    }
+
+    #[test]
+    fn launch_values_serve_only_the_start_size_the_user_chose() {
         let main = monitor(r"\\.\DISPLAY1", Rect::new(0, 0, 1920, 1080), true);
+        let monitors = [main.clone()];
         let mut settings = Settings::default();
         let key = ClientKey::new("acct", Some(1));
         assert!(launch_values(&settings, &key).is_empty());
-        remember(&mut settings, &key, &placement(Rect::new(0, 0, 1296, 759), &main));
+        // The game runs windowed at its own 1920x1080 and is put on a tile (Arrange all, Apply)
+        // or resized by hand: the window is remembered, to go back there, and the game still
+        // starts at its own resolution. Served as the resolution, as in 1.2.0 to 1.2.4, the
+        // next start would be at 944x501 and everything placed by pixel (FFXIDB's minimap) off.
+        remember(&mut settings, &key, &placement(Rect::new(0, 0, 960, 540), &main));
+        assert_eq!(settings.saved["acct#1"].client, (944, 501));
+        assert!(settings.start.is_empty());
+        assert!(launch_values(&settings, &key).is_empty(), "a remembered window is never a resolution");
+        // The file a Crystal 1.2.0 to 1.2.4 left (remembered windows, no start sizes) reads the same.
+        let old: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(old.start.is_empty() && launch_values(&old, &key).is_empty());
+        // The user places the closed game's tile: that is its start size, frame taken off.
+        assert!(place(&mut settings, &key, Rect::new(0, 0, 1296, 759), &monitors));
+        assert_eq!(settings.start["acct#1"], Start { client: (1280, 720), mode: Mode::Windowed });
         assert_eq!(launch_values(&settings, &key), vec![("0001", 1280), ("0002", 720), ("0034", 1)]);
-        // A client with a slot falls back to the account's slotless layout.
+        // Running again, moved and stretched to another tile: remembered there, same start size.
+        assert!(remember(&mut settings, &key, &placement(Rect::new(960, 0, 960, 540), &main)));
+        assert_eq!(settings.saved["acct#1"].rect, Rect::new(960, 0, 960, 540));
+        assert_eq!(launch_values(&settings, &key), vec![("0001", 1280), ("0002", 720), ("0034", 1)]);
+        // It survives the settings file, and is forgotten with the window.
+        let again: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(again, settings);
+        forget(&mut settings, &key);
+        assert!(settings.saved.is_empty() && settings.start.is_empty() && launch_values(&settings, &key).is_empty());
+        // A client with a slot falls back to the account's slotless start size.
         let mut plain = Settings::default();
-        let mut border = placement(Rect::new(0, 0, 1280, 720), &main);
-        border.mode = Mode::Borderless;
-        border.client = (1280, 720);
-        remember(&mut plain, &ClientKey::new("acct", None), &border);
+        assert!(place(&mut plain, &ClientKey::new("acct", None), Rect::new(0, 0, 1280, 720), &monitors));
         assert_eq!(launch_values(&plain, &key), vec![("0001", 1280), ("0002", 720), ("0034", 3)]);
         plain.launch_at_saved_size = false;
         assert!(launch_values(&plain, &key).is_empty());
+        // A tile smaller than the game can be is a window to go back to, with no start size.
+        let mut small = Settings::default();
+        assert!(place(&mut small, &key, Rect::new(0, 0, 300, 200), &monitors));
+        assert!(small.start.is_empty() && launch_values(&small, &key).is_empty());
     }
 
     #[test]
@@ -380,15 +587,64 @@ mod tests {
     }
 
     #[test]
-    fn old_files_load_with_defaults() {
-        let s: Settings = serde_json::from_str("{}").unwrap();
-        assert_eq!(s, Settings::default());
-        assert!(s.remember && s.restore && s.launch_at_saved_size);
-        // A remembered window written before frames were kept still loads (frame left alone), and
-        // an empty undo is not written.
-        let old = r#"{"saved":{"a":{"rect":{"x":0,"y":0,"w":10,"h":10},"client":[10,10],"monitor":{"device":"d","rect":{"x":0,"y":0,"w":10,"h":10},"work":{"x":0,"y":0,"w":10,"h":10},"dpi":96}}}}"#;
-        let s: Settings = serde_json::from_str(old).unwrap();
-        assert_eq!(s.saved["a"].frame, None);
-        assert!(!serde_json::to_string(&s).unwrap().contains("undo"));
+    fn full_screen_puts_every_client_over_a_whole_monitor() {
+        let main = monitor(r"\\.\DISPLAY1", Rect::new(0, 0, 3840, 2160), true);
+        let side = monitor(r"\\.\DISPLAY2", Rect::new(3840, 0, 1920, 1080), false);
+        assert_eq!(Preset::FullScreen.area(&main), main.rect, "the taskbar's strip too");
+        assert_eq!(Preset::Grid.area(&main), main.work);
+        assert_eq!(Preset::MainLarge.area(&main), main.work);
+        // One monitor: all five over it, exactly.
+        assert_eq!(arrange(Preset::FullScreen, 5, &[main.rect], 16.0 / 9.0), vec![main.rect; 5]);
+        // Two alike: each has one before either has two. A much smaller one has its share by size.
+        let twin = Rect::new(3840, 0, 3840, 2160);
+        assert_eq!(arrange(Preset::FullScreen, 3, &[main.rect, twin], 16.0 / 9.0), vec![main.rect, main.rect, twin]);
+        let both = arrange(Preset::FullScreen, 5, &[main.rect, side.rect], 16.0 / 9.0);
+        assert_eq!(both, vec![main.rect, main.rect, main.rect, main.rect, side.rect]);
+        assert!(arrange(Preset::FullScreen, 0, &[main.rect], 1.7).is_empty());
+    }
+
+    #[test]
+    fn a_tile_placed_in_the_editor_is_the_clients_remembered_window() {
+        // A mixed-DPI desktop: a 4K monitor at 150 % and a 1080p one at 100 %.
+        let main = Monitor { dpi: 144, ..monitor(r"\\.\DISPLAY1", Rect::new(0, 0, 3840, 2160), true) };
+        let side = monitor(r"\\.\DISPLAY2", Rect::new(3840, 0, 1920, 1080), false);
+        let monitors = [main.clone(), side.clone()];
+        let mut settings = Settings::default();
+        let key = ClientKey::new("acct", Some(2));
+        // Nothing remembered yet: a borderless window at the tile, on the monitor it is on.
+        let tile = Rect::new(4800, 0, 960, 540);
+        assert!(place(&mut settings, &key, tile, &monitors));
+        assert!(!place(&mut settings, &key, tile, &monitors), "no change, nothing to save");
+        let saved = settings.saved["acct#2"].clone();
+        assert_eq!((saved.rect, saved.client, saved.mode, saved.shown, saved.frame), (tile, (960, 540), Mode::Borderless, Shown::Normal, None));
+        assert_eq!(saved.monitor, MonitorRef::from(&side), "the 1080p monitor, with its own scaling");
+        assert_eq!(restore_rect(&saved, &monitors), Some((tile, Shown::Normal)), "it starts exactly there");
+        assert_eq!(launch_values(&settings, &key), vec![("0001", 960), ("0002", 540), ("0034", 3)]);
+        // Moved over the whole of the other monitor: that monitor's full screen, to the pixel.
+        assert!(place(&mut settings, &key, main.rect, &monitors));
+        let full = settings.saved["acct#2"].clone();
+        assert_eq!((full.rect, full.mode, full.monitor.dpi), (main.rect, Mode::Fullscreen, 144));
+        assert_eq!(restore_rect(&full, &monitors), Some((main.rect, Shown::Normal)));
+        assert!(launch_values(&settings, &key).is_empty(), "a game over its whole monitor keeps its own resolution");
+        assert!(settings.start.is_empty(), "the tile's start size went with it");
+        // A windowed game keeps its caption and its frame: the tile is the window, frame included.
+        let mut windowed = Settings::default();
+        remember(&mut windowed, &key, &placement(Rect::new(100, 100, 1296, 759), &main));
+        assert!(place(&mut windowed, &key, Rect::new(0, 0, 1920, 1044), &monitors));
+        let saved = &windowed.saved["acct#2"];
+        assert_eq!((saved.rect, saved.client, saved.mode, saved.frame), (Rect::new(0, 0, 1920, 1044), (1904, 1005), Mode::Windowed, Some(Frame::default())));
+        // A client with a slot and nothing of its own starts from its account's window.
+        let mut shared = Settings::default();
+        remember(&mut shared, &ClientKey::new("acct", None), &placement(Rect::new(100, 100, 1296, 759), &main));
+        assert!(place(&mut shared, &key, Rect::new(3840, 0, 1296, 759), &monitors));
+        assert_eq!(shared.saved["acct#2"].mode, Mode::Windowed);
+        assert_eq!(shared.saved["acct"].rect, Rect::new(100, 100, 1296, 759), "the account's own stays");
+        // It survives the settings file.
+        let text = serde_json::to_string(&shared).unwrap();
+        assert_eq!(serde_json::from_str::<Settings>(&text).unwrap(), shared);
+        // No monitors, or no size: nothing is remembered.
+        assert!(!place(&mut settings, &key, tile, &[]));
+        assert!(!place(&mut settings, &key, Rect::new(0, 0, 0, 100), &monitors));
+        assert_eq!(monitor_for(&Rect::new(3000, 500, 1280, 720), &monitors), Some(&main), "astride two: the one it is mostly on");
     }
 }

@@ -1,21 +1,33 @@
-//! The cycle keys while a game is in front, through a low-level keyboard hook.
+//! Crystal's hotkeys while a game is in front, through a low-level keyboard hook.
 //!
 //! RegisterHotKey alone does not reach Crystal while FFXI is in front: the game reads the
 //! keyboard through DirectInput, which takes keys in a low-level hook (or raw input) of its own,
 //! and Windows matches registered hotkeys only after the low-level hooks let a key through. A
 //! low-level hook installed later than the game's runs first, so this one sees the chord before
-//! the game does.
+//! the game does. That holds for every registered hotkey, so the hook is given the account
+//! hotkeys as well as the cycle keys.
 //!
-//! Kept to the minimum: the hook runs on a thread of its own (it must answer every key at once,
-//! and the desktop thread waits for activations), is installed only while a Crystal game window
-//! is in front (`arm`/`disarm`, driven by the desktop thread's foreground hook), and is installed
-//! again shortly after each arm so it stays ahead of the game's own hook, which DirectInput
-//! installs when the game takes the keyboard on activation. It recognises exactly the in-game
-//! chords (Ctrl+Tab and Ctrl+Shift+Tab by default), with exactly those modifiers, and only while
-//! the window in front belongs to a tracked game: it then swallows that key's press, repeats and
-//! release, and posts the chord's id to the desktop window. Every other key, and every key sent
-//! by software, passes untouched. Nothing is recorded or logged about keys but the chord key's
-//! own scan code, flags and timing.
+//! Kept to the minimum, so no other program's keys are touched:
+//! - The hook exists only while a Crystal game window is in front (`arm`/`disarm`, driven by the
+//!   desktop thread's foreground hook). With any other window in front there is no hook at all.
+//! - It takes exactly the chords it was given (the hotkeys the user set), with
+//!   exactly those modifiers, and only while the window in front belongs to a tracked game: it
+//!   then swallows that key's press, repeats and release, and posts the chord's id to the
+//!   desktop window. Every other key passes at once: a key no chord uses costs two short list
+//!   scans and no system call (`Matcher::event`).
+//! - It runs on a thread of its own, above normal priority, that does nothing else: a busy
+//!   desktop or UI thread can't delay the keyboard, and Windows has no cause to drop the hook
+//!   (it silently removes one that keeps exceeding LowLevelHooksTimeout).
+//! - It is installed again shortly after each arm, and every few seconds for as long as it is
+//!   armed (`REHOOK_EVERY`): the game's own hook, which DirectInput installs when the game takes
+//!   the keyboard, would otherwise get ahead of it, and a hook Windows dropped comes back.
+//! - Keys sent by software (a Stream Deck, AutoHotkey) are keys like any other: the same chord
+//!   does the same thing. Only Crystal's own sent keys (`OWN_INPUT`) are let through unread.
+//! - Nothing is recorded or logged about keys but the chord key's own scan code, flags and
+//!   timing.
+//!
+//! The number pad's keys are matched by scan code (`hotkeys::canonical`), so a number pad chord
+//! fires whatever Num Lock says, and the number pad's Enter is not the main one.
 //!
 //! One physical press is one chord. A low-level hook is not told which key-downs are
 //! auto-repeats, so the matcher keeps each chord key's press from its first key-down to its
@@ -40,6 +52,10 @@ const WM_ARM: u32 = 0x8000 + 0x01;
 const WM_DISARM: u32 = 0x8000 + 0x02;
 /// After an arm, the hook is installed again at these delays (ms), each after the last.
 const REHOOK_AFTER: [u32; 2] = [300, 1200];
+/// And then at this interval (ms) for as long as the hook is armed.
+const REHOOK_EVERY: u32 = 5000;
+/// `dwExtraInfo` of the keys Crystal itself sends (`desktop`'s passed-on key): never a chord.
+pub(crate) const OWN_INPUT: usize = 0x4352_5953;
 /// A held key repeats at least this often (Windows' slowest repeat delay is 1 s): a press with
 /// no event for longer was released while the hook was off.
 const RELEASE_MISSED_AFTER: u32 = 1500;
@@ -70,7 +86,8 @@ pub(crate) enum Verdict {
 /// A chord key that is down.
 #[derive(Clone, Copy, Debug)]
 struct Down {
-    vk: u16,
+    /// The key as chords name it (`hotkeys::canonical`).
+    key: u16,
     /// It fired a chord: its repeats and release are swallowed. Otherwise they pass (the press
     /// went to the game or to Windows), and never fire.
     fired: bool,
@@ -101,21 +118,34 @@ impl Matcher {
     /// passed press released meanwhile is forgotten. A press that fired stays: Windows never saw
     /// it, so only its release or `RELEASE_MISSED_AFTER` ends it.
     pub(crate) fn armed(&mut self, now: u32, is_down: impl Fn(u16) -> bool) {
-        self.down.retain(|d| d.fired || is_down(d.vk));
+        self.down.retain(|d| d.fired || is_down(d.key));
         for d in self.down.iter_mut().filter(|d| !d.fired) { d.last = now; }
         for (_, hotkey) in &self.keys {
-            if is_down(hotkey.key) && !self.down.iter().any(|d| d.vk == hotkey.key) {
-                self.down.push(Down { vk: hotkey.key, fired: false, since: now, last: now, repeats: 0 });
+            if is_down(hotkey.key) && !self.down.iter().any(|d| d.key == hotkey.key) {
+                self.down.push(Down { key: hotkey.key, fired: false, since: now, last: now, repeats: 0 });
             }
         }
     }
 
-    /// One key event: `vk`, pressed or released, at `now` (the event's time, ms). `modifiers`
-    /// (the `MOD_*` bits held now) and `game_in_front` are asked only for a new press of a key
-    /// that could complete a chord.
-    pub(crate) fn key(&mut self, vk: u16, down: bool, now: u32, modifiers: impl FnOnce() -> u8, game_in_front: impl FnOnce() -> bool) -> Verdict {
+    /// One key event for a key that is the same under either name (every key but the number
+    /// pad's): see `event`.
+    #[cfg(test)]
+    pub(crate) fn key(&mut self, key: u16, down: bool, now: u32, modifiers: impl FnOnce() -> u8, game_in_front: impl FnOnce() -> bool) -> Verdict {
+        self.event(key, key, down, now, modifiers, game_in_front)
+    }
+
+    /// One key event: `key` (as chords name it: `hotkeys::canonical`) and its plain virtual key
+    /// `vk`, pressed or released, at `now` (the event's time, ms). `modifiers` (the `MOD_*` bits
+    /// held now) and `game_in_front` are asked only for a new press of a key that could
+    /// complete a chord; any other key is passed after two short scans.
+    ///
+    /// A chord on a number pad key matches that key whatever Num Lock makes its virtual key; a
+    /// chord on a plain virtual key also matches the number pad key Windows reports under it
+    /// (Insert for the number pad's 0 with Num Lock off, Enter for its Enter), as the same
+    /// chord registered with RegisterHotKey does.
+    pub(crate) fn event(&mut self, key: u16, vk: u16, down: bool, now: u32, modifiers: impl FnOnce() -> u8, game_in_front: impl FnOnce() -> bool) -> Verdict {
         let mut before = None;
-        if let Some(at) = self.down.iter().position(|d| d.vk == vk) {
+        if let Some(at) = self.down.iter().position(|d| d.key == key) {
             let quiet = now.wrapping_sub(self.down[at].last);
             if quiet <= RELEASE_MISSED_AFTER {
                 if down {
@@ -126,31 +156,32 @@ impl Matcher {
                     return if press.fired { Verdict::Swallow } else { Verdict::Pass };
                 }
                 let press = self.down.swap_remove(at);
-                self.note_release(vk, now);
+                self.note_release(key, now);
                 return if press.fired { Verdict::Release { held: now.wrapping_sub(press.since), repeats: press.repeats } } else { Verdict::Pass };
             }
             // Its release was missed: this event starts over.
             self.down.swap_remove(at);
             before = Some(Before::Unreleased(quiet));
         }
-        if !self.keys.iter().any(|(_, h)| h.key == vk) { return Verdict::Pass; }
+        if !self.keys.iter().any(|(_, h)| h.key == key || h.key == vk) { return Verdict::Pass; }
         if !down {
-            self.note_release(vk, now);
+            self.note_release(key, now);
             return Verdict::Pass;
         }
         let before = before.unwrap_or_else(|| {
-            self.released.iter().find(|(k, _)| *k == vk).map_or(Before::First, |(_, at)| Before::Released(now.wrapping_sub(*at)))
+            self.released.iter().find(|(k, _)| *k == key).map_or(Before::First, |(_, at)| Before::Released(now.wrapping_sub(*at)))
         });
         let held = modifiers();
-        let id = self.keys.iter().find(|(_, h)| h.key == vk && h.modifiers == held).map(|(id, _)| *id).filter(|_| game_in_front());
-        self.down.push(Down { vk, fired: id.is_some(), since: now, last: now, repeats: 0 });
+        let chord = |named: u16| self.keys.iter().find(|(_, h)| h.key == named && h.modifiers == held).map(|(id, _)| *id);
+        let id = chord(key).or_else(|| chord(vk)).filter(|_| game_in_front());
+        self.down.push(Down { key, fired: id.is_some(), since: now, last: now, repeats: 0 });
         id.map_or(Verdict::Pass, |id| Verdict::Fire { id, before })
     }
 
-    fn note_release(&mut self, vk: u16, now: u32) {
-        match self.released.iter_mut().find(|(k, _)| *k == vk) {
+    fn note_release(&mut self, key: u16, now: u32) {
+        match self.released.iter_mut().find(|(k, _)| *k == key) {
             Some(entry) => entry.1 = now,
-            None => self.released.push((vk, now)),
+            None => self.released.push((key, now)),
         }
     }
 }
@@ -279,6 +310,9 @@ fn run(shared: Arc<Shared>, ready: mpsc::Sender<u32>, reply: mpsc::Sender<Result
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
     // SAFETY: this thread's own queue, timers and hook, all released before it ends.
     unsafe {
+        // Every key on the PC waits for this thread while the hook is in: it answers ahead of
+        // ordinary work, however busy the games keep the processors.
+        windows_sys::Win32::System::Threading::SetThreadPriority(windows_sys::Win32::System::Threading::GetCurrentThread(), windows_sys::Win32::System::Threading::THREAD_PRIORITY_HIGHEST);
         let mut msg: MSG = std::mem::zeroed();
         // Create the queue before anyone posts to it.
         PeekMessageW(&mut msg, std::ptr::null_mut(), WM_USER, WM_USER, PM_NOREMOVE);
@@ -296,7 +330,7 @@ fn run(shared: Arc<Shared>, ready: mpsc::Sender<u32>, reply: mpsc::Sender<Result
                         stop_timer(run);
                         if result.is_ok() {
                             run.rehooks = REHOOK_AFTER.len();
-                            run.timer = SetTimer(std::ptr::null_mut(), 0, REHOOK_AFTER[0], None);
+                            run.timer = SetTimer(std::ptr::null_mut(), 0, rehook_delay(run.rehooks), None);
                         }
                         result
                     })).unwrap_or(Err(0));
@@ -311,16 +345,19 @@ fn run(shared: Arc<Shared>, ready: mpsc::Sender<u32>, reply: mpsc::Sender<Result
                     if run.hook.is_null() { return; }
                     let _ = install(run); // a failure keeps the hook already in place
                     run.rehooks = run.rehooks.saturating_sub(1);
-                    if run.rehooks > 0 {
-                        let delay = REHOOK_AFTER[REHOOK_AFTER.len() - run.rehooks];
-                        run.timer = SetTimer(std::ptr::null_mut(), 0, delay, None);
-                    }
+                    run.timer = SetTimer(std::ptr::null_mut(), 0, rehook_delay(run.rehooks), None);
                 }),
                 _ => {}
             }
         }
         RUNNING.with(|r| if let Some(mut run) = r.borrow_mut().take() { uninstall(&mut run); });
     }
+}
+
+/// How long until the hook is installed again, with `early` of `REHOOK_AFTER`'s re-installs
+/// still due; after them, `REHOOK_EVERY` for as long as the hook is armed.
+fn rehook_delay(early: usize) -> u32 {
+    if early == 0 { REHOOK_EVERY } else { REHOOK_AFTER[REHOOK_AFTER.len().saturating_sub(early)] }
 }
 
 /// Install the hook ahead of every other, then remove the one it replaces. The matcher is not
@@ -358,10 +395,11 @@ fn stop_timer(run: &mut Running) {
     }
 }
 
-/// Whether Windows has `vk` down now (a key this hook swallowed never reads as down).
-fn key_down(vk: u16) -> bool {
+/// Whether Windows has `key` down now, under any virtual key it reports it as (a key this
+/// hook swallowed never reads as down).
+fn key_down(key: u16) -> bool {
     // SAFETY: a key-state query.
-    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(i32::from(vk)) as u16 & 0x8000 != 0 }
+    super::hotkeys::virtual_keys(key).iter().any(|vk| unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(i32::from(*vk)) as u16 & 0x8000 != 0 })
 }
 
 /// The `MOD_*` bits held now.
@@ -383,17 +421,20 @@ fn game_in_front(shared: &Shared) -> bool {
 }
 
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{CallNextHookEx, PostMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, WM_KEYDOWN, WM_SYSKEYDOWN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CallNextHookEx, PostMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, WM_KEYDOWN, WM_SYSKEYDOWN};
     if code == HC_ACTION as i32 && lparam != 0 {
         // SAFETY: for HC_ACTION, lParam points at the event's KBDLLHOOKSTRUCT.
         let event = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
-        if event.flags & LLKHF_INJECTED == 0 {
+        // A key Crystal sent itself is passed unread; any other sent key is a key.
+        if !(event.flags & LLKHF_INJECTED != 0 && event.dwExtraInfo == OWN_INPUT) {
             let down = matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+            let vk = event.vkCode as u16;
+            let key = super::hotkeys::canonical(vk, event.scanCode as u16, event.flags & LLKHF_EXTENDED != 0);
             let verdict = RUNNING.with(|r| {
                 let mut running = r.try_borrow_mut().ok()?;
                 let run = running.as_mut()?;
-                let shared = run.shared.clone();
-                Some((run.matcher.key(event.vkCode as u16, down, event.time, modifiers, || game_in_front(&shared)), shared.window))
+                let Running { matcher, shared, .. } = run;
+                Some((matcher.event(key, vk, down, event.time, modifiers, || game_in_front(shared)), shared.window))
             });
             match verdict {
                 Some((Verdict::Swallow, _)) => return 1,
@@ -419,13 +460,13 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::hotkeys::{DEFAULT_CYCLE, DEFAULT_CYCLE_BACK};
+    use crate::features::hotkeys::{OLD_CYCLE as CYCLE, OLD_CYCLE_BACK as CYCLE_BACK};
 
     const TAB: u16 = 0x09;
     const CTRL: u8 = MOD_CONTROL;
     const CTRL_SHIFT: u8 = MOD_CONTROL | MOD_SHIFT;
 
-    fn keys() -> Vec<(i32, Hotkey)> { vec![(1, DEFAULT_CYCLE), (2, DEFAULT_CYCLE_BACK)] }
+    fn keys() -> Vec<(i32, Hotkey)> { vec![(1, CYCLE), (2, CYCLE_BACK)] }
 
     fn matcher() -> Matcher {
         let mut m = Matcher::default();
@@ -450,6 +491,114 @@ mod tests {
             assert_eq!(m.key(vk, true, 3000, || mods, || true), Verdict::Pass, "{vk:#x} {mods}");
             assert_eq!(m.key(vk, false, 3050, || mods, || true), Verdict::Pass);
         }
+    }
+
+    /// The rule other programs rely on: with the default chords set, every key but Tab passes
+    /// whatever is held, without a look at the modifiers or the window in front; and Tab passes
+    /// under every modifier combination but the two chords.
+    #[test]
+    fn every_key_no_chord_uses_passes_untouched() {
+        let mut m = matcher();
+        let mut t = 1000;
+        for vk in (1..=0xFEu16).filter(|vk| *vk != TAB) {
+            for down in [true, true, false] {
+                t += 10;
+                assert_eq!(m.key(vk, down, t, || panic!("modifiers asked for {vk:#x}"), || panic!("foreground asked for {vk:#x}")), Verdict::Pass, "{vk:#x}");
+            }
+        }
+        for mods in (0..16u8).filter(|mods| *mods != CTRL && *mods != CTRL_SHIFT) {
+            t += 10;
+            assert_eq!(m.key(TAB, true, t, || mods, || true), Verdict::Pass, "Tab with {mods:#x}");
+            t += 10;
+            assert_eq!(m.key(TAB, false, t, || mods, || true), Verdict::Pass);
+        }
+        // Nothing was kept of the keys that passed but the chord key's own press and release.
+        assert!(m.down.is_empty());
+        assert_eq!(m.released.len(), 1);
+    }
+
+    /// An account hotkey is taken over a game like a cycle key, and like it nowhere else (there
+    /// RegisterHotKey delivers it).
+    #[test]
+    fn account_chords_are_taken_only_over_a_game() {
+        let mut m = Matcher::default();
+        let account = Hotkey::new(MOD_CONTROL | MOD_ALT, 0x31); // Ctrl+Alt+1
+        m.set_keys(vec![(1, CYCLE), (2, CYCLE_BACK), (3, account)]);
+        assert_eq!(fired(m.key(0x31, true, 100, || MOD_CONTROL | MOD_ALT, || true)), Some(3));
+        assert_eq!(m.key(0x31, true, 400, || MOD_CONTROL | MOD_ALT, || true), Verdict::Swallow, "held: one switch");
+        assert_eq!(m.key(0x31, false, 500, || MOD_CONTROL | MOD_ALT, || true), Verdict::Release { held: 400, repeats: 1 });
+        // The game's own Ctrl+1 and Alt+1 (macros) and a bare 1 are the game's.
+        for mods in [0, MOD_CONTROL, MOD_ALT, MOD_SHIFT, MOD_CONTROL | MOD_ALT | MOD_SHIFT] {
+            assert_eq!(m.key(0x31, true, 1000, || mods, || true), Verdict::Pass, "{mods:#x}");
+            assert_eq!(m.key(0x31, false, 1050, || mods, || true), Verdict::Pass);
+        }
+        // No game in front: the key goes on to Windows, which has the chord registered.
+        assert_eq!(m.key(0x31, true, 2000, || MOD_CONTROL | MOD_ALT, || false), Verdict::Pass);
+        assert_eq!(m.key(0x31, false, 2050, || MOD_CONTROL | MOD_ALT, || false), Verdict::Pass);
+    }
+
+    /// The hook's event for a number pad key: its name for chords, and its virtual key.
+    fn pad(vk: u16, scan: u16, extended: bool) -> (u16, u16) { (crate::features::hotkeys::canonical(vk, scan, extended), vk) }
+
+    #[test]
+    fn a_number_pad_chord_fires_whatever_num_lock_says_and_only_for_the_number_pad() {
+        use crate::features::hotkeys::NUM_ENTER;
+        let mut m = Matcher::default();
+        m.set_keys(vec![(1, Hotkey::new(CTRL, 0x60)), (2, Hotkey::new(CTRL, NUM_ENTER)), (3, Hotkey::new(0, 0x6B))]);
+        let mut t = 0;
+        let mut tap = |m: &mut Matcher, (key, vk): (u16, u16), mods: u8| {
+            t += 100;
+            let verdict = m.event(key, vk, true, t, || mods, || true);
+            m.event(key, vk, false, t + 50, || mods, || true);
+            verdict
+        };
+        // Ctrl+Num 0 with Num Lock on (VK_NUMPAD0), and off (it arrives as Insert, unextended).
+        assert_eq!(fired(tap(&mut m, pad(0x60, 0x52, false), CTRL)), Some(1));
+        assert_eq!(fired(tap(&mut m, pad(0x2D, 0x52, false), CTRL)), Some(1));
+        // The Insert key itself, the top row's 0 and a bare Num 0 are not that chord.
+        assert_eq!(tap(&mut m, pad(0x2D, 0x52, true), CTRL), Verdict::Pass);
+        assert_eq!(tap(&mut m, pad(0x30, 0x0B, false), CTRL), Verdict::Pass);
+        assert_eq!(tap(&mut m, pad(0x60, 0x52, false), 0), Verdict::Pass);
+        // The number pad's Enter, not the main one.
+        assert_eq!(fired(tap(&mut m, pad(0x0D, 0x1C, true), CTRL)), Some(2));
+        assert_eq!(tap(&mut m, pad(0x0D, 0x1C, false), CTRL), Verdict::Pass);
+        // A bare number pad key (an in-game chord): alone, not with Ctrl held.
+        assert_eq!(fired(tap(&mut m, pad(0x6B, 0x4E, false), 0)), Some(3));
+        assert_eq!(tap(&mut m, pad(0x6B, 0x4E, false), CTRL), Verdict::Pass);
+        // Held: one action, and the release found under the same name with Num Lock off.
+        let (key, vk) = pad(0x2D, 0x52, false);
+        assert_eq!(fired(m.event(key, vk, true, 5000, || CTRL, || true)), Some(1));
+        assert_eq!(m.event(key, vk, true, 5300, || CTRL, || true), Verdict::Swallow);
+        assert_eq!(m.event(key, vk, false, 5400, || CTRL, || true), Verdict::Release { held: 400, repeats: 1 });
+    }
+
+    /// A chord on a plain virtual key takes the number pad key Windows reports under it too, as
+    /// the same chord registered with RegisterHotKey does; a number pad chord comes first.
+    #[test]
+    fn a_plain_chord_matches_as_register_hot_key_would() {
+        let mut m = Matcher::default();
+        m.set_keys(vec![(1, Hotkey::new(CTRL | MOD_ALT, 0x2D)), (2, Hotkey::new(CTRL | MOD_ALT, 0x0D))]); // Ctrl+Alt+Insert, Ctrl+Alt+Enter
+        let (key, vk) = pad(0x2D, 0x52, false);
+        assert_eq!(fired(m.event(key, vk, true, 100, || CTRL | MOD_ALT, || true)), Some(1), "Num 0 with Num Lock off is Insert to Windows");
+        m.event(key, vk, false, 150, || CTRL | MOD_ALT, || true);
+        let (key, vk) = pad(0x0D, 0x1C, true);
+        assert_eq!(fired(m.event(key, vk, true, 300, || CTRL | MOD_ALT, || true)), Some(2), "either Enter");
+        m.event(key, vk, false, 350, || CTRL | MOD_ALT, || true);
+        // With a chord on the number pad key itself, that one has it.
+        m.set_keys(vec![(1, Hotkey::new(CTRL | MOD_ALT, 0x2D)), (3, Hotkey::new(CTRL | MOD_ALT, 0x60))]);
+        let (key, vk) = pad(0x2D, 0x52, false);
+        assert_eq!(fired(m.event(key, vk, true, 500, || CTRL | MOD_ALT, || true)), Some(3));
+        m.event(key, vk, false, 550, || CTRL | MOD_ALT, || true);
+        let (key, vk) = pad(0x2D, 0x52, true);
+        assert_eq!(fired(m.event(key, vk, true, 700, || CTRL | MOD_ALT, || true)), Some(1), "the Insert key");
+    }
+
+    #[test]
+    fn the_hook_is_installed_again_soon_after_an_arm_and_then_for_as_long_as_it_is_armed() {
+        assert_eq!(rehook_delay(REHOOK_AFTER.len()), REHOOK_AFTER[0]);
+        assert_eq!(rehook_delay(1), REHOOK_AFTER[1]);
+        assert_eq!(rehook_delay(0), REHOOK_EVERY);
+        assert_eq!(rehook_delay(0), REHOOK_EVERY, "and again, with no end");
     }
 
     #[test]

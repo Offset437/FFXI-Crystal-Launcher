@@ -19,8 +19,10 @@ use crate::i18n::t;
 /// One code's window.
 pub(crate) const STEP_MS: u64 = 30_000;
 /// A code with less than this left in its window could expire before PlayOnline checks it, so
-/// the sign-in waits for the next window instead.
-pub(crate) const MIN_LEFT_MS: u64 = 3_000;
+/// the sign-in waits for the next window instead. The code leaves with the session line; the
+/// loader sends it at member login, after Connect and the W2U check: 0.7–4.1 s later (mean
+/// 1.2 s) over 71 sign-ins in the loader log of 2026-10-22, so 8 s is twice the worst seen.
+pub(crate) const MIN_LEFT_MS: u64 = 8_000;
 /// 80 bits, the shortest key authenticator setups hand out.
 const MIN_KEY_CHARS: usize = 16;
 const MAX_KEY_CHARS: usize = 128;
@@ -142,12 +144,12 @@ impl Authenticator {
     }
 
     /// A fresh code, made now: it may first wait (at most about a minute) for a window in which
-    /// it is neither about to expire nor already used.
-    pub(crate) fn code(&self) -> Zeroizing<String> {
+    /// it is neither about to expire nor already used. `Sent::record` once it has left.
+    pub(crate) fn code(&self) -> (Zeroizing<String>, Sent) {
         self.code_with(now_ms, std::thread::sleep)
     }
 
-    fn code_with(&self, mut now: impl FnMut() -> u64, mut sleep: impl FnMut(Duration)) -> Zeroizing<String> {
+    fn code_with(&self, mut now: impl FnMut() -> u64, mut sleep: impl FnMut(Duration)) -> (Zeroizing<String>, Sent) {
         let (step, wait) = plan(now(), read_ledger(&self.ledger));
         if !wait.is_zero() {
             sleep(wait);
@@ -158,9 +160,20 @@ impl Authenticator {
                 sleep(Duration::from_millis(left));
             }
         }
-        // Recorded before it leaves: a sign-in that fails after this never reuses it.
-        write_ledger(&self.ledger, step);
-        hotp(&self.secret, step, DIGITS)
+        (hotp(&self.secret, step, DIGITS), Sent { ledger: self.ledger.clone(), step })
+    }
+}
+
+/// A made code's time step, recorded once the code has left for the game host: a sign-in that
+/// fails after that never reuses it, and one whose send failed keeps the window.
+pub(crate) struct Sent {
+    ledger: PathBuf,
+    step: u64,
+}
+
+impl Sent {
+    pub(crate) fn record(self) {
+        write_ledger(&self.ledger, self.step);
     }
 }
 
@@ -246,8 +259,8 @@ mod tests {
         let window = 1_000 * STEP_MS;
         // Plenty of time left: this window's code, now.
         assert_eq!(plan(window, None), (1_000, Duration::ZERO));
-        assert_eq!(plan(window + STEP_MS - MIN_LEFT_MS, None), (1_000, Duration::ZERO), "exactly 3 s left is enough");
-        // Less than 3 s left: the next window's code, once it begins.
+        assert_eq!(plan(window + STEP_MS - MIN_LEFT_MS, None), (1_000, Duration::ZERO), "exactly MIN_LEFT_MS left is enough");
+        // Less than that left: the next window's code, once it begins.
         assert_eq!(plan(window + STEP_MS - MIN_LEFT_MS + 1, None), (1_001, Duration::from_millis(MIN_LEFT_MS - 1)));
         assert_eq!(plan(window + STEP_MS - 1, None), (1_001, Duration::from_millis(1)));
     }
@@ -257,7 +270,7 @@ mod tests {
         let window = 1_000 * STEP_MS;
         // The same window again: wait for the next one.
         assert_eq!(plan(window + 5_000, Some(1_000)), (1_001, Duration::from_millis(25_000)));
-        // The previous submission took the next window early (the 3 s rule): the one after it.
+        // The previous submission took the next window early (the MIN_LEFT_MS rule): the one after it.
         assert_eq!(plan(window + 29_000, Some(1_001)), (1_002, Duration::from_millis(31_000)));
         // Older submissions do not hold anything up.
         assert_eq!(plan(window + 5_000, Some(999)), (1_000, Duration::ZERO));
@@ -270,11 +283,16 @@ mod tests {
         let clock = Cell::new(window + 5_000);
         let slept = Cell::new(Duration::ZERO);
         let sleep = |d: Duration| { slept.set(slept.get() + d); clock.set(clock.get() + d.as_millis() as u64); };
-        let first = authenticator.code_with(|| clock.get(), sleep);
+        let (unsent, _) = authenticator.code_with(|| clock.get(), sleep);
+        assert_eq!(read_ledger(&root.join(LEDGER)), None, "a code that never left keeps its window");
+        let (first, sent) = authenticator.code_with(|| clock.get(), sleep);
+        assert_eq!(first.as_str(), unsent.as_str());
+        sent.record();
         assert_eq!(slept.get(), Duration::ZERO);
         assert_eq!(read_ledger(&root.join(LEDGER)), Some(1_000));
         let again = Authenticator::new("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", &root).unwrap();
-        let second = again.code_with(|| clock.get(), sleep);
+        let (second, sent) = again.code_with(|| clock.get(), sleep);
+        sent.record();
         assert_eq!(slept.get(), Duration::from_millis(25_000), "waited for the next window");
         assert_eq!(read_ledger(&root.join(LEDGER)), Some(1_001));
         assert_ne!(first.as_str(), second.as_str());

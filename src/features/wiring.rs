@@ -42,9 +42,7 @@ impl App {
             let slot = self.settings.account_auto_login.get(&key).filter(|login| login.enabled).map(|login| login.character_slot);
             runtime.game_started(GameStart { account: key, slot, label: row.account.label.clone(), pid });
         }
-        // A Play still bringing up a game: windows are put in Home order once it is done (told
-        // after this observation's starts, so its last game is part of that pass).
-        runtime.set_launching(self.accounts.iter().any(|row| row.game_start_pending() && !row.is_playing()));
+
         let sessions: Vec<String> = self.accounts.iter()
             .filter(|row| row.pid.is_some() && row.account.mode == AccountMode::Retail).map(|row| row.key.clone()).collect();
         if sessions != self.features_sessions {
@@ -58,8 +56,8 @@ impl App {
         }
     }
 
-    /// The Home account order changed (a drag finished): running games' windows follow it now
-    /// rather than at the next observation.
+    /// The Home account order changed (a drag finished): the cycle keys and the next launch
+    /// follow it now rather than at the next observation. No running window is touched.
     pub(crate) fn features_order_changed(&mut self) {
         if self.preview { return; }
         if let Some(runtime) = &self.features { runtime.set_order(self.accounts.iter().map(|row| row.key.clone()).collect()); }
@@ -89,7 +87,6 @@ impl App {
                 super::recovery::Decision::Offer { .. } => { self.features_view.offers.insert(account, decision); }
                 _ => { self.features_view.offers.remove(&account); }
             },
-            Event::Notification(_) => {}
         }
     }
 }

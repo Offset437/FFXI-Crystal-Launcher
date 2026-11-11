@@ -1,6 +1,6 @@
 [package]
 name = "xi-launcher"
-version = "1.2.4"
+version = "1.2.5"
 edition = "2021"
 license = "GPL-3.0-only"
 publish = false
@@ -10,7 +10,6 @@ elevated-ui = []
 # Installer builds: run the installed crystal\pol.exe (checked against the loader's hash
 # recorded at build time) and carry no embedded copy to extract.
 installed-host = []
-launcher-startup-diagnostics = []
 # Slint renderers. software ships: measured 2026-11-09 against femtovg (release, --preview),
 # it reaches the first frame in 132 ms (femtovg 324 ms: the OpenGL probe and context), holds
 # 23 MB private with the window open (femtovg 254 MB, the GL driver's) and 11 MB in the tray
@@ -27,8 +26,6 @@ software = ["slint/renderer-software"]
 
 [dependencies]
 imagecrate = { package = "image", version = "=0.25.8", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
-crystal-pol = { path = "crates/pol-auth" }
-sha1 = "=0.10.7"
 sha2 = "0.10"
 ring = "=0.17.14"
 semver = "=1.0.28"
@@ -51,7 +48,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Registry",
     "Win32_System_Diagnostics_ToolHelp", "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Shell",
-    "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Accessibility", "Win32_Security_Cryptography", "Win32_Security_WinTrust",
+    "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Input", "Win32_UI_Accessibility", "Win32_Security_Cryptography", "Win32_Security_WinTrust",
     "Win32_Storage_FileSystem",
     "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", # signer lookup
     "Win32_System_Pipes", "Win32_System_IO", # session pipe
@@ -84,7 +81,7 @@ slint-build = "=1.18.1"
 slint = { version = "=1.18.1", default-features = false, features = ["renderer-software"] }
 
 [workspace]
-exclude = ["crystal-loader", "crates/pol-auth"]
+exclude = ["crystal-loader"]
 
 [profile.dev]
 debug = 0

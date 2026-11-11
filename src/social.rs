@@ -34,6 +34,8 @@ fn localized(text: &str) -> Option<String> {
         "Invalid native storage result." => return Some(t("Invalid native storage result.").into()),
         "Invalid native PlayOnline message header." => return Some(t("Invalid native PlayOnline message header.").into()),
         "Could not encode the PlayOnline request." => return Some(t("Could not encode the PlayOnline request.").into()),
+        "Invalid native POL friend snapshot." => return Some(t("Invalid native POL friend snapshot.").into()),
+        "Invalid game friend locations." => return Some(t("Invalid game friend locations.").into()),
         _ => {}
     }
     if let Some(code) = text

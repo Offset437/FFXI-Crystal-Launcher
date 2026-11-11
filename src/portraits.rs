@@ -199,11 +199,20 @@ pub(crate) fn shown(portrait: Option<u16>) -> Option<u16> {
 /// Stock portrait `id` itself, privacy mode or not: the picker's choices, which identify nobody.
 /// UI thread only.
 pub(crate) fn stock_image(id: u16) -> Option<slint::Image> {
+    // Least recently used first: a full cache drops its oldest picture, not all of them.
     thread_local! {
-        static IMAGES: std::cell::RefCell<std::collections::HashMap<u16, slint::Image>> = Default::default();
+        static IMAGES: std::cell::RefCell<Vec<(u16, slint::Image)>> = Default::default();
     }
-    if let Some(image) = IMAGES.with(|images| images.borrow().get(&id).cloned()) {
-        return Some(image);
+    let hit = IMAGES.with(|images| {
+        let mut images = images.borrow_mut();
+        let at = images.iter().position(|(cached, _)| *cached == id)?;
+        let entry = images.remove(at);
+        let image = entry.1.clone();
+        images.push(entry);
+        Some(image)
+    });
+    if hit.is_some() {
+        return hit;
     }
     let pixels = rgba(id)?;
     let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&pixels, WIDTH, HEIGHT);
@@ -211,9 +220,9 @@ pub(crate) fn stock_image(id: u16) -> Option<slint::Image> {
     IMAGES.with(|images| {
         let mut images = images.borrow_mut();
         if images.len() >= CACHED_SHEETS * CELLS {
-            images.clear();
+            images.remove(0);
         }
-        images.insert(id, image.clone());
+        images.push((id, image.clone()));
     });
     Some(image)
 }

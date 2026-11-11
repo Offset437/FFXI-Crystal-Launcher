@@ -156,12 +156,19 @@ pub fn history_line(time: &str, label: &str, outcome: &str, log: Option<&Path>) 
     format!("{time} | {} | {} | {log}", flat(label), flat(outcome))
 }
 
+/// The size past which the launch history is rotated.
+const HISTORY_MAX: u64 = 1 << 20;
+
 /// Best-effort append; diagnostics must never fail a launch.
 pub fn append_history(history: &Path, label: &str, outcome: &str, log: Option<&Path>) {
     let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let line = history_line(&time, label, outcome, log);
     if let Some(parent) = history.parent() {
         let _ = fs::create_dir_all(parent);
+    }
+    // The history keeps one earlier file at most: past 1 MiB it becomes `<name>.old`.
+    if fs::metadata(history).is_ok_and(|m| m.len() > HISTORY_MAX) {
+        let _ = fs::rename(history, history.with_extension("old"));
     }
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(history) {
         // One write per line: the UI, the prefetch thread and every worker append at once.

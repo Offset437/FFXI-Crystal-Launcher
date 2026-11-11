@@ -1,6 +1,6 @@
 //! Constants and encoders of the launcher <-> loader wire contract that both
-//! sides must agree on byte for byte. The launcher (`src/main.rs`) and
-//! `crates/pol-auth` include this file via `#[path]`, so it depends on
+//! sides must agree on byte for byte. The launcher (`src/main.rs`) and the
+//! loader itself include this file via `#[path]`, so it depends on
 //! `core`/`std` only and changes here change both ends together.
 
 /// The one protocol major version (`hello`'s and the session lines' `v`).

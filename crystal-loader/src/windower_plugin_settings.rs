@@ -1,106 +1,90 @@
-//! Serialize FFXIDB's complete settings transactions between Crystal hosts.
+//! Serialize FFXIDB's settings transactions between Crystal hosts, and put
+//! back the minimap position fields its stock save drops.
 //!
-//! FFXIDB 1.2.3.14 ignores an unsuccessful XML read and then saves its fresh
-//! document. Its CRT opens writers exclusively, so simultaneous startup or a
-//! later minimap save can erase another character's settings. A file-open lock
-//! would be too short: it must include read, modify, and write.
+//! FFXIDB keeps every character's minimap position in one FFXIDB.xml. It
+//! ignores an unsuccessful XML read and then saves a fresh document, and its
+//! CRT opens writers exclusively, so games starting together, or a later save,
+//! can erase each other's settings. A file-open lock would be too short: it
+//! must cover the read, the change and the write.
 //!
-//! This adapter is deliberately specific to the verified FFXIDB build below;
-//! Hook's side is found by signature (crate::hook_layout) in any Hook build.
-//! Only Hook's GetProcAddress import and the new FFXIDB object's vptr change.
-//! No instructions, vendor files, other plugins, or process-wide APIs change.
-//! The original factory, object, callbacks, calling conventions, and return
-//! values remain in use. Crystal's tables live until process exit.
+//! Nothing here depends on an FFXIDB build. Only Windower's side is located:
+//! Hook's plugin loader, by signature (crate::hook_layout). Through it Crystal
+//! changes three kinds of data pointer, never code:
+//! - Hook's GetProcAddress import, to see FFXIDB's `CreateInstance`;
+//! - FFXIDB's own KERNEL32 CreateFile imports, to see when it opens a file;
+//! - four slots of the plugin object's vtable, in place: Initialize, Command,
+//!   Incoming and Mouse, the stdcall callbacks of Hook's plugin interface.
 //!
-//! FFXIDB caches its signature-scan results in a function-local static map
-//! (RVA C77F0, filled at 3E358). Some entries are pointer values it read from
-//! the game's heap at scan time, so they are only valid for the game that was
-//! running then. A fresh mapping starts with that map unconstructed (zero
-//! .bss); a mapping that outlived its game still holds the old pointers and
-//! faults in the minimap target draw (6E3E4) once the next game is in a zone.
+//! Each wrapped callback (and the factory) is a scope. The first time FFXIDB
+//! opens FFXIDB.xml inside a scope, that thread takes the session-wide
+//! settings mutex and reads the file as it was; the mutex is held until the
+//! outermost scope returns. Callbacks that never open the file (mouse moves,
+//! most packets) take no lock at all. At the end, if the file changed, the
+//! position fields the stock save dropped are restored ([`restore_positions`])
+//! by plain XML text, then the mutex is released.
 //!
-//! So every game must get a fresh mapping, but FFXIDB must not be unmapped
-//! inside the game's own teardown. Hook FreeLibrary's every plugin while the
-//! game is closing, under its plugin-list lock, with game, Hook and renderer
-//! threads still shutting down. The 2026-10-23 17:14 test build let that
-//! FreeLibrary run FFXIDB's DLL_PROCESS_DETACH and unmap it there, and
-//! clients then hung at /logout. Earlier builds kept a reference for the
-//! whole process and never hung at logout, but reused the stale mapping in
-//! the next game.
-//! Crystal now holds one reference per mapping (HELD) through the end of its
-//! game, exactly like those releases at logout, and drops it in
-//! `game_starting`, on the host thread before the next GameStart, when no
-//! game, Hook teardown or plugin is running. Hook then maps a fresh copy.
-//! If anything else still keeps the old copy mapped, the factory refuses it
-//! (logged) instead of letting FFXIDB use the previous game's addresses.
+//! What Crystal cannot cover is said in the loader log and, once per host, in
+//! the launch history ([`report_unprotected`]): an unverified Hook loader, an
+//! FFXIDB without CreateFile imports, a vtable that cannot be changed, or
+//! FFXIDB opening its settings outside the callbacks above.
+//!
+//! FFXIDB caches game addresses from signature scans in static maps, valid
+//! only for the game that was running then. A mapping that outlived its game
+//! faults in the next one, but FFXIDB must not be unmapped inside the game's
+//! own teardown either (Hook FreeLibrary's it under its plugin-list lock, and
+//! clients hung at /logout when that unmapped it). Crystal holds one reference
+//! per mapping (HELD) through the end of its game and drops it in
+//! `game_starting`, before the next GameStart. If something else still keeps
+//! the old copy mapped, its vtable still holds Crystal's wrappers, and the
+//! factory refuses it (logged) instead of reusing the previous game's
+//! addresses.
 
 use crate::hook_layout::{OwnedModule, Plugins};
+use crate::mem::read;
 use std::{
+    cell::RefCell,
     ffi::{c_void, CStr, OsString},
     fs::{File, OpenOptions},
     io::{Read, Write},
     marker::PhantomData,
-    os::windows::{
-        ffi::{OsStrExt, OsStringExt},
-        fs::OpenOptionsExt,
-    },
+    os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
-        atomic::{AtomicPtr, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
         Mutex, OnceLock,
     },
 };
 use windows_sys::{
-    core::PCSTR,
+    core::{PCSTR, PCWSTR},
     Win32::{
-        Foundation::{CloseHandle, FreeLibrary, FARPROC, HMODULE, WAIT_ABANDONED, WAIT_OBJECT_0},
-        Security::Cryptography::{BCryptHash, BCRYPT_SHA256_ALG_HANDLE},
-        Storage::FileSystem::{MoveFileExW, ReplaceFileW, FILE_SHARE_DELETE, FILE_SHARE_READ},
+        Foundation::{CloseHandle, FreeLibrary, FARPROC, HANDLE, HMODULE, WAIT_ABANDONED, WAIT_OBJECT_0},
+        Globalization::{MultiByteToWideChar, CP_ACP},
+        Security::{
+            Cryptography::{BCryptHash, BCRYPT_SHA256_ALG_HANDLE},
+            SECURITY_ATTRIBUTES,
+        },
+        Storage::FileSystem::{CreateFile2, CreateFileA, CreateFileW, CREATEFILE2_EXTENDED_PARAMETERS},
         System::{
             LibraryLoader::{
-                GetModuleHandleExW, GetProcAddress,
-                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                GetModuleHandleExW, GetProcAddress, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             },
             Threading::{
-                CreateMutexExW, ReleaseMutex, WaitForSingleObject, INFINITE,
-                MUTEX_MODIFY_STATE, SYNCHRONIZATION_SYNCHRONIZE,
+                CreateMutexExW, ReleaseMutex, WaitForSingleObject, INFINITE, MUTEX_MODIFY_STATE,
+                SYNCHRONIZATION_SYNCHRONIZE,
             },
         },
     },
 };
 
-const FFXIDB_SHA256: &str = "a843f6eca81fdf6b3e60984e0dd0bd93f6b292b2ccfe8bf79cca0fe51dbd8a58";
-const FFXIDB_ID: (u32, u32) = (0x6A51_21AC, 0xD_5000);
-const FACTORY_RVA: usize = 0x6_9DC0;
-const VTABLE_RVA: usize = 0xB_54C4;
 const SHARED_SETTINGS_MUTEX: &str = "Local\\CrystalLauncher.FFXIDB.settings.shared.v1";
-// FFXIDB's scan-result cache: a lazily constructed std::map {head, size} in
-// zero-filled .data. `mov ecx, offset cache` at both its lookup (3DCB9) and
-// its store (3E361) is checked live before the cache is trusted to be empty.
-const SCAN_CACHE_RVA: usize = 0xC_77F0;
-const SCAN_CACHE_REFERENCES: [usize; 2] = [0x3_DCB9, 0x3_E361];
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
-static COMMAND_TRACES: AtomicUsize = AtomicUsize::new(0);
-static POSITION_TRACES: AtomicUsize = AtomicUsize::new(0);
-
-static REPAIR_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 // Hook's plugin loader (crate::hook_layout, any build): it pushes
 // "CreateInstance" and the module, calls its KERNEL32!GetProcAddress import,
 // then calls the returned cdecl factory at factory_lookup + 0x17. Initialize
-// pushes (API, object) before public stdcall vtable+8. 4.7.9.3 and 4.7.9.6
-// reproduce their proven tables; other builds use the scan alone.
-
-// The 17 public stdcall callbacks are followed by a deleting destructor and
-// 16 internal thiscall callbacks. Preserve every entry and the RTTI locator
-// at vtable[-1], since the stock callbacks dispatch to the internal entries.
-const VTABLE_RVAS: [usize; 34] = [
-    0x78A50, 0x78A40, 0x78940, 0x78920, 0x78910, 0x78900, 0x788F0, 0x788D0, 0x788B0, 0x78890,
-    0x78870, 0x78670, 0x78640, 0x78610, 0x785F0, 0x785D0, 0x785B0, 0x149D0, 0x6A670, 0x6A470,
-    0x77810, 0x6A180, 0x6A170, 0x6A1A0, 0x77800, 0x777F0, 0x777E0, 0x6A4A0, 0x777D0, 0x6A120,
-    0x777C0, 0x777B0, 0x777A0, 0x6A190,
-];
+// pushes (API, object) before public stdcall vtable+8.
 
 type Resolve = unsafe extern "system" fn(HMODULE, PCSTR) -> FARPROC;
 type Factory = unsafe extern "C" fn() -> *mut c_void;
@@ -113,51 +97,55 @@ type Command = unsafe extern "system" fn(*mut c_void, *const u8);
 type Incoming = unsafe extern "system" fn(*mut c_void, *const u8, *const u8, u32, u8) -> u8;
 type Mouse = unsafe extern "system" fn(*mut c_void, u32, i32, i32, i32, u8) -> u8;
 
+/// The vtable slots of Hook's plugin interface that are wrapped, in the order
+/// of [`ORIGINAL`]: Initialize, Command, Incoming and Mouse. Their stdcall
+/// signatures are Windower's plugin ABI, the same for every plugin.
+const WRAPPED: [usize; 4] = [2, 7, 11, 13];
+/// The stock callbacks of the mapping in use, in [`WRAPPED`] order.
+static ORIGINAL: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+
+fn wrappers() -> [usize; 4] {
+    [initialize as *const () as usize, command as *const () as usize, incoming as *const () as usize, mouse as *const () as usize]
+}
 
 struct Bridge {
     _hook: OwnedModule,
     resolve: Resolve,
 }
-/// One FFXIDB mapping. It records the base address only; the one module
-/// reference Crystal keeps on that mapping lives in HELD and is dropped
-/// before the next GameStart.
-struct Adapter {
-    module: usize,
-    path: PathBuf,
-    factory: Factory,
-    original: [usize; 34],
-    original_vtable: usize,
-    // Box is stable when Adapter moves into its leaked allocation.
-    shadow: Box<[usize; 35]>,
-    transaction: &'static SettingsMutex,
-    /// GAME value when an instance was last constructed; NONE before that.
-    constructed_in: AtomicUsize,
-}
-const NONE: usize = usize::MAX;
 static BRIDGE: OnceLock<Bridge> = OnceLock::new();
-// The adapter for the FFXIDB mapping currently in use. Replaced when a game
-// loads a new mapping; earlier adapters are leaked so no reference dangles.
-static ADAPTER: AtomicPtr<Adapter> = AtomicPtr::new(std::ptr::null_mut());
 static INSTALL: Mutex<()> = Mutex::new(());
-static MAPPINGS: AtomicUsize = AtomicUsize::new(0);
 
-fn current_adapter() -> Option<&'static Adapter> {
-    let adapter = ADAPTER.load(Ordering::SeqCst);
-    // SAFETY: only `publish` stores here, always a leaked, never-freed Box.
-    (!adapter.is_null()).then(|| unsafe { &*adapter })
+/// The FFXIDB mapping Crystal protects.
+#[derive(Clone, Copy, Debug)]
+struct Mapping {
+    module: usize,
+    /// The stock `CreateInstance`.
+    factory: usize,
+    /// The vtable Crystal changed in place; 0 until an instance is built.
+    vtable: usize,
+    /// The game (GAME) during which it was built.
+    game: usize,
 }
+static MAPPING: Mutex<Option<Mapping>> = Mutex::new(None);
 
-fn publish(adapter: Adapter) -> &'static Adapter {
-    let adapter: &'static Adapter = Box::leak(Box::new(adapter));
-    ADAPTER.store(adapter as *const Adapter as *mut Adapter, Ordering::SeqCst);
-    adapter
+/// The settings mutex for one plugin path. Leaked: scopes borrow it.
+struct Settings {
+    plugin: PathBuf,
+    mutex: SettingsMutex,
+}
+static SETTINGS: AtomicPtr<Settings> = AtomicPtr::new(std::ptr::null_mut());
+
+fn settings() -> Option<&'static Settings> {
+    let settings = SETTINGS.load(Ordering::Acquire);
+    // SAFETY: only `protect` stores here, always a leaked, never-freed Box.
+    (!settings.is_null()).then(|| unsafe { &*settings })
 }
 
 // GameStart calls made by this host. FFXIDB scan results are valid only for
 // the game that was running when they were taken.
 static GAME: AtomicUsize = AtomicUsize::new(0);
 // Base of the FFXIDB mapping Crystal holds one module reference on (0: none).
-// Taken when a mapping is verified; dropped only by `release_held`.
+// Taken when an instance is protected; dropped only by `release_held`.
 static HELD: AtomicUsize = AtomicUsize::new(0);
 
 /// Keep `module` mapped until the next game starts, so Hook's FreeLibrary at
@@ -170,7 +158,7 @@ fn hold(module: usize) {
     std::mem::forget(reference);
     let previous = HELD.swap(module, Ordering::SeqCst);
     if previous != 0 {
-        // Never more than one reference: the same mapping verified twice, or
+        // Never more than one reference: the same mapping protected twice, or
         // (not expected) an older one still held.
         unsafe { FreeLibrary(previous as HMODULE) };
     }
@@ -201,45 +189,6 @@ pub(crate) fn game_starting() {
     GAME.fetch_add(1, Ordering::SeqCst);
 }
 
-/// The adapter in use, as `decide` sees it.
-#[derive(Clone, Copy, Debug)]
-struct Previous {
-    module: usize,
-    still_mapped: bool,
-    /// The game during which an instance was last constructed from it.
-    constructed_in: Option<usize>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Decision {
-    /// Verify this mapping and protect its instance.
-    Protect,
-    /// The same mapping, asked again during the game that built it.
-    SameGame,
-    /// A second FFXIDB image is loaded at the same time.
-    SecondImage,
-    /// FFXIDB's scan cache holds game addresses from an earlier game: its
-    /// stock code would dereference them. Never construct an instance.
-    StaleScanCache,
-}
-
-fn decide(previous: Option<Previous>, module: usize, cache_fresh: bool, game: usize) -> Decision {
-    if let Some(p) = previous {
-        if p.module != module && p.still_mapped {
-            return Decision::SecondImage;
-        }
-    }
-    if cache_fresh {
-        return Decision::Protect;
-    }
-    // A populated cache is expected only when this same mapping already
-    // built an instance during the current game (Hook asking again).
-    match previous {
-        Some(p) if p.module == module && p.constructed_in == Some(game) => Decision::SameGame,
-        _ => Decision::StaleScanCache,
-    }
-}
-
 /// `base` is still the start of a loaded FFXIDB.dll image.
 fn mapped_ffxidb(base: usize) -> bool {
     let mut module = std::ptr::null_mut();
@@ -250,21 +199,12 @@ fn mapped_ffxidb(base: usize) -> bool {
             &mut module,
         )
     };
-    ok != 0
-        && module as usize == base
-        && module_path(base).is_some_and(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("FFXIDB.dll"))
-        })
+    ok != 0 && module as usize == base && module_path(base).is_some_and(|path| is_named(&path, "FFXIDB.dll"))
 }
 
-/// FFXIDB's scan cache has never been constructed in this mapping, so every
-/// game address it uses will be scanned against the running game.
-fn scan_cache_fresh(base: usize) -> bool {
-    read::<[u32; 2]>(base + SCAN_CACHE_RVA) == Some([0, 0])
+fn is_named(path: &Path, name: &str) -> bool {
+    path.file_name().is_some_and(|file| file.to_string_lossy().eq_ignore_ascii_case(name))
 }
-
-use crate::mem::read;
 
 fn pe_identity(base: usize) -> Option<(u32, u32)> {
     crate::pe::identity(base).map(|image| (image.timestamp, image.size as u32))
@@ -290,23 +230,14 @@ fn sha256(bytes: &[u8]) -> Option<String> {
     (status == 0).then(|| digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-fn file_matches(path: &Path, expected: &str) -> bool {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| sha256(&bytes))
-        .as_deref()
-        == Some(expected)
-}
-
-/// The FFXIDB file at `path` is the one build this adapter supports (the
-/// plugin side is still pinned; see the module notes). For the release survey.
-#[cfg(test)]
-pub(crate) fn ffxidb_file_supported(path: &Path) -> Result<(), String> {
-    if !path.is_file() {
-        return Err(format!("{} is not installed", path.display()));
+/// Says that FFXIDB runs without protection: in the loader log each time, and
+/// once per host, through the launcher, in the launch history.
+pub(crate) fn report_unprotected(reason: &str) {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    log!("note: FFXIDB minimap settings protection is OFF: {reason}");
+    if !REPORTED.swap(true, Ordering::SeqCst) {
+        crate::events::send(crate::proto::notice_line(&format!("FFXIDB minimap settings protection is off: {reason}.")));
     }
-    file_matches(path, FFXIDB_SHA256).then_some(())
-        .ok_or_else(|| "not the verified FFXIDB 1.2.3.14 build (the adapter is pinned to it)".into())
 }
 
 /// Live re-check, in this process's memory, of every byte the resolved
@@ -334,23 +265,6 @@ fn verified_hook(base: usize) -> Result<(Plugins, String), String> {
     Ok((plugins, label))
 }
 
-fn plugin_layout(base: usize) -> bool {
-    read::<u32>(base + VTABLE_RVA - 4) == Some((base + 0xBCEE0) as u32)
-        && VTABLE_RVAS.iter().enumerate().all(|(index, rva)| {
-            read::<u32>(base + VTABLE_RVA + index * 4) == Some((base + rva) as u32)
-        })
-        && read::<[u8; 5]>(base + FACTORY_RVA) == Some([0x55, 0x8B, 0xEC, 0x6A, 0xFF])
-        && read::<[u8; 5]>(base + 0x78940) == Some([0x55, 0x8B, 0xEC, 0x6A, 0xFF])
-        && read::<[u8; 3]>(base + 0x78A35) == Some([0xC2, 0x08, 0x00])
-        && read::<[u8; 3]>(base + 0x788EB) == Some([0xC2, 0x08, 0x00])
-        && read::<[u8; 3]>(base + 0x78866) == Some([0xC2, 0x14, 0x00])
-        && read::<[u8; 3]>(base + 0x78633) == Some([0xC2, 0x18, 0x00])
-        && SCAN_CACHE_REFERENCES.iter().all(|rva| {
-            read::<u8>(base + rva) == Some(0xB9)
-                && read::<u32>(base + rva + 1) == Some((base + SCAN_CACHE_RVA) as u32)
-        })
-}
-
 /// Change one aligned data pointer; never write executable code. A failed
 /// page restore is reported even when the replacement is already active.
 fn replace_pointer(address: usize, expected: usize, replacement: usize) -> Result<(), String> {
@@ -370,7 +284,7 @@ fn replace_pointer(address: usize, expected: usize, replacement: usize) -> Resul
 
 /// Call after Hook has loaded and before GameStart. Ok(true) means Hook's
 /// factory interception is installed; the log confirms FFXIDB when it loads.
-/// An unsupported Hook build is explicitly logged and left stock.
+/// An unsupported Hook build is reported and left stock.
 pub(crate) fn install() -> Result<bool, String> {
     let _serial = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(hook) = crate::hook_layout::retain_hook() else { return Ok(false) };
@@ -378,10 +292,10 @@ pub(crate) fn install() -> Result<bool, String> {
     let (build, version) = match verified_hook(base) {
         Ok(found) => found,
         Err(reason) => {
-            log!(
-                "note: FFXIDB shared-settings protection unavailable: Windower Hook.dll verification failed: {reason} (loaded PE identity {:X?})",
+            report_unprotected(&format!(
+                "Windower's Hook.dll plugin loader could not be verified: {reason} (loaded PE identity {:X?})",
                 pe_identity(base)
-            );
+            ));
             return Ok(false);
         }
     };
@@ -545,66 +459,6 @@ impl SettingsMutex {
     }
 }
 
-fn shadow_table(original: &[usize; 34], rtti: usize) -> Box<[usize; 35]> {
-    let mut shadow = Box::new([0; 35]);
-    shadow[0] = rtti;
-    shadow[1..].copy_from_slice(original);
-    // XML entry points in this exact image:
-    // - Initialize registers fields (173D0/17790/17B60/17F20) and loads the
-    //   current character (3B550).
-    // - Command -> 701F0 -> 238D0 (save all), 26170, or 6B3E0/6BD00/
-    //   6C110/6C2D0 -> 25E70/25D60/25C40 -> 23DD0 (save one field).
-    // - Mouse -> 72540 -> 6C110/6C2D0 -> 25C40 -> 23DD0.
-    // - Incoming -> 78670 -> 3B550 loads character settings on 0x00A/0x00B.
-    // Update/render/shutdown do not reach these XML helpers. Leave their
-    // graphics/resource calls outside the mutex to avoid adding a lock order
-    // between the settings lock and unrelated Hook/Direct3D callbacks.
-    for (slot, wrapper) in [
-        (2, initialize as *const () as usize),
-        (7, command as *const () as usize),
-        (11, incoming as *const () as usize),
-        (13, mouse as *const () as usize),
-    ] {
-        shadow[slot + 1] = wrapper;
-    }
-    shadow
-}
-
-/// Verify one FFXIDB mapping. The module reference taken here only covers
-/// preparation (Hook holds its own); it is released before returning.
-fn prepare(
-    module: usize,
-    factory: usize,
-    path: &Path,
-    reuse: Option<&'static SettingsMutex>,
-) -> Result<Option<Adapter>, String> {
-    let _preparing =
-        OwnedModule::retain_at(module).ok_or("FFXIDB module disappeared during adapter preparation")?;
-    // The image identity, factory and layout were checked by the caller.
-    if !file_matches(path, FFXIDB_SHA256) {
-        return Ok(None);
-    }
-    let transaction = match reuse {
-        Some(transaction) => transaction,
-        None => &*Box::leak(Box::new(SettingsMutex::open(path)?)),
-    };
-    {
-        let _probe = transaction.acquire(30_000)?;
-    }
-    let original = VTABLE_RVAS.map(|rva| module + rva);
-    let shadow = shadow_table(&original, module + 0xBCEE0);
-    Ok(Some(Adapter {
-        module,
-        path: path.to_owned(),
-        factory: unsafe { std::mem::transmute::<usize, Factory>(factory) },
-        original,
-        original_vtable: module + VTABLE_RVA,
-        shadow,
-        transaction,
-        constructed_in: AtomicUsize::new(NONE),
-    }))
-}
-
 fn as_farproc(factory: Factory) -> FARPROC {
     Some(unsafe { std::mem::transmute::<Factory, unsafe extern "system" fn() -> isize>(factory) })
 }
@@ -618,78 +472,82 @@ unsafe extern "system" fn resolve(module: HMODULE, name: PCSTR) -> FARPROC {
     {
         return original;
     }
-    let Some(path) = module_path(module as usize) else {
+    let Some(path) = module_path(module as usize).filter(|path| is_named(path, "FFXIDB.dll")) else {
         return original;
     };
-    if !path
-        .file_name()
-        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("FFXIDB.dll"))
-    {
-        return original;
-    }
     let _serial = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
-    resolve_ffxidb(module as usize, original, &path)
-}
-
-fn resolve_ffxidb(module: usize, original: FARPROC, path: &Path) -> FARPROC {
-    let previous = current_adapter();
-    let game = GAME.load(Ordering::SeqCst);
-    let factory = original.unwrap() as *const () as usize;
-    // The scan-cache offsets mean something only in the pinned image; any
-    // other build is left stock.
-    let pinned = pe_identity(module) == Some(FFXIDB_ID)
-        && factory == module + FACTORY_RVA
-        && plugin_layout(module);
-    if !pinned {
-        log!("note: FFXIDB shared-settings protection unavailable: unsupported plugin build (requires verified 1.2.3.14); leaving stock callbacks");
-        return original;
-    }
-    let decision = decide(
-        previous.map(|p| Previous {
-            module: p.module,
-            still_mapped: p.module != module && mapped_ffxidb(p.module),
-            constructed_in: match p.constructed_in.load(Ordering::SeqCst) {
-                NONE => None,
-                game => Some(game),
-            },
-        }),
-        module,
-        scan_cache_fresh(module),
-        game,
-    );
-    match decision {
-        Decision::SecondImage => {
-            log!("error: refusing a second FFXIDB image with a different settings location");
-            return as_farproc(disabled_factory);
-        }
-        Decision::StaleScanCache => {
-            // Only reachable if something other than Crystal kept FFXIDB
-            // mapped after Crystal released it. Its own code would crash this
-            // game. A later game loads it again once that reference is gone.
-            log!("note: FFXIDB not loaded for this game: the plugin stayed in memory after the previous game and still holds that game's addresses");
-            return as_farproc(disabled_factory);
-        }
-        Decision::SameGame => return as_farproc(create_instance),
-        Decision::Protect => {}
-    }
-    let reuse = previous.filter(|p| p.path == path).map(|p| p.transaction);
-    match prepare(module, factory, path, reuse) {
-        Ok(Some(adapter)) => {
-            publish(adapter);
-            hold(module);
-            let mapping = MAPPINGS.fetch_add(1, Ordering::Relaxed) + 1;
-            log!("stage: verified FFXIDB 1.2.3.14 shared-settings transaction protection prepared (mapping {mapping} in this host, base {module:#x}, scan cache empty; kept loaded until the next game starts)");
-            as_farproc(create_instance)
-        }
-        Ok(None) => {
-            log!("note: FFXIDB shared-settings protection unavailable: unsupported plugin build (requires verified 1.2.3.14); leaving stock callbacks");
+    let factory = original.map_or(0, |f| f as *const () as usize);
+    match protect(module as usize, &path, factory) {
+        Ok(factory) => factory,
+        Err(reason) => {
+            report_unprotected(&reason);
             original
         }
-        Err(error) => {
-            log!("error: FFXIDB disabled before construction because settings protection failed: {error}");
-            as_farproc(disabled_factory)
+    }
+}
+
+/// The vtable at `vtable` already holds Crystal's wrappers: this mapping
+/// built an instance before.
+fn patched(vtable: usize) -> bool {
+    read::<usize>(vtable + WRAPPED[0] * 4) == Some(wrappers()[0])
+}
+
+/// The factory Hook gets for the FFXIDB at `module`. Err: protection is off,
+/// FFXIDB runs stock.
+fn protect(module: usize, plugin: &Path, factory: usize) -> Result<FARPROC, String> {
+    let game = GAME.load(Ordering::SeqCst);
+    let mut mapping = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(last) = *mapping {
+        if last.module != module && mapped_ffxidb(last.module) {
+            log!("error: refusing a second FFXIDB image loaded beside the first");
+            return Ok(as_farproc(disabled_factory));
+        }
+        if last.module == module && last.vtable != 0 && patched(last.vtable) {
+            if last.game == game {
+                // Hook asking again during the game that built it.
+                return Ok(as_farproc(create_instance));
+            }
+            // Only reachable if something other than Crystal kept FFXIDB
+            // mapped after Crystal released it: its scan caches hold the
+            // previous game's addresses and its own code would crash this
+            // game. A later game loads it again once that reference is gone.
+            log!("note: FFXIDB not loaded for this game: the plugin stayed in memory after the previous game and still holds that game's addresses");
+            return Ok(as_farproc(disabled_factory));
         }
     }
+    route_file_opens(module)?;
+    if settings().is_none_or(|settings| settings.plugin != plugin) {
+        let settings = Box::new(Settings { plugin: plugin.to_owned(), mutex: SettingsMutex::open(plugin)? });
+        SETTINGS.store(Box::leak(settings), Ordering::Release);
+    }
+    *mapping = Some(Mapping { module, factory, vtable: 0, game });
+    log!("stage: FFXIDB at {module:#x}: its settings file opens are serialized across Crystal game hosts");
+    Ok(as_farproc(create_instance))
+}
+
+/// Points FFXIDB's own KERNEL32 CreateFile imports at [`opening`]'s wrappers.
+/// Err when it imports none of them or a slot cannot be changed.
+fn route_file_opens(module: usize) -> Result<(), String> {
+    let mut routed = 0;
+    // SAFETY: Hook just loaded this module and holds it.
+    for import in unsafe { crate::iat::import_slots(module, "KERNEL32.dll") } {
+        let replacement = match import.name.as_deref() {
+            Some("CreateFileW") => create_file_w as *const () as usize,
+            Some("CreateFileA") => create_file_a as *const () as usize,
+            Some("CreateFile2") => create_file_2 as *const () as usize,
+            _ => continue,
+        };
+        let slot = import.slot as usize;
+        let current = read::<usize>(slot).ok_or("FFXIDB's import table is unreadable")?;
+        if current != replacement {
+            replace_pointer(slot, current, replacement)?;
+        }
+        routed += 1;
+    }
+    if routed == 0 {
+        return Err("this FFXIDB.dll imports no CreateFile function from KERNEL32, so Crystal cannot see it open its settings".into());
+    }
+    Ok(())
 }
 
 unsafe extern "C" fn disabled_factory() -> *mut c_void {
@@ -697,701 +555,288 @@ unsafe extern "C" fn disabled_factory() -> *mut c_void {
 }
 
 unsafe extern "C" fn create_instance() -> *mut c_void {
-    let adapter = adapter();
-    let game = GAME.load(Ordering::SeqCst);
-    // Re-check at construction: Hook calls the factory right after resolving
-    // it, but never construct over a scan cache left by an earlier game.
-    if !scan_cache_fresh(adapter.module)
-        && adapter.constructed_in.load(Ordering::SeqCst) != game
-    {
-        log!("note: FFXIDB not constructed: its scan cache holds an earlier game's addresses");
-        return std::ptr::null_mut();
-    }
-    let _guard = match adapter.transaction.acquire(30_000) {
-        Ok(guard) => guard,
-        Err(error) => {
-            log!("error: FFXIDB not constructed: {error}");
-            return std::ptr::null_mut();
-        }
+    let Some(mut mapping) = *MAPPING.lock().unwrap_or_else(|e| e.into_inner()) else {
+        std::process::abort()
     };
-    let instance = (adapter.factory)();
+    let factory = std::mem::transmute::<usize, Factory>(mapping.factory);
+    let instance = serialized(|| factory());
     if instance.is_null() {
         return instance;
     }
-    if let Err(error) = replace_pointer(
-        instance as usize,
-        adapter.original_vtable,
-        adapter.shadow[1..].as_ptr() as usize,
-    ) {
-        // Do not guess a destructor for an object whose vptr is unexpected.
-        // Nothing has been initialized or published to Hook yet. Its normal
-        // null-factory path rejects the plugin; the small allocation remains.
-        log!("error: FFXIDB not initialized: {error}");
-        return std::ptr::null_mut();
+    match wrap(instance as usize) {
+        Ok(vtable) => {
+            mapping.vtable = vtable;
+            mapping.game = GAME.load(Ordering::SeqCst);
+            *MAPPING.lock().unwrap_or_else(|e| e.into_inner()) = Some(mapping);
+            hold(mapping.module);
+            log!("stage: FFXIDB settings callbacks protected across Crystal game hosts (kept loaded until the next game starts)");
+        }
+        Err(reason) => report_unprotected(&reason),
     }
-    adapter.constructed_in.store(game, Ordering::SeqCst);
-    log!("stage: FFXIDB settings callbacks protected across Crystal game hosts");
     instance
 }
 
-fn adapter() -> &'static Adapter {
-    current_adapter().unwrap_or_else(|| std::process::abort())
-}
-fn callback_transaction(adapter: &Adapter) -> SettingsTransaction<'_> {
-    adapter
-        .transaction
-        .acquire(INFINITE)
-        .unwrap_or_else(|error| {
-            // A permanent valid handle cannot time out. Never call stock code
-            // unlocked, or return from void Initialize pretending it succeeded.
-            log!(
-                "error: {error}; terminating this host to prevent unlocked FFXIDB settings writes"
-            );
-            std::process::abort()
-        })
-}
-
-#[derive(Debug, PartialEq)]
-enum SettingsCommand {
-    Position { x: Option<f32>, y: Option<f32> },
-    Save,
-    Reload,
-}
-
-fn settings_command(text: &str) -> Option<SettingsCommand> {
-    // The verified callback treats ASCII verbs case-insensitively and removes
-    // double quotes while grouping tokens. Classify the same numeric commands
-    // without retaining or logging arbitrary command text.
-    let mut tokens = Vec::new();
-    let mut token = String::new();
-    let mut quoted = false;
-    for character in text.chars() {
-        if character == '"' {
-            quoted = !quoted;
-        } else if character.is_ascii_whitespace() && !quoted {
-            if !token.is_empty() {
-                tokens.push(std::mem::take(&mut token));
-            }
-        } else {
-            token.push(character.to_ascii_lowercase());
+/// Replaces the [`WRAPPED`] slots of `instance`'s vtable, in place, keeping
+/// the stock callbacks in [`ORIGINAL`]. A slot already wrapped (the same
+/// mapping building another instance) is left as it is.
+fn wrap(instance: usize) -> Result<usize, String> {
+    let vtable = crate::mem::pointer(instance, 0x100).ok_or("FFXIDB's plugin object has no readable vtable")?;
+    for (index, (slot, wrapper)) in WRAPPED.into_iter().zip(wrappers()).enumerate() {
+        let at = vtable + slot * 4;
+        let current = read::<usize>(at).ok_or("FFXIDB's vtable is unreadable")?;
+        if current != wrapper {
+            ORIGINAL[index].store(current, Ordering::Release);
+            replace_pointer(at, current, wrapper)?;
         }
     }
-    if !token.is_empty() {
-        tokens.push(token);
-    }
-    let mut words = tokens.iter().map(String::as_str);
-    let mut verb = words.next()?;
-    // The verified plugin accepts these optional map prefixes.
-    if matches!(verb, "m" | "map") {
-        verb = words.next()?;
-    }
-    let number = |word: Option<&str>| word?.parse::<f32>().ok().filter(|n| n.is_finite());
-    match verb {
-        "p" | "pos" | "position" => Some(SettingsCommand::Position {
-            x: Some(number(words.next())?),
-            y: Some(number(words.next())?),
-        }),
-        "px" | "posx" | "positionx" => Some(SettingsCommand::Position {
-            x: Some(number(words.next())?),
-            y: None,
-        }),
-        "py" | "posy" | "positiony" => Some(SettingsCommand::Position {
-            x: None,
-            y: Some(number(words.next())?),
-        }),
-        "save" => Some(SettingsCommand::Save),
-        "r" | "reload" => Some(SettingsCommand::Reload),
-        _ => None,
-    }
+    Ok(vtable)
 }
 
-fn bounded_command(text: *const u8) -> Option<String> {
-    if text.is_null() {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    for offset in 0..256 {
-        let byte = read::<u8>((text as usize).checked_add(offset)?)?;
-        if byte == 0 {
-            return String::from_utf8(bytes).ok();
-        }
-        bytes.push(byte);
-    }
-    None
+/// The settings transaction of one thread's outermost callback.
+struct Scope {
+    depth: usize,
+    open: Option<Open>,
 }
-
-fn global_settings_active(this: *mut c_void) -> bool {
-    settings_scope(this).as_deref() == Some("global")
-}
-
-fn valid_settings_scope(scope: &str) -> bool {
-    // Character scopes are XML element names in the verified settings format.
-    // Accept the bounded ASCII representation; never interpolate arbitrary XML.
-    !scope.is_empty()
-        && scope.len() <= 128
-        && scope.as_bytes()[0].is_ascii_alphabetic()
-        && scope.bytes().all(|byte| byte.is_ascii_alphanumeric())
-}
-
-/// The characters of an MSVC `basic_string<T>` {buffer-or-pointer[16], size,
-/// capacity} at `address`, read in one span: inline below the small-string
-/// capacity, else at the pointer. Refuses an empty, oversized or
-/// inconsistent representation, and (`require_nul`) a missing terminator.
-fn read_msvc_string<T: Copy + Default + PartialEq>(address: usize, max_len: usize, max_cap: Option<u32>, require_nul: bool) -> Option<Vec<T>> {
-    let layout = read::<[u32; 6]>(address)?;
-    let (length, capacity) = (layout[4] as usize, layout[5] as usize);
-    if length == 0 || length > max_len || length > capacity || max_cap.is_some_and(|max| layout[5] > max) {
-        return None;
-    }
-    let data = if capacity < 16 / std::mem::size_of::<T>() { address } else { layout[0] as usize };
-    let count = length + usize::from(require_nul);
-    let bytes = count.checked_mul(std::mem::size_of::<T>())?;
-    data.checked_add(bytes)?;
-    let mut out = vec![T::default(); count];
-    if !crate::mem::read_into(data, &mut out) || (require_nul && out.pop() != Some(T::default())) {
-        return None;
-    }
-    Some(out)
-}
-
-fn settings_scope(this: *mut c_void) -> Option<String> {
-    // In this exact, hash-verified image, settings live at object+B8 and the
-    // current character std::string at settings+18. An empty login name is
-    // normalized to "global" by 3B550. Check the representation before reading.
-    let bytes = read_msvc_string::<u8>((this as usize).checked_add(0xD0)?, 128, Some(32767), true)?;
-    let scope = String::from_utf8(bytes).ok()?;
-    valid_settings_scope(&scope).then_some(scope)
-}
-
-fn settings_filename(this: *mut c_void) -> Option<PathBuf> {
-    // The filename already selected by FFXIDB is a std::wstring at object+B8.
-    // Reading this avoids inferring Hook's settings root from the DLL location.
-    let buffer = read_msvc_string::<u16>((this as usize).checked_add(0xB8)?, 32767, None, false)?;
-    if buffer.contains(&0) {
-        return None;
-    }
-    let path = PathBuf::from(OsString::from_wide(&buffer));
-    (path.is_absolute()
-        && path
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("FFXIDB.xml")))
-    .then_some(path)
-}
-
-fn read_settings(file: &mut File) -> Result<String, String> {
-    let mut xml = String::new();
-    file.take(MAX_SETTINGS_BYTES + 1)
-        .read_to_string(&mut xml)
-        .map_err(|e| format!("settings read failed ({:?})", e.kind()))?;
-    if xml.len() as u64 > MAX_SETTINGS_BYTES {
-        return Err("settings XML exceeds repair limit".into());
-    }
-    Ok(xml)
-}
-
-fn settings_node<'a, 'input>(
-    document: &'a roxmltree::Document<'input>,
-    scope: &str,
-) -> Result<Option<roxmltree::Node<'a, 'input>>, String> {
-    let root = document.root_element();
-    if root.tag_name().name() != "settings" || root.tag_name().namespace().is_some() {
-        return Err("unexpected settings XML root".into());
-    }
-    let mut nodes = root
-        .children()
-        .filter(|node| node.is_element() && node.tag_name().name() == scope);
-    let Some(node) = nodes.next() else {
-        return Ok(None);
-    };
-    if nodes.next().is_some() {
-        return Err("settings XML has duplicate target sections".into());
-    }
-    if node.tag_name().namespace().is_some() {
-        return Err("unsupported settings section namespace".into());
-    }
-    Ok(Some(node))
-}
-
-#[derive(Debug)]
-struct GlobalPosition {
-    fields: [Option<String>; 2],
-}
-
-impl GlobalPosition {
-    fn capture(xml: &str) -> Result<Self, String> {
-        let document = roxmltree::Document::parse(xml).map_err(|_| "invalid settings XML")?;
-        let global =
-            settings_node(&document, "global")?.ok_or("settings XML has no global section")?;
-        Ok(Self {
-            fields: position_fields(xml, Some(global))?,
-        })
-    }
-
-    fn restore_missing(&self, current: &str) -> Result<Option<String>, String> {
-        let document =
-            roxmltree::Document::parse(current).map_err(|_| "invalid current settings XML")?;
-        let global = settings_node(&document, "global")?;
-        let mut insertion = String::new();
-        for (index, name) in ["X", "Y"].iter().enumerate() {
-            let present = position_child(global, name, false)
-                .map_err(|()| "ambiguous current global position field")?;
-            if present.is_none() {
-                if let Some(field) = &self.fields[index] {
-                    insertion.push_str(field);
-                }
-            }
-        }
-        if insertion.is_empty() {
-            return Ok(None);
-        }
-        // Splice only missing fields into the freshly read document. Preserve
-        // every other byte, including newer edits, other characters and comments.
-        // If X/Y were its only fields, the vendor removes the empty global
-        // section too. Recreate only these coordinates, never its old document.
-        append_position_fields(current, &document, global, "global", insertion).map(Some)
-    }
-}
-
-/// The section's unique, un-namespaced `name` child, if any. Err on a
-/// namespaced or second match, or (`leaf_only`) one with element children.
-fn position_child<'a, 'i>(
-    section: Option<roxmltree::Node<'a, 'i>>,
-    name: &str,
-    leaf_only: bool,
-) -> Result<Option<roxmltree::Node<'a, 'i>>, ()> {
-    let mut nodes = section
-        .into_iter()
-        .flat_map(|node| node.children())
-        .filter(|node| node.is_element() && node.tag_name().name() == name);
-    let Some(node) = nodes.next() else { return Ok(None) };
-    if node.tag_name().namespace().is_some()
-        || nodes.next().is_some()
-        || (leaf_only && node.children().any(|child| child.is_element()))
-    {
-        return Err(());
-    }
-    Ok(Some(node))
-}
-
-fn position_fields(
-    xml: &str,
-    section: Option<roxmltree::Node<'_, '_>>,
-) -> Result<[Option<String>; 2], String> {
-    let mut fields = [None, None];
-    for (index, name) in ["X", "Y"].iter().enumerate() {
-        if let Some(node) = position_child(section, name, true).map_err(|()| "ambiguous position field")? {
-            if node
-                .text()
-                .and_then(|s| s.trim().parse::<f64>().ok())
-                .is_some_and(f64::is_finite)
-            {
-                fields[index] = Some(xml[node.range()].to_owned());
-            }
-        }
-    }
-    Ok(fields)
-}
-
-fn append_position_fields(
-    current: &str,
-    document: &roxmltree::Document<'_>,
-    section: Option<roxmltree::Node<'_, '_>>,
-    scope: &str,
-    mut insertion: String,
-) -> Result<String, String> {
-    let container = section.unwrap_or_else(|| document.root_element());
-    if section.is_none() {
-        insertion = format!("<{scope}>{insertion}</{scope}>");
-    }
-    let range = container.range();
-    let container_xml = &current[range.clone()];
-    let (start, end, replacement) = if container_xml.ends_with("/>") {
-        (
-            range.end - 2,
-            range.end,
-            format!(">{insertion}</{}>", container.tag_name().name()),
-        )
-    } else {
-        let closing = container_xml
-            .rfind("</")
-            .ok_or("missing settings closing tag")?;
-        (range.start + closing, range.start + closing, insertion)
-    };
-    let mut result = current.to_owned();
-    result.replace_range(start..end, &replacement);
-    roxmltree::Document::parse(&result).map_err(|_| "invalid repaired settings XML")?;
-    Ok(result)
-}
-
-fn pin_character_position(
-    current: &str,
-    scope: &str,
-    position: [Option<f32>; 2],
-    retained: &[Option<String>; 2],
-) -> Result<Option<String>, String> {
-    if !valid_settings_scope(scope) || scope == "global" {
-        return Err("cannot verify character settings scope".into());
-    }
-    let document = roxmltree::Document::parse(current).map_err(|_| "invalid settings XML")?;
-    let section = settings_node(&document, scope)?;
-    let mut insertion = String::new();
-    for (index, name) in ["X", "Y"].into_iter().enumerate() {
-        let field = match position[index] {
-            Some(value) if value.is_finite() => format!("<{name}>{value}</{name}>"),
-            Some(_) => return Err("non-finite character position".into()),
-            None => match &retained[index] {
-                Some(field) => field.clone(),
-                None => continue,
-            },
-        };
-        // An axis the callback already persisted keeps its value and
-        // formatting; only compensate for its equality-based deletion.
-        if position_child(section, name, true).map_err(|()| "ambiguous character position field")?.is_none() {
-            insertion.push_str(&field);
-        }
-    }
-    if insertion.is_empty() {
-        Ok(None)
-    } else {
-        append_position_fields(current, &document, section, scope, insertion).map(Some)
-    }
-}
-
-struct PositionRepair {
+/// FFXIDB.xml as it was when the scope first opened it, and the lock taken then.
+struct Open {
     path: PathBuf,
-    before: GlobalPosition,
+    before: Option<String>,
+    _guard: SettingsTransaction<'static>,
+}
+thread_local! {
+    static SCOPE: RefCell<Scope> = const { RefCell::new(Scope { depth: 0, open: None }) };
 }
 
-impl PositionRepair {
-    fn capture(this: *mut c_void) -> Result<Option<Self>, String> {
-        if !global_settings_active(this) {
-            return Ok(None);
+/// Runs one FFXIDB callback as a settings scope: any FFXIDB.xml it opens is
+/// read, changed and written under the settings mutex, which is released, after
+/// the position repair, when the outermost scope returns.
+fn serialized<R>(call: impl FnOnce() -> R) -> R {
+    SCOPE.with(|scope| scope.borrow_mut().depth += 1);
+    let result = call();
+    let open = SCOPE.with(|scope| {
+        let mut scope = scope.borrow_mut();
+        scope.depth -= 1;
+        if scope.depth == 0 { scope.open.take() } else { None }
+    });
+    if let Some(open) = open {
+        open.finish();
+    }
+    result
+}
+
+/// FFXIDB is about to open `path`. The first open of its settings in a scope
+/// takes the mutex and reads the file as it was.
+fn opening(path: PathBuf) {
+    if !is_named(&path, "FFXIDB.xml") {
+        return;
+    }
+    // try_with: a thread that is exiting has no scope (nor a callback).
+    let _ = SCOPE.try_with(|scope| {
+        let mut scope = scope.borrow_mut();
+        if scope.open.is_some() {
+            return;
         }
-        let path = settings_filename(this).ok_or("cannot verify FFXIDB settings filename")?;
-        let mut file =
-            File::open(&path).map_err(|e| format!("settings open failed ({:?})", e.kind()))?;
-        let before = GlobalPosition::capture(&read_settings(&mut file)?)?;
-        Ok(before
-            .fields
-            .iter()
-            .any(Option::is_some)
-            .then_some(Self { path, before }))
-    }
-
-    fn apply(&self) -> Result<bool, String> {
-        edit_settings(&self.path, |current| self.before.restore_missing(current))
-    }
-}
-
-fn edit_settings(
-    path: &Path,
-    edit: impl FnOnce(&str) -> Result<Option<String>, String>,
-) -> Result<bool, String> {
-    // Deny writers while examining and staging the current file. The
-    // callback's transaction mutex stays held through the replacement.
-    let mut file = OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
-        .open(path)
-        .map_err(|e| format!("settings reopen failed ({:?})", e.kind()))?;
-    let current = read_settings(&mut file)?;
-    let Some(repaired) = edit(&current)? else {
-        return Ok(false);
-    };
-    let parent = path.parent().ok_or("settings path has no parent")?;
-    let temporary = parent.join(format!(
-        ".FFXIDB.crystal-{}-{}.tmp",
-        std::process::id(),
-        REPAIR_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|e| format!("repair staging failed ({:?})", e.kind()))?;
-    let staged = output
-        .write_all(repaired.as_bytes())
-        .and_then(|()| output.sync_all());
-    drop(output);
-    // ReplaceFile opens the destination for write access itself. Close our
-    // read handle only after staging; all protected hosts still hold/wait on
-    // the same transaction mutex. Preserve the existing file's metadata.
-    drop(file);
-    match staged {
-        Ok(()) => {
-            let backup = temporary.with_extension("backup");
-            // Reserve this name with create_new: ReplaceFile may overwrite
-            // its backup name, so it must never be someone else's file.
-            let reservation = match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&backup)
-            {
-                Ok(file) => file,
-                Err(error) => {
-                    let _ = std::fs::remove_file(&temporary);
-                    return Err(format!(
-                        "repair backup reservation failed ({:?})",
-                        error.kind()
-                    ));
-                }
-            };
-            drop(reservation);
-            let target: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-            let replacement: Vec<_> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
-            let backup_w: Vec<_> = backup.as_os_str().encode_wide().chain(Some(0)).collect();
-            if unsafe {
-                ReplaceFileW(
-                    target.as_ptr(),
-                    replacement.as_ptr(),
-                    backup_w.as_ptr(),
-                    0,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
-            } == 0
-            {
-                let error = std::io::Error::last_os_error().raw_os_error();
-                recover_replacement_failure(path, &temporary, &backup, &current, error);
-                Err(format!("repair replacement failed (Win32 {:?})", error))
-            } else {
-                let _ = std::fs::remove_file(backup);
-                Ok(true)
+        if scope.depth == 0 {
+            static OUTSIDE: AtomicBool = AtomicBool::new(false);
+            if !OUTSIDE.swap(true, Ordering::Relaxed) {
+                report_unprotected("FFXIDB opened its settings outside the plugin callbacks Crystal serializes");
             }
+            return;
         }
-        Err(e) => {
-            // Replacement has not started, so only the incomplete staging
-            // file belongs to this failed write; the current XML is intact.
-            let _ = std::fs::remove_file(temporary);
-            Err(format!("repair staging write failed ({:?})", e.kind()))
-        }
-    }
-}
-
-fn same_settings_file(path: &Path, expected: &str) -> bool {
-    File::open(path)
-        .ok()
-        .and_then(|mut file| read_settings(&mut file).ok())
-        .as_deref()
-        == Some(expected)
-}
-
-fn recover_replacement_failure(
-    target: &Path,
-    staging: &Path,
-    backup: &Path,
-    current: &str,
-    error: Option<i32>,
-) {
-    // ReplaceFile errors 1176/1177 can leave the target missing or renamed.
-    // Recover only our complete backup, and never replace a newly created
-    // target. A failed non-replacing rename leaves the backup untouched.
-    if same_settings_file(backup, current) {
-        let source: Vec<_> = backup.as_os_str().encode_wide().chain(Some(0)).collect();
-        let destination: Vec<_> = target.as_os_str().encode_wide().chain(Some(0)).collect();
-        unsafe {
-            MoveFileExW(source.as_ptr(), destination.as_ptr(), 0);
-        }
-    }
-    // Keep recovery copies after every partially completed replacement, even
-    // when target recovery succeeded. On an ordinary failure, cleanup is safe
-    // only after verifying the complete current file still exists at target.
-    if !matches!(error, Some(1176 | 1177)) && same_settings_file(target, current) {
-        let _ = std::fs::remove_file(staging);
-        let _ = std::fs::remove_file(backup);
-    }
-}
-
-enum PositionSnapshot {
-    Global(PositionRepair),
-    Character {
-        path: PathBuf,
-        scope: String,
-        axes: [bool; 2],
-        retained: [Option<String>; 2],
-    },
-}
-
-impl PositionSnapshot {
-    fn capture(this: *mut c_void, axes: [bool; 2]) -> Result<Option<Self>, String> {
-        let scope = settings_scope(this).ok_or("cannot verify active settings scope")?;
-        if scope == "global" {
-            return PositionRepair::capture(this).map(|snapshot| snapshot.map(Self::Global));
-        }
-        let path = settings_filename(this).ok_or("cannot verify FFXIDB settings filename")?;
-        let mut file = File::open(&path)
-            .map_err(|error| format!("settings open failed ({:?})", error.kind()))?;
-        let before = read_settings(&mut file)?;
-        let document = roxmltree::Document::parse(&before).map_err(|_| "invalid settings XML")?;
-        let before = position_fields(&before, settings_node(&document, &scope)?)?;
-        // Stock px/py saves both axes. Keep an existing untouched override,
-        // but never turn an inherited untouched axis into a new override.
-        let retained = std::array::from_fn(|index| {
-            if axes[index] {
-                None
-            } else {
-                before[index].clone()
-            }
+        let Some(settings) = settings() else { return };
+        let guard = settings.mutex.acquire(INFINITE).unwrap_or_else(|error| {
+            // A permanent valid handle cannot time out. Never let FFXIDB
+            // read and write its settings unlocked.
+            log!("error: {error}; terminating this host to prevent unlocked FFXIDB settings writes");
+            std::process::abort()
         });
-        Ok(Some(Self::Character {
-            path,
-            scope,
-            axes,
-            retained,
-        }))
-    }
+        let before = read_settings(&path);
+        scope.open = Some(Open { path, before, _guard: guard });
+    });
+}
 
-    fn apply(&self, this: *mut c_void) -> Result<bool, String> {
-        let (path, scope) = match self {
-            Self::Global(repair) => (&repair.path, "global"),
-            Self::Character { path, scope, .. } => (path, scope.as_str()),
-        };
-        if settings_scope(this).as_deref() != Some(scope)
-            || settings_filename(this).as_ref() != Some(path)
-        {
-            return Err("active settings scope or filename changed during position save".into());
-        }
-        match self {
-            Self::Global(repair) => repair.apply(),
-            Self::Character { axes, retained, .. } => {
-                // The verified position setters store accepted coordinates at
-                // map+0/+4 (object+148) before saving fields. Read those values,
-                // not raw command arguments or unrelated inherited defaults.
-                let position = read::<[f32; 2]>(this as usize + 0x148)
-                    .filter(|values| values.iter().all(|value| value.is_finite()))
-                    .ok_or("cannot verify accepted character position")?;
-                edit_settings(path, |current| {
-                    pin_character_position(
-                        current,
-                        scope,
-                        std::array::from_fn(|index| axes[index].then_some(position[index])),
-                        retained,
-                    )
-                })
+impl Open {
+    /// After the callback, still under the mutex: restore the position fields
+    /// a stock save dropped.
+    fn finish(self) {
+        static TRACES: AtomicUsize = AtomicUsize::new(0);
+        let Some(before) = &self.before else { return };
+        let Some(after) = read_settings(&self.path).filter(|after| after != before) else { return };
+        let Some(repaired) = restore_positions(before, &after) else { return };
+        let result = replace_settings(&self.path, &repaired);
+        if TRACES.fetch_add(1, Ordering::Relaxed) < 64 {
+            match result {
+                Ok(()) => log!("stage: FFXIDB minimap position fields a stock save dropped were restored"),
+                Err(error) => log!("note: FFXIDB minimap position repair failed ({:?})", error.kind()),
             }
         }
     }
 }
 
-fn position_snapshot(this: *mut c_void, axes: [bool; 2]) -> Option<PositionSnapshot> {
-    match PositionSnapshot::capture(this, axes) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            if POSITION_TRACES.fetch_add(1, Ordering::Relaxed) < 64 {
-                log!("note: FFXIDB position preservation unavailable: {error}");
-            }
-            None
-        }
+unsafe fn wide_name(name: *const u16) -> Option<PathBuf> {
+    if name.is_null() {
+        return None;
     }
+    let length = (0..32_768).find(|&at| *name.add(at) == 0)?;
+    Some(PathBuf::from(OsString::from_wide(std::slice::from_raw_parts(name, length))))
 }
 
-fn complete_position(snapshot: Option<PositionSnapshot>, this: *mut c_void) {
-    if let Some(snapshot) = snapshot {
-        match snapshot.apply(this) {
-            Ok(true) => {
-                if POSITION_TRACES.fetch_add(1, Ordering::Relaxed) < 64 {
-                    match snapshot {
-                        PositionSnapshot::Global(_) => log!("stage: FFXIDB preserved global coordinates removed by stock position save"),
-                        PositionSnapshot::Character { .. } => log!("stage: FFXIDB pinned explicit character coordinates removed by stock position save"),
-                    }
-                }
-            }
-            Ok(false) => {}
-            Err(error) => {
-                if POSITION_TRACES.fetch_add(1, Ordering::Relaxed) < 64 {
-                    log!("note: FFXIDB position preservation failed: {error}");
-                }
-            }
+unsafe extern "system" fn create_file_w(
+    name: PCWSTR, access: u32, share: u32, security: *const SECURITY_ATTRIBUTES,
+    disposition: u32, flags: u32, template: HANDLE,
+) -> HANDLE {
+    if let Some(path) = wide_name(name) {
+        opening(path);
+    }
+    CreateFileW(name, access, share, security, disposition, flags, template)
+}
+
+unsafe extern "system" fn create_file_2(
+    name: PCWSTR, access: u32, share: u32, disposition: u32,
+    parameters: *const CREATEFILE2_EXTENDED_PARAMETERS,
+) -> HANDLE {
+    if let Some(path) = wide_name(name) {
+        opening(path);
+    }
+    CreateFile2(name, access, share, disposition, parameters)
+}
+
+unsafe extern "system" fn create_file_a(
+    name: PCSTR, access: u32, share: u32, security: *const SECURITY_ATTRIBUTES,
+    disposition: u32, flags: u32, template: HANDLE,
+) -> HANDLE {
+    if !name.is_null() && CStr::from_ptr(name.cast()).to_bytes().to_ascii_lowercase().ends_with(b"ffxidb.xml") {
+        let mut wide = vec![0u16; 32_768];
+        let length = MultiByteToWideChar(CP_ACP, 0, name, -1, wide.as_mut_ptr(), wide.len() as i32);
+        if length > 0 {
+            opening(PathBuf::from(OsString::from_wide(&wide[..length as usize - 1])));
         }
     }
+    CreateFileA(name, access, share, security, disposition, flags, template)
 }
 
 unsafe extern "system" fn initialize(this: *mut c_void, api: *mut c_void) {
-    let a = adapter();
-    let _guard = callback_transaction(a);
-    let original: Initialize = std::mem::transmute(a.original[2]);
-    original(this, api);
+    let stock = std::mem::transmute::<usize, Initialize>(ORIGINAL[0].load(Ordering::Acquire));
+    serialized(|| stock(this, api))
 }
 unsafe extern "system" fn command(this: *mut c_void, text: *const u8) {
-    let a = adapter();
-    let _guard = callback_transaction(a);
-    let classified = bounded_command(text).and_then(|text| settings_command(&text));
-    if let Some(command) = &classified {
-        if COMMAND_TRACES.fetch_add(1, Ordering::Relaxed) < 128 {
-            let scope = if global_settings_active(this) {
-                "global"
-            } else {
-                "character-or-uninitialized"
-            };
-            // Only a fixed command class and numeric arguments; never raw text,
-            // a character name, settings path or any other user-provided value.
-            log!("stage: FFXIDB settings command {command:?}; scope={scope}");
-        }
+    let stock = std::mem::transmute::<usize, Command>(ORIGINAL[1].load(Ordering::Acquire));
+    serialized(|| stock(this, text))
+}
+unsafe extern "system" fn incoming(this: *mut c_void, previous: *const u8, data: *const u8, size: u32, blocked: u8) -> u8 {
+    let stock = std::mem::transmute::<usize, Incoming>(ORIGINAL[2].load(Ordering::Acquire));
+    serialized(|| stock(this, previous, data, size, blocked))
+}
+unsafe extern "system" fn mouse(this: *mut c_void, kind: u32, x: i32, y: i32, wheel: i32, blocked: u8) -> u8 {
+    let stock = std::mem::transmute::<usize, Mouse>(ORIGINAL[3].load(Ordering::Acquire));
+    serialized(|| stock(this, kind, x, y, wheel, blocked))
+}
+
+fn read_settings(path: &Path) -> Option<String> {
+    let mut xml = String::new();
+    File::open(path).ok()?.take(MAX_SETTINGS_BYTES + 1).read_to_string(&mut xml).ok()?;
+    (xml.len() as u64 <= MAX_SETTINGS_BYTES).then_some(xml)
+}
+
+/// Writes `xml` beside `path` and renames it over `path`: a reader sees the
+/// old file or the new one, never a partial write.
+fn replace_settings(path: &Path, xml: &str) -> std::io::Result<()> {
+    static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+    let staging = path.with_file_name(format!(
+        ".FFXIDB.crystal-{}-{}.tmp",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)
+        .and_then(|mut file| file.write_all(xml.as_bytes()).and_then(|()| file.sync_all()))
+        .and_then(|()| std::fs::rename(&staging, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staging);
     }
-    let snapshot = match classified {
-        Some(SettingsCommand::Position { x, y }) => {
-            position_snapshot(this, [x.is_some(), y.is_some()])
-        }
-        _ => None,
-    };
-    let original: Command = std::mem::transmute(a.original[7]);
-    original(this, text);
-    complete_position(snapshot, this);
-}
-/// Only zone packets 0x00A/0x00B reach FFXIDB's XML from Incoming (78670 ->
-/// 3B550). Every other chunk runs without the session-wide settings lock, so
-/// one client's file work never stalls another client's packet dispatch. An
-/// unreadable header takes the lock.
-fn incoming_reaches_settings(header: Option<u16>) -> bool {
-    header.is_none_or(|header| matches!(header & 0x1FF, 0x0A | 0x0B))
-}
-/// Mouse kind 0 is an ordinary move (72540 never saves on it); every other
-/// kind may reach 6C110/6C2D0 and takes the settings lock.
-fn mouse_reaches_settings(kind: u32) -> bool {
-    kind != 0
-}
-unsafe extern "system" fn incoming(
-    this: *mut c_void,
-    previous: *const u8,
-    data: *const u8,
-    size: u32,
-    blocked: u8,
-) -> u8 {
-    let a = adapter();
-    let original: Incoming = std::mem::transmute(a.original[11]);
-    // Only the header is read, never the character-name payload.
-    let header = if size >= 2 { read::<u16>(data as usize) } else { None };
-    if !incoming_reaches_settings(header) {
-        return original(this, previous, data, size, blocked);
-    }
-    let _guard = callback_transaction(a);
-    original(this, previous, data, size, blocked)
-}
-unsafe extern "system" fn mouse(
-    this: *mut c_void,
-    kind: u32,
-    x: i32,
-    y: i32,
-    wheel: i32,
-    blocked: u8,
-) -> u8 {
-    let a = adapter();
-    let original: Mouse = std::mem::transmute(a.original[13]);
-    if !mouse_reaches_settings(kind) {
-        return original(this, kind, x, y, wheel, blocked);
-    }
-    let _guard = callback_transaction(a);
-    // Exact 72540 switch: kind 2 persists only when dragging (map+B8) and not
-    // blocked. Do no file I/O for anything else.
-    let saves_position = kind == 2
-        && blocked == 0
-        && read::<u8>(this as usize + 0x200).is_some_and(|dragging| dragging != 0);
-    let snapshot = saves_position
-        .then(|| position_snapshot(this, [true, true]))
-        .flatten();
-    let result = original(this, kind, x, y, wheel, blocked);
-    complete_position(snapshot, this);
     result
+}
+
+const AXES: [&str; 2] = ["X", "Y"];
+
+/// The settings XML `after` one callback, with the minimap position fields
+/// the stock save dropped put back; None when nothing was dropped.
+///
+/// FFXIDB deletes a field whose value equals the one it inherits: a
+/// character's X or Y equal to the global one, and a global X or Y equal to
+/// itself (an axis the move left alone), removing a global section left
+/// empty. So a field present `before` and missing `after` is restored with
+/// the value it inherited: the global field after the callback, else the
+/// global field before it. Every other byte is kept. A character section the
+/// callback removed (the stock `save` command) stays removed.
+fn restore_positions(before: &str, after: &str) -> Option<String> {
+    use roxmltree::{Document, Node};
+    fn child<'a, 'i>(parent: Option<Node<'a, 'i>>, name: &str) -> Option<Node<'a, 'i>> {
+        parent?.children().find(|node| node.is_element() && node.has_tag_name(name))
+    }
+    fn number<'a, 'i>(node: Option<Node<'a, 'i>>) -> Option<Node<'a, 'i>> {
+        node.filter(|node| node.text().and_then(|text| text.trim().parse::<f64>().ok()).is_some_and(f64::is_finite))
+    }
+    let (old, new) = (Document::parse(before).ok()?, Document::parse(after).ok()?);
+    let (old_root, new_root) = (old.root_element(), new.root_element());
+    if !old_root.has_tag_name("settings") || !new_root.has_tag_name("settings") {
+        return None;
+    }
+    let (old_global, new_global) = (child(Some(old_root), "global"), child(Some(new_root), "global"));
+    let inherited = AXES.map(|axis| {
+        number(child(new_global, axis))
+            .map(|node| &after[node.range()])
+            .or_else(|| number(child(old_global, axis)).map(|node| &before[node.range()]))
+    });
+    let mut edits = Vec::new();
+    for section in old_root.children().filter(Node::is_element) {
+        let name = section.tag_name().name();
+        // A repeated section: only the first counts, as when FFXIDB looks it up.
+        if child(Some(old_root), name) != Some(section) {
+            continue;
+        }
+        let current = child(Some(new_root), name);
+        if current.is_none() && name != "global" {
+            continue;
+        }
+        let missing: String = AXES
+            .iter()
+            .zip(inherited)
+            .filter(|(axis, _)| child(Some(section), axis).is_some() && child(current, axis).is_none())
+            .filter_map(|(_, value)| value)
+            .collect();
+        if !missing.is_empty() {
+            edits.push(match current {
+                Some(node) => append(after, node, &missing)?,
+                None => append(after, new_root, &format!("<global>{missing}</global>"))?,
+            });
+        }
+    }
+    if edits.is_empty() {
+        return None;
+    }
+    edits.sort_by_key(|(start, ..)| std::cmp::Reverse(*start));
+    let mut repaired = after.to_owned();
+    for (start, end, text) in edits {
+        repaired.replace_range(start..end, &text);
+    }
+    Document::parse(&repaired).ok()?;
+    Some(repaired)
+}
+
+/// The edit (start, end, replacement) of `xml` that adds `text` at the end of
+/// `element`'s content.
+fn append(xml: &str, element: roxmltree::Node<'_, '_>, text: &str) -> Option<(usize, usize, String)> {
+    let range = element.range();
+    let source = &xml[range.clone()];
+    if source.ends_with("/>") {
+        Some((range.end - 2, range.end, format!(">{text}</{}>", element.tag_name().name())))
+    } else {
+        let at = range.start + source.rfind("</")?;
+        Some((at, at, text.to_owned()))
+    }
 }
 
 #[cfg(test)]
@@ -1402,7 +847,10 @@ pub(crate) mod tests {
         thread,
         time::{Duration, Instant},
     };
-    use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+    use windows_sys::Win32::{
+        Foundation::WAIT_TIMEOUT,
+        System::LibraryLoader::{LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32},
+    };
 
     fn unique() -> String {
         format!(
@@ -1418,20 +866,6 @@ pub(crate) mod tests {
         TransactionMutex::open(&format!("Local\\CrystalLauncher.FFXIDB.test.{}", unique())).unwrap()
     }
 
-    #[test]
-    fn only_callbacks_that_can_reach_the_xml_take_the_shared_lock() {
-        assert!(incoming_reaches_settings(Some(0x000A)));
-        assert!(incoming_reaches_settings(Some(0x040B)), "the size bits above 0x1FF are ignored");
-        assert!(incoming_reaches_settings(None), "an unreadable header stays locked");
-        for header in [0x0000, 0x000D, 0x0028, 0x0061, 0x020C] {
-            assert!(!incoming_reaches_settings(Some(header)), "{header:#x}");
-        }
-        assert!(!mouse_reaches_settings(0), "a plain move never saves");
-        for kind in [1, 2, 3, 4] {
-            assert!(mouse_reaches_settings(kind), "{kind}");
-        }
-    }
-
     #[repr(C)]
     struct Fixture {
         vptr: usize,
@@ -1439,10 +873,14 @@ pub(crate) mod tests {
         api: usize,
         command: usize,
     }
-    static FIXTURE_VTABLE: OnceLock<[usize; 34]> = OnceLock::new();
+    /// A plugin vtable in writable memory, as the loader leaves FFXIDB's.
+    static FIXTURE_VTABLE: OnceLock<usize> = OnceLock::new();
+    fn fixture_slot(slot: usize) -> usize {
+        unsafe { *(*FIXTURE_VTABLE.get().unwrap() as *const usize).add(slot) }
+    }
     unsafe extern "C" fn fixture_factory() -> *mut c_void {
         Box::into_raw(Box::new(Fixture {
-            vptr: FIXTURE_VTABLE.get().unwrap().as_ptr() as usize,
+            vptr: *FIXTURE_VTABLE.get().unwrap(),
             calls: 0,
             api: 0,
             command: 0,
@@ -1453,8 +891,7 @@ pub(crate) mod tests {
         let object = &mut *this.cast::<Fixture>();
         object.api = api as usize;
         object.calls |= 1;
-        // Reenter a wrapped callback on the same thread while Initialize owns
-        // the mutex; this would deadlock with a nonreentrant Rust mutex.
+        // Reenter a wrapped callback on the same thread inside Initialize's scope.
         let f: Command = std::mem::transmute(*(object.vptr as *const usize).add(7));
         f(this, c"nested".as_ptr().cast());
     }
@@ -1500,9 +937,10 @@ pub(crate) mod tests {
         0xC7
     }
 
+    /// The only test in this process that uses MAPPING, ORIGINAL and GAME.
     #[test]
-    fn factory_and_stdcall_callbacks_preserve_arguments_results_reentry_and_reload() {
-        let mut original = [0x1234usize; 34];
+    fn factory_and_wrapped_callbacks_preserve_arguments_results_reentry_and_relaunch() {
+        let mut original = vec![0x1234usize; 34];
         for (slot, f) in [
             (2, fixture_initialize as *const () as usize),
             (3, fixture_shutdown as *const () as usize),
@@ -1514,75 +952,88 @@ pub(crate) mod tests {
         ] {
             original[slot] = f;
         }
-        assert!(FIXTURE_VTABLE.set(original).is_ok());
-        let shadow = shadow_table(&original, 0x5678);
-        let stable_table = shadow[1..].as_ptr() as usize;
-        for slot in 0..34 {
-            if ![2, 7, 11, 13].contains(&slot) {
-                assert_eq!(shadow[slot + 1], original[slot]);
-            }
-        }
-        // A zeroed stand-in image: its scan cache reads as never constructed.
-        static FIXTURE_IMAGE: [u8; SCAN_CACHE_RVA + 8] = [0; SCAN_CACHE_RVA + 8];
-        assert!(current_adapter().is_none());
-        publish(Adapter {
-            module: FIXTURE_IMAGE.as_ptr() as usize,
-            path: PathBuf::from("FFXIDB.dll"),
-            factory: fixture_factory,
-            original,
-            original_vtable: FIXTURE_VTABLE.get().unwrap().as_ptr() as usize,
-            shadow,
-            transaction: Box::leak(Box::new(SettingsMutex {
-                shared: test_mutex(),
-                legacy: test_mutex(),
-            })),
-            constructed_in: AtomicUsize::new(NONE),
-        });
+        let table = Box::leak(original.clone().into_boxed_slice()).as_ptr() as usize;
+        assert!(FIXTURE_VTABLE.set(table).is_ok());
+        static FIXTURE_IMAGE: [u8; 0x40] = [0; 0x40];
+        let module = FIXTURE_IMAGE.as_ptr() as usize;
+        *MAPPING.lock().unwrap() = Some(Mapping { module, factory: fixture_factory as *const () as usize, vtable: 0, game: GAME.load(Ordering::SeqCst) });
         for _ in 0..64 {
             unsafe {
                 let object = create_instance();
                 assert!(!object.is_null());
-                let table = (*object.cast::<Fixture>()).vptr as *const usize;
-                assert_eq!(table as usize, stable_table);
-                assert_eq!(*table.sub(1), 0x5678);
-                let init: Initialize = std::mem::transmute(*table.add(2));
+                assert_eq!((*object.cast::<Fixture>()).vptr, table, "changed in place, never replaced");
+                for (slot, stock) in original.iter().enumerate() {
+                    let expected = match WRAPPED.iter().position(|wrapped| *wrapped == slot) {
+                        Some(index) => wrappers()[index],
+                        None => *stock,
+                    };
+                    assert_eq!(fixture_slot(slot), expected, "slot {slot}");
+                }
+                let init: Initialize = std::mem::transmute(fixture_slot(2));
                 init(object, 0xF1234567usize as *mut c_void);
                 assert_eq!(
                     CStr::from_ptr((*object.cast::<Fixture>()).command as *const i8).to_bytes(),
                     b"nested"
                 );
-                let tick: Notify = std::mem::transmute(*table.add(5));
+                let tick: Notify = std::mem::transmute(fixture_slot(5));
                 tick(object);
-                let draw: Notify = std::mem::transmute(*table.add(6));
+                let draw: Notify = std::mem::transmute(fixture_slot(6));
                 draw(object);
-                let cmd: Command = std::mem::transmute(*table.add(7));
+                let cmd: Command = std::mem::transmute(fixture_slot(7));
                 let save = c"save".as_ptr().cast();
                 cmd(object, save);
-                let packet: Incoming = std::mem::transmute(*table.add(11));
+                let packet: Incoming = std::mem::transmute(fixture_slot(11));
                 assert_eq!(
-                    packet(
-                        object,
-                        0xAABBCCDDusize as *const u8,
-                        0x12345678usize as *const u8,
-                        0x98765432,
-                        0xA5
-                    ),
+                    packet(object, 0xAABBCCDDusize as *const u8, 0x12345678usize as *const u8, 0x98765432, 0xA5),
                     0xC3
                 );
-                let input: Mouse = std::mem::transmute(*table.add(13));
+                let input: Mouse = std::mem::transmute(fixture_slot(13));
                 assert_eq!(input(object, 0xFFFFFFFF, -500, 700, -120, 0xA5), 0xC7);
-                assert_eq!(
-                    (
-                        (*object.cast::<Fixture>()).calls,
-                        (*object.cast::<Fixture>()).api
-                    ),
-                    (7, 0xF1234567)
-                );
+                assert_eq!(((*object.cast::<Fixture>()).calls, (*object.cast::<Fixture>()).api), (7, 0xF1234567));
                 assert_eq!((*object.cast::<Fixture>()).command, save as usize);
-                let release: Notify = std::mem::transmute(*table.add(3));
+                let release: Notify = std::mem::transmute(fixture_slot(3));
                 release(object);
             }
         }
+        // The same mapping: served again during its own game, refused in a
+        // later one (its scan caches would hold the earlier game's addresses).
+        let plugin = Path::new("FFXIDB.dll");
+        let factory = fixture_factory as *const () as usize;
+        let served = |result: Result<FARPROC, String>| result.unwrap().map(|f| f as *const () as usize);
+        assert_eq!(served(protect(module, plugin, factory)), Some(create_instance as *const () as usize));
+        GAME.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(served(protect(module, plugin, factory)), Some(disabled_factory as *const () as usize));
+    }
+
+    /// The scope itself, without vendor code: the first settings open takes
+    /// the lock and reads the file, a nested callback shares it, a stock save
+    /// that drops X is repaired, and the lock is free once the scope returns.
+    #[test]
+    fn a_scope_locks_on_the_first_settings_open_and_repairs_a_dropped_field() {
+        let root = std::env::temp_dir().join(format!("crystal-ffxidb-scope-{}", unique()));
+        std::fs::create_dir(&root).unwrap();
+        let plugin = root.join("FFXIDB.dll");
+        std::fs::write(&plugin, b"fixture").unwrap();
+        let shared = format!("Local\\CrystalLauncher.FFXIDB.scope-test.{}", unique());
+        let settings = Box::leak(Box::new(Settings { plugin: plugin.clone(), mutex: SettingsMutex::with_shared_name(&plugin, &shared).unwrap() }));
+        SETTINGS.store(settings, Ordering::Release);
+        let xml = root.join("FFXIDB.xml");
+        std::fs::write(&xml, "<settings><global><X>100</X><Y>200</Y></global></settings>").unwrap();
+        let other = TransactionMutex::open(&shared).unwrap();
+        // Opening anything else is not a transaction.
+        serialized(|| opening(root.join("map.dat")));
+        assert!(other.acquire(0).is_ok());
+        serialized(|| {
+            serialized(|| opening(xml.clone()));
+            let held = thread::scope(|s| s.spawn(|| TransactionMutex::open(&shared).unwrap().acquire(0).is_err()).join().unwrap());
+            assert!(held, "the lock is held until the outermost scope returns");
+            opening(xml.clone());
+            // The stock position save: Y moved, X equal to itself dropped.
+            std::fs::write(&xml, "<settings><global><Y>250</Y></global></settings>").unwrap();
+        });
+        assert!(thread::spawn(move || TransactionMutex::open(&shared).unwrap().acquire(0).is_ok()).join().unwrap());
+        assert_eq!(std::fs::read_to_string(&xml).unwrap(), "<settings><global><Y>250</Y><X>100</X></global></settings>");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1838,345 +1289,117 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn position_repair_keeps_current_edits_and_only_adds_missing_global_fields() {
-        let before = GlobalPosition::capture(
-            "<settings><global><X>100</X><Y>200</Y></global><Alpha><X>310</X></Alpha></settings>",
-        )
-        .unwrap();
-        let current = "<?xml version=\"1.0\"?><settings><!-- new note --><global><Y>250</Y><Zoom>75</Zoom></global><Alpha><X>311</X></Alpha><NewCharacter><X>900</X></NewCharacter></settings>";
-        let repaired = before.restore_missing(current).unwrap().unwrap();
+    fn restore_positions_puts_back_only_what_a_stock_save_dropped() {
+        let before = "<settings><global><X>100</X><Y>200</Y></global><Alpha><X>310</X><Y>410</Y></Alpha><Beta><Zoom>2</Zoom></Beta></settings>";
+        let restored = |after: &str| restore_positions(before, after);
+        // Global `pos 100 250`: Y moved and is kept; X, equal to itself, comes back.
         assert_eq!(
-            repaired,
-            current.replace("</global>", "<X>100</X></global>")
+            restored("<settings><global><Y>250</Y></global><Alpha><X>310</X><Y>410</Y></Alpha><Beta><Zoom>2</Zoom></Beta></settings>").as_deref(),
+            Some("<settings><global><Y>250</Y><X>100</X></global><Alpha><X>310</X><Y>410</Y></Alpha><Beta><Zoom>2</Zoom></Beta></settings>")
         );
-        assert!(before.restore_missing(&repaired).unwrap().is_none());
+        // Global `pos 100 200`: both dropped and the emptied section removed.
         assert_eq!(
-            before
-                .restore_missing("<settings><global /></settings>")
-                .unwrap()
-                .unwrap(),
-            "<settings><global ><X>100</X><Y>200</Y></global></settings>"
+            restored("<settings><Alpha><X>310</X><Y>410</Y></Alpha><Beta><Zoom>2</Zoom></Beta></settings>").as_deref(),
+            Some("<settings><Alpha><X>310</X><Y>410</Y></Alpha><Beta><Zoom>2</Zoom></Beta><global><X>100</X><Y>200</Y></global></settings>")
         );
-        assert!(before
-            .restore_missing("<settings><global><X>999</X><Y>250</Y></global></settings>")
-            .unwrap()
-            .is_none());
-        let without_global =
-            "<settings><!-- retained --><Alpha><X>311</X></Alpha><NewCharacter/></settings>";
+        // Alpha `pos 100 250`: X moved to the global value and was dropped as
+        // inherited; it is pinned at that value, not put back at 310.
         assert_eq!(
-            before.restore_missing(without_global).unwrap().unwrap(),
-            without_global.replace(
-                "</settings>",
-                "<global><X>100</X><Y>200</Y></global></settings>"
-            )
+            restored("<settings><global><X>100</X><Y>200</Y></global><Alpha><Y>250</Y></Alpha><Beta><Zoom>2</Zoom></Beta></settings>").as_deref(),
+            Some("<settings><global><X>100</X><Y>200</Y></global><Alpha><Y>250</Y><X>100</X></Alpha><Beta><Zoom>2</Zoom></Beta></settings>")
         );
+        // A section left self-closing, and comments and other fields, are kept.
+        assert_eq!(
+            restored("<settings><!-- note --><global><X>100</X><Y>200</Y></global><Alpha/><Beta><Zoom>3</Zoom></Beta></settings>").as_deref(),
+            Some("<settings><!-- note --><global><X>100</X><Y>200</Y></global><Alpha><X>100</X><Y>200</Y></Alpha><Beta><Zoom>3</Zoom></Beta></settings>")
+        );
+        // Intentional moves and the stock `save` (character sections removed) are left alone.
+        assert_eq!(restored("<settings><global><X>1</X><Y>2</Y></global><Alpha><X>3</X><Y>4</Y></Alpha><Beta><Zoom>2</Zoom></Beta></settings>"), None);
+        assert_eq!(restored("<settings><global><X>310</X><Y>410</Y></global></settings>"), None);
+        // A field never present is not invented, and nothing is guessed from bad XML.
+        assert_eq!(restore_positions("<settings><Beta/></settings>", "<settings><Beta/></settings>"), None);
+        assert_eq!(restored("<settings><global>"), None);
+        assert_eq!(restored("<other><global/></other>"), None);
     }
 
-    #[test]
-    fn position_repair_rejects_partial_or_ambiguous_xml() {
-        for xml in [
-            "<settings><global><X>100",
-            "<settings><global><X>1</X><X>2</X></global></settings>",
-            "<settings><global/><global/></settings>",
-            "<other><global><X>1</X></global></other>",
-            "<settings xmlns:g=\"urn:test\"><g:global/></settings>",
-            "<settings xmlns:g=\"urn:test\"><global><g:X>1</g:X></global></settings>",
-        ] {
-            assert!(GlobalPosition::capture(xml).is_err());
-        }
-        let before =
-            GlobalPosition::capture("<settings><global><X>100</X></global></settings>").unwrap();
-        assert!(before.restore_missing("<settings><global>").is_err());
-        assert_eq!(
-            before.restore_missing("<settings/>").unwrap().unwrap(),
-            "<settings><global><X>100</X></global></settings>"
-        );
-        for xml in [
-            "<settings xmlns:g=\"urn:test\"><g:global/></settings>",
-            "<settings xmlns:g=\"urn:test\"><global><g:X>1</g:X></global></settings>",
-            "<settings><global><X>1</X><X>2</X></global></settings>",
-        ] {
-            assert!(before.restore_missing(xml).is_err());
-        }
-        let namespaced_attribute = GlobalPosition::capture(
-            "<settings xmlns:g=\"urn:test\"><global><X g:note=\"test\">100</X></global></settings>",
-        )
-        .unwrap();
-        assert!(namespaced_attribute.restore_missing("<settings/>").is_err());
+    // ---- The real plugin, isolated: copies of Windower's FFXIDB.dll builds
+    // (CRYSTAL_TEST_FFXIDB_BUILDS_DIR, `FFXIDB-*.dll`, and/or the plugin under
+    // CRYSTAL_WINDOWER_ROOT) run in child processes against temporary XML,
+    // without Hook or a game.
+
+    /// Test data only, never used by the protection: the two FFXIDB internals
+    /// the children call to stand in for Initialize (no Hook API exists here),
+    /// field registration and the character selector (its XML read), by link
+    /// stamp. Both builds keep the settings (file name first) at object+B8
+    /// and the map's drag flag at object+200.
+    const BUILDS: [(u32, usize, usize); 2] = [
+        (0x6A51_21AC, 0x1_73D0, 0x3_B550), // 1.2.3.14
+        (0x6ADE_2305, 0x1_7390, 0x3_ADD0), // 1.2.3.17
+    ];
+    const SETTINGS_FIELD: usize = 0xB8;
+    const DRAG_FLAG: usize = 0x200;
+
+    fn link_stamp(file: &[u8]) -> u32 {
+        let nt = u32::from_le_bytes(file[0x3C..0x40].try_into().unwrap()) as usize;
+        u32::from_le_bytes(file[nt + 8..nt + 12].try_into().unwrap())
     }
 
-    #[test]
-    fn character_pinning_preserves_unedited_xml_and_inheritance() {
-        let current = "<?xml version=\"1.0\"?><settings><!-- retained --><global><X>100</X><Y>200</Y></global><Alpha><Y>250</Y><Zoom>75</Zoom></Alpha><Beta><X>510</X><Y>610</Y></Beta></settings>";
-        let pinned =
-            pin_character_position(current, "Alpha", [Some(100.0), Some(250.0)], &[None, None])
-                .unwrap()
-                .unwrap();
-        assert_eq!(pinned, current.replace("</Alpha>", "<X>100</X></Alpha>"));
-        assert!(pin_character_position(
-            &pinned,
-            "Alpha",
-            [Some(100.0), Some(250.0)],
-            &[None, None]
-        )
-        .unwrap()
-        .is_none());
-
-        let inherited = "<settings><global><X>100</X><Y>200</Y></global><Alpha><Zoom>75</Zoom></Alpha><Beta/></settings>";
-        assert_eq!(
-            pin_character_position(inherited, "Alpha", [Some(100.0), None], &[None, None])
-                .unwrap()
-                .unwrap(),
-            inherited.replace("</Alpha>", "<X>100</X></Alpha>")
-        );
-        // An untouched explicit Y is different from an inherited Y: retain
-        // its original bytes when stock px also de-duplicates that field.
-        assert_eq!(
-            pin_character_position(
-                inherited,
-                "Alpha",
-                [Some(100.0), None],
-                &[None, Some("<Y note=\"kept\">200.0</Y>".into())]
-            )
-            .unwrap()
-            .unwrap(),
-            inherited.replace("</Alpha>", "<X>100</X><Y note=\"kept\">200.0</Y></Alpha>")
-        );
-        assert_eq!(
-            pin_character_position(
-                "<settings><Beta/></settings>",
-                "Alpha",
-                [Some(100.0), Some(200.0)],
-                &[None, None]
-            )
-            .unwrap()
-            .unwrap(),
-            "<settings><Beta/><Alpha><X>100</X><Y>200</Y></Alpha></settings>"
-        );
+    /// Every FFXIDB build available to these tests that the children know.
+    fn fixture_builds() -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = std::env::var_os("CRYSTAL_TEST_FFXIDB_BUILDS_DIR") {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                if name.starts_with("ffxidb-") && name.ends_with(".dll") {
+                    found.push(entry.path());
+                }
+            }
+        }
+        if let Some(root) = std::env::var_os("CRYSTAL_WINDOWER_ROOT") {
+            found.push(PathBuf::from(root).join("plugins").join("FFXIDB.dll"));
+        }
+        found.retain(|path| std::fs::read(path).is_ok_and(|file| BUILDS.iter().any(|build| build.0 == link_stamp(&file))));
+        found.sort();
+        assert!(!found.is_empty(), "set CRYSTAL_TEST_FFXIDB_BUILDS_DIR or CRYSTAL_WINDOWER_ROOT to FFXIDB 1.2.3.14 / 1.2.3.17");
+        found
     }
 
-    #[test]
-    fn character_pinning_rejects_ambiguous_scope_fields_and_nonfinite_values() {
-        for xml in [
-            "<settings><Alpha>",
-            "<other><Alpha/></other>",
-            "<settings><Alpha/><Alpha/></settings>",
-            "<settings><Alpha><X>1</X><X>2</X></Alpha></settings>",
-            "<settings><Alpha><X><nested/></X></Alpha></settings>",
-            "<settings xmlns:g=\"urn:test\"><g:Alpha/></settings>",
-            "<settings xmlns:g=\"urn:test\"><Alpha><g:X>1</g:X></Alpha></settings>",
-        ] {
-            assert!(pin_character_position(
-                xml,
-                "Alpha",
-                [Some(100.0), Some(200.0)],
-                &[None, None]
-            )
-            .is_err());
-        }
-        for scope in ["", "global", "Alpha/><Beta", "Alpha:Beta", "9Alpha"] {
-            assert!(pin_character_position(
-                "<settings/>",
-                scope,
-                [Some(100.0), None],
-                &[None, None]
-            )
-            .is_err());
-        }
-        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            assert!(pin_character_position(
-                "<settings/>",
-                "Alpha",
-                [Some(value), None],
-                &[None, None]
-            )
-            .is_err());
-        }
-    }
-
-    #[test]
-    fn character_snapshot_refuses_changed_callback_context() {
-        let root = std::env::temp_dir().join(format!("crystal-ffxidb-context-{}", unique()));
-        std::fs::create_dir(&root).unwrap();
-        let path = root.join("FFXIDB.xml");
-        let initial = "<settings><global><X>100</X><Y>200</Y></global><Alpha><Y>250</Y></Alpha><Beta/></settings>";
-        std::fs::write(&path, initial).unwrap();
-        // Test-owned object storage exercises validation only, never a vendor
-        // call. A callback changing its selected character/file must not apply
-        // the pre-callback snapshot to either scope or file.
-        let mut object = [0u32; 0x150 / 4];
-        let filename: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        let set_filename = |object: &mut [u32], value: &[u16]| {
-            object[0xB8 / 4..0xD0 / 4].copy_from_slice(&[
-                value.as_ptr() as u32,
-                0,
-                0,
-                0,
-                value.len() as u32 - 1,
-                value.len() as u32 - 1,
-            ]);
+    /// Loads `path` and installs the host's resolver over the stock one, as
+    /// `install` does for Hook.
+    fn load_plugin(path: &Path) -> HMODULE {
+        let wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let module = unsafe {
+            LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)
         };
-        let set_scope = |object: &mut [u32], name: &str| unsafe {
-            object
-                .as_mut_ptr()
-                .add(0xD0 / 4)
-                .cast::<VendorString>()
-                .write(VendorString::new(name));
-        };
-        set_filename(&mut object, &filename);
-        set_scope(&mut object, "Alpha");
-        object[0x148 / 4] = 100.0f32.to_bits();
-        object[0x14C / 4] = 250.0f32.to_bits();
-        let this = object.as_mut_ptr().cast();
-        let snapshot = PositionSnapshot::capture(this, [true, true])
-            .unwrap()
-            .unwrap();
-
-        set_scope(&mut object, "Beta");
-        assert!(snapshot.apply(this).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), initial);
-        set_scope(&mut object, "Alpha");
-        let changed_filename: Vec<_> = root
-            .join("changed")
-            .join("FFXIDB.xml")
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        set_filename(&mut object, &changed_filename);
-        assert!(snapshot.apply(this).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), initial);
-        set_filename(&mut object, &filename);
-        object[0x148 / 4] = f32::NAN.to_bits();
-        assert!(snapshot.apply(this).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), initial);
-        set_scope(&mut object, "Alpha>");
-        assert!(PositionSnapshot::capture(this, [true, true]).is_err());
-        std::fs::remove_file(path).unwrap();
-        std::fs::remove_dir(root).unwrap();
+        assert!(!module.is_null(), "{}", std::io::Error::last_os_error());
+        let _ = BRIDGE.set(Bridge { _hook: OwnedModule(0), resolve: GetProcAddress });
+        module
     }
 
-    #[test]
-    fn position_repair_replaces_atomically_and_leaves_failed_replacements_intact() {
-        let root = std::env::temp_dir().join(format!("crystal-ffxidb-repair-{}", unique()));
-        std::fs::create_dir(&root).unwrap();
-        let path = root.join("FFXIDB.xml");
-        let before =
-            GlobalPosition::capture("<settings><global><X>100</X><Y>200</Y></global></settings>")
-                .unwrap();
-        let repair = PositionRepair {
-            path: path.clone(),
-            before,
-        };
-        let current = "<settings><global><Y>250</Y></global><NewCharacter><X>900</X></NewCharacter></settings>";
-        std::fs::write(&path, current).unwrap();
-        assert!(repair.apply().unwrap());
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            current.replace("</global>", "<X>100</X></global>")
-        );
-
-        std::fs::write(&path, current).unwrap();
-        let denies_replace = OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ)
-            .open(&path)
-            .unwrap();
-        assert!(repair.apply().is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), current);
-        assert_eq!(
-            std::fs::read_dir(&root).unwrap().count(),
-            1,
-            "failed replacement removes only its own staging file"
-        );
-        drop(denies_replace);
-
-        let partial = "<settings><global><Y>";
-        std::fs::write(&path, partial).unwrap();
-        assert!(repair.apply().is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), partial);
-        std::fs::remove_file(path).unwrap();
-        std::fs::remove_dir(root).unwrap();
+    fn factory_of(module: HMODULE) -> Option<usize> {
+        unsafe { resolve(module, c"CreateInstance".as_ptr().cast()) }.map(|f| f as *const () as usize)
     }
 
-    #[test]
-    fn settings_command_classification_retains_only_numeric_position_data() {
-        assert_eq!(
-            settings_command(" map pos -9999 250 "),
-            Some(SettingsCommand::Position {
-                x: Some(-9999.0),
-                y: Some(250.0)
-            })
-        );
-        assert_eq!(
-            settings_command("px 100"),
-            Some(SettingsCommand::Position {
-                x: Some(100.0),
-                y: None
-            })
-        );
-        assert_eq!(
-            settings_command("py 200"),
-            Some(SettingsCommand::Position {
-                x: None,
-                y: Some(200.0)
-            })
-        );
-        assert_eq!(settings_command("save"), Some(SettingsCommand::Save));
-        assert_eq!(settings_command("m reload"), Some(SettingsCommand::Reload));
-        for input in [
-            "POS 100 250",
-            "MAP POS 100 250",
-            "pos \"100\" \"250\"",
-            "\"Map\" \"Pos\" 100 250",
-        ] {
-            assert_eq!(
-                settings_command(input),
-                Some(SettingsCommand::Position {
-                    x: Some(100.0),
-                    y: Some(250.0)
-                })
-            );
+    fn run_child(test: &str, root: &Path, env: &[(&str, &str)]) -> std::process::Child {
+        let mut child = Process::new(std::env::current_exe().unwrap());
+        child
+            .args(["--exact", &format!("windower_plugin_settings::tests::{test}"), "--ignored", "--nocapture"])
+            .env("CRYSTAL_TEST_FFXIDB_ROOT", root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        for (key, value) in env {
+            child.env(key, value);
         }
-        for input in [
-            "pos private 1",
-            "pos NaN 1",
-            "pos inf 1",
-            "unknown private text",
-        ] {
-            assert_eq!(settings_command(input), None);
-        }
+        child.spawn().unwrap()
     }
 
-    #[test]
-    fn partial_replacement_failure_retains_recovery_copies_and_never_overwrites_new_edits() {
-        let root = std::env::temp_dir().join(format!("crystal-ffxidb-recovery-{}", unique()));
-        std::fs::create_dir(&root).unwrap();
-        let target = root.join("FFXIDB.xml");
-        let stage = root.join("repair.tmp");
-        let backup = root.join("repair.backup");
-        let current = "<settings><global><Y>250</Y></global></settings>";
-        let repaired = "<settings><global><X>100</X><Y>250</Y></global></settings>";
-        std::fs::write(&stage, repaired).unwrap();
-        std::fs::write(&backup, current).unwrap();
-        // Model ERROR_UNABLE_TO_MOVE_REPLACEMENT after the original was renamed.
-        recover_replacement_failure(&target, &stage, &backup, current, Some(1176));
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), current);
-        assert_eq!(std::fs::read_to_string(&stage).unwrap(), repaired);
-        assert!(!backup.exists());
-
-        let newer = "<settings><global><X>900</X><Y>901</Y></global><NewCharacter/></settings>";
-        std::fs::write(&target, newer).unwrap();
-        std::fs::write(&backup, current).unwrap();
-        // Model a partial replacement with another complete target already present.
-        recover_replacement_failure(&target, &stage, &backup, current, Some(1177));
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), newer);
-        assert_eq!(std::fs::read_to_string(&backup).unwrap(), current);
-        assert_eq!(std::fs::read_to_string(&stage).unwrap(), repaired);
-        for path in [&target, &stage, &backup] {
-            std::fs::remove_file(path).unwrap();
+    fn wait_for(path: &Path, what: &str) {
+        let started = Instant::now();
+        while !path.exists() {
+            assert!(started.elapsed() < Duration::from_secs(15), "{what}");
+            thread::sleep(Duration::from_millis(10));
         }
-        std::fs::remove_dir(root).unwrap();
     }
 
     #[repr(C)]
@@ -2185,305 +1408,139 @@ pub(crate) mod tests {
         length: u32,
         capacity: u32,
     }
-
     impl VendorString {
         fn new(value: &str) -> Self {
             assert!(value.len() < 16 && value.is_ascii());
-            let mut result = Self {
-                bytes: [0; 16],
-                length: value.len() as u32,
-                capacity: 15,
-            };
+            let mut result = Self { bytes: [0; 16], length: value.len() as u32, capacity: 15 };
             result.bytes[..value.len()].copy_from_slice(value.as_bytes());
             result
         }
     }
 
-    unsafe fn vendor_cached_position(base: usize, settings: *mut c_void) -> [f32; 2] {
-        let field: unsafe extern "thiscall" fn(*mut c_void, *const VendorString) -> usize =
-            std::mem::transmute(base + 0x14600);
-        ["X", "Y"].map(|name| {
-            let field = field(settings, &VendorString::new(name));
-            assert_ne!(field, 0);
-            // Exact 2562B..25643 getter: flag +4 selects the std::string at
-            // +20 (default) or +50 (current). Read its numeric input without
-            // calling the internal float getter's nonstandard XMM0 return ABI.
-            let current = read::<u8>(field + 4).unwrap() != 0;
-            let address = field + if current { 0x50 } else { 0x20 };
-            let bytes = read_msvc_string::<u8>(address, 32, None, true).unwrap();
-            let value = std::str::from_utf8(&bytes).unwrap().parse::<f32>().unwrap();
-            assert!(value.is_finite());
-            value
-        })
-    }
-
     #[test]
     #[ignore = "Child of the isolated exact-DLL regression; never run against live settings"]
     fn vendor_settings_child() {
-        let Some(root) = std::env::var_os("CRYSTAL_TEST_FFXIDB_VENDOR_ROOT").map(PathBuf::from)
-        else {
-            return;
-        };
-        let scenario = std::env::var("CRYSTAL_TEST_FFXIDB_VENDOR_SCENARIO").unwrap();
-        let inherited_reader =
-            scenario == "stock-inherited-reader" || scenario.starts_with("inherited-reader");
-        let role = std::env::var("CRYSTAL_TEST_FFXIDB_VENDOR_ROLE").unwrap();
-        let shared = std::env::var("CRYSTAL_TEST_FFXIDB_VENDOR_MUTEX").unwrap();
+        let Some(root) = std::env::var_os("CRYSTAL_TEST_FFXIDB_ROOT").map(PathBuf::from) else { return };
+        let scenario = std::env::var("CRYSTAL_TEST_FFXIDB_SCENARIO").unwrap();
+        let role = std::env::var("CRYSTAL_TEST_FFXIDB_ROLE").unwrap();
         let path = root.join("FFXIDB.dll");
         let xml = root.join("FFXIDB.xml").canonicalize().unwrap();
-        assert!(file_matches(&path, FFXIDB_SHA256));
-        let before_load = matches!(scenario.as_str(), "initialize" | "observer-initialize")
-            .then(|| std::fs::read_to_string(&xml).unwrap());
+        let stamp = link_stamp(&std::fs::read(&path).unwrap());
+        let &(_, register, select) = BUILDS.iter().find(|build| build.0 == stamp).unwrap();
+        let module = load_plugin(&path);
+        // Ready before anything can wait on the shared mutex the parent holds.
+        std::fs::write(root.join(format!("{role}.ready")), b"ready").unwrap();
+        assert_eq!(factory_of(module), Some(create_instance as *const () as usize));
+        let base = module as usize;
         unsafe {
-            use windows_sys::Win32::System::LibraryLoader::{
-                LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
-            };
-            let wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-            let module = LoadLibraryExW(
-                wide.as_ptr(),
-                std::ptr::null_mut(),
-                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
-            );
-            assert!(!module.is_null(), "{}", std::io::Error::last_os_error());
-            if let Some(before) = before_load {
-                assert_eq!(std::fs::read_to_string(&xml).unwrap(), before);
-            }
-            let base = module as usize;
-            assert_eq!(pe_identity(base), Some(FFXIDB_ID));
-            assert!(plugin_layout(base));
-            let original = VTABLE_RVAS.map(|rva| base + rva);
-            // Use an isolated shared mutex, so this test cannot delay live games.
-            assert!(scan_cache_fresh(base));
-            assert!(current_adapter().is_none());
-            publish(Adapter {
-                module: base,
-                path: path.clone(),
-                factory: std::mem::transmute::<usize, Factory>(base + FACTORY_RVA),
-                original,
-                original_vtable: base + VTABLE_RVA,
-                shadow: shadow_table(&original, base + 0xBCEE0),
-                transaction: Box::leak(Box::new(
-                    SettingsMutex::with_shared_name(&path, &shared).unwrap(),
-                )),
-                constructed_in: AtomicUsize::new(NONE),
-            });
-            std::fs::write(root.join(format!("{role}.ready")), b"ready").unwrap();
             let instance = create_instance();
             assert!(!instance.is_null());
-            let settings = (instance as *mut u8).add(0xB8);
+            let vtable = *(instance as *const *const usize);
+            assert_eq!(*vtable.add(WRAPPED[1]), wrappers()[1], "FFXIDB's own vtable now holds the wrappers");
+            // The settings file name Initialize would take from Hook's API.
+            let settings = (instance as *mut u8).add(SETTINGS_FIELD);
+            let name = settings.cast::<u32>();
+            assert_eq!((*name.add(4), *name.add(5)), (0, 7), "an empty std::wstring");
             let mut filename: Vec<_> = xml.as_os_str().encode_wide().chain(Some(0)).collect();
-            assert!(filename.len() > 8);
-            let layout = settings.cast::<u32>();
-            assert_eq!(*layout.add(4), 0);
-            assert_eq!(*layout.add(5), 7);
-            // Borrow this test-owned filename for the process lifetime. Only
-            // the uninitialized filename changes; no Hook, graphics or game API
-            // is initialized. The DLL runs its own factory and XML algorithms.
-            *layout = filename.as_mut_ptr() as u32;
-            *layout.add(4) = filename.len() as u32 - 1;
-            *layout.add(5) = filename.len() as u32 - 1;
+            *name = filename.as_mut_ptr() as u32;
+            *name.add(4) = filename.len() as u32 - 1;
+            *name.add(5) = filename.len() as u32 - 1;
             std::mem::forget(filename);
-            let select: unsafe extern "thiscall" fn(*mut c_void, *const VendorString) =
-                std::mem::transmute(base + 0x3B550);
-            let before_initialize = std::fs::read_to_string(&xml).unwrap();
-            let observer = (scenario == "observer-initialize").then(|| {
-                OpenOptions::new()
-                    .read(true)
-                    .share_mode(
-                        FILE_SHARE_READ
-                            | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE
-                            | FILE_SHARE_DELETE,
-                    )
-                    .open(&xml)
-                    .unwrap()
-            });
-            if observer.is_some() {
-                // These are the exact bundled CRT entry points called by
-                // TinyXML load (75240) and save (765E0), not another CRT's
-                // approximation of its sharing flags.
-                let fopen: unsafe extern "C" fn(*mut *mut c_void, *const u8, *const u8) -> i32 =
-                    std::mem::transmute(base + 0x50944);
-                let fclose: unsafe extern "C" fn(*mut c_void) -> i32 =
-                    std::mem::transmute(base + 0x474E6);
-                let name = std::ffi::CString::new(xml.to_str().unwrap()).unwrap();
-                let mut stream = std::ptr::null_mut();
-                assert_eq!(
-                    fopen(&mut stream, name.as_ptr().cast(), c"rb".as_ptr().cast()),
-                    0
-                );
-                assert!(!stream.is_null());
-                assert_eq!(fclose(stream), 0);
-                stream = std::ptr::null_mut();
-                assert_ne!(fopen(&mut stream, name.as_ptr().cast(), c"w".as_ptr().cast()), 0);
-                assert!(stream.is_null());
-            }
-            {
-                let _guard = callback_transaction(adapter());
-                let register: unsafe extern "thiscall" fn(
-                    *mut c_void,
-                    *const VendorString,
-                    i32,
-                    u32,
-                    u32,
-                ) = std::mem::transmute(base + 0x173D0);
+            let register: unsafe extern "thiscall" fn(*mut c_void, *const VendorString, i32, u32, u32) = std::mem::transmute(base + register);
+            let select: unsafe extern "thiscall" fn(*mut c_void, *const VendorString) = std::mem::transmute(base + select);
+            let character = if scenario.starts_with("named") { "Alpha" } else { "global" };
+            // Initialize's settings work, in a scope as Initialize runs.
+            serialized(|| {
                 register(settings.cast(), &VendorString::new("X"), 0, 0, 0);
                 register(settings.cast(), &VendorString::new("Y"), 0, 0, 0);
-                let name = if matches!(scenario.as_str(), "named" | "save" | "named-save")
-                    || inherited_reader
-                {
-                    "Alpha"
-                } else {
-                    "global"
-                };
-                select(settings.cast(), &VendorString::new(name));
-                // Initialize normally copies these loaded X/Y fields into the
-                // map. Seed only that fixture state: calling its graphics
-                // initialization would require a live Hook API.
-                *((instance as *mut u8).add(0x148).cast::<[f32; 2]>()) =
-                    vendor_cached_position(base, settings.cast());
-            }
-            if scenario == "initialize" || scenario == "observer-initialize" {
-                if observer.is_some() {
-                    assert_eq!(std::fs::read_to_string(&xml).unwrap(), before_initialize);
-                }
-                assert_eq!(
-                    vendor_cached_position(base, settings.cast()),
-                    [2124.0, 1066.0]
-                );
-                std::fs::write(root.join(format!("{role}.done")), b"done").unwrap();
-                return;
-            }
-            drop(observer);
-            let vtable = *(instance.cast::<usize>()) as *const usize;
-            if scenario == "mouse" || scenario == "inherited-reader-mouse" {
-                *((instance as *mut u8).add(0x200)) = 1;
-                *((instance as *mut u8).add(0x1F8).cast::<f32>()) = 0.0;
-                *((instance as *mut u8).add(0x1FC).cast::<f32>()) = 0.0;
-                let callback: Mouse = std::mem::transmute(*vtable.add(13));
+                select(settings.cast(), &VendorString::new(character));
+            });
+            if scenario == "mouse" {
+                // A drag in progress from the map's corner, released at (100, 250).
+                *(instance as *mut u8).add(DRAG_FLAG) = 1;
+                *(instance as *mut u8).add(DRAG_FLAG - 8).cast::<f32>() = 0.0;
+                *(instance as *mut u8).add(DRAG_FLAG - 4).cast::<f32>() = 0.0;
+                let callback: Mouse = std::mem::transmute(*vtable.add(WRAPPED[3]));
                 callback(instance, 2, 100, 250, 0, 0);
             } else {
-                let callback: Command = std::mem::transmute(if scenario.starts_with("stock") {
-                    original[7]
-                } else {
-                    *vtable.add(7)
+                let callback: Command = std::mem::transmute(match scenario.as_str() {
+                    "stock" => ORIGINAL[1].load(Ordering::Acquire),
+                    _ => *vtable.add(WRAPPED[1]),
                 });
-                let text: &[u8] = match scenario.as_str() {
-                    "save" | "named-save" => b"save\0",
-                    "inherited-writer" => b"pos 600 700\0",
-                    "inherited-reader-same" => b"pos 100 200\0",
-                    "inherited-reader-px" | "inherited-reader-px-explicit" => b"px 100\0",
-                    "inherited-reader-py" | "inherited-reader-py-explicit" => b"py 200\0",
-                    "same" | "six" => b"pos 100 200\0",
-                    "upper" | "stock-upper" => b"POS 100 250\0",
-                    "prefix" | "stock-prefix" => b"MAP POS 100 250\0",
-                    "quoted" | "stock-quoted" => b"pos \"100\" \"250\"\0",
-                    _ => b"pos 100 250\0",
-                };
                 if scenario == "named-save" {
                     callback(instance, c"pos 100 250".as_ptr().cast());
-                    let positioned = std::fs::read_to_string(&xml).unwrap();
-                    let document = roxmltree::Document::parse(&positioned).unwrap();
-                    let character = settings_node(&document, "Alpha").unwrap().unwrap();
-                    assert!(character.children().any(|node| node.has_tag_name("X")));
-                }
-                for _ in 0..if scenario == "six" { 12 } else { 1 } {
-                    callback(instance, text.as_ptr());
-                }
-            }
-            if inherited_reader {
-                let expected_before = if matches!(
-                    scenario.as_str(),
-                    "inherited-reader-same"
-                        | "inherited-reader-px"
-                        | "inherited-reader-py"
-                        | "inherited-reader-px-explicit"
-                        | "inherited-reader-py-explicit"
-                ) {
-                    [100.0, 200.0]
+                    callback(instance, c"save".as_ptr().cast());
                 } else {
-                    [100.0, 250.0]
-                };
-                assert_eq!(
-                    vendor_cached_position(base, settings.cast()),
-                    expected_before
-                );
-                assert_eq!(
-                    read::<[f32; 2]>(instance as usize + 0x148),
-                    Some(expected_before)
-                );
-                std::fs::write(root.join("inherited-reader.positioned"), b"ready").unwrap();
-                let started = Instant::now();
-                while !root.join("inherited-writer.done").exists() {
-                    assert!(
-                        started.elapsed() < Duration::from_secs(15),
-                        "global writer did not finish"
-                    );
-                    thread::sleep(Duration::from_millis(10));
+                    let (text, times) = if scenario == "six" { (c"pos 100 200", 12) } else { (c"pos 100 250", 1) };
+                    for _ in 0..times {
+                        callback(instance, text.as_ptr().cast());
+                    }
                 }
-                let _guard = callback_transaction(adapter());
-                let before_xml = std::fs::read_to_string(&xml).unwrap();
-                let before = vendor_cached_position(base, settings.cast());
-                assert_eq!(
-                    before, expected_before,
-                    "the other process cannot update this cache"
-                );
-                // This is the real selector used by Initialize and incoming
-                // 0x00A/0x00B. Invoke it directly; those public callbacks also
-                // require a live Hook API/graphics context, which this fixture
-                // deliberately does not fabricate.
-                select(settings.cast(), &VendorString::new("Alpha"));
-                let after = vendor_cached_position(base, settings.cast());
-                let expected_after = match scenario.as_str() {
-                    "stock-inherited-reader" => [600.0, 250.0],
-                    "inherited-reader-px" => [100.0, 700.0],
-                    "inherited-reader-py" => [600.0, 200.0],
-                    _ => expected_before,
-                };
-                assert_eq!(
-                    after, expected_after,
-                    "only intentionally positioned axes should be pinned on settings reload"
-                );
-                assert_eq!(
-                    std::fs::read_to_string(&xml).unwrap(),
-                    before_xml,
-                    "reload must not rewrite XML"
-                );
-                std::fs::write(
-                    root.join("inherited-reader.observed"),
-                    format!("{before:?}\n{after:?}\n"),
-                )
-                .unwrap();
             }
-            std::fs::write(root.join(format!("{role}.done")), b"done").unwrap();
-            // Vendor objects retain test-owned buffers; let process exit reclaim
-            // everything instead of invoking graphics-related plugin teardown.
         }
+        std::fs::write(root.join(format!("{role}.done")), b"done").unwrap();
+        // Vendor objects keep test-owned buffers; process exit reclaims them.
     }
 
     #[test]
-    fn relaunch_decisions_follow_the_scan_cache() {
-        let at = |module, still_mapped, constructed_in| {
-            Some(Previous { module, still_mapped, constructed_in })
+    #[ignore = "Executes FFXIDB copies against isolated XML, without Hook or a game"]
+    fn installed_plugin_position_callbacks_preserve_settings() {
+        let initial = "<settings><global><X>100</X><Y>200</Y></global><Alpha><X>310</X><Y>410</Y></Alpha><Beta><X>510</X><Y>610</Y></Beta></settings>";
+        let fields = |xml: &str, section: &str| {
+            let document = roxmltree::Document::parse(xml).unwrap();
+            let node = document.root_element().children().find(|node| node.has_tag_name(section));
+            node.map(|node| AXES.map(|axis| node.children().find(|child| child.has_tag_name(axis)).and_then(|child| child.text()).map(str::to_owned)))
         };
-        // First game in a host.
-        assert_eq!(decide(None, 0x5000_0000, true, 1), Decision::Protect);
-        // Hook unloaded game 1's mapping; game 2 maps a fresh copy, at the
-        // same base or elsewhere.
-        assert_eq!(decide(at(0x5000_0000, false, Some(1)), 0x5000_0000, true, 2), Decision::Protect);
-        assert_eq!(decide(at(0x5000_0000, false, Some(1)), 0x6000_0000, true, 2), Decision::Protect);
-        // The 2026-10-23 crash: game 1's mapping survived into game 2 with
-        // its scan cache (game 1 heap pointers) still populated.
-        assert_eq!(
-            decide(at(0x5000_0000, false, Some(1)), 0x5000_0000, false, 2),
-            Decision::StaleScanCache
-        );
-        // A populated cache Crystal never saw constructed is not trusted.
-        assert_eq!(decide(None, 0x5000_0000, false, 1), Decision::StaleScanCache);
-        assert_eq!(decide(at(0x5000_0000, false, None), 0x5000_0000, false, 1), Decision::StaleScanCache);
-        // Hook asking again for the mapping built during this same game.
-        assert_eq!(decide(at(0x5000_0000, false, Some(2)), 0x5000_0000, false, 2), Decision::SameGame);
-        // Two images at once stay refused.
-        assert_eq!(decide(at(0x5000_0000, true, Some(2)), 0x6000_0000, true, 2), Decision::SecondImage);
+        let pair = |x: Option<&str>, y: Option<&str>| Some([x.map(str::to_owned), y.map(str::to_owned)]);
+        for source in fixture_builds() {
+            let root = std::env::temp_dir().join(format!("crystal-ffxidb-vendor-{}", unique()));
+            std::fs::create_dir(&root).unwrap();
+            std::fs::copy(&source, root.join("FFXIDB.dll")).unwrap();
+            let shared = format!("Local\\CrystalLauncher.FFXIDB.vendor-test.{}", unique());
+            let spawn = |scenario: &str, role: &str| {
+                run_child("vendor_settings_child", &root, &[
+                    ("CRYSTAL_TEST_FFXIDB_SCENARIO", scenario),
+                    ("CRYSTAL_TEST_FFXIDB_ROLE", role),
+                    ("CRYSTAL_TEST_FFXIDB_SHARED_MUTEX", &shared),
+                ])
+            };
+            for scenario in ["stock", "global", "mouse", "named", "named-save"] {
+                std::fs::write(root.join("FFXIDB.xml"), initial).unwrap();
+                assert!(spawn(scenario, scenario).wait().unwrap().success(), "{}: {scenario}", source.display());
+                let xml = std::fs::read_to_string(root.join("FFXIDB.xml")).unwrap();
+                let (global, alpha, beta) = (fields(&xml, "global"), fields(&xml, "Alpha"), fields(&xml, "Beta"));
+                let (expected_global, expected_alpha, expected_beta) = match scenario {
+                    // The stock callback, unwrapped, reproduces the loss.
+                    "stock" => (pair(None, Some("250")), fields(initial, "Alpha"), fields(initial, "Beta")),
+                    "global" | "mouse" => (pair(Some("100"), Some("250")), fields(initial, "Alpha"), fields(initial, "Beta")),
+                    // X moved to the global value: pinned, not inherited or put back.
+                    "named" => (fields(initial, "global"), pair(Some("100"), Some("250")), fields(initial, "Beta")),
+                    // The stock `save`, which drops every character, is unchanged.
+                    _ => (pair(Some("100"), Some("250")), None, None),
+                };
+                assert_eq!((global, alpha, beta), (expected_global, expected_alpha, expected_beta), "{}: {scenario}", source.display());
+            }
+            // Six games saving at once, held at the shared mutex until all have
+            // started: every section survives 72 saves.
+            std::fs::write(root.join("FFXIDB.xml"), initial).unwrap();
+            let gate = TransactionMutex::open(&shared).unwrap();
+            let guard = gate.acquire(0).unwrap();
+            let mut children: Vec<_> = (0..6).map(|i| spawn("six", &format!("six{i}"))).collect();
+            for i in 0..6 {
+                wait_for(&root.join(format!("six{i}.ready")), "all six FFXIDB processes must start");
+            }
+            thread::sleep(Duration::from_millis(200));
+            assert!(!(0..6).any(|i| root.join(format!("six{i}.done")).exists()), "the held mutex must stop every settings read");
+            drop(guard);
+            for child in &mut children {
+                assert!(child.wait().unwrap().success());
+            }
+            let xml = std::fs::read_to_string(root.join("FFXIDB.xml")).unwrap();
+            for section in ["global", "Alpha", "Beta"] {
+                assert_eq!(fields(&xml, section), fields(initial, section), "{}: {section}", source.display());
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     fn loaded(base: usize) -> bool {
@@ -2501,43 +1558,17 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "Child of the isolated FFXIDB relaunch regression; never run against live settings"]
     fn relaunch_child() {
-        use windows_sys::Win32::System::LibraryLoader::{
-            LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
-        };
-        let Some(root) = std::env::var_os("CRYSTAL_TEST_FFXIDB_RELAUNCH_ROOT").map(PathBuf::from)
-        else {
-            return;
-        };
+        let Some(root) = std::env::var_os("CRYSTAL_TEST_FFXIDB_ROOT").map(PathBuf::from) else { return };
         assert!(std::env::var_os("CRYSTAL_TEST_FFXIDB_SHARED_MUTEX").is_some());
         let path = root.join("FFXIDB.dll");
-        let wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        let load = || unsafe {
-            let module = LoadLibraryExW(
-                wide.as_ptr(),
-                std::ptr::null_mut(),
-                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
-            );
-            assert!(!module.is_null(), "{}", std::io::Error::last_os_error());
-            module
-        };
-        // Hook's resolver is the stock GetProcAddress, as in a live host.
-        let stock: Resolve = GetProcAddress;
-        assert!(BRIDGE.set(Bridge { _hook: OwnedModule(0), resolve: stock }).is_ok());
-        let protected = create_instance as *const () as usize;
-        let disabled = disabled_factory as *const () as usize;
-        let resolve_factory = |module: HMODULE| unsafe {
-            resolve(module, c"CreateInstance".as_ptr().cast()).map(|f| f as usize)
-        };
+        let protected = Some(create_instance as *const () as usize);
+        let disabled = Some(disabled_factory as *const () as usize);
         // Bounded: the parent also kills this child if any unload never returns.
         let starting = |game: usize| {
             let previous = HELD.load(Ordering::SeqCst);
-            let started = std::time::Instant::now();
+            let started = Instant::now();
             game_starting();
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(10),
-                "game {game}: releasing the previous FFXIDB copy took {:?}",
-                started.elapsed()
-            );
+            assert!(started.elapsed() < Duration::from_secs(10), "game {game}: releasing the previous FFXIDB copy took {:?}", started.elapsed());
             assert_eq!(HELD.load(Ordering::SeqCst), 0, "game {game}");
             previous
         };
@@ -2547,463 +1578,73 @@ pub(crate) mod tests {
         for game in 1..=2 {
             let previous = starting(game);
             if game > 1 {
-                // Earlier builds: the previous copy, and its scan cache, reached this game.
                 assert!(!loaded(previous), "game {game}: the previous game's FFXIDB must be unloaded before GameStart");
             }
-            let module = load();
+            let module = load_plugin(&path);
             let base = module as usize;
-            assert!(scan_cache_fresh(base), "game {game} must get a fresh FFXIDB mapping");
-            assert_eq!(resolve_factory(module), Some(protected), "game {game}");
-            let instance = unsafe { create_instance() };
-            assert!(!instance.is_null(), "game {game}");
-            assert_eq!(
-                read::<usize>(instance as usize),
-                Some(adapter().shadow[1..].as_ptr() as usize)
-            );
-            assert_eq!(adapter().module, base);
+            assert_eq!(factory_of(module), protected, "game {game} must get a fresh FFXIDB mapping");
+            assert!(!unsafe { create_instance() }.is_null(), "game {game}");
             assert_eq!(HELD.load(Ordering::SeqCst), base, "game {game}");
             unsafe { FreeLibrary(module) };
             // The 2026-10-23 test build: Hook's FreeLibrary unmapped FFXIDB
-            // inside the game's teardown, and clients hung at /logout. It must
-            // stay mapped until the host starts the next game.
+            // inside the game's teardown, and clients hung at /logout.
             assert!(loaded(base), "game {game}: FFXIDB must stay mapped through the end of its game");
         }
-        // Something else keeps FFXIDB mapped past its game: game 3's factory
-        // must refuse the stale mapping rather than let FFXIDB crash.
+        // Something else keeps FFXIDB mapped past its game: game 4's factory
+        // must refuse that copy (its scan caches hold game 3's addresses).
         let previous = starting(3);
         assert!(!loaded(previous));
-        let module = load();
-        let extra = load();
+        let module = load_plugin(&path);
+        let extra = load_plugin(&path);
         assert_eq!(module, extra);
         let base = module as usize;
-        assert_eq!(resolve_factory(module), Some(protected));
-        let instance = unsafe { create_instance() };
-        assert!(!instance.is_null());
-        // Stand in for game 3's scans: FFXIDB's std::map size becomes nonzero.
-        let size = (base + SCAN_CACHE_RVA + 4) as *mut u32;
-        unsafe { size.write_volatile(1) };
-        // Hook asking again within game 3 is still served.
-        assert_eq!(resolve_factory(module), Some(protected));
+        assert_eq!(factory_of(module), protected);
+        assert!(!unsafe { create_instance() }.is_null());
+        assert_eq!(factory_of(module), protected, "Hook asking again within game 3 is still served");
         unsafe { FreeLibrary(module) };
-        assert!(loaded(base));
         assert_eq!(starting(4), base);
         assert!(loaded(base), "the extra reference keeps the old mapping");
-        assert_eq!(resolve_factory(module), Some(disabled), "game 4 must not reuse game 3's cache");
-        assert!(unsafe { create_instance() }.is_null());
-        // Leave FFXIDB's .data as its unconstructed map expects at unload.
-        unsafe { size.write_volatile(0) };
+        assert_eq!(factory_of(module), disabled, "game 4 must not reuse game 3's copy");
         unsafe { FreeLibrary(extra) };
         assert!(!loaded(base));
         std::fs::write(root.join("relaunch.done"), b"done").unwrap();
     }
 
     #[test]
-    #[ignore = "Executes a verified local FFXIDB copy, without Hook or a game"]
+    #[ignore = "Executes FFXIDB copies, without Hook or a game"]
     fn installed_plugin_unloads_between_games_in_one_host() {
-        let windower = PathBuf::from(std::env::var_os("CRYSTAL_WINDOWER_ROOT")
-            .expect("Set CRYSTAL_WINDOWER_ROOT to the installation containing the verified FFXIDB.dll; this test copies it to an isolated fixture"));
-        let source = windower.join("plugins").join("FFXIDB.dll");
-        assert!(file_matches(&source, FFXIDB_SHA256));
-        let root = std::env::temp_dir().join(format!("crystal-ffxidb-relaunch-{}", unique()));
-        std::fs::create_dir(&root).unwrap();
-        std::fs::copy(source, root.join("FFXIDB.dll")).unwrap();
-        let mut child = Process::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "windower_plugin_settings::tests::relaunch_child",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env("CRYSTAL_TEST_FFXIDB_RELAUNCH_ROOT", &root)
-            .env(
-                "CRYSTAL_TEST_FFXIDB_SHARED_MUTEX",
-                format!("Local\\CrystalLauncher.FFXIDB.relaunch-test.{}", unique()),
-            )
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        // Four games of load/unload take well under a second; a stuck
-        // FreeLibrary (loader-lock wait in FFXIDB's detach) never returns.
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            if std::time::Instant::now() > deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("FFXIDB relaunch child did not finish in 60 s: an unload or load hung");
-            }
-            thread::sleep(Duration::from_millis(50));
-        };
-        assert!(status.success());
-        assert!(root.join("relaunch.done").exists(), "child skipped the scenario");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    #[ignore = "Executes a verified local FFXIDB copy against isolated XML, without Hook or a game"]
-    fn installed_plugin_position_callbacks_preserve_settings() {
-        let windower = PathBuf::from(std::env::var_os("CRYSTAL_WINDOWER_ROOT")
-            .expect("Set CRYSTAL_WINDOWER_ROOT to the installation containing the verified FFXIDB.dll; this test copies it to an isolated fixture"));
-        let source = windower.join("plugins").join("FFXIDB.dll");
-        assert!(file_matches(&source, FFXIDB_SHA256));
-        let root = std::env::temp_dir().join(format!("crystal-ffxidb-vendor-{}", unique()));
-        std::fs::create_dir(&root).unwrap();
-        std::fs::copy(source, root.join("FFXIDB.dll")).unwrap();
-        let shared = format!("Local\\CrystalLauncher.FFXIDB.vendor-test.{}", unique());
-        let initial = "<settings><global><X>100</X><Y>200</Y></global><Alpha><X>310</X><Y>410</Y></Alpha><Beta><X>510</X><Y>610</Y></Beta></settings>";
-        let spawn = |scenario: &str, role: &str| {
-            Process::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "windower_plugin_settings::tests::vendor_settings_child",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env("CRYSTAL_TEST_FFXIDB_VENDOR_ROOT", &root)
-                .env("CRYSTAL_TEST_FFXIDB_VENDOR_SCENARIO", scenario)
-                .env("CRYSTAL_TEST_FFXIDB_VENDOR_ROLE", role)
-                .env("CRYSTAL_TEST_FFXIDB_VENDOR_MUTEX", &shared)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .unwrap()
-        };
-        let fields = |xml: &str, section: &str| {
-            let doc = roxmltree::Document::parse(xml).unwrap();
-            doc.root_element()
-                .children()
-                .find(|node| node.has_tag_name(section))
-                .map(|node| {
-                    ["X", "Y"].map(|name| {
-                        node.children()
-                            .find(|child| child.has_tag_name(name))
-                            .and_then(|child| child.text())
-                            .map(str::to_owned)
-                    })
-                })
-        };
-        for scenario in [
-            "stock",
-            "stock-upper",
-            "stock-prefix",
-            "stock-quoted",
-            "global",
-            "upper",
-            "prefix",
-            "quoted",
-            "same",
-            "named",
-            "mouse",
-            "save",
-            "named-save",
-        ] {
-            std::fs::write(root.join("FFXIDB.xml"), initial).unwrap();
-            assert!(
-                spawn(scenario, scenario).wait().unwrap().success(),
-                "{scenario}"
-            );
-            let xml = std::fs::read_to_string(root.join("FFXIDB.xml")).unwrap();
-            let global = fields(&xml, "global").unwrap();
-            match scenario {
-                "stock" | "stock-upper" | "stock-prefix" | "stock-quoted" => assert_eq!(
-                    global,
-                    [None, Some("250".into())],
-                    "uncorrected real callback reproduces loss"
-                ),
-                "global" | "upper" | "prefix" | "quoted" | "mouse" => {
-                    assert_eq!(global, [Some("100".into()), Some("250".into())])
+        for source in fixture_builds() {
+            let root = std::env::temp_dir().join(format!("crystal-ffxidb-relaunch-{}", unique()));
+            std::fs::create_dir(&root).unwrap();
+            std::fs::copy(&source, root.join("FFXIDB.dll")).unwrap();
+            let shared = format!("Local\\CrystalLauncher.FFXIDB.relaunch-test.{}", unique());
+            let mut child = run_child("relaunch_child", &root, &[("CRYSTAL_TEST_FFXIDB_SHARED_MUTEX", &shared)]);
+            // Four games of load/unload take well under a second; a stuck
+            // FreeLibrary (loader-lock wait in FFXIDB's detach) never returns.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
                 }
-                "save" | "named-save" => {
-                    let expected = if scenario == "save" {
-                        ["310", "410"]
-                    } else {
-                        ["100", "250"]
-                    };
-                    assert_eq!(global, expected.map(|value| Some(value.into())));
-                    assert!(
-                        fields(&xml, "Alpha").is_none(),
-                        "explicit stock save semantics are unchanged"
-                    );
-                    assert!(fields(&xml, "Beta").is_none());
-                    continue;
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{}: FFXIDB relaunch child did not finish in 60 s: an unload or load hung", source.display());
                 }
-                _ => assert_eq!(global, [Some("100".into()), Some("200".into())]),
-            }
-            assert_eq!(
-                fields(&xml, "Beta").unwrap(),
-                [Some("510".into()), Some("610".into())]
-            );
-            if scenario == "named" {
-                assert_eq!(
-                    fields(&xml, "Alpha").unwrap(),
-                    [Some("100".into()), Some("250".into())]
-                );
-            } else {
-                assert_eq!(
-                    fields(&xml, "Alpha").unwrap(),
-                    [Some("310".into()), Some("410".into())]
-                );
-            }
-        }
-        std::fs::write(root.join("FFXIDB.xml"), initial).unwrap();
-        let gate = TransactionMutex::open(&shared).unwrap();
-        let guard = gate.acquire(0).unwrap();
-        let mut children: Vec<_> = (0..6).map(|i| spawn("six", &format!("six{i}"))).collect();
-        let started = Instant::now();
-        while !(0..6).all(|i| root.join(format!("six{i}.ready")).exists()) {
-            assert!(
-                started.elapsed() < Duration::from_secs(15),
-                "all six exact-DLL processes must reach the held guard"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(!(0..6).any(|i| root.join(format!("six{i}.done")).exists()));
-        drop(guard);
-        for child in &mut children {
-            assert!(child.wait().unwrap().success());
-        }
-        let xml = std::fs::read_to_string(root.join("FFXIDB.xml")).unwrap();
-        for section in ["global", "Alpha", "Beta"] {
-            assert_eq!(fields(&xml, section), fields(initial, section));
-        }
-        assert!(root
-            .canonicalize()
-            .unwrap()
-            .starts_with(std::env::temp_dir().canonicalize().unwrap()));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[ignore = "Checks character axes using two verified FFXIDB copies and isolated XML"]
-    fn installed_plugin_pins_explicit_character_axes() {
-        let windower = PathBuf::from(std::env::var_os("CRYSTAL_WINDOWER_ROOT").expect(
-            "Set CRYSTAL_WINDOWER_ROOT to the installation containing the verified FFXIDB.dll",
-        ));
-        let source = windower.join("plugins").join("FFXIDB.dll");
-        assert!(file_matches(&source, FFXIDB_SHA256));
-        let root = std::env::temp_dir().join(format!("crystal-ffxidb-inherited-{}", unique()));
-        std::fs::create_dir(&root).unwrap();
-        let initial = "<settings><global><X>100</X><Y>200</Y></global><Alpha><X>100</X><Y>200</Y></Alpha><Beta><X>510</X><Y>610</Y></Beta></settings>";
-        let fields = |xml: &str, section: &str| {
-            let doc = roxmltree::Document::parse(xml).unwrap();
-            let section = doc
-                .root_element()
-                .children()
-                .find(|node| node.has_tag_name(section))
-                .unwrap();
-            ["X", "Y"].map(|name| {
-                section
-                    .children()
-                    .find(|node| node.has_tag_name(name))
-                    .and_then(|node| node.text())
-                    .map(str::to_owned)
-            })
-        };
-        for (scenario, expected_fields, before, after) in [
-            (
-                "stock-inherited-reader",
-                [None, Some("250")],
-                [100.0, 250.0],
-                [600.0, 250.0],
-            ),
-            (
-                "inherited-reader",
-                [Some("100"), Some("250")],
-                [100.0, 250.0],
-                [100.0, 250.0],
-            ),
-            (
-                "inherited-reader-mouse",
-                [Some("100"), Some("250")],
-                [100.0, 250.0],
-                [100.0, 250.0],
-            ),
-            (
-                "inherited-reader-same",
-                [Some("100"), Some("200")],
-                [100.0, 200.0],
-                [100.0, 200.0],
-            ),
-            (
-                "inherited-reader-px",
-                [Some("100"), None],
-                [100.0, 200.0],
-                [100.0, 700.0],
-            ),
-            (
-                "inherited-reader-py",
-                [None, Some("200")],
-                [100.0, 200.0],
-                [600.0, 200.0],
-            ),
-            (
-                "inherited-reader-px-explicit",
-                [Some("100"), Some("200")],
-                [100.0, 200.0],
-                [100.0, 200.0],
-            ),
-            (
-                "inherited-reader-py-explicit",
-                [Some("100"), Some("200")],
-                [100.0, 200.0],
-                [100.0, 200.0],
-            ),
-        ] {
-            let case = root.join(scenario);
-            std::fs::create_dir(&case).unwrap();
-            std::fs::copy(&source, case.join("FFXIDB.dll")).unwrap();
-            let shared = format!("Local\\CrystalLauncher.FFXIDB.inherited-test.{}", unique());
-            let xml = case.join("FFXIDB.xml");
-            let case_initial = if matches!(scenario, "inherited-reader-px" | "inherited-reader-py")
-            {
-                initial.replace(
-                    "<Alpha><X>100</X><Y>200</Y></Alpha>",
-                    "<Alpha><Zoom>75</Zoom></Alpha>",
-                )
-            } else {
-                initial.to_owned()
+                thread::sleep(Duration::from_millis(50));
             };
-            std::fs::write(&xml, &case_initial).unwrap();
-            let spawn = |child_scenario: &str| {
-                Process::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "windower_plugin_settings::tests::vendor_settings_child",
-                        "--ignored",
-                        "--nocapture",
-                    ])
-                    .env("CRYSTAL_TEST_FFXIDB_VENDOR_ROOT", &case)
-                    .env("CRYSTAL_TEST_FFXIDB_VENDOR_SCENARIO", child_scenario)
-                    .env("CRYSTAL_TEST_FFXIDB_VENDOR_ROLE", child_scenario)
-                    .env("CRYSTAL_TEST_FFXIDB_VENDOR_MUTEX", &shared)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::inherit())
-                    .spawn()
-                    .unwrap()
-            };
-            let mut reader = spawn(scenario);
-            let started = Instant::now();
-            while !case.join("inherited-reader.positioned").exists() {
-                assert!(
-                    reader.try_wait().unwrap().is_none(),
-                    "{scenario}: named client exited before positioning"
-                );
-                assert!(
-                    started.elapsed() < Duration::from_secs(15),
-                    "named client did not position"
-                );
-                thread::sleep(Duration::from_millis(10));
-            }
-            let expected_fields = expected_fields.map(|value| value.map(str::to_owned));
-            let positioned = std::fs::read_to_string(&xml).unwrap();
-            assert_eq!(
-                fields(&positioned, "global"),
-                [Some("100".into()), Some("200".into())]
-            );
-            assert_eq!(fields(&positioned, "Alpha"), expected_fields, "{scenario}");
-            assert_eq!(fields(&positioned, "Beta"), fields(initial, "Beta"));
-            assert!(spawn("inherited-writer").wait().unwrap().success());
-            assert!(reader.wait().unwrap().success(), "{scenario}");
-            let changed = std::fs::read_to_string(&xml).unwrap();
-            assert_eq!(
-                fields(&changed, "global"),
-                [Some("600".into()), Some("700".into())]
-            );
-            assert_eq!(fields(&changed, "Alpha"), expected_fields);
-            assert_eq!(fields(&changed, "Beta"), fields(initial, "Beta"));
-            if matches!(scenario, "inherited-reader-px" | "inherited-reader-py") {
-                let document = roxmltree::Document::parse(&changed).unwrap();
-                let character = settings_node(&document, "Alpha").unwrap().unwrap();
-                assert_eq!(
-                    character
-                        .children()
-                        .find(|node| node.has_tag_name("Zoom"))
-                        .unwrap()
-                        .text(),
-                    Some("75")
-                );
-            }
-            assert_eq!(
-                std::fs::read_to_string(case.join("inherited-reader.observed")).unwrap(),
-                format!("{before:?}\n{after:?}\n")
-            );
+            assert!(status.success(), "{}", source.display());
+            assert!(root.join("relaunch.done").exists(), "child skipped the scenario");
+            let _ = std::fs::remove_dir_all(&root);
         }
-        assert!(root
-            .canonicalize()
-            .unwrap()
-            .starts_with(std::env::temp_dir().canonicalize().unwrap()));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    #[ignore = "Executes real startup field registration with an isolated shared-read observer"]
-    fn installed_plugin_registration_with_shared_reader() {
-        let source = PathBuf::from(std::env::var_os("CRYSTAL_WINDOWER_ROOT").unwrap())
-            .join("plugins")
-            .join("FFXIDB.dll");
-        assert!(file_matches(&source, FFXIDB_SHA256));
-        let root = std::env::temp_dir().join(format!("crystal-ffxidb-initialize-{}", unique()));
-        std::fs::create_dir(&root).unwrap();
-        std::fs::copy(&source, root.join("FFXIDB.dll")).unwrap();
-        let initial = "<settings><global><X>2124</X><Y>1066</Y><Scale>1</Scale></global><Alpha><X>1985</X><Y>1035</Y></Alpha></settings>";
-        for scenario in ["initialize", "observer-initialize"] {
-            std::fs::write(root.join("FFXIDB.xml"), initial).unwrap();
-            let result = Process::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "windower_plugin_settings::tests::vendor_settings_child",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env("CRYSTAL_TEST_FFXIDB_VENDOR_ROOT", &root)
-                .env("CRYSTAL_TEST_FFXIDB_VENDOR_SCENARIO", scenario)
-                .env("CRYSTAL_TEST_FFXIDB_VENDOR_ROLE", scenario)
-                .env(
-                    "CRYSTAL_TEST_FFXIDB_VENDOR_MUTEX",
-                    format!("Local\\CrystalLauncher.FFXIDB.initialize-test.{}", unique()),
-                )
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .status()
-                .unwrap();
-            assert!(result.success(), "{scenario}");
-            let saved = std::fs::read_to_string(root.join("FFXIDB.xml")).unwrap();
-            let document = roxmltree::Document::parse(&saved).unwrap();
-            for (scope, expected) in [("global", ["2124", "1066"]), ("Alpha", ["1985", "1035"])] {
-                let section = settings_node(&document, scope).unwrap().unwrap();
-                for (axis, expected) in ["X", "Y"].into_iter().zip(expected) {
-                    assert_eq!(
-                        section
-                            .children()
-                            .find(|node| node.has_tag_name(axis))
-                            .unwrap()
-                            .text(),
-                        Some(expected)
-                    );
-                }
-            }
-        }
-        assert!(root
-            .canonicalize()
-            .unwrap()
-            .starts_with(std::env::temp_dir().canonicalize().unwrap()));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[ignore = "Read-only installed PE verification; neither vendor DLL is loaded or executed"]
-    fn installed_builds_match_adapter_and_callback_abi() {
+    #[ignore = "Read-only installed PE verification; no vendor DLL is loaded or executed"]
+    fn installed_hook_builds_match_the_plugin_loader_check() {
         let root = std::env::var_os("CRYSTAL_WINDOWER_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\Games\Final Fantasy XI Programs\Windower 4"));
-        let plugin = root.join("plugins").join("FFXIDB.dll");
         let mut hooks = vec![root.join("Hook.dll")];
         // Optional local archive verifies every Hook build there, including
         // versions no longer installed. Never download or execute these DLLs.
@@ -3017,7 +1658,7 @@ pub(crate) mod tests {
             }
         }
         let known: Vec<Plugins> = crate::hook_layout::KNOWN.iter().filter_map(|k| k.plugins).collect();
-        for path in hooks {
+        for path in hooks.into_iter().filter(|path| path.is_file()) {
             let file = std::fs::read(&path).unwrap();
             let mut image = crate::windower_bootstrap_contract::map_pe_relocated(&file);
             let base = image.as_ptr() as usize;
@@ -3045,21 +1686,15 @@ pub(crate) mod tests {
             }
             assert!(hook_layout(base, &build));
         }
+    }
 
-        let file = std::fs::read(plugin).unwrap();
-        assert_eq!(sha256(&file).as_deref(), Some(FFXIDB_SHA256));
-        let mut image = crate::windower_bootstrap_contract::map_pe_relocated(&file);
-        let base = image.as_ptr() as usize;
-        assert_eq!(pe_identity(base), Some(FFXIDB_ID));
-        assert!(plugin_layout(base));
-        assert!(scan_cache_fresh(base), "the scan cache lives in zero-filled .data");
-        for rva in SCAN_CACHE_REFERENCES {
-            image[rva + 1] ^= 1;
-            assert!(!plugin_layout(base), "moved scan cache reference at {rva:X}");
-            image[rva + 1] ^= 1;
-        }
-        assert!(plugin_layout(base));
-        image[VTABLE_RVA + 2 * 4] ^= 1;
-        assert!(!plugin_layout(base), "changed callback must be refused");
+    #[test]
+    fn an_unprotected_ffxidb_is_reported_to_the_launcher_once_per_host() {
+        let reason = "this FFXIDB.dll imports no CreateFile function from KERNEL32, so Crystal cannot see it open its settings";
+        let sent = crate::events::capture(|| {
+            report_unprotected(reason);
+            report_unprotected(reason);
+        });
+        assert_eq!(sent, vec![crate::proto::notice_line(&format!("FFXIDB minimap settings protection is off: {reason}."))]);
     }
 }

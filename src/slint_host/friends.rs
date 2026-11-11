@@ -234,7 +234,7 @@ pub(super) fn wire(ui: &MainWindow) {
     view.on_play(|| act(|a| a.play.clone()));
     view.on_choose_portrait(|| act(|a| a.portrait.clone()));
     view.on_connect(|| act(|a| a.connect.clone()));
-    view.on_otp_edited(|value| act(|a| a.otp_key.clone().map(|key| Message::OtpChanged(key, value.into()))));
+    view.on_otp_edited(|value| act(|a| a.otp_key.clone().map(|key| Message::OtpChanged(key, super::view::otp_digits(value.as_str())))));
     view.on_account_picked(|i| act(|a| a.account_keys.get(index(i)?).cloned().map(Message::FriendsAccount)));
     view.on_status_picked(|i| act(|a| a.status.then(|| STATUSES.get(index(i)?).copied().map(Message::FriendsStatus)).flatten()));
     view.on_status_options(|| deliver(Message::FriendsStatusOptions));
@@ -486,14 +486,14 @@ fn problems(x: &Ctx, state: &State) {
     let friends = &x.app.friends;
     let mut problems: Vec<String> = Vec::new();
     if !friends.error.is_empty() {
-        problems.push(friends.error.clone());
+        problems.push(crate::social::localize(&friends.error));
     }
     if let Some(error) = friends.snapshot.as_ref().and_then(|s| s.session_error.as_ref()) {
-        problems.push(error.clone());
+        problems.push(crate::social::localize(error));
     }
     let shown = friends.snapshot.as_ref().filter(|s| s.fetched_at != 0 && friends.connected);
     if let Some(error) = shown.and_then(|s| s.error.as_ref()) {
-        problems.push(tf("{error} The previous list is still shown.", &[("error", error)]));
+        problems.push(tf("{error} The previous list is still shown.", &[("error", &crate::social::localize(error))]));
     }
     strings_model(&state.problems, problems.iter().map(|problem| private(x.app, problem)));
 }
@@ -527,7 +527,7 @@ fn sign_in(view: &FriendsView, x: &Ctx, actions: &mut Actions) {
         t("Sign in to use PlayOnline friends.")
     };
     put!(view, get_sign_in_message, set_sign_in_message, message.into());
-    let error = state.snapshot.as_ref().and_then(|s| s.error.as_ref()).map(|error| private(app, &tf("Could not load friends: {error}", &[("error", error)])));
+    let error = state.snapshot.as_ref().and_then(|s| s.error.as_ref()).map(|error| private(app, &tf("Could not load friends: {error}", &[("error", &crate::social::localize(error))])));
     put!(view, get_sign_in_error, set_sign_in_error, error.unwrap_or_default().into());
     let controls = retail && !state.connected;
     put!(view, get_sign_in_controls, set_sign_in_controls, controls);
@@ -724,13 +724,13 @@ fn panes(view: &FriendsView, x: &Ctx, snapshot: &Snapshot, state: &mut State, ac
 fn confirm(view: &FriendsView, x: &Ctx, friend: Option<&Friend>, actions: &mut Actions) {
     put!(view, get_confirm_shown, set_confirm_shown, friend.is_some());
     let Some(friend) = friend else { return };
-    let shown = display_name(friend);
+    let shown = hidden(&display_name(friend));
     let (question, action) = if friend.alternate {
         (tf("Unblock {name}? Their messages will reach you again.", &[("name", &shown)]), t("Unblock"))
     } else {
         (tf("Remove {name} from your PlayOnline friends?", &[("name", &shown)]), t("Remove"))
     };
-    put!(view, get_confirm_question, set_confirm_question, private(x.app, &question).into());
+    put!(view, get_confirm_question, set_confirm_question, question.into());
     put!(view, get_confirm_action, set_confirm_action, action.into());
     put!(view, get_confirm_danger, set_confirm_danger, !friend.alternate);
     actions.confirm = x.ready.then_some(Message::FriendsRemoveConfirm);

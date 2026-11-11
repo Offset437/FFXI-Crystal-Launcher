@@ -1,5 +1,6 @@
-// The top bar's content right of the account rail (Skyline `.top`): the page tabs, then Privacy
-// mode and the theme switch as quiet icon tools and a separator before the caption buttons.
+// The top bar's content right of the account rail (Skyline `.top`): the page tabs, then the
+// Discord link, Privacy mode and the theme switch as quiet icon tools and a separator before the
+// caption buttons.
 // Empty parts of it fall through to ChromeBar's title area, which drags the window.
 import { Theme } from "theme.slint";
 import { View } from "state.slint";
@@ -55,6 +56,15 @@ export component TitleContent inherits HorizontalLayout {
     }
     // The tabs never run into the tools: at least a tab gap between them.
     Rectangle { horizontal-stretch: 1; min-width: Theme.small ? 12px : 28px; }
+    IconButton {
+        cross-axis-self-alignment: center;
+        side: 30px;
+        wide: 34px;
+        glyph-size: 16px;
+        glyph: Glyph.discord;
+        hint: View.strings.discord;
+        clicked => { View.open-discord(); }
+    }
     IconButton {
         cross-axis-self-alignment: center;
         side: 30px;

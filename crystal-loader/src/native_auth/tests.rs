@@ -914,6 +914,22 @@ fn game_start_mirrors_the_viewer_exit() {
     fs::remove_dir_all(viewer).unwrap();
 }
 
+/// A startup sign-out acknowledged after the sign-in but before the hand-off
+/// starts no game: nothing is handed over, and Drop completes the sign-out.
+#[test]
+fn a_startup_sign_out_before_the_hand_off_starts_no_game() {
+    let _serial = CONTROL_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let viewer = fixture();
+    let mut s = session(&viewer);
+    s.registered = true;
+    with_startup_state(|state| state.store(CANCELLING_SIGN_IN, Ordering::Release));
+    clear_calls();
+    let events = events::capture(|| assert!(!s.attach_game()));
+    assert!(events.is_empty() && trace(&[]).is_empty(), "{events:?}");
+    forget(s);
+    fs::remove_dir_all(viewer).unwrap();
+}
+
 #[test]
 fn handoff_does_not_run_an_overdue_mail_retry_inside_callback_teardown() {
     let _serial = CONTROL_TEST.lock().unwrap_or_else(|e| e.into_inner());

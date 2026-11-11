@@ -92,7 +92,12 @@ pub(crate) fn decode(reader: &mut dyn Read) -> std::io::Result<(u32, String)> {
     String::from_utf8(body).map(|s| (opcode, s)).map_err(|_| bad("not UTF-8"))
 }
 
-enum Message { Update(Activity, bool), Clear, Stop }
+enum Message {
+    Update(Activity, bool),
+    #[cfg(test)]
+    Clear,
+    Stop,
+}
 
 struct Worker { tx: Sender<Message>, join: JoinHandle<()> }
 
@@ -134,6 +139,7 @@ impl Presence {
     }
 
     /// Removes the activity (a game ended). Does nothing if never connected.
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         if self.worker.is_some() { self.send(Message::Clear); }
     }
@@ -220,6 +226,7 @@ fn run(rx: mpsc::Receiver<Message>, base: &str, client_id: &str, status: &Mutex<
         }
         let activity = match message {
             Message::Update(activity, privacy) => Some(activity_json(&activity, privacy)),
+            #[cfg(test)]
             Message::Clear => Some(Value::Null),
             Message::Stop => None,
         };

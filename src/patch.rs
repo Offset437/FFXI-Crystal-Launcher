@@ -210,14 +210,6 @@ pub enum LaunchCheck {
     Unverified(PatchReport),
 }
 
-/// Looks the Viewer's patch host up through the user's own resolver so the first check of
-/// a launch (its W2U at Connect) finds it cached (a cold lookup measured 427 ms). DNS
-/// only; nothing reaches Square Enix's version servers. Never in unit tests (offline). A
-/// failed warm-up leaves no negative cache entry behind (`dns::warm`).
-pub(crate) fn warm_dns() {
-    crate::dns::warm(crate::dns::VIEWER_PATCH_HOST);
-}
-
 // --- round 2: "network not ready" and phases on every path (pol-spec 07d §2) ---
 
 /// How long a W2U whose first attempt failed instantly and locally
@@ -357,7 +349,7 @@ pub(crate) trait Net {
     fn sleep(&mut self, pause: Duration) { std::thread::sleep(pause) }
     fn elapsed(&self, since: Instant) -> Duration { since.elapsed() }
     /// After a retried W2U: the 07d §2.1 negative-cache rule (`dns::forget`).
-    fn forget_negative(&mut self) { crate::dns::forget(&[crate::dns::POL_LOGIN_HOST, crate::dns::VIEWER_PATCH_HOST, crate::dns::GAME_PATCH_HOST]) }
+    fn forget_negative(&mut self) { crate::dns::forget(&[crate::dns::VIEWER_PATCH_HOST, crate::dns::GAME_PATCH_HOST]) }
 }
 pub(crate) struct SystemNet;
 impl Net for SystemNet {}
@@ -403,8 +395,8 @@ fn w2u_exchange(host: &str, port: u16, request: &[u8], limit: Duration, net: &mu
             _ => break Some(result),
         }
     };
-    // A warm-up during the outage may have cached a negative answer for polcore's
-    // ci000.pol.com lookup at Open(1) or the W20's patch host (07d §2.1).
+    // The first attempt's cached lookup during the outage may have left a negative
+    // answer for the patch hosts (07d §2.1).
     net.forget_negative();
     match outcome {
         Some(result) => result.map_err(Unanswered::Error),
@@ -545,7 +537,7 @@ fn viewer_connect_net(dir: &Path, host: &str, port: u16, limit: Duration, net: &
 }
 
 #[cfg(test)]
-fn viewer_connect_at(dir: &Path, server: &str) -> crate::viewer::ConnectVerdict {
+pub(crate) fn viewer_connect_at(dir: &Path, server: &str) -> crate::viewer::ConnectVerdict {
     let (host, port) = server.rsplit_once(':').unwrap();
     viewer_connect_net(dir, host, port.parse().unwrap(), CHECK_TIMEOUT, &mut SystemNet).verdict
 }

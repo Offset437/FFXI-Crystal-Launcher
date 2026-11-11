@@ -40,7 +40,6 @@ export global Theme {
     out property <color> warn: root.light ? #96650A : #F2BC62;
     /// Coral: errors and Maintenance.
     out property <color> danger: root.light ? #B4472F : #F2A090;
-    out property <color> violet: root.light ? #7C52C8 : #B892F2;
     /// A segmented control's track.
     out property <color> seg: root.light ? #1220310F : #FFFFFF0D;
     /// The look-up bar over the sky.
@@ -70,13 +69,10 @@ export global Theme {
     out property <color> halo: root.light ? #3C8CE633 : #78BEFF57;
     /// The state words beside each lamp.
     out property <color> lamp-off: root.faint;
-    out property <color> lamp-rising: root.ink2;
     out property <color> lamp-ready: root.ink2;
     out property <color> lamp-game: root.ice-hi;
     out property <color> lamp-code: root.warn;
     out property <color> lamp-error: root.danger;
-    /// The gauge's unlit part: a flat tone over the lit crystal (facets show through).
-    out property <color> crystal-unlit: root.light ? #C9D4DE : #1C2A3D;
 
     // ---- the earlier names, mapped onto Skyline (every page keeps compiling and inherits the look) ----
     out property <color> panel: root.rail;
@@ -96,9 +92,7 @@ export global Theme {
     out property <color> quiet: root.ink2;
     out property <color> thumb: root.fill;
     out property <color> info: root.ice;
-    out property <color> ok-fill: root.light ? #DDF1E6 : #14302A;
     out property <color> track: root.line;
-    out property <color> warn-bar: root.warn;
     out property <color> scrim: root.light ? #14213075 : #04080DBD;
     /// Status tones readable on either theme.
     out property <color> ok-tone: root.ok;
@@ -152,12 +146,7 @@ export global Theme {
 
     // ---- controls ----
     out property <length> control-h: 36px;
-    out property <length> control-sm-h: 28px;
-    out property <length> control-pad-x: 14px;
-    out property <length> control-sm-pad-x: 11px;
     out property <length> sheet-w: 464px;
-    /// The features sheet: its lists carry several controls a row.
-    out property <length> sheet-wide-w: 600px;
     out property <length> sheet-pad-x: 28px;
     /// A form label above its control.
     out property <length> label-gap: 6px;
@@ -166,7 +155,6 @@ export global Theme {
     out property <length> card-row-y: 9px;
     /// A list row (news headlines, settings rows).
     out property <length> row-h: 40px;
-    out property <length> footer-h: 76px;
 
     // ---- type ----
     out property <string> sans: "Source Sans 3";

@@ -32,10 +32,6 @@ mod native_social;
 mod park;
 mod pol_core;
 mod start_gate;
-#[cfg(any(test, feature = "native-backup-diagnostics"))]
-mod native_backup;
-#[cfg(feature = "native-login-diagnostics")]
-mod native_socket_trace;
 #[macro_use]
 pub mod log;
 pub mod windower_parallel;
@@ -154,12 +150,6 @@ pub(crate) mod startup_timing {
         crate::log!("native startup timing: stage={stage} start_host_us={} end_host_us={} host_clock_valid={} elapsed_us={}",
             start.host_us.unwrap_or(0), end.host_us.unwrap_or(0), start.host_us.is_some() && end.host_us.is_some(),
             end.instant.saturating_duration_since(start.instant).as_micros());
-    }
-
-    #[cfg(feature = "native-login-diagnostics")]
-    pub(crate) fn mark(stage: &'static str) {
-        let at = Stamp::capture();
-        report(stage, at, at);
     }
 
     #[cfg(test)]
@@ -314,8 +304,6 @@ fn fail(pipe: &Pipe, code: i32, msg: String) -> i32 {
 }
 
 fn log_session(session: &proto::Session) {
-    #[cfg(feature = "native-login-diagnostics")]
-    startup_timing::mark("session-accepted");
     log!("stage: session ok (v{}, region {}, install_dir {})", proto::PROTOCOL_VERSION, session.region.name(),
         session.install_dir.as_deref().unwrap_or("(none)"));
 }
@@ -340,11 +328,7 @@ fn run_session(pipe: Pipe, reader: LineReader, session: proto::Session) -> i32 {
 type GameResult = Result<game::GameOutcome, String>;
 
 fn spawn_game(run: impl FnOnce() -> GameResult + Send + 'static) -> Result<std::thread::JoinHandle<GameResult>, String> {
-    std::thread::Builder::new().name("crystal-game".into()).stack_size(GAME_THREAD_STACK).spawn(move || {
-        #[cfg(feature = "native-login-diagnostics")]
-        startup_timing::mark("game-worker-start");
-        run()
-    }).map_err(|e| format!("cannot start the game thread: {e}"))
+    std::thread::Builder::new().name("crystal-game".into()).stack_size(GAME_THREAD_STACK).spawn(run).map_err(|e| format!("cannot start the game thread: {e}"))
 }
 
 fn join_game(game: std::thread::JoinHandle<GameResult>) -> GameResult {

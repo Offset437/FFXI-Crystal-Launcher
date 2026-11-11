@@ -2,12 +2,12 @@
 //! written to `<data dir>\crystal\pol.exe` when a matching installed host is unavailable.
 //! The loader writes its own log beside itself, so both locations stay user-writable.
 //!
-//! The file is rewritten only when its SHA-256 differs from the embedded one, in place under its
-//! own name (no temp file renamed into an executable: that drop-then-rename pattern is what
-//! antivirus heuristics flag). Nothing runs it until its hash is checked again, so a write cut
-//! short is just rewritten on the next launch. A running game keeps the old `pol.exe` open, so
-//! it cannot be rewritten; the new build then goes to `crystal\<hash8>\pol.exe` and the old one
-//! stays until nothing runs it.
+//! The file is rewritten only when its SHA-256 differs from the embedded one, through a
+//! temporary file renamed into place (`fsutil::write_atomic`): sign-ins starting in parallel
+//! never see or run a half-written loader, and the worker that loses the race finds the
+//! winner's identical file. A running game keeps the old `pol.exe` open, so it cannot be
+//! replaced; the new build then goes to `crystal\<hash8>\pol.exe` and the old one stays until
+//! nothing runs it.
 
 use sha2::{Digest, Sha256};
 use std::{
@@ -66,37 +66,28 @@ pub(super) fn has_hash(path: &Path, hash: &str) -> bool {
     fs::read(path).map(|b| sha256_hex(&b) == hash).unwrap_or(false)
 }
 
-/// Writes `bytes` to `path` under its final name. Callers check the hash before running it,
-/// and a failed write leaves no partial file behind.
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path.parent().ok_or_else(|| io::Error::other("no parent folder"))?;
-    fs::create_dir_all(dir)?;
-    let result = fs::write(path, bytes);
-    if result.is_err() && !has_hash(path, &sha256_hex(bytes)) {
-        // A file another process holds open fails before writing anything; leave it be.
-        if fs::metadata(path).is_ok_and(|m| m.len() != bytes.len() as u64) {
-            let _ = fs::remove_file(path);
-        }
+/// Puts `bytes` (SHA-256 `hash`) at `path`, whole or not at all. A replace that failed because
+/// another worker had just put the same loader there (and may already run it) is success.
+fn write(path: &Path, bytes: &[u8], hash: &str) -> io::Result<()> {
+    fs::create_dir_all(path.parent().ok_or_else(|| io::Error::other("no parent folder"))?)?;
+    match crate::fsutil::write_atomic(path, bytes) {
+        Err(_) if has_hash(path, hash) => Ok(()),
+        result => Ok(result?),
     }
-    result
 }
 
 /// Puts the loader in `<root>\crystal` and returns the path to run. The standard
 /// `crystal\pol.exe` when it already matches or can be replaced, else `crystal\<hash8>\pol.exe`.
 pub(crate) fn extract_into(root: &Path, bytes: &[u8], hash: &str) -> io::Result<PathBuf> {
     let standard = root.join("crystal").join("pol.exe");
-    if has_hash(&standard, hash) {
-        return Ok(standard);
-    }
-    if write_atomic(&standard, bytes).is_ok() && has_hash(&standard, hash) {
+    if has_hash(&standard, hash) || write(&standard, bytes, hash).is_ok() {
         return Ok(standard);
     }
     // In use by a running game (or otherwise unreplaceable): a versioned copy beside it.
     let versioned = root.join("crystal").join(&hash[..8.min(hash.len())]).join("pol.exe");
-    if has_hash(&versioned, hash) {
-        return Ok(versioned);
+    if !has_hash(&versioned, hash) {
+        write(&versioned, bytes, hash)?;
     }
-    write_atomic(&versioned, bytes)?;
     Ok(versioned)
 }
 
@@ -148,6 +139,23 @@ mod tests {
         // A later launch reuses the versioned copy.
         assert_eq!(extract_into(&root, new, &hash).unwrap(), path);
         drop(_held);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn parallel_extractions_all_get_the_whole_loader() {
+        let root = temp("parallel");
+        let bytes = vec![7u8; 4 << 20];
+        let hash = sha256_hex(&bytes);
+        let paths: Vec<_> = std::thread::scope(|s| {
+            let workers: Vec<_> = (0..8).map(|_| s.spawn(|| extract_into(&root, &bytes, &hash).unwrap())).collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+        for path in paths {
+            assert!(has_hash(&path, &hash), "{}", path.display());
+        }
+        assert!(has_hash(&root.join("crystal").join("pol.exe"), &hash));
+        assert!(fs::read_dir(root.join("crystal")).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
         fs::remove_dir_all(&root).unwrap();
     }
 

@@ -127,19 +127,14 @@ pub(crate) struct Report {
     pub started: usize,
     /// (program name, reason) per failure.
     pub failures: Vec<(String, String)>,
-    /// A program was started with Crystal's own (elevated) rights: no normal-rights start worked.
-    pub kept_elevated: usize,
 }
 
 /// Start what `to_start` picks with `launch`; a failure is recorded and the rest still start.
-pub(crate) fn run_with(programs: &[Program], running: &[Running], mut launch: impl FnMut(&Program) -> Result<Level, String>) -> Report {
+pub(crate) fn run_with(programs: &[Program], running: &[Running], mut launch: impl FnMut(&Program) -> Result<(), String>) -> Report {
     let mut report = Report::default();
     for program in to_start(programs, running) {
         match launch(program) {
-            Ok(level) => {
-                report.started += 1;
-                if level == Level::Elevated { report.kept_elevated += 1; }
-            }
+            Ok(()) => report.started += 1,
             Err(reason) => report.failures.push((program.name(), reason)),
         }
     }
@@ -159,20 +154,12 @@ pub(crate) fn run(programs: Vec<Program>) -> Report {
     run_with(&programs, &sys::running(&names), sys::launch)
 }
 
-/// The rights a program was started with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Level {
-    Normal,
-    Elevated,
-}
 
 /// The log line for a report, or None when nothing happened.
 pub(crate) fn log_lines(report: &Report) -> Vec<String> {
     let mut lines = Vec::new();
     if report.started > 0 {
-        let mut line = format!("started {} program(s) with the game", report.started);
-        if report.kept_elevated > 0 { line += &format!("; {} with Crystal's administrator rights", report.kept_elevated); }
-        lines.push(line);
+        lines.push(format!("started {} program(s) with the game, elevated", report.started));
     }
     for (name, reason) in &report.failures {
         lines.push(format!("could not start {name}: {reason}"));
@@ -193,20 +180,11 @@ pub(crate) fn notice(report: &Report) -> Option<String> {
 // ---- Windows ----------------------------------------------------------------------------------
 
 pub(crate) mod sys {
-    use super::{Level, Program, Running};
+    use super::{Program, Running};
     use crate::i18n::t;
     use std::os::windows::process::CommandExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
-    use windows_sys::Win32::Security::{
-        DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ADJUST_DEFAULT,
-        TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
-    };
-    use crate::win::wide;
-    use windows_sys::Win32::System::Threading::{
-        CreateProcessWithTokenW, OpenProcess, OpenProcessToken, CREATE_NEW_PROCESS_GROUP, PROCESS_INFORMATION,
-        PROCESS_QUERY_INFORMATION, STARTUPINFOW,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
+    use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+    use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
     /// The running processes whose file name (lower case) is in `names`, with the image path
     /// where Windows gives it. Other processes are never opened.
@@ -222,70 +200,29 @@ pub(crate) mod sys {
             .collect()
     }
 
-    /// Start `path` with the desktop shell's (normal-rights) token. Err when it cannot be done:
-    /// no shell window, a token that will not duplicate, or the Secondary Logon service off.
-    fn spawn_with_shell_token(path: &str, args: &str, dir: &str) -> Result<(), u32> {
-        unsafe {
-            let shell = GetShellWindow();
-            if shell.is_null() { return Err(0); }
-            let mut pid = 0u32;
-            GetWindowThreadProcessId(shell, &mut pid);
-            let process = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
-            if process.is_null() { return Err(windows_sys::Win32::Foundation::GetLastError()); }
-            let mut token = std::ptr::null_mut();
-            let opened = OpenProcessToken(process, TOKEN_DUPLICATE, &mut token) != 0;
-            CloseHandle(process);
-            if !opened { return Err(windows_sys::Win32::Foundation::GetLastError()); }
-            let mut primary = std::ptr::null_mut();
-            let duplicated = DuplicateTokenEx(token, TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID,
-                std::ptr::null(), SecurityImpersonation, TokenPrimary, &mut primary) != 0;
-            CloseHandle(token);
-            if !duplicated { return Err(windows_sys::Win32::Foundation::GetLastError()); }
-            let mut command = wide(&if args.trim().is_empty() { format!("\"{path}\"") } else { format!("\"{path}\" {}", args.trim()) });
-            let dir = wide(dir);
-            let mut startup: STARTUPINFOW = std::mem::zeroed();
-            startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-            let mut info: PROCESS_INFORMATION = std::mem::zeroed();
-            let ok = CreateProcessWithTokenW(primary, 0, std::ptr::null(), command.as_mut_ptr(), CREATE_NEW_PROCESS_GROUP,
-                std::ptr::null(), dir.as_ptr(), &startup, &mut info) != 0;
-            let error = if ok { 0 } else { windows_sys::Win32::Foundation::GetLastError() };
-            CloseHandle(primary);
-            if ok {
-                CloseHandle(info.hProcess);
-                CloseHandle(info.hThread);
-                Ok(())
-            } else {
-                Err(error)
-            }
-        }
-    }
-
     fn os_reason(error: &std::io::Error) -> String {
         if error.kind() == std::io::ErrorKind::NotFound { t("file not found").into() }
         else if error.kind() == std::io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) { t("access denied").into() }
         else { error.to_string() }
     }
 
-    /// Start one program: its own folder as the working directory, detached, not waited for.
-    /// Crystal at normal rights starts it directly; elevated, through the shell's token so the
-    /// program does not inherit administrator rights, and as itself only if that fails.
-    pub(crate) fn launch(program: &Program) -> Result<Level, String> {
+    /// The start command for a program: its own folder as the working directory, detached. No
+    /// token is chosen, so the child inherits Crystal's own (the game's) rights.
+    pub(crate) fn command(file: &std::path::Path, args: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(file);
+        if !args.trim().is_empty() { command.raw_arg(args.trim()); }
+        if let Some(dir) = file.parent() { command.current_dir(dir); }
+        command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()).creation_flags(CREATE_NEW_PROCESS_GROUP);
+        command
+    }
+
+    /// Start one program, detached and not waited for.
+    pub(crate) fn launch(program: &Program) -> Result<(), String> {
         let path = program.path.trim().trim_matches('"').trim();
         let file = std::path::Path::new(path);
         if !file.is_absolute() || !file.is_file() { return Err(t("file not found").into()); }
-        let dir = file.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
-        let mut level = Level::Normal;
-        if crate::win::process::is_elevated() {
-            match spawn_with_shell_token(path, &program.args, &dir) {
-                Ok(()) => return Ok(Level::Normal),
-                Err(_) => level = Level::Elevated,
-            }
-        }
-        let mut command = std::process::Command::new(file);
-        if !program.args.trim().is_empty() { command.raw_arg(program.args.trim()); }
-        command.current_dir(&dir).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null()).creation_flags(CREATE_NEW_PROCESS_GROUP);
-        command.spawn().map(|_child| level).map_err(|e| os_reason(&e))
+        command(file, &program.args).spawn().map(|_child| ()).map_err(|e| os_reason(&e))
     }
 }
 #[cfg(test)]
@@ -373,7 +310,7 @@ mod tests {
             match p.path.as_str() {
                 r"C:\missing.exe" => Err("file not found".into()),
                 r"C:\denied.exe" => Err("access denied".into()),
-                _ => Ok(Level::Normal),
+                _ => Ok(()),
             }
         });
         assert_eq!(tried.len(), 3, "a failure does not stop the rest");
@@ -382,6 +319,26 @@ mod tests {
         assert_eq!(log_lines(&report).len(), 3);
         assert!(notice(&report).unwrap().ends_with("(+1)"));
         assert!(notice(&Report::default()).is_none());
+    }
+
+    #[test]
+    fn programs_start_with_the_launchers_own_token_in_their_own_folder() {
+        let file = std::path::Path::new(r"C:\Tools\Voice.exe");
+        let command = sys::command(file, " --minimized ");
+        assert_eq!(command.get_program(), file.as_os_str());
+        assert_eq!(command.get_current_dir(), Some(std::path::Path::new(r"C:\Tools")));
+        // A plain `Command` has no token override: the child inherits Crystal's (elevated) token.
+        let source = include_str!("open_with_game.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        for forbidden in ["CreateProcessWithTokenW", "GetShellWindow", "DuplicateTokenEx"] {
+            assert!(!code.contains(forbidden), "{forbidden} must not return");
+        }
+    }
+
+    #[test]
+    fn the_log_line_says_elevated() {
+        let report = Report { started: 2, failures: Vec::new() };
+        assert_eq!(log_lines(&report), ["started 2 program(s) with the game, elevated"]);
     }
 
     #[test]

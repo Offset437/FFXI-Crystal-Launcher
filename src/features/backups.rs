@@ -239,13 +239,7 @@ fn collect(sources: &Sources) -> Result<(Vec<Item>, BTreeMap<String, String>), S
 
 // ---------------------------------------------------------------- helpers
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
-}
+use crate::pol_less::tools::embedded::hex;
 
 /// Hashes at most `limit` bytes of `reader`; returns (bytes read, hex digest).
 fn hash_reader(reader: &mut dyn Read, limit: u64) -> std::io::Result<(u64, String)> {
@@ -422,6 +416,7 @@ fn verify_archive(path: &Path) -> Result<(Manifest, VerifyReport), String> {
 }
 
 /// Recomputes every file's SHA-256 against the manifest.
+#[cfg(test)]
 pub(crate) fn verify(path: &Path) -> Result<VerifyReport, String> { verify_archive(path).map(|(_, r)| r) }
 
 /// Program names from the process list (`None`: it could not be read).

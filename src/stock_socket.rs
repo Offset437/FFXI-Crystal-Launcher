@@ -2,7 +2,7 @@
 //! bind 0.0.0.0:0, SO_RCVBUF = SO_SNDBUF = 0x10000 before connect), so the
 //! W2U (:54000) and W20 (:53001) version checks carry stock's SYN fingerprint
 //! (window scale 1, window 32768 after the handshake), keep the default delayed
-//! ACK, and close 60-115 ms after the reply instead of in the same millisecond
+//! ACK, and close 100-115 ms after the reply instead of in the same millisecond
 //! (pol-spec 07a w2u-at-connect F1/F2; 07c §3).
 //!
 //! Stock values, from capture\stock-20261006-045841.pcapng (both connections, per segment):

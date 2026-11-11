@@ -7,9 +7,9 @@
 //! at once (hotkeys, threads, priorities). Backups and restores run off the UI thread.
 
 use super::backups::{self, BackupInfo, RestoreReport, Sources};
-use super::game_window::Monitor;
+use super::game_window::{Monitor, Rect};
 use super::hotkeys::{self, Hotkey};
-use super::layouts::Preset;
+use super::layouts::{self, Preset};
 use super::perf::{self, Priority};
 use super::profiles;
 use super::recovery::Decision;
@@ -48,6 +48,7 @@ impl Section {
 
     pub(crate) const ALL: [Section; 6] = [Self::Windows, Self::Hotkeys, Self::Recovery, Self::Backups, Self::Clients, Self::Activity];
 
+    #[cfg(test)]
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Windows => t("Layouts"),
@@ -87,15 +88,24 @@ pub(crate) enum Msg {
     Remember(bool),
     RestoreLayouts(bool),
     LaunchAtSavedSize(bool),
-    OrderWindows(bool),
-    /// Arrange every game window; `None` uses every monitor.
-    Arrange(Preset, Option<String>),
-    /// Put the windows the last Arrange all moved back where they were.
+
+    /// The layout editor: an account's tile was put here (dragged, resized or nudged). With its
+    /// game's window open the tile waits for Apply; else it is the client's remembered window.
+    Place(String, Rect),
+    /// Fill the tiles with a preset on a monitor (`None`: every monitor): the open game
+    /// windows' tiles when any is open, else every account's.
+    Preset(Preset, Option<String>),
+    /// Move the open game windows to their tiles.
+    ApplyLayout,
+    /// Put the windows the last Apply moved back where they were.
     RestoreWindows,
     /// Forget a remembered window (a `ClientKey` id).
     Forget(String),
-    // Hotkeys: the typed chord ("" clears it).
-    Hotkey(Target, String),
+    // Hotkeys: a field starts recording, stops without a change, or has its chord (None
+    // clears it). A chord that can't be used is refused with its reason and the hotkey stays.
+    HotkeyRecord(Target),
+    HotkeyCancel,
+    Hotkey(Target, Option<Hotkey>),
     // Crash recovery.
     Offer(bool),
     AutoRelaunch(bool),
@@ -137,6 +147,10 @@ pub(crate) struct State {
     pub section: Section,
     /// Every configured hotkey and its problem, as the runtime last reported.
     pub hotkeys: Vec<hotkeys::Status>,
+    /// The hotkey field that is recording.
+    pub recording: Option<Target>,
+    /// The in-game chords another program has registered, as last asked (`in_game_taken`).
+    pub hotkeys_taken: Vec<Hotkey>,
     /// Ended games recovery offers a relaunch for, until played or dismissed.
     pub offers: BTreeMap<String, Decision>,
     pub backups: Vec<BackupInfo>,
@@ -152,6 +166,9 @@ pub(crate) struct State {
     /// Typed values that could not be used, by field id, with why.
     pub field_errors: BTreeMap<String, String>,
     pub monitors: Vec<Monitor>,
+    /// The layout editor's tiles of open game windows that Apply has not moved yet, by account.
+    /// Never saved: a tile is remembered when its window is moved to it.
+    pub pending: BTreeMap<String, Rect>,
     /// The launch profiles read for the detected tool folders (Windower, Ashita), off the UI
     /// thread; read again each time the sheet or the account editor opens.
     pub profiles: Option<(ProfileDirs, Arc<profiles::Lists>)>,
@@ -238,6 +255,13 @@ impl App {
         }
     }
 
+    /// The client an account's game runs as: the account, and the character slot its automatic
+    /// character login picks (as `features_observed` names a game that starts).
+    pub(crate) fn feature_client_key(&self, account: &str) -> ClientKey {
+        let slot = self.settings.account_auto_login.get(account).filter(|login| login.enabled).map(|login| login.character_slot);
+        ClientKey::new(account, slot)
+    }
+
     /// `--preview-features-<section>`: the sheet open on `section`, over a runtime that keeps its
     /// files in a fresh temporary folder with sample settings, play time and two backups. Nothing
     /// of the user's is read or written; no game is touched.
@@ -253,13 +277,16 @@ impl App {
         let keys: Vec<String> = self.accounts.iter().map(|row| row.key.clone()).collect();
         let key = |i: usize| keys.get(i).cloned().unwrap_or_else(|| format!("preview-{i}"));
         let mut settings = super::FeatureSettings::default();
-        // The preview keeps the default cycle chords (Ctrl+Tab, Ctrl+Shift+Tab) and two clean
-        // per-account keys; tests keep one refused chord (F5) to exercise the error row.
+        // The sample has both cycle keys set (they wait for a game: nothing is registered).
+        // The preview adds two clean per-account keys; tests keep one refused chord (Win+L,
+        // never registered) to exercise the error row.
+        settings.hotkeys.cycle = Hotkey::parse("Ctrl+Tab");
+        settings.hotkeys.cycle_back = Hotkey::parse("Ctrl+Shift+Tab");
         if live_hotkeys {
             settings.hotkeys.accounts.insert(key(0), Hotkey::parse("Ctrl+Alt+1").expect("valid"));
             settings.hotkeys.accounts.insert(key(1), Hotkey::parse("Ctrl+Alt+2").expect("valid"));
         } else {
-            settings.hotkeys.accounts.insert(key(1), Hotkey::parse("F5").expect("valid"));
+            settings.hotkeys.accounts.insert(key(1), Hotkey::parse("Win+L").expect("valid"));
         }
         settings.recovery.auto_relaunch = true;
         settings.notify.enabled = true;
@@ -339,13 +366,17 @@ impl App {
         let Some(runtime) = self.features.clone() else {
             // Previews and tests have no runtime: only the sheet's own state changes.
             match msg {
-                Msg::Open(open) => self.features_view.open = open,
-                Msg::Section(section) => self.features_view.section = section,
+                Msg::Open(open) => { self.features_view.open = open; self.features_view.recording = None; }
+                Msg::Section(section) => { self.features_view.section = section; self.features_view.recording = None; }
                 _ => {}
             }
             return Effect::none();
         };
         let mut sources = matches!(msg, Msg::BackupNow | Msg::RestoreBackup).then(|| self.feature_backup_sources());
+        // The accounts in Home order, each with the client its game runs as (the layout editor).
+        let clients: Vec<(String, ClientKey)> = if matches!(msg, Msg::Place(..) | Msg::Preset(..)) {
+            self.accounts.iter().map(|row| (row.key.clone(), self.feature_client_key(&row.key))).collect()
+        } else { Vec::new() };
         let view = &mut self.features_view;
         let save = |change: &dyn Fn(&mut super::FeatureSettings), view: &mut State| {
             if let Err(error) = runtime.update(|s| change(s)) { view.notice = Some((true, error)); }
@@ -354,28 +385,70 @@ impl App {
             Msg::Open(open) => {
                 view.open = open;
                 view.confirm_restore = None;
+                view.recording = None;
                 if open {
                     view.notice = None;
                     view.field_errors.clear();
                     view.monitors = runtime.monitors();
+                    view.pending.retain(|account, _| runtime.has_window(account));
                     view.hotkeys = runtime.hotkey_status();
+                    in_game_taken(&runtime, view);
                     if !view.backups_loaded { return Effect::done(Message::Feature(Msg::LoadBackups)); }
                 }
             }
             Msg::Section(section) => {
                 view.section = section;
-                if section == Section::Windows { view.monitors = runtime.monitors(); }
+                view.recording = None;
+                if section == Section::Windows {
+                    view.monitors = runtime.monitors();
+                    view.pending.retain(|account, _| runtime.has_window(account));
+                }
                 if section == Section::Backups && !view.backups_loaded { return Effect::done(Message::Feature(Msg::LoadBackups)); }
             }
             Msg::Remember(on) => save(&|s| s.layouts.remember = on, view),
             Msg::RestoreLayouts(on) => save(&|s| s.layouts.restore = on, view),
             Msg::LaunchAtSavedSize(on) => save(&|s| s.layouts.launch_at_saved_size = on, view),
-            Msg::OrderWindows(on) => save(&|s| s.layouts.order_windows = on, view),
-            Msg::Arrange(preset, monitor) => {
-                let devices: Vec<String> = monitor.into_iter().collect();
-                view.notice = Some(match runtime.arrange(preset, &devices) {
-                    Ok(1) => (false, t("Arranged 1 window.").to_owned()),
-                    Ok(count) => (false, tf("Arranged {count} windows.", &[("count", &count)])),
+
+            Msg::Place(account, rect) => {
+                view.notice = None;
+                if runtime.has_window(&account) {
+                    view.pending.insert(account, rect);
+                } else if let Some((_, key)) = clients.iter().find(|(key, _)| *key == account) {
+                    view.pending.remove(&account);
+                    if let Err(error) = runtime.place_windows(&[(key.clone(), rect)]) { view.notice = Some((true, error)); }
+                }
+            }
+            Msg::Preset(preset, device) => {
+                view.notice = None;
+                view.monitors = runtime.monitors();
+                let chosen: Vec<&Monitor> = view.monitors.iter().filter(|m| device.as_ref().is_none_or(|d| *d == m.device)).collect();
+                let chosen = if chosen.is_empty() { view.monitors.iter().filter(|m| m.primary).collect() } else { chosen };
+                let areas: Vec<Rect> = chosen.iter().map(|m| preset.area(m)).collect();
+                let aspect = runtime.settings().layouts.aspect;
+                let open = runtime.layout_windows();
+                if open.is_empty() {
+                    // No game window is open: every account's remembered window, in Home order.
+                    let rects = layouts::arrange(preset, clients.len(), &areas, aspect);
+                    let places: Vec<(ClientKey, Rect)> = clients.into_iter().map(|(_, key)| key).zip(rects).collect();
+                    if let Err(error) = runtime.place_windows(&places) { view.notice = Some((true, error)); }
+                } else {
+                    // The open windows Apply may move, in Home order; the others keep their tiles.
+                    let movable: Vec<String> = open.into_iter().filter(|(_, _, movable)| *movable).map(|(account, ..)| account).collect();
+                    if movable.is_empty() { view.notice = Some((true, t("Fullscreen games are left alone.").to_owned())); }
+                    let rects = layouts::arrange(preset, movable.len(), &areas, aspect);
+                    view.pending.extend(movable.into_iter().zip(rects));
+                }
+            }
+            Msg::ApplyLayout => {
+                let targets: Vec<(String, Rect)> = view.pending.iter().map(|(account, rect)| (account.clone(), *rect)).collect();
+                view.notice = Some(match runtime.apply_layout(&targets) {
+                    Ok(done) => {
+                        view.pending.retain(|account, _| !done.contains(account) && runtime.has_window(account));
+                        match done.len() {
+                            1 => (false, t("Moved 1 window.").to_owned()),
+                            count => (false, tf("Moved {count} windows.", &[("count", &count)])),
+                        }
+                    }
                     Err(error) => (true, error),
                 });
             }
@@ -391,28 +464,38 @@ impl App {
                     if let Err(error) = runtime.forget_layout(&key) { view.notice = Some((true, error)); }
                 }
             }
-            Msg::Hotkey(target, text) => {
+            Msg::HotkeyRecord(target) => {
+                view.field_errors.remove(&target.id());
+                view.recording = Some(target);
+            }
+            Msg::HotkeyCancel => view.recording = None,
+            Msg::Hotkey(target, hotkey) => {
                 let id = target.id();
-                let text = text.trim();
-                let hotkey = if text.is_empty() { None } else {
-                    match Hotkey::parse(text) {
-                        Some(hotkey) => Some(hotkey),
-                        None => {
-                            view.field_errors.insert(id, t("Type a hotkey such as Ctrl+Alt+1.").into());
-                            return Effect::none();
-                        }
-                    }
-                };
+                view.recording = None;
+                // A chord Windows makes impossible is not saved: the hotkey stays as it was,
+                // and the row says which chord was pressed and why it was not taken.
+                if let Some((hotkey, problem)) = hotkey.and_then(|h| h.problem().map(|p| (h, p))) {
+                    runtime.record_note(&format!("not saved: {problem:?}"));
+                    view.field_errors.insert(id, format!("{} · {}", hotkey.label(), problem.text()));
+                    return Effect::none();
+                }
                 view.field_errors.remove(&id);
-                save(&|s| match &target {
+                let saved = runtime.update(|s| match &target {
                     Target::Next => s.hotkeys.cycle = hotkey,
                     Target::Previous => s.hotkeys.cycle_back = hotkey,
                     Target::Account(key) => match hotkey {
                         Some(hotkey) => { s.hotkeys.accounts.insert(key.clone(), hotkey); }
                         None => { s.hotkeys.accounts.remove(key); }
                     },
-                }, view);
+                });
+                runtime.record_note(match (&saved, hotkey) {
+                    (Err(_), _) => "set, but the settings file could not be written",
+                    (Ok(()), Some(_)) => "saved",
+                    (Ok(()), None) => "cleared",
+                });
+                if let Err(error) = saved { view.notice = Some((true, error)); }
                 view.hotkeys = runtime.hotkey_status();
+                in_game_taken(&runtime, view);
             }
             Msg::Offer(on) => save(&|s| s.recovery.offer = on, view),
             Msg::AutoRelaunch(on) => save(&|s| s.recovery.auto_relaunch = on, view),
@@ -502,6 +585,24 @@ impl App {
         }
         Effect::none()
     }
+}
+
+/// Asks Windows whether another program has registered each in-game chord (the cycle keys,
+/// and an account's hotkey with no Ctrl, Alt or Win). They are registered only while a game is
+/// in front, so a clash would otherwise show only then; asked as the page opens and as a
+/// hotkey is set. Not asked while a game is in front (Crystal holds them itself then), nor
+/// for a chord a hotkey that works everywhere holds.
+fn in_game_taken(runtime: &super::Runtime, view: &mut State) {
+    if runtime.foreground_is_game() { return; }
+    let hotkeys = runtime.settings().hotkeys;
+    let held = |h: &Hotkey| hotkeys.accounts.values().any(|own| own == h && !own.game_only());
+    let mut asked: Vec<Hotkey> = [hotkeys.cycle, hotkeys.cycle_back].into_iter().flatten()
+        .chain(hotkeys.accounts.values().copied().filter(Hotkey::game_only))
+        .filter(|h| h.problem().is_none() && !held(h))
+        .collect();
+    asked.sort();
+    asked.dedup();
+    view.hotkeys_taken = asked.into_iter().filter(|h| super::desktop::probe(*h) == Err(1409)).collect(); // ERROR_HOTKEY_ALREADY_REGISTERED
 }
 
 /// An account's performance entry, created on first change; an entry back at every default is

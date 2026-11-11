@@ -370,6 +370,7 @@ impl Parked {
             drop(supervision);
             return lost(self, "the pipe did not take the credentials", progress, fallback);
         }
+        supervision.auth.credentials_sent();
         drop(fallback);
         self.log.line("Credentials sent; launcher copy cleared.");
         self.log.reached(&mut timing, Milestone::CredentialsSent);

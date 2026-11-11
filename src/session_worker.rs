@@ -3400,8 +3400,12 @@ mod tests {
         // this idle automatic sign-in out; the answer starts PlayOnline's update. Dropping its
         // task avoids any real updater network or disk work; exercise its native preparation
         // below with the same op.
-        app.begin_viewer_update(&backend::account_key(&account));
-        assert_eq!(app.play_updates.viewer_confirm, Some((backend::account_key(&account), 1)));
+        // (Another account's Play: this one is signed in.)
+        app.accounts.push(crate::tests::app().accounts.remove(1));
+        let refused = app.accounts[1].key.clone();
+        app.note_refused(&refused, Instant::now(), None);
+        app.tend_viewer_update();
+        assert_eq!(app.play_updates.viewer_confirm, Some((refused, 1)));
         assert!(app.maintenance.is_none(), "nothing signs out before the answer");
         assert_eq!(app.update(crate::Message::ConfirmViewerUpdate).units(), 1);
         assert!(app.maintenance == Some(crate::MaintenanceKind::Update));

@@ -139,7 +139,10 @@ export component ToggleRow inherits Rectangle {
 /// A detail pane's scroller: the content's own width, a thin thumb in the lane at the right.
 export component PaneScroll inherits Rectangle {
     in property <length> scroll-to: 0px;
+    /// A mouse drag pans the pane (off where a drag inside it moves something of its own).
+    in property <bool> drag-pan: true;
     page := Flickable {
+        mouse-drag-pan-enabled: root.drag-pan;
         // Its width comes from the pane alone: its content (which reflows by that width) must
         // not feed back into it.
         min-width: 0px;

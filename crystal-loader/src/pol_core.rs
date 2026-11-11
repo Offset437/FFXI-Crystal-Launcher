@@ -70,8 +70,6 @@ pub(crate) enum Group {
     Mail,
     Handles,
     Game,
-    /// Pilot diagnostics builds only (native-backup-diagnostics).
-    Backup,
     /// Ignored offline ABI tests only; never required in production.
     Offline,
 }
@@ -84,7 +82,6 @@ impl Group {
             Group::Mail => "PlayOnline mail",
             Group::Handles => "Handle setup",
             Group::Game => "Game exit result",
-            Group::Backup => "Server settings trace",
             Group::Offline => "Offline ABI check",
         }
     }
@@ -119,7 +116,7 @@ pub(crate) const SERVICES: &[Service] = &[
     s(374, 0, SignIn), s(375, 1, SignIn), s(376, 6, SignIn), s(377, 1, SignIn),
     s(383, 0, Friends), s(384, 1, Friends), s(385, 0, Friends), s(394, 2, Friends),
     value(401, SignIn), s(404, 1, Friends), s(405, 1, Friends),
-    s(421, 0, Offline), s(434, 0, SignIn), s(463, 0, SignIn), s(464, 1, Backup), s(465, 1, Backup),
+    s(421, 0, Offline), s(434, 0, SignIn), s(463, 0, SignIn),
     s(807, 0, SignIn), s(809, 0, SignIn), s(814, 2, SignIn), s(815, 0, SignIn), s(816, 1, SignIn),
     s(817, 0, SignIn), s(818, 0, SignIn), s(819, 1, SignIn), s(823, 0, SignIn), s(824, 3, SignIn),
     s(825, 2, SignIn), s(826, 2, SignIn), s(828, 0, SignIn), s(835, 0, SignIn), s(838, 0, SignIn),
@@ -135,7 +132,7 @@ pub(crate) const SERVICES: &[Service] = &[
     s(1072, 2, SignIn), s(1074, 0, SignIn), s(1075, 1, SignIn), s(1103, 0, SignIn), s(1107, 1, SignIn),
     s(1140, 1, SignIn), s(1149, 2, SignIn), s(1175, 1, SignIn), s(1302, 2, SignIn),
     s(1304, 0, Mail), s(1305, 1, Mail), s(1309, 1, SignIn), s(1502, 4, SignIn), s(1527, 1, SignIn),
-    s(1528, 1, SignIn), s(1535, 4, Backup), s(1536, 3, Backup),
+    s(1528, 1, SignIn),
 ];
 
 pub(crate) fn service(slot: usize) -> Option<&'static Service> {
@@ -143,13 +140,9 @@ pub(crate) fn service(slot: usize) -> Option<&'static Service> {
     SERVICES.binary_search_by_key(&slot, |s| s.slot).ok().map(|i| &SERVICES[i])
 }
 
-/// Services a production host requires. Pilot builds add their own.
+/// Services a production host requires.
 fn required(group: Group) -> bool {
-    match group {
-        Offline => false,
-        Backup => cfg!(feature = "native-backup-diagnostics"),
-        _ => true,
-    }
+    group != Offline
 }
 
 /// IPOLCoreCom methods Crystal calls (vtable index, name).
@@ -288,24 +281,6 @@ pub(crate) fn check_table(layout: &Layout, address: usize, table: &[usize]) -> R
     }
     let services = SERVICES.iter().filter(|s| required(s.group)).count();
     Ok(Table { rva: address - layout.base, missing, added, services })
-}
-
-/// Slot 463 (backup cancel) ends `push <backup context>; call; pop ecx; ret`
-/// in both verified builds; the pushed address is the core's backup context,
-/// whose first word is its state. Found by that shape and checked to lie in
-/// writable data. `code` is the first bytes of slot 463.
-#[cfg(any(test, feature = "native-backup-diagnostics"))]
-pub(crate) fn backup_state(layout: &Layout, code: &[u8]) -> Result<usize, String> {
-    let pattern = crate::sigscan::Pattern::parse("68 ?? ?? ?? ?? E8 ?? ?? ?? ?? 59 C3").expect("valid pattern");
-    let hits = crate::sigscan::scan(code, std::slice::from_ref(&pattern));
-    let [at] = hits[0][..] else {
-        return Err(format!("backup context: {} matches in service 463", hits[0].len()));
-    };
-    let address = u32::from_le_bytes(code[at + 1..at + 5].try_into().unwrap()) as usize;
-    if !layout.writable_data(address, 4) {
-        return Err("backup context is not in the core's writable data".into());
-    }
-    Ok(address)
 }
 
 /// The installed Viewer's frame period (µs), read from its app.dll file. The

@@ -32,7 +32,7 @@ pub(crate) fn needs_code(app: &App, item: &crate::AccountRow) -> bool {
 }
 /// Which state an account row shows, in priority order (its colour needs only this).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RowState { Closing, Waiting, Updating, ViewerConfirm, Playing, Starting, SigningIn, SignedIn, Private, NeedsCode, Problem, Idle }
+pub(crate) enum RowState { Closing, Waiting, Updating, ViewerConfirm, ViewerUpdating, Playing, Starting, SigningIn, SignedIn, Private, NeedsCode, Problem, Idle }
 pub(crate) fn row_state(app: &App, item: &crate::AccountRow) -> RowState {
     if item.shutting_down || item.signing_out {
         RowState::Closing
@@ -42,6 +42,8 @@ pub(crate) fn row_state(app: &App, item: &crate::AccountRow) -> RowState {
         RowState::Updating
     } else if app.play_updates.viewer_confirm.as_ref().is_some_and(|(key, _)| *key == item.key) {
         RowState::ViewerConfirm
+    } else if !item.busy && app.viewer_update_of(&item.key).is_some() {
+        RowState::ViewerUpdating
     } else if item.is_playing() {
         RowState::Playing
     } else if item.game_start_pending() {
@@ -82,6 +84,9 @@ pub(crate) fn row_view(app: &App, item: &crate::AccountRow) -> RowView {
                 // Cancel next to the download's progress stops the download; the wait's own
                 // Cancel is back once it is done.
                 if let Some(generation) = update.cancel { row.action = Some((t("Cancel").into(), Message::CancelPlayUpdate(generation), false)); }
+            } else if let Some(update) = crate::play_update::viewer_line(app, &item.key) {
+                // Its sign-in for the wait was stopped for PlayOnline's update.
+                (row.detail, row.progress) = (update.headline, update.fraction);
             }
             row
         }
@@ -95,6 +100,15 @@ pub(crate) fn row_view(app: &App, item: &crate::AccountRow) -> RowView {
         RowState::ViewerConfirm => {
             let mut row = view(item.status_text().into_owned(), String::new());
             row.action = Some((t("Sign out and update").into(), Message::ConfirmViewerUpdate, true));
+            row
+        }
+        RowState::ViewerUpdating => {
+            let Some(update) = crate::play_update::viewer_line(app, &item.key) else { return view(t("Not signed in").into(), String::new()) };
+            let mut row = view(update.headline, String::new());
+            row.progress = update.fraction;
+            if app.viewer_update_running() && !app.maintenance_cancelled {
+                row.action = Some((t("Cancel").into(), Message::CancelMaintenance, false));
+            }
             row
         }
         RowState::Playing => {

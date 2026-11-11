@@ -3,17 +3,29 @@
 use super::*;
 use std::{process::Command, time::Instant};
 
+/// The helper's folder in ProgramData (`start`); stale ones are removed at start (`clean_stale`).
+pub(super) const WORK_PREFIX: &str = "CrystalLauncher-update-";
+
 pub(super) fn start(stage: &Stage) -> Result<(), String> {
     verify(&stage.release.envelope, &trusted_key()?)?;
     verify_archive(&stage.directory.join("release.zip"), &stage.release)?;
     let target = std::env::current_exe().map_err(|e| e.to_string())?;
     validate_target(&target)?;
-    // A download reused from an earlier run may hold an earlier attempt's files; the helper
-    // unpacks into a folder it creates itself.
-    let _ = fs::remove_dir_all(stage.directory.join("apply-verified"));
+    // A download reused from an earlier run may hold an earlier attempt's files.
+    let _ = fs::remove_dir_all(stage.directory.join("apply"));
     let _ = fs::remove_file(stage.directory.join("helper-ready"));
     let _ = fs::remove_file(stage.directory.join("last-error.txt"));
-    let helper = stage.directory.join("apply-helper.exe");
+    // The helper runs elevated, and so does what it installs: both live in a folder only
+    // administrators can change (no planted DLL beside it, no file swapped while it waits).
+    let work = if crate::win::process::is_elevated() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        crate::prereqs::admin_scratch(&format!("{WORK_PREFIX}{}-{stamp}", std::process::id()))
+    } else {
+        let work = stage.directory.join("apply");
+        fs::create_dir(&work).map(|()| work)
+    }
+    .map_err(|e| e.to_string())?;
+    let helper = work.join("apply-helper.exe");
     fs::copy(&target, &helper).map_err(|e| e.to_string())?;
     let mut command = Command::new(helper);
     command
@@ -193,6 +205,27 @@ fn keep_backup(backup: &Path) {
     let _ = fs::write(backup.join(RESTORE_FAILED), "");
 }
 
+/// In a backup while the restarted launcher has not shown that it starts; that launcher removes
+/// it once its window loop runs (`super::started`), and only then may the backup go.
+pub(super) const AWAITING_START: &str = "awaiting-start";
+
+/// Whether the restarted launcher started: `Some(true)` once it removed `marker` (or closed
+/// normally), `Some(false)` when it exited with an error first, `None` while it is still
+/// starting after a minute.
+fn started(child: &mut std::process::Child, marker: &Path) -> Option<bool> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        if !marker.exists() {
+            return Some(true);
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status.success() || !marker.exists());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
+}
+
 fn restore_package(backup: &Path, target: &Path) -> Result<(), String> {
     let parent = target.parent().ok_or("Invalid backup destination.")?;
     for (index, name) in FILES.iter().enumerate() {
@@ -348,6 +381,10 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
     if !directory.is_absolute() {
         return Err("An absolute staging directory is required.".into());
     }
+    let work = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_owned))
+        .ok_or("The update helper could not locate itself.")?;
     let mut parent_closed = false;
     let result = (|| {
         validate_target(&target)?;
@@ -360,10 +397,14 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
                 t("Launcher updates cannot install an older or identical version.").into(),
             );
         }
-        let archive = directory.join("release.zip");
-        ordinary_file(&archive)?;
+        // Only a copy in the helper's own folder (`start`) is verified, unpacked and installed:
+        // the staging folder stays writable by the user.
+        let staged = directory.join("release.zip");
+        ordinary_file(&staged)?;
+        let archive = work.join("release.zip");
+        fs::copy(&staged, &archive).map_err(|e| e.to_string())?;
         verify_archive(&archive, &release)?;
-        let extracted = directory.join("apply-verified");
+        let extracted = work.join("verified");
         fs::create_dir(&extracted).map_err(|e| e.to_string())?;
         unpack(&archive, &extracted)?;
         fs::write(
@@ -374,10 +415,18 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
         parent.wait()?;
         parent_closed = true;
         let backup = install_package(&extracted, &target)?;
+        let marker = backup.join(AWAITING_START);
+        let watching = fs::write(&marker, "").is_ok();
         match relaunch(&target) {
-            Ok(_) => {
-                // No rollback is possible past this point; the backup is only clutter.
-                let _ = fs::remove_dir_all(&backup);
+            Ok(mut child) => {
+                if watching && started(&mut child, &marker) == Some(false) {
+                    restore_package(&backup, &target).inspect_err(|_| keep_backup(&backup))?;
+                    return Err(t("The new launcher closed as it started; the previous version was restored.").into());
+                }
+                // Still starting after the wait: the backup stays until it has (`clean_stale`).
+                if !marker.exists() {
+                    let _ = fs::remove_dir_all(&backup);
+                }
                 refresh_registration_after_restart(
                     &target,
                     &release.payload.version,
@@ -393,6 +442,9 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
             }
         }
     })();
+    // The helper's own exe stays until a later start removes its folder (`clean_stale`).
+    let _ = fs::remove_dir_all(work.join("verified"));
+    let _ = fs::remove_file(work.join("release.zip"));
     if let Err(error) = &result {
         let _ = fs::write(directory.join("last-error.txt"), error);
         if let Some(root) = directory.parent() {
@@ -650,6 +702,23 @@ mod tests {
         child.wait().unwrap();
         assert!(mismatch.is_err());
         parent.unwrap().wait().unwrap();
+    }
+
+    #[test]
+    fn a_restarted_launcher_that_fails_before_it_starts_is_rolled_back() {
+        let root = fixture();
+        let marker = root.join(AWAITING_START);
+        let shell = PathBuf::from(std::env::var_os("WINDIR").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let run = |code: u32| {
+            Command::new(&shell).args(["-NoProfile", "-NonInteractive", "-Command", &format!("exit {code}")]).spawn().unwrap()
+        };
+        fs::write(&marker, "").unwrap();
+        assert_eq!(started(&mut run(3), &marker), Some(false), "crashed with the marker in place");
+        assert_eq!(started(&mut run(0), &marker), Some(true), "closed normally");
+        fs::remove_file(&marker).unwrap();
+        assert_eq!(started(&mut run(3), &marker), Some(true), "it had started");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -51,6 +51,9 @@ pub(crate) enum LoaderEvent {
     NativeSocialResult { id: String, action: String, code: i32, payload: Option<Vec<u8>> },
     Exit(i32),
     Error(String),
+    /// `notice`: one line for the launch history (a protection the host could not provide,
+    /// and why). The game goes on.
+    Notice(String),
     /// A type this launcher doesn't know; ignored.
     Unknown,
     /// The pipe closed.
@@ -155,7 +158,7 @@ pub(crate) fn parse_event(line: &[u8]) -> Result<LoaderEvent, String> {
         "authenticated" => LoaderEvent::Authenticated,
         "native_friends" => {
             let blob=base64_decode(value.payload.as_deref().unwrap_or(""))
-                .filter(|b| b.len()==crystal_pol::friends::BLOB_LEN && &b[..8]==crystal_pol::friends::MAGIC)
+                .filter(|b| b.len()==crate::wire::FRIENDS_LEN && &b[..8]==crate::wire::FRIENDS_MAGIC)
                 .ok_or("Invalid native POL friend snapshot.")?;
             let locations = value.locations.as_deref().map(|encoded| {
                 base64_decode(encoded).filter(|b| crate::friends::valid_locations(b))
@@ -212,16 +215,25 @@ pub(crate) fn parse_event(line: &[u8]) -> Result<LoaderEvent, String> {
         },
         "exit" => LoaderEvent::Exit(value.code.map_or(0, |c| c.clamp(i32::MIN as i64, i32::MAX as i64) as i32)),
         "error" => LoaderEvent::Error(clean_message(value.message.as_deref().unwrap_or("unspecified error"))),
+        "notice" => match value.message.as_deref().map(|text| clean_line(text, 400)).filter(|text| !text.is_empty()) {
+            Some(text) => LoaderEvent::Notice(text),
+            None => LoaderEvent::Unknown,
+        },
         _ => LoaderEvent::Unknown,
     })
 }
 
 /// One line of loader text, safe for the status bar and history file.
 fn clean_message(message: &str) -> String {
+    clean_line(message, 240)
+}
+
+/// `message` on one line: control characters become spaces, at most `limit` characters.
+fn clean_line(message: &str, limit: usize) -> String {
     let flat: String = message
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
-        .take(240)
+        .take(limit)
         .collect();
     flat.trim().to_owned()
 }
@@ -740,13 +752,19 @@ mod tests {
             LoaderEvent::Error("FFXiMain.dll missing".into())
         );
         assert_eq!(parse_event(br#"{"type":"future-thing"}"#).unwrap(), LoaderEvent::Unknown);
+        // A notice is one history line, whole (the FFXIDB one is longer than an error's limit).
+        let long = format!("FFXIDB minimap settings protection is off: {}.", "x".repeat(300));
+        assert_eq!(parse_event(format!("{{\"type\":\"notice\",\"message\":\"{long}\"}}").as_bytes()).unwrap(), LoaderEvent::Notice(long));
+        assert_eq!(parse_event(b"{\"type\":\"notice\",\"message\":\"two\\nlines\"}").unwrap(), LoaderEvent::Notice("two lines".into()));
+        assert_eq!(parse_event(br#"{"type":"notice"}"#).unwrap(), LoaderEvent::Unknown);
+        assert_eq!(parse_event(br#"{"type":"notice","message":"  "}"#).unwrap(), LoaderEvent::Unknown);
         assert!(parse_event(b"not json").is_err());
         assert!(parse_event(br#"{"type":"hello","pid":1}"#).is_err());
     }
 
     #[test]
     fn native_friend_locations_are_optional_and_bounded() {
-        use crystal_pol::friends::{BLOB_LEN,MAGIC};
+        use crate::wire::{FRIENDS_LEN as BLOB_LEN,FRIENDS_MAGIC as MAGIC};
         let mut blob=vec![0;BLOB_LEN]; blob[..8].copy_from_slice(MAGIC);
         let encoded = |b: &[u8]| { let mut out=Vec::new(); base64_into(&mut out,b); String::from_utf8(out).unwrap() };
         let line=serde_json::json!({"type":"native_friends","payload":encoded(&blob)});

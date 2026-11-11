@@ -466,7 +466,7 @@ fn strings() -> SettingsStrings {
         found: t("Found").into(),
         not_found: t("Not found").into(),
         owg_title: t("Open with the game").into(),
-        owg_sub: t("Started once when the first game opens.").into(),
+        owg_sub: t("Started once when the first game opens, with the same rights as the game.").into(),
         program_path: t("Program path").into(),
         arguments: t("Arguments (optional)").into(),
         enabled: t("Enabled").into(),

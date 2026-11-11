@@ -144,6 +144,7 @@ fn merge(at: DateTime<Utc>, bodies: [Result<Vec<u8>, String>; 2]) -> Reading {
 }
 
 /// `read` from `url` (a local fake server in tests). Stamped when the request is made.
+#[cfg(test)]
 pub(crate) async fn read_from(url: &str) -> Reading {
     let at = Utc::now();
     let body = match crate::services::web_client() {

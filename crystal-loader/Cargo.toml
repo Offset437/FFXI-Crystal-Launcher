@@ -9,10 +9,6 @@ description = "32-bit FFXI game host using the installed PlayOnline core for ret
 [features]
 # The default build steps polcore at the Viewer's 20 ms frame (pol-spec 07b decision 2).
 default = []
-# Temporary, content-free forwarding traces for server-settings live pilots.
-native-backup-diagnostics = []
-# Temporary socket-call metadata only; never changes native POL transport.
-native-login-diagnostics = ["windows-sys/Win32_Networking_WinSock"]
 
 # Own workspace root: this crate never joins the launcher build.
 [workspace]
@@ -38,7 +34,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Security",
-    # BCryptHash: pins the verified FFXIDB plugin file (windower_plugin_settings.rs).
+    # BCryptHash: names the FFXIDB settings mutex by path (windower_plugin_settings.rs).
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
