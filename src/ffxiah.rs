@@ -248,6 +248,10 @@ pub(crate) fn wiki_search_url(query: &str) -> String {
     };
     url.into()
 }
+/// The `AH_SERVERS` entry named `saved`; missing or unknown names give `DEFAULT_AH_SERVER`.
+pub(crate) fn saved_ah_server(saved: Option<&str>) -> &'static str {
+    saved.and_then(|name| AH_SERVERS.iter().find(|(server, _)| *server == name)).map_or(DEFAULT_AH_SERVER, |(server, _)| *server)
+}
 pub(crate) fn ah_server_id(server: &str) -> Option<u8> {
     AH_SERVERS.iter().find(|(name, _)| *name == server).map(|(_, id)| *id)
 }

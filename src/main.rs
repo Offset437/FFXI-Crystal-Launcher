@@ -248,6 +248,9 @@ pub(crate) struct Settings {
     /// Settings → System → Open with the game: programs started once per Play batch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_with_game: Vec<open_with_game::Program>,
+    /// Home → FFXIAH look-up: the chosen world. Absent or unknown = `DEFAULT_AH_SERVER`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ah_server: Option<String>,
 }
 fn default_true() -> bool {
     true
@@ -288,6 +291,7 @@ impl Default for Settings {
             close_to_tray: false,
             start_with_windows: false,
             open_with_game: Vec::new(),
+            ah_server: None,
         }
     }
 }
@@ -1298,6 +1302,7 @@ impl App {
         let dgvoodoo = dgvoodoo::State::new(settings.dgvoodoo);
         let mut app = Self::base(config.clone(), settings, tick_gate::EventSender::new(sender), receiver, dgvoodoo);
         app.viewport = initial_window_size();
+        app.ah_server = crate::ffxiah::saved_ah_server(app.settings.ah_server.as_deref());
         app.preview = preview;
         app.settings_damaged = startup_warning.is_some();
         app.startup_warning = startup_warning;
@@ -5354,6 +5359,11 @@ impl App {
             Message::AhQueryChanged(value) => self.ah_query = value,
             Message::AhServerChanged(value) => {
                 self.ah_server = value;
+                if !self.preview && self.settings.ah_server.as_deref() != Some(value) {
+                    self.settings.ah_server = Some(value.to_owned());
+                    // Unsaved, it still holds for this window.
+                    let _ = save_settings(&self.config, &self.settings);
+                }
                 if self.ah_lookup.open { return self.search_ah(); }
             }
             Message::AhResults(generation, result) => self.ah_lookup.finish(generation, result),
@@ -10565,6 +10575,31 @@ mod tests {
     /// Files before 2026-10-13 load: an account that had "Sign in when Crystal opens" is known to
     /// sign in without a code (unless its latest sign-in took one), the switch is on, and the old
     /// field is never written again. New fields round-trip.
+    #[test]
+    fn the_ah_server_choice_is_saved_and_unknown_values_fall_back() {
+        let root = std::env::temp_dir().join(format!("crystal-ah-server-{}", backend::unique_id().unwrap()));
+        let config = crate::backend::Config { experiment: root.clone(), repository: root.clone(), game_install: None, dat_overlays: Vec::new() };
+        let path = settings_path(&config);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"install_path":"C:\\Games\\FFXI"}"#).unwrap();
+        let old = load_settings(&config).unwrap();
+        assert!(old.ah_server.is_none());
+        assert_eq!(crate::ffxiah::saved_ah_server(old.ah_server.as_deref()), crate::ffxiah::DEFAULT_AH_SERVER);
+
+        let mut app = app();
+        app.preview = false;
+        app.config = config.clone();
+        app.settings = old;
+        let _ = app.update(Message::AhServerChanged("Bismarck"));
+        assert_eq!(app.ah_server, "Bismarck");
+        let reloaded = load_settings(&config).unwrap();
+        assert_eq!(crate::ffxiah::saved_ah_server(reloaded.ah_server.as_deref()), "Bismarck");
+
+        assert_eq!(crate::ffxiah::saved_ah_server(Some("Nowhere")), crate::ffxiah::DEFAULT_AH_SERVER);
+        assert_eq!(crate::ffxiah::saved_ah_server(None), crate::ffxiah::DEFAULT_AH_SERVER);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn old_startup_sign_in_settings_migrate_and_new_ones_round_trip() {
         let root = std::env::temp_dir().join(format!("crystal-presign-migrate-{}", backend::unique_id().unwrap()));
