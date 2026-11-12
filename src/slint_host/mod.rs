@@ -654,19 +654,73 @@ fn native_handle(window: &slint::Window) -> isize {
     }
 }
 
-/// The window's top-left for `size` centred on the primary monitor's work area (physical px).
-fn centred(size: Size) -> Option<slint::PhysicalPosition> {
+/// The primary display's usable area, in physical pixels, and its DPI scale.
+struct WorkArea {
+    rect: windows_sys::Win32::Foundation::RECT,
+    scale: f64,
+}
+
+impl WorkArea {
+    fn width(&self) -> i32 {
+        self.rect.right - self.rect.left
+    }
+
+    fn height(&self) -> i32 {
+        self.rect.bottom - self.rect.top
+    }
+
+    fn physical_size(&self, size: Size) -> (i32, i32) {
+        (
+            (f64::from(size.width) * self.scale).round() as i32,
+            (f64::from(size.height) * self.scale).round() as i32,
+        )
+    }
+
+    fn fits(&self, size: Size) -> bool {
+        let (width, height) = self.physical_size(size);
+        width <= self.width() && height <= self.height()
+    }
+
+    fn centred(&self, size: Size) -> slint::PhysicalPosition {
+        let (width, height) = self.physical_size(size);
+        slint::PhysicalPosition::new(
+            self.rect.left + (self.width() - width).max(0) / 2,
+            self.rect.top + (self.height() - height).max(0) / 2,
+        )
+    }
+}
+
+fn primary_work_area() -> Option<WorkArea> {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
     use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETWORKAREA};
-    let mut area = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-    if unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, (&mut area as *mut RECT).cast(), 0) } == 0 { return None; }
-    let scale = unsafe { GetDpiForSystem() } as f32 / 96.0;
-    let (w, h) = ((size.width * scale) as i32, (size.height * scale) as i32);
-    Some(slint::PhysicalPosition::new(
-        area.left + ((area.right - area.left - w) / 2).max(0),
-        area.top + ((area.bottom - area.top - h) / 2).max(0),
-    ))
+    let mut rect = RECT::default();
+    if unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, (&mut rect as *mut RECT).cast(), 0) } == 0 {
+        return None;
+    }
+    let dpi = unsafe { GetDpiForSystem() };
+    if dpi == 0 || rect.right <= rect.left || rect.bottom <= rect.top {
+        return None;
+    }
+    Some(WorkArea { rect, scale: f64::from(dpi) / 96.0 })
+}
+
+/// The window's top-left for `size` centred on the primary monitor's work area (physical px).
+fn centred(size: Size) -> Option<slint::PhysicalPosition> {
+    primary_work_area().map(|area| area.centred(size))
+}
+
+pub(super) fn desktop_window_size() -> Size {
+    window_size_for_work_area(primary_work_area().as_ref())
+}
+
+fn window_size_for_work_area(work_area: Option<&WorkArea>) -> Size {
+    use crate::{DEFAULT_WINDOW_SIZE, SMALL_WINDOW_SIZE};
+    if work_area.is_some_and(|area| !area.fits(DEFAULT_WINDOW_SIZE)) {
+        SMALL_WINDOW_SIZE
+    } else {
+        DEFAULT_WINDOW_SIZE
+    }
 }
 
 /// A window opened from the background (the tray, a second start) comes to the front.

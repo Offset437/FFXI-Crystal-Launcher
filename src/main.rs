@@ -866,6 +866,7 @@ impl std::fmt::Debug for Message {
 
 pub(crate) struct App {
     pub viewport: Size,
+    auto_size_on_open: bool,
     pub maximized: bool,
     pub title_held: bool, // title pressed, drag not yet started
     pub page: Page,
@@ -1065,6 +1066,7 @@ impl App {
     fn base(config: Config, settings: Settings, sender: tick_gate::EventSender, receiver: mpsc::Receiver<WorkerEvent>, dgvoodoo: dgvoodoo::State) -> Self {
         Self {
             viewport: Size::new(1200.0, 820.0),
+            auto_size_on_open: false,
             maximized: false,
             title_held: false,
             page: Page::Home,
@@ -1204,7 +1206,9 @@ impl App {
         // so the first Play doesn't wait for it.
         let dgvoodoo = dgvoodoo::State::new(settings.dgvoodoo);
         let mut app = Self::base(config.clone(), settings, tick_gate::EventSender::new(sender), receiver, dgvoodoo);
-        app.viewport = initial_window_size();
+        let size_override = initial_window_size_override(preview);
+        app.viewport = size_override.unwrap_or(DEFAULT_WINDOW_SIZE);
+        app.auto_size_on_open = size_override.is_none();
         app.ah_server = crate::ffxiah::saved_ah_server(app.settings.ah_server.as_deref());
         app.preview = preview;
         app.settings_damaged = startup_warning.is_some();
@@ -3968,8 +3972,11 @@ impl App {
         }
     }
 
-    /// Open the window (at start, or back from the background) at its last size.
+    /// Choose a startup size on first open and reuse the last size when returning from the tray.
     fn open_window(&mut self) -> Effect<Message> {
+        if std::mem::take(&mut self.auto_size_on_open) {
+            self.viewport = slint_host::desktop_window_size();
+        }
         let id = WindowId::unique();
         self.window = Some(id);
         Effect::window(id, WindowOp::Open { size: self.viewport, maximized: self.maximized })
@@ -6310,21 +6317,25 @@ fn selected_folder(raw: &str, must_exist: bool) -> Result<PathBuf, String> {
     }
 }
 
-fn initial_window_size() -> Size {
+const DEFAULT_WINDOW_SIZE: Size = Size::new(1440.0, 900.0);
+const SMALL_WINDOW_SIZE: Size = Size::new(900.0, 650.0);
+const LARGE_WINDOW_SIZE: Size = Size::new(1920.0, 1080.0);
+
+fn initial_window_size_override(preview: bool) -> Option<Size> {
     // TEMP: XI_PREVIEW_SIZE=WxH for responsive checks.
     if let Some((w, h)) = std::env::var("XI_PREVIEW_SIZE").ok().and_then(|v| {
         let (w, h) = v.split_once('x')?;
         Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?))
     }) {
-        return Size::new(w, h);
+        return Some(Size::new(w, h));
     }
     if preview::has("--preview-small") {
-        Size::new(900.0, 650.0)
+        Some(SMALL_WINDOW_SIZE)
     } else if preview::has("--preview-wide") {
         // a large window, to check the layout reflows at 1.0.
-        Size::new(1920.0, 1080.0)
+        Some(LARGE_WINDOW_SIZE)
     } else {
-        Size::new(1440.0, 900.0)
+        preview.then_some(DEFAULT_WINDOW_SIZE)
     }
 }
 
