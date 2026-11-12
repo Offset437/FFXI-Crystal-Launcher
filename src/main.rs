@@ -46,6 +46,7 @@ mod settings_page;
 mod official_versions;
 mod operation;
 mod palette;
+mod panic_log;
 mod patch;
 mod patch_watch;
 mod play_flag;
@@ -6471,6 +6472,9 @@ fn main() {
     unsafe {
         use windows_sys::Win32::System::LibraryLoader::{SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32};
         SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+    if std::env::args_os().skip(1).any(|arg| arg == "--log-panics") {
+        panic_log::install(&Config::default().experiment);
     }
     if let Some(result) = self_update::cli(&std::env::args().collect::<Vec<_>>()) {
         if let Err(error) = result { eprintln!("{error}"); std::process::exit(1); }

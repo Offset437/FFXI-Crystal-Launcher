@@ -103,6 +103,8 @@ This builds the 32-bit game host, then the launcher with the host embedded. `-In
 
 [Open an issue](https://github.com/Offset437/FFXI-Crystal-Launcher/issues) with your Crystal version, launch method, what happened and how to reproduce it. Hide account details and private messages in screenshots and logs. For account or billing problems, contact [Square Enix support](https://support.na.square-enix.com/main.php?id=20&la=1).
 
+To save a Rust panic report from the launcher, run `Crystal-Launcher.exe --log-panics` or add `--log-panics` to its launch arguments. After a panic, look for `crystal-launcher-panic.log` in `%LOCALAPPDATA%\Crystal Launcher\iced-launcher` or in `%TEMP%` if the first folder is unwritable.
+
 ## License
 
 Crystal is an independent project, not affiliated with or endorsed by Square Enix, Windower or Ashita. Code and original SVG icons are [GPL-3.0-only](LICENSE), with no warranty; see [third-party notices](THIRD_PARTY.md). The code license does not cover Square Enix's game, artwork, logos, news images, music or trademarks.
