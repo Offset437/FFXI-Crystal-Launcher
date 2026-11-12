@@ -9,7 +9,7 @@ mod detect;
 /// The System tab's component cards as plain data for the Slint front end.
 pub(crate) mod front;
 mod install;
-pub(crate) use install::{admin_scratch, no_standard_user_writes, owned_by_admins, program_data};
+pub(crate) use install::{admin_scratch, program_data};
 pub(crate) mod model;
 mod trust;
 

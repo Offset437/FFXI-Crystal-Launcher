@@ -3845,14 +3845,6 @@ impl App {
                 let exe = std::env::current_exe().map_err(|_| t("Could not locate Crystal's program file.").to_owned())?;
                 let user = startup_task::current_user().ok_or_else(|| t("Could not identify the Windows user.").to_owned())?;
                 let mut run = startup_task_runner();
-                // The task starts Crystal elevated at logon: never a file a standard user could
-                // swap. A task already registered for such a folder is removed.
-                if on != Some(false)
-                    && !exe.parent().is_some_and(|dir| prereqs::owned_by_admins(dir) && prereqs::no_standard_user_writes(dir))
-                {
-                    let _ = startup_task::set(false, &exe, &user, &scratch, &mut run);
-                    return Err(t("Start with Windows needs Crystal in a folder only administrators can change, such as Program Files.").into());
-                }
                 match on {
                     Some(on) => startup_task::set(on, &exe, &user, &scratch, &mut run),
                     None => startup_task::ensure(&exe, &user, &scratch, &mut run).map(|_| ()),

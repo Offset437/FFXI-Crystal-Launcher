@@ -625,7 +625,8 @@ impl Runtime {
     /// have a window, in Home order: one still loading (no window yet) or closed is skipped, and a
     /// minimised one is restored, as Alt+Tab does (`hotkeys::cycle`). One history line: the press,
     /// where it went (places in Home order, never names) and each foreground step's result.
-    /// Crystal never changes the z-order itself: the window comes up as Windows brings it.
+    /// The window switched to is also put in front of the other game windows (`game_window::raise`),
+    /// past any that are always on top: the one seen is the one switched to.
     fn run_action(&self, action: &Action, via: desktop::Via, key: Option<keyhook::Fired>) {
         let front = game_window::foreground();
         let (games, in_front) = {
@@ -643,6 +644,9 @@ impl Runtime {
         };
         let switch = hotkeys::cycle(action, &games, current.as_deref());
         let result = switch.as_ref().map(|s| game_window::activate(s.hwnd, s.restore, via == desktop::Via::Hotkey));
+        if let (Some(s), Some(r)) = (&switch, &result) {
+            if r.ok() { game_window::raise(s.hwnd, &windows.iter().map(|(_, h)| *h).collect::<Vec<_>>(), std::time::Duration::from_millis(150)); }
+        }
         let name = match action {
             Action::Next => "next".to_owned(),
             Action::Previous => "previous".to_owned(),

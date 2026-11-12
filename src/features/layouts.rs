@@ -168,8 +168,7 @@ pub(crate) fn find_monitor<'a>(saved: &MonitorRef, monitors: &'a [Monitor]) -> O
 /// monitor is never put inside the work area.
 pub(crate) fn restore_rect(saved: &Saved, monitors: &[Monitor]) -> Option<(Rect, Shown)> {
     let monitor = find_monitor(&saved.monitor, monitors)?;
-    // A restore never minimises or maximises: the remembered rectangle is the normal one.
-    let shown = Shown::Normal;
+    let shown = if saved.shown == Shown::Minimized { Shown::Normal } else { saved.shown };
     if saved.mode == Mode::Fullscreen { return Some((monitor.rect, Shown::Normal)); }
     let same = monitor.rect == saved.monitor.rect && monitor.work == saved.monitor.work && monitor.dpi == saved.monitor.dpi;
     if same { return Some((saved.rect, shown)); }

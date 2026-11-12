@@ -294,12 +294,13 @@ pub(crate) const MOVE_ONLY: u32 = {
 
 /// `apply`, also putting back `frame` when the window's frame differs from it (the styles are
 /// set first and the move carries SWP_FRAMECHANGED, so the new frame takes effect with it).
-/// Nothing here activates a window or changes the z-order. A window is never maximised: one that
-/// is maximised already and stays so is left alone, any other is put at the normal rectangle.
+/// Nothing here activates a window or changes the z-order, with one exception Windows has no
+/// other call for: a window that has to become maximised is maximised with SW_MAXIMIZE, which
+/// activates it. One that is maximised already and stays so is left alone.
 pub(crate) fn apply_frame(hwnd: isize, rect: Rect, shown: Shown, frame: Option<Frame>) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetWindowLongW, GetWindowPlacement, GetWindowRect, IsIconic, IsWindow, IsZoomed, SetWindowLongW, SetWindowPlacement, SetWindowPos, ShowWindow,
-        GWL_EXSTYLE, GWL_STYLE, SWP_FRAMECHANGED, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, WINDOWPLACEMENT,
+        GWL_EXSTYLE, GWL_STYLE, SWP_FRAMECHANGED, SW_MAXIMIZE, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, WINDOWPLACEMENT,
     };
     let _dpi = PhysicalDpi::enter();
     let hwnd = hwnd as HWND;
@@ -336,9 +337,11 @@ pub(crate) fn apply_frame(hwnd: isize, rect: Rect, shown: Shown, frame: Option<F
         let moved = (Rect::from_win(&now) == rect && flags & SWP_FRAMECHANGED == 0)
             || SetWindowPos(hwnd, std::ptr::null_mut(), rect.x, rect.y, rect.w, rect.h, flags) != 0;
         match shown {
+            // Windows has no maximise that doesn't activate; 1.2.4 behaviour (users keep games maximised).
+            Shown::Maximized => { ShowWindow(hwnd, SW_MAXIMIZE); }
             // Not SW_MINIMIZE: that one activates the next window in the z-order.
             Shown::Minimized => { ShowWindow(hwnd, SW_SHOWMINNOACTIVE); }
-            Shown::Maximized | Shown::Normal => {}
+            Shown::Normal => {}
         }
         moved
     }
@@ -518,7 +521,8 @@ pub(crate) enum Method {
     /// SetForegroundWindow on its own: allowed for the thread that received the hotkey, or while
     /// Crystal is in front.
     Direct,
-    /// Attached to the input of the thread in front and SetForegroundWindow, then detached (Windows then treats the call as that thread's own).
+    /// Attached to the input of the thread in front, BringWindowToTop and SetForegroundWindow,
+    /// then detached (Windows then treats the call as that thread's own).
     Attached,
     /// AttachThreadInput itself failed; nothing was tried.
     AttachRefused,
@@ -586,7 +590,7 @@ pub(crate) fn activate(hwnd: isize, restore: bool, own_input: bool) -> Activatio
     use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
     use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, IsHungAppWindow, IsIconic, SetForegroundWindow, ShowWindow, SwitchToThisWindow, SW_RESTORE,
+        BringWindowToTop, GetForegroundWindow, IsHungAppWindow, IsIconic, SetForegroundWindow, ShowWindow, SwitchToThisWindow, SW_RESTORE,
     };
     let target = hwnd as HWND;
     let in_front = || foreground().is_some_and(|(now, _)| now == hwnd);
@@ -627,6 +631,9 @@ pub(crate) fn activate(hwnd: isize, restore: bool, own_input: bool) -> Activatio
                     if IsHungAppWindow(front_window) != 0 { out.hung = true; return out; }
                     SetLastError(0);
                     if AttachThreadInput(current, thread, 1) != 0 {
+                        // Needed: without it Windows refuses the attached call (1.2.5 regression,
+                        // every switch "attach+set ret=0"). Only the target the user asked for.
+                        BringWindowToTop(target);
                         SetLastError(0);
                         let returned = SetForegroundWindow(target) != 0;
                         let error = GetLastError();
@@ -694,6 +701,32 @@ pub(crate) fn is_shown(hwnd: isize) -> bool {
         let mut cloaked = 0u32;
         let read = DwmGetWindowAttribute(hwnd as HWND, DWMWA_CLOAKED as u32, &mut cloaked as *mut u32 as *mut _, std::mem::size_of::<u32>() as u32);
         read < 0 || cloaked == 0
+    }
+}
+
+/// After a hotkey switch: put `target` in front of `others` without activating anything. A window
+/// given the foreground normally comes up by itself (a game does it between frames), so it gets
+/// `settle` first; otherwise it goes to the top, and any of `others` still in front (always on
+/// top) is put directly behind it. Only ever on the user's switch, never by Crystal on its own.
+pub(crate) fn raise(target: isize, others: &[isize], settle: std::time::Duration) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsHungAppWindow, SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE};
+    const KEEP: u32 = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+    let mut all = vec![target];
+    all.extend(others.iter().copied().filter(|h| *h != target));
+    let in_front = || -> Vec<isize> {
+        let z = z_order(&all);
+        let at = z.iter().position(|h| *h == target).unwrap_or(0);
+        z[..at].iter().copied().filter(|h| is_shown(*h)).collect()
+    };
+    let start = std::time::Instant::now();
+    while !in_front().is_empty() && start.elapsed() < settle { std::thread::sleep(std::time::Duration::from_millis(5)); }
+    if in_front().is_empty() { return; }
+    // SAFETY: z-order calls on window handles; a closed one makes its call fail, a hung one is skipped.
+    unsafe {
+        if IsHungAppWindow(target as HWND) == 0 { SetWindowPos(target as HWND, HWND_TOP, 0, 0, 0, 0, KEEP); }
+        for hwnd in in_front() {
+            if IsHungAppWindow(hwnd as HWND) == 0 { SetWindowPos(hwnd as HWND, target as HWND, 0, 0, 0, 0, KEEP); }
+        }
     }
 }
 

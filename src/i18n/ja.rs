@@ -1297,7 +1297,6 @@ pub(super) static JA: &[(&str, &str)] = &[
     ("Start Crystal in the background when Windows starts", "Windowsの起動時にCrystalをバックグラウンドで起動する"),
     ("Start FFXI", "FFXIを起動"),
     ("Start at the saved size", "保存したサイズで起動する"),
-    ("Start with Windows needs Crystal in a folder only administrators can change, such as Program Files.", "Windows起動時の自動起動には、管理者だけが変更できるフォルダー（Program Filesなど）にCrystalを置く必要があります。"),
     ("Started once when the first game opens, with the same rights as the game.", "最初のゲームが起動したときに、ゲームと同じ権限で一度だけ開始します。"),
     ("Starting", "起動中"),
     ("Starting 1 account in parallel. Continue in each game window after sign-in.", "1アカウントを起動しています。ログイン後はゲーム画面で続行してください。"),

@@ -21,8 +21,9 @@ pub(crate) const STEP_MS: u64 = 30_000;
 /// A code with less than this left in its window could expire before PlayOnline checks it, so
 /// the sign-in waits for the next window instead. The code leaves with the session line; the
 /// loader sends it at member login, after Connect and the W2U check: 0.7–4.1 s later (mean
-/// 1.2 s) over 71 sign-ins in the loader log of 2026-10-22, so 8 s is twice the worst seen.
-pub(crate) const MIN_LEFT_MS: u64 = 8_000;
+/// 1.2 s) over 71 sign-ins in the loader log of 2026-10-22, so 5 s covers the worst seen
+/// without making a quarter of sign-ins wait.
+pub(crate) const MIN_LEFT_MS: u64 = 5_000;
 /// 80 bits, the shortest key authenticator setups hand out.
 const MIN_KEY_CHARS: usize = 16;
 const MAX_KEY_CHARS: usize = 128;
