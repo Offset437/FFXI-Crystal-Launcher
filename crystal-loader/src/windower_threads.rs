@@ -6,13 +6,13 @@
 //! on the PC (thousands), so each walk costs ~30 ms; Hook does 37 of them while
 //! it starts (measured: 1.12 s of a 1.2 s readiness wait, 2026-10-22).
 //!
-//! While the startup wait lasts, Hook's own `CreateToolhelp32Snapshot` for
-//! threads is answered from a fresh Process Snapshotting (PSS) capture of this
-//! process alone, taken at the same moment the call is made. Hook then walks
+//! On native Windows with Process Snapshotting (PSS), Hook's own
+//! `CreateToolhelp32Snapshot` for threads is answered from a fresh capture of
+//! this process alone, taken at the same moment the call is made. Hook then walks
 //! exactly the threads it would have kept (Toolhelp's other processes are the
 //! ones it skips), and still opens, suspends and resumes them itself. Nothing
-//! is cached between calls. Any other request, any failure and every call
-//! after startup goes to the original functions.
+//! is cached between calls. Other requests and capture failures use the original
+//! functions. Wine and systems without the full set of PSS exports keep Toolhelp.
 //!
 //! Hook calls `CloseHandle` while it holds other threads suspended, so the
 //! `CloseHandle`/`Thread32*` wrappers never lock or allocate: cursors live in
@@ -20,19 +20,24 @@
 
 use std::{
     cell::UnsafeCell,
+    ffi::c_void,
     mem::size_of,
-    sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+        OnceLock,
+    },
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, SetLastError, ERROR_BAD_LENGTH, ERROR_NO_MORE_FILES, ERROR_NO_MORE_ITEMS, HANDLE},
     System::{
         Diagnostics::{
             ProcessSnapshotting::{
-                PssCaptureSnapshot, PssFreeSnapshot, PssWalkMarkerCreate, PssWalkMarkerFree, PssWalkSnapshot,
-                HPSS, HPSSWALK, PSS_CAPTURE_THREADS, PSS_THREAD_ENTRY, PSS_WALK_THREADS,
+                HPSS, HPSSWALK, PSS_ALLOCATOR, PSS_CAPTURE_FLAGS, PSS_CAPTURE_THREADS,
+                PSS_THREAD_ENTRY, PSS_WALK_INFORMATION_CLASS, PSS_WALK_THREADS,
             },
             ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, THREADENTRY32, TH32CS_SNAPTHREAD},
         },
+        LibraryLoader::{GetModuleHandleA, GetProcAddress},
         Threading::{CreateEventW, GetCurrentProcess, GetCurrentProcessId},
     },
 };
@@ -78,6 +83,49 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static SERVED: AtomicU64 = AtomicU64::new(0);
 static SERVED_MICROS: AtomicU64 = AtomicU64::new(0);
 static FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+struct PssApi {
+    capture: unsafe extern "system" fn(HANDLE, PSS_CAPTURE_FLAGS, u32, *mut HPSS) -> u32,
+    free: unsafe extern "system" fn(HANDLE, HPSS) -> u32,
+    marker_create: unsafe extern "system" fn(*const PSS_ALLOCATOR, *mut HPSSWALK) -> u32,
+    marker_free: unsafe extern "system" fn(HPSSWALK) -> u32,
+    walk: unsafe extern "system" fn(HPSS, PSS_WALK_INFORMATION_CLASS, HPSSWALK, *mut c_void, u32) -> u32,
+}
+
+static PSS: OnceLock<Result<PssApi, &'static str>> = OnceLock::new();
+
+impl PssApi {
+    fn resolve() -> Result<Self, &'static str> {
+        let ntdll = unsafe { GetModuleHandleA(c"ntdll.dll".as_ptr().cast()) };
+        if ntdll.is_null() {
+            return Err("could not check the runtime for Wine");
+        }
+        // Some Wine builds lack these exports, and others provide only stubs.
+        if unsafe { GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()) }.is_some() {
+            return Err("Wine uses the original Toolhelp functions");
+        }
+
+        let kernel32 = unsafe { GetModuleHandleA(c"kernel32.dll".as_ptr().cast()) };
+        if kernel32.is_null() {
+            return Err("kernel32.dll is unavailable");
+        }
+        macro_rules! resolve {
+            ($name:literal, $missing:literal) => {{
+                let address = unsafe { GetProcAddress(kernel32, $name.as_ptr().cast()) }
+                    .ok_or($missing)?;
+                // SAFETY: Each named kernel32 export has the signature of its PssApi field.
+                unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, _>(address) }
+            }};
+        }
+        Ok(Self {
+            capture: resolve!(c"PssCaptureSnapshot", "kernel32.dll lacks PssCaptureSnapshot"),
+            free: resolve!(c"PssFreeSnapshot", "kernel32.dll lacks PssFreeSnapshot"),
+            marker_create: resolve!(c"PssWalkMarkerCreate", "kernel32.dll lacks PssWalkMarkerCreate"),
+            marker_free: resolve!(c"PssWalkMarkerFree", "kernel32.dll lacks PssWalkMarkerFree"),
+            walk: resolve!(c"PssWalkSnapshot", "kernel32.dll lacks PssWalkSnapshot"),
+        })
+    }
+}
 
 /// Logs the thread walks Hook made since the previous report, under `phase`.
 /// Nothing is logged for a host without private Windower startup.
@@ -149,34 +197,35 @@ fn find(handle: HANDLE) -> Option<&'static Cursor> {
 
 /// This process's threads into `out`; `None` on any PSS failure or overflow.
 fn capture_into(out: &mut [Thread; MAX_THREADS]) -> Option<usize> {
-    struct Snapshot(HPSS);
+    let api = PSS.get()?.as_ref().ok()?;
+    struct Snapshot(HPSS, &'static PssApi);
     impl Drop for Snapshot {
         fn drop(&mut self) {
-            unsafe { PssFreeSnapshot(GetCurrentProcess(), self.0) };
+            unsafe { (self.1.free)(GetCurrentProcess(), self.0) };
         }
     }
-    struct Marker(HPSSWALK);
+    struct Marker(HPSSWALK, &'static PssApi);
     impl Drop for Marker {
         fn drop(&mut self) {
-            unsafe { PssWalkMarkerFree(self.0) };
+            unsafe { (self.1.marker_free)(self.0) };
         }
     }
     unsafe {
         let mut snapshot = std::ptr::null_mut();
-        if PssCaptureSnapshot(GetCurrentProcess(), PSS_CAPTURE_THREADS, 0, &mut snapshot) != 0 {
+        if (api.capture)(GetCurrentProcess(), PSS_CAPTURE_THREADS, 0, &mut snapshot) != 0 {
             return None;
         }
-        let snapshot = Snapshot(snapshot);
+        let snapshot = Snapshot(snapshot, api);
         let mut marker = std::ptr::null_mut();
-        if PssWalkMarkerCreate(std::ptr::null(), &mut marker) != 0 {
+        if (api.marker_create)(std::ptr::null(), &mut marker) != 0 {
             return None;
         }
-        let marker = Marker(marker);
+        let marker = Marker(marker, api);
         let owner = GetCurrentProcessId();
         let mut count = 0;
         loop {
             let mut entry: PSS_THREAD_ENTRY = std::mem::zeroed();
-            let code = PssWalkSnapshot(snapshot.0, PSS_WALK_THREADS, marker.0,
+            let code = (api.walk)(snapshot.0, PSS_WALK_THREADS, marker.0,
                 (&mut entry as *mut PSS_THREAD_ENTRY).cast(), size_of::<PSS_THREAD_ENTRY>() as u32);
             if code == ERROR_NO_MORE_ITEMS {
                 return (count > 0).then_some(count);
@@ -302,6 +351,7 @@ pub(crate) unsafe fn install(base: usize) {
     }
     let saved = unsafe { GetLastError() };
     let result = (|| -> Result<(), &'static str> {
+        PSS.get_or_init(PssApi::resolve).as_ref().map_err(|reason| *reason)?;
         let wanted = [
             ("CreateToolhelp32Snapshot", snapshot as *const () as usize),
             ("Thread32First", first as *const () as usize),
@@ -337,10 +387,10 @@ pub(crate) unsafe fn install(base: usize) {
         crate::log!("Windower Hook thread walks: process-only for the whole session");
         Ok(())
     })();
-    unsafe { SetLastError(saved) };
     if let Err(reason) = result {
         crate::log!("note: Windower Hook thread walks keep all-PC Toolhelp: {reason}");
     }
+    unsafe { SetLastError(saved) };
 }
 
 #[cfg(test)]
@@ -462,6 +512,7 @@ mod tests {
         fn new() -> Self {
             static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
             let guard = ONE.lock().unwrap_or_else(|e| e.into_inner());
+            PSS.get_or_init(PssApi::resolve).as_ref().expect("native Windows with PSS");
             ENABLED.store(true, Ordering::Release);
             Self(guard)
         }
