@@ -50,9 +50,12 @@ mod pol_less;
 mod portraits;
 mod preview;
 mod privacy;
+mod retail_region;
 mod services;
 mod self_update;
 mod session_worker;
+mod launcher_change;
+mod start_watch;
 mod startup_prefetch;
 mod startup_task;
 mod stock_socket;
@@ -171,6 +174,8 @@ pub(crate) struct AccountRow {
     pub busy: bool,
     signing_out: bool,
     pub shutting_down: bool,
+    /// How the shut-down in flight (`shutting_down`) ends the game.
+    shutdown_mode: session_worker::game_shutdown::Mode,
     /// Background sign-in can accept Play without starting another login.
     preparing_session: bool,
     /// The current sign-in thread's completion flag, set just before its Complete is sent:
@@ -355,6 +360,10 @@ impl AccountRow {
     pub(crate) fn can_play(&self) -> bool {
         !self.shutting_down && !self.signing_out && !self.batch_pending && !self.is_playing() && self.queued_play.is_none() && (!self.busy || self.preparing_session)
     }
+    /// A running retail game that a shut-down can still end (not already closing).
+    pub(crate) fn can_shut_down(&self) -> bool {
+        self.account.mode == AccountMode::Retail && self.is_playing() && !self.shutting_down && !self.signing_out && !self.busy
+    }
     fn queued_signin_play(&self) -> bool {
         self.busy && self.preparing_session && self.queued_play.is_some() && !self.batch_pending && !self.is_playing()
     }
@@ -368,7 +377,12 @@ impl AccountRow {
     /// The status line to show. A client's exit report and the row's note are worded in the
     /// current language here; any later status replaces both.
     pub(crate) fn status_text(&self) -> std::borrow::Cow<'_, str> {
-        if self.shutting_down { return t("Shutting down FFXI…").into(); }
+        if self.shutting_down {
+            return match self.shutdown_mode {
+                session_worker::game_shutdown::Mode::Graceful => t("Shutting down FFXI…"),
+                session_worker::game_shutdown::Mode::Instant => t("Closing FFXI…"),
+            }.into();
+        }
         if self.signing_out { return t("Signing out of PlayOnline…").into(); }
         let status: std::borrow::Cow<'_, str> = match &self.exit {
             Some(report) if report.summary == self.status => report.message().into(),
@@ -660,6 +674,8 @@ pub(crate) enum Message {
     FriendsConnect,
     FriendsPlay,
     FriendsSignOut,
+    /// One account row's Shut down.
+    ShutdownAccount(String),
     ShutdownSelected,
     ShutdownAll,
     GameShutdownFinished(String, u64, Result<(), String>),
@@ -726,6 +742,10 @@ pub(crate) enum Message {
     /// Settings → System: "Sign accounts in when Crystal opens".
     AutoSignIn(bool),
     SignInAfterGame(bool),
+    /// Settings → System: the shut-down action ends the game host at once.
+    CloseGamesInstantly(bool),
+    /// Settings → System: Home's item and wiki search.
+    ItemSearch(bool),
     SetLaunchWith(crate::backend::LaunchWith),
     WikiQueryChanged(String),
     AhQueryChanged(String),
@@ -772,12 +792,18 @@ pub(crate) enum Message {
     PlayFlagLoaded(play_flag::Reading),
     /// Cancel these accounts' "Wait and play".
     CancelWait(Vec<String>),
+    /// A row's Cancel for a start that waits (`start_watch`).
+    CancelStart(String),
     /// Pause the Play-driven update with this generation (its downloads are kept).
     CancelPlayUpdate(u64),
     /// A Play's PlayOnline update may sign the idle accounts out (the row asked once).
     ConfirmViewerUpdate,
     PatchLoaded(u64, patch::PatchReport),
     ViewerLoaded(u64, viewer::Status),
+    /// The PlayOnline editions the registry names (`retail_region::installed_editions`).
+    PolEditions(Vec<retail_region::RetailRegion>),
+    /// Downloads → Install: the official installer's region (0 US, 1 EU, 2 JP).
+    InstallerRegion(u8),
     CloseRequested,
     ConfirmClose,
     CancelClose,
@@ -847,6 +873,8 @@ pub(crate) struct App {
     pub viewer: Option<viewer::Status>,
     pub viewer_loading: bool,
     viewer_generation: u64,
+    /// The PlayOnline editions the registry names; `pol_editions` adds the found US Viewer.
+    pol_editions: Vec<retail_region::RetailRegion>,
     pub settings: Settings,
     pub show_settings: bool,
     pub status: String,
@@ -868,6 +896,10 @@ pub(crate) struct App {
     status_hold_spent: bool,
     /// Plays clicked before the first status read, waiting for it.
     held_plays: Vec<HeldPlay>,
+    /// Rows that say "Starting": their flags as last logged, and the stuck-start net.
+    start_watch: start_watch::StartWatch,
+    /// Idle sessions to sign out and in again for a changed launcher (`launcher_change`).
+    launcher_changes: launcher_change::LauncherChanges,
     /// Plays waiting for FFXI to come back ("Wait and play").
     waiting_plays: Vec<WaitingPlay>,
     /// The last read of FFXI's play flag, and when the next is due (only while a Play waits or
@@ -938,6 +970,10 @@ pub(crate) struct App {
     /// successful one installed: a W2U that still asks for that version starts no second update.
     viewer_target: Option<String>,
     viewer_installed: Option<String>,
+    /// A PlayOnline update succeeded in this window: a sign-in Crystal starts again (or by
+    /// itself) that local evidence still calls out of date (`viewer::Status::stale`, an old
+    /// core) starts no second update, so nothing loops; a user's own Play still does.
+    viewer_updated: bool,
     active_operation: Option<operation::Operation>,
     config: Config,
     sender: tick_gate::EventSender,
@@ -1033,6 +1069,7 @@ impl App {
             viewer: None,
             viewer_loading: false,
             viewer_generation: 0,
+            pol_editions: Vec::new(),
             settings,
             show_settings: false,
             status: String::new(),
@@ -1045,6 +1082,8 @@ impl App {
             status_read_done: true,
             status_hold_spent: false,
             held_plays: Vec::new(),
+            start_watch: start_watch::StartWatch::default(),
+            launcher_changes: launcher_change::LauncherChanges::default(),
             waiting_plays: Vec::new(),
             play_flag: play_flag::Known::default(),
             flag_schedule: play_flag::Schedule::default(),
@@ -1085,6 +1124,7 @@ impl App {
             viewer_tended: None,
             viewer_target: None,
             viewer_installed: None,
+            viewer_updated: false,
             active_operation: None,
             config,
             sender,
@@ -1348,7 +1388,7 @@ impl App {
         // Resolve again on click: a status refresh may have changed the action.
         let action = self.main_action();
         match action {
-            MainAction::Play => self.play(self.launch_keys(true)),
+            MainAction::Play => self.play_from_home("main", true),
             MainAction::Working => {
                 self.page = Page::Maintenance;
                 self.show_settings = false;
@@ -1550,6 +1590,7 @@ impl App {
         }
         let install = account_folder.unwrap_or_else(|| PathBuf::from(&self.settings.install_path));
         let dir = PathBuf::from(&self.settings.installer_path);
+        let installer_region = self.installer_region();
         let op = operation::Operation::default();
         // The update or repair reads and writes the game folder: its I/O, not ours.
         startup_prefetch::cancel();
@@ -1645,17 +1686,18 @@ impl App {
                         Err(error) => (Err(error.message), None),
                     };
                 }
-                MaintenanceKind::Download => installer::download(dir, op).await,
+                MaintenanceKind::Download => installer::download(dir, installer_region, op).await,
                 MaintenanceKind::Extract | MaintenanceKind::Setup => {
                     tokio::task::spawn_blocking(move || {
                         op.check_cancelled()?;
                         // No stage: the page names the step from `kind`.
                         op.progress(crate::operation::Stage::None, 0, 0, dir.display().to_string());
                         if kind == MaintenanceKind::Extract {
-                            installer::extract(&dir)?;
-                            Ok(t("Extractor finished. Choose Run setup. If you extracted elsewhere, browse to that FFXIFullSetup_US folder first.").into())
+                            installer::extract(&dir, installer_region)?;
+                            Ok(tf("Extractor finished. Choose Run setup. If you extracted elsewhere, browse to that {folder} folder first.",
+                                &[("folder", &installer::official(installer_region).folder)]))
                         } else {
-                            installer::install(&dir)?;
+                            installer::install(&dir, installer_region)?;
                             Ok(t("Setup closed. Crystal will look for the installed FFXI folder. PlayOnline Viewer installs only when selected in the wizard. Then press Update to install the official updates.").into())
                         }
                     }).await.unwrap_or_else(|_| Err(t("Installer worker could not complete.").into()))
@@ -1816,6 +1858,7 @@ impl App {
                     busy: false,
                     signing_out: false,
                     shutting_down: false,
+                    shutdown_mode: session_worker::game_shutdown::Mode::Graceful,
                     preparing_session: false,
                     sign_in_done: None,
                     queued_play: None,
@@ -1923,10 +1966,43 @@ impl App {
         self.viewer_loading = true;
         self.viewer_generation += 1;
         let generation = self.viewer_generation;
-        Effect::perform(async move {
-            tokio::task::spawn_blocking(viewer::local_status).await
-                .unwrap_or_else(|e| viewer::unavailable(e.to_string()))
-        }, move |report| Message::ViewerLoaded(generation, report))
+        Effect::batch([
+            Effect::perform(async move {
+                tokio::task::spawn_blocking(viewer::local_status).await
+                    .unwrap_or_else(|e| viewer::unavailable(e.to_string()))
+            }, move |report| Message::ViewerLoaded(generation, report)),
+            Effect::perform(async { tokio::task::spawn_blocking(|| retail_region::installed_editions(None)).await.unwrap_or_default() },
+                Message::PolEditions),
+        ])
+    }
+
+    /// The PlayOnline editions on this PC: the registry's, and US when the US Viewer was found.
+    pub(crate) fn pol_editions(&self) -> Vec<retail_region::RetailRegion> {
+        let mut editions = self.pol_editions.clone();
+        if self.viewer.as_ref().is_some_and(|status| status.folder.is_some()) && !editions.contains(&retail_region::RetailRegion::Us) {
+            editions.insert(0, retail_region::RetailRegion::Us);
+        }
+        editions
+    }
+
+    /// The region Downloads installs: the one chosen there, else an installed client's, else US.
+    pub(crate) fn installer_region(&self) -> retail_region::RetailRegion {
+        self.settings.installer_region.and_then(retail_region::RetailRegion::from_account)
+            .or_else(|| self.pol_editions().first().copied())
+            .unwrap_or(retail_region::RetailRegion::Us)
+    }
+
+    /// The installer folder follows the region while it is one of the default folders; a folder
+    /// the user picked stays.
+    fn follow_installer_region(&mut self) {
+        if retail_region::RetailRegion::ALL.into_iter().any(|region| self.settings.installer_path == settings::installer_folder(region)) {
+            self.settings.installer_path = settings::installer_folder(self.installer_region());
+        }
+    }
+
+    /// A retail account whose region is not an installed PlayOnline edition: what to set it to.
+    pub(crate) fn region_mismatch(&self, account: &Account) -> Option<String> {
+        (account.mode == AccountMode::Retail).then(|| retail_region::mismatch(account.region, &self.pol_editions())).flatten()
     }
 
     fn set_viewer_status(&mut self, generation: u64, report: viewer::Status) {
@@ -1956,6 +2032,7 @@ impl App {
         // In Home order, whatever order they were picked in: the coordinator starts the games
         // in the order it is given, so their taskbar buttons come up in Home order.
         keys.sort_by_key(|(key, _)| self.accounts.iter().position(|row| row.key == *key));
+        self.log_play_click("batch", &keys.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>());
         self.prefetch_startup_files(&keys.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>());
         let mut jobs = Vec::new();
         let mut generations = HashMap::new();
@@ -3009,6 +3086,13 @@ impl App {
             if keys.is_empty() { return; }
             keys
         };
+        // A signed-in session that cannot take this Play's plan (its launcher was changed since it
+        // signed in) is refused on its own row: it must not fail a batch for the other accounts.
+        let keys = if social_only { keys } else {
+            let keys = self.refuse_changed_launchers(keys);
+            if keys.is_empty() { return; }
+            keys
+        };
         if !social_only {
             let together = self.coordinated_keys(&keys);
             if together.len() > 1 {
@@ -3095,7 +3179,7 @@ impl App {
                 // The stock FFXI version check runs immediately before the game starts, here
                 // as well as in a Play that signs in: off the interface thread, once the
                 // session's Viewer main menu is up and idle (07c §5.3), then the request.
-                let install = match pol_less::install_directory(&config) {
+                let install = match pol_less::install_directory_for(&config, account.region) {
                     Ok(install) => install,
                     Err(error) => { row.status = error; row.problem = true; continue; }
                 };
@@ -3116,8 +3200,9 @@ impl App {
                 let trigger = trigger.unwrap_or(LaunchTrigger::PreSignedPlay);
                 // This session's update just finished (phase 2): stock starts the game with no
                 // second version check, and no patch-host lookup either.
+                let region = account.region;
                 let spawned = std::thread::Builder::new().name("xi-start-game".into()).spawn(move || {
-                    if !skip_w20 { crate::dns::warm(crate::dns::GAME_PATCH_HOST); }
+                    if !skip_w20 { crate::dns::warm(retail_region::game_patch_host(region)); }
                     if let Some(log) = &log {
                         launch_log::append_launcher_lines(log, &pol_less::launch_clock_lines(&launch_timing::Timeline::begin_at(clicked), trigger));
                     }
@@ -3132,14 +3217,18 @@ impl App {
                             }
                             return Ok(t("FINAL FANTASY XI was updated in this session; starting it.").into());
                         }
-                        let (check, timing) = patch::check_before_launch_timed(&install);
+                        // US: the stock check as always. EU/JP: the same frame to their region's
+                        // name for the host, and an update left to the official Viewer.
+                        let (check, timing) = patch::check_before_launch_at(&install, retail_region::game_patch_host(region));
                         if let Some(log) = &log {
                             launch_log::append_launcher_lines(log, &launch_timing::check_lines("FFXI check (W20)", &timing));
                         }
-                        report = Some(match &check {
-                            patch::LaunchCheck::Start(r) | patch::LaunchCheck::Update(r) | patch::LaunchCheck::Unverified(r) => r.clone(),
-                        });
-                        patch::gate(check)
+                        if region == 0 {
+                            report = Some(match &check {
+                                patch::LaunchCheck::Start(r) | patch::LaunchCheck::Update(r) | patch::LaunchCheck::Unverified(r) => r.clone(),
+                            });
+                        }
+                        retail_region::game_gate(region, patch::gate(check))
                     });
                     tx.send(WorkerEvent::StartGame(tx.key.clone(), report, result));
                 });
@@ -3209,11 +3298,15 @@ impl App {
                     // Local readiness only; the sign-in's own W2U runs at Connect (07c §3).
                     // Only a blocking local state replaces the Viewer row: a passing one has
                     // no server verdict and would erase the updater's.
-                    let viewer = viewer::local_status();
-                    if let Err(error) = viewer::gate(&viewer) {
-                        let _ = tx.tx.send(WorkerEvent::Viewer(viewer_generation, viewer));
-                        tx.complete(Err(error));
-                        return;
+                    // The gate is the US Viewer's: an EU/JP account signs in with its own
+                    // region's Viewer, which `retail_region` finds and reads in the sign-in.
+                    if retail_region::us_viewer_gates(account.mode == AccountMode::Retail, account.region) {
+                        let viewer = viewer::local_status();
+                        if let Err(error) = viewer::gate(&viewer) {
+                            let _ = tx.tx.send(WorkerEvent::Viewer(viewer_generation, viewer));
+                            tx.complete(Err(error));
+                            return;
+                        }
                     }
                     if dgvoodoo {
                         let installing = tx.clone();
@@ -3257,6 +3350,30 @@ impl App {
             }
         }
         self.status = launch_status(social_only, all_native, count, &tools);
+    }
+
+    /// The Play `keys` less those whose signed-in session cannot take this Play's plan (the
+    /// account's launcher or its profile changed since it signed in): each of those rows says
+    /// why (`ensure_launch_plan`) and is left free to play once signed out, and the others go on.
+    fn refuse_changed_launchers(&mut self, keys: Vec<String>) -> Vec<String> {
+        let refused: Vec<(String, String)> = keys.iter().filter_map(|key| {
+            let row = self.accounts.iter().find(|row| row.key == *key && row.can_play())?;
+            let plan = self.settings.launch_plan(&row.account)?;
+            let config = self.settings.config_for(&self.config, &row.account);
+            let error = session_worker::find(&config, &row.account)?.ensure_launch_plan(&plan).err()?;
+            Some((key.clone(), error))
+        }).collect();
+        for (key, error) in &refused {
+            if let Some(row) = self.accounts.iter_mut().find(|row| row.key == *key) {
+                row.status = error.clone();
+                row.problem = true;
+            }
+        }
+        if let Some((key, error)) = refused.first() {
+            let label = self.accounts.iter().find(|row| row.key == *key).map_or_else(String::new, |row| row.account.label.clone());
+            self.status = tf("{account}: {message}", &[("account", &label), ("message", error)]);
+        }
+        keys.into_iter().filter(|key| !refused.iter().any(|(refused, _)| refused == key)).collect()
     }
 
     /// A capable worker can check the version during the rest of sign-in. Older
@@ -3358,8 +3475,14 @@ impl App {
     /// refused during a maintenance, a sign-out, a startup sign-in that failed or was skipped):
     /// its next Play starts warm instead of cold. A pre-sign-in that comes later takes the park.
     fn park_keys(&self) -> Vec<(String, pol_less::park::ParkKey, pol_less::Plan)> {
+        // A parked host loads PlayOnline's core: none while PlayOnline is known to need its
+        // update (its core may be too old to park, and the update closes every park anyway).
+        if self.viewer_update_pending() || self.viewer.as_ref().is_some_and(|status| status.version.state == patch::PatchState::Required) {
+            return Vec::new();
+        }
         self.accounts.iter()
-            .filter(|row| row.account.mode == AccountMode::Retail && !row.signed_out && !self.presign_coming(row)
+            // An experimental EU/JP account signs in cold (`retail_region`): never parked.
+            .filter(|row| row.account.mode == AccountMode::Retail && row.account.region == 0 && !row.signed_out && !self.presign_coming(row)
                 && row.pid.is_none() && !row.busy && row.can_play())
             .filter_map(|row| {
                 let plan = self.launch_tools.launch_plan(&self.settings, &row.account)?;
@@ -3562,6 +3685,14 @@ impl App {
                 Note::Parked(_) => {}
                 // An older loader: expected, and not parked again until something changes.
                 Note::Failed(why) if why == park::UNSUPPORTED => {}
+                // An old PlayOnline core: no park works until PlayOnline is updated, so none
+                // starts again (`park_keys`), and Play runs the update.
+                Note::Failed(why) if viewer::core_check_outdated(&why) => {
+                    let shown = viewer::stale(self.viewer.take());
+                    let message = viewer::stale_message(&shown.version.local_version);
+                    self.show_viewer(shown);
+                    self.park_note(&row, &message);
+                }
                 Note::Failed(why) => self.park_note(&row, &why),
                 Note::Ended => self.park_note(&row, t("The parked game host ended.")),
             }
@@ -3686,17 +3817,18 @@ impl App {
         pol_less::park::close_workers(self.parks.drain(None));
     }
 
+    /// The running games a shut-down can still end (only the checked accounts' with selected).
     pub(crate) fn shutdown_count(&self, selected: bool) -> usize {
-        self.accounts.iter().filter(|row| (!selected || row.selected) && row.account.mode == AccountMode::Retail
-            && row.is_playing() && !row.shutting_down && !row.signing_out && !row.busy).count()
+        self.accounts.iter().filter(|row| (!selected || row.selected) && row.can_shut_down()).count()
     }
 
-    fn shutdown_games(&mut self, selected: bool) -> Effect<Message> {
+    /// Ends one account's game (only), the checked accounts' games, or every running game.
+    fn shutdown_games(&mut self, selected: bool, only: Option<&str>) -> Effect<Message> {
         if self.closing { return Effect::none(); }
+        let mode = session_worker::game_shutdown::Mode::from_setting(self.settings.close_games_instantly);
         let mut tasks = Vec::new();
         for row in &mut self.accounts {
-            if (selected && !row.selected) || row.account.mode != AccountMode::Retail
-                || !row.is_playing() || row.shutting_down || row.signing_out || row.busy { continue; }
+            if (selected && !row.selected) || only.is_some_and(|key| row.key != key) || !row.can_shut_down() { continue; }
             let key = row.key.clone();
             let generation = row.launch_generation;
             let config = self.settings.config_for(&self.config, &row.account);
@@ -3708,14 +3840,15 @@ impl App {
             }
             row.network_wait = None;
             row.shutting_down = true;
+            row.shutdown_mode = mode;
             row.problem = false;
-            row.status = t("Shutting down FFXI…").into();
+            row.status = row.status_text().into_owned();
             if self.preview {
                 tasks.push(Effect::done(Message::GameShutdownFinished(key, generation, Ok(()))));
             } else {
                 tasks.push(Effect::perform(async move {
                     tokio::task::spawn_blocking(move || match session {
-                        Some(session) => session_worker::game_shutdown::request(&session),
+                        Some(session) => mode.run(&session),
                         None => Err(t("The selected game session ended before shutdown could be requested.").into()),
                     }).await.unwrap_or_else(|_| Err(t("Could not request game shutdown.").into()))
                 }, move |result| Message::GameShutdownFinished(key.clone(), generation, result)));
@@ -3896,7 +4029,7 @@ impl App {
     fn tick_quiet(&self) -> bool {
         self.page != Page::Friends
             && !self.startup_signin_pending && self.startup_waiting.is_empty()
-            && self.waiting_plays.is_empty() && self.play_updates.jobs.is_empty()
+            && self.waiting_plays.is_empty() && self.play_updates.jobs.is_empty() && self.launcher_changes.is_empty()
             && self.recovering.is_none() && !self.closing && self.parks_settled
             && self.accounts.iter().all(|row| row.resign.is_none() && row.network_wait.is_none()
                 && row.queued_play.is_none() && !row.shutting_down && !row.signing_out && !row.batch_requested)
@@ -4230,6 +4363,10 @@ impl App {
     }
 
     fn worker_event(&mut self, event: WorkerEvent) {
+        // Any report for a row: its start is not stuck (`watch_starts`).
+        if let WorkerEvent::Progress(key, _) | WorkerEvent::StartGame(key, ..) | WorkerEvent::Complete(key, _) = &event {
+            self.note_start_activity(key);
+        }
         match event {
             WorkerEvent::Viewer(generation, report) => self.set_viewer_status(generation, report),
             WorkerEvent::InterruptedUpdate(done) => self.interrupted_update_finished(*done),
@@ -4340,6 +4477,13 @@ impl App {
                 // A sign-in that reached a verdict on the account (no network or host failure that
                 // is retried): a Play waiting on it waits no longer.
                 let mut verdict = false;
+                // A sign-in refused because local evidence says PlayOnline is out of date
+                // (`viewer::Status::stale`, or the host's core check found an old core):
+                // `Some(whether the user's own Play started it)`. Its update asks the server.
+                let mut stale_refusal = None;
+                // The host's own words for an old core, kept for the row should no update follow.
+                let mut core_refusal = None;
+                let viewer_local = self.viewer.as_ref().map(|status| status.version.local_version.clone());
                 if let Some(row) = self.accounts.iter_mut().find(|r| r.key == key) {
                     let batch = row.batch_requested;
                     row.busy = false;
@@ -4396,6 +4540,12 @@ impl App {
                             let queued = row.queued_play.take();
                             // The row shows the reason; the log path stays behind View log.
                             let (message, log) = launch_log::split_log(&error);
+                            // The host's core check found an old PlayOnline core (an old or fresh
+                            // install): that is PlayOnline's update to run, and the row says so.
+                            let reworded = viewer::core_check_outdated(message)
+                                .then(|| viewer::stale_message(viewer_local.as_deref().unwrap_or(t("Unavailable"))));
+                            if reworded.is_some() { core_refusal = Some(message.to_owned()); }
+                            let message = reworded.as_deref().unwrap_or(message);
                             let update = patch::parse_update_required(message);
                             // 07d §5.4-5.5: a sign-in that never reached a verdict on the account
                             // (no network, or its host went away before authentication) starts
@@ -4426,15 +4576,20 @@ impl App {
                             // The sign-in's W2U said PlayOnline is out of date: so does the
                             // window's PlayOnline status.
                             viewer_outdated = viewer::outdated_versions(message);
+                            let stale = viewer_outdated.is_none() && viewer::local_update_required(message);
                             let play = queued.is_some() || matches!(trigger, Some(launch_timing::LaunchTrigger::Play
                                 | launch_timing::LaunchTrigger::ParkedPlay | launch_timing::LaunchTrigger::PreSignedPlay
                                 | launch_timing::LaunchTrigger::QueuedPlay | launch_timing::LaunchTrigger::BatchPlay
                                 | launch_timing::LaunchTrigger::ReissuedPlay));
+                            if stale {
+                                // Crystal's own start again (after an update) is not the user's click.
+                                stale_refusal = Some(play && trigger != Some(launch_timing::LaunchTrigger::ReissuedPlay));
+                            }
                             // PlayOnline's update follows whatever started this sign-in (a Play, a
                             // batch, Crystal's own sign-in, Connect) and starts it again, as stock's
                             // Viewer updates at Connect; the game's update (a batch's W20) runs in
                             // the session the batch kept signed in. A batch's accounts keep its click.
-                            if viewer_outdated.is_some() {
+                            if viewer_outdated.is_some() || stale {
                                 let clicked = row.play_timing.as_ref().map_or_else(|| queued.unwrap_or_else(Instant::now), launch_timing::Timeline::started);
                                 refused_sign_in = Some((clicked, (!play).then(|| trigger.unwrap_or(launch_timing::LaunchTrigger::Connect))));
                             }
@@ -4475,7 +4630,8 @@ impl App {
                                 row.log = log;
                             }
                             if let Some(wait) = row.network_wait { follow_up = Some((wait, true)); }
-                            self.status = tf("{account}: {message}", &[("account", &row.account.label), ("message", &error)]);
+                            let shown = if reworded.is_some() { message } else { error.as_str() };
+                            self.status = tf("{account}: {message}", &[("account", &row.account.label), ("message", &shown)]);
                         }
                     }
                 }
@@ -4487,7 +4643,21 @@ impl App {
                 // its row instead of waiting to sign in again into the same verdict: a refused
                 // password or account never costs a second login. One stopped for a PlayOnline
                 // update keeps waiting: that update answers it, and no login was sent.
-                if verdict && viewer_outdated.is_none() && self.is_waiting(&key) { self.unwait(std::slice::from_ref(&key)); }
+                if verdict && viewer_outdated.is_none() && stale_refusal.is_none() && self.is_waiting(&key) { self.unwait(std::slice::from_ref(&key)); }
+                if let Some(by_user) = stale_refusal {
+                    // Local evidence, no server verdict: the update asks the server for its version
+                    // itself (no `viewer_asked`), the request a W2U at Connect would have been. One
+                    // that already ran here and left it so starts no second one by itself.
+                    if by_user || !self.viewer_updated {
+                        let shown = viewer::stale(self.viewer.take());
+                        self.show_viewer(shown);
+                        if let Some((clicked, sign_in)) = refused_sign_in { self.note_refused(&key, clicked, sign_in); }
+                    } else if let Some(original) = core_refusal {
+                        // PlayOnline was just updated and its core still fails the check: the
+                        // host's own reason, not another update.
+                        if let Some(row) = self.accounts.iter_mut().find(|row| row.key == key) { row.status = original; }
+                    }
+                }
                 if let Some((local, remote)) = viewer_outdated {
                     // An update that just installed this very version and is asked for again
                     // changed nothing the server accepts: the row keeps the refusal, no loop.
@@ -4583,13 +4753,27 @@ impl App {
         Effect::batch([effect, auto])
     }
 
+    /// A game runs or is starting on some account: in a new session, or relaunched inside one
+    /// already signed in (a batch Play after FFXI returned to the Viewer).
+    pub(crate) fn game_active(&self) -> bool {
+        self.accounts.iter().any(|row| row.is_playing() || row.game_start_pending())
+    }
+
+    /// Whether `msg` may restart Crystal now. A download that finishes restarts at once only
+    /// while no game runs or starts: "Update and restart" may be pressed before a Play whose
+    /// games are still starting when the download lands. Otherwise the update stays Ready and
+    /// the automatic restart (`self_update::auto`) installs it once the games are over.
+    fn self_update_can_restart(&self, msg: &self_update::Msg) -> bool {
+        self.can_restart_launcher() && !(matches!(msg, self_update::Msg::Downloaded(_)) && self.game_active())
+    }
+
     /// What the automatic restart sees now.
     fn auto_conditions(&self, now: Instant) -> self_update::auto::Conditions {
         self_update::auto::Conditions {
             enabled: self.settings.launcher_auto_restart,
             ready: matches!(self.self_update, self_update::State::Ready(_)),
             can_restart: self.can_restart_launcher(),
-            game_running: self.accounts.iter().any(|row| row.is_playing() || row.game_start_pending()),
+            game_running: self.game_active(),
             dialog: self.controller_modal(),
             user_active: self.auto_restart.user_active(self.window.is_some(), now),
         }
@@ -4669,7 +4853,7 @@ impl App {
             Message::SelfUpdate(self_update::Msg::Applied(Ok(()))) => { self.close_parks(); tray::set_icon(false); tray::wake_ui_thread_soon(); return Effect::Exit; }
             Message::SelfUpdate(msg) => {
                 if !self.preview {
-                    let can_restart = self.can_restart_launcher();
+                    let can_restart = self.self_update_can_restart(&msg);
                     let task = self_update::update(&mut self.self_update, msg, &self.config, can_restart).map(Message::SelfUpdate);
                     // The update replaces this exe: no parked host may outlive it (07d §1.5).
                     // They close off the interface thread before the helper starts.
@@ -4704,6 +4888,15 @@ impl App {
             Message::SignInAfterGame(on) => {
                 self.settings.sign_in_after_game = on;
                 if !on { for row in &mut self.accounts { row.drop_resign(); } }
+                self.persist_settings();
+            }
+            Message::ItemSearch(on) => {
+                self.settings.item_search = on;
+                if !on { self.ah_lookup.open = false; }
+                self.persist_settings();
+            }
+            Message::CloseGamesInstantly(on) => {
+                self.settings.close_games_instantly = on;
                 self.persist_settings();
             }
             Message::ControllerPlay => {
@@ -4819,8 +5012,9 @@ impl App {
             Message::FriendsSignOut => {
                 if let Some(key) = self.friends.account.clone() { return self.sign_out_account(key); }
             }
-            Message::ShutdownSelected => return self.shutdown_games(true),
-            Message::ShutdownAll => return self.shutdown_games(false),
+            Message::ShutdownAccount(key) => return self.shutdown_games(false, Some(&key)),
+            Message::ShutdownSelected => return self.shutdown_games(true, None),
+            Message::ShutdownAll => return self.shutdown_games(false, None),
             Message::GameShutdownFinished(key, generation, result) => {
                 if let Some(row) = self.accounts.iter_mut().find(|row| row.key == key && row.launch_generation == generation) {
                     row.shutting_down = false;
@@ -4856,10 +5050,13 @@ impl App {
                         row.exit = None;
                         row.timing.clear();
                     }
+                    let signed_out = result.is_ok();
                     if self.friends.account.as_ref() == Some(&key) {
                         self.friends.error = result.err().unwrap_or_default();
                         self.load_friends();
                     }
+                    // A sign-out for a changed launcher signs back in.
+                    self.launcher_signed_out(&key, signed_out);
                 }
             }
             Message::FriendsStatus(action) => {
@@ -5009,6 +5206,8 @@ impl App {
                 let keys = self.take_resigns(Instant::now());
                 self.start_resigns(keys, launch_timing::LaunchTrigger::SignInAfterGame);
                 self.start_queued_plays();
+                // After every release: what changed on the rows, and a start nothing answers.
+                self.watch_starts(Instant::now());
                 let accounts = &self.accounts;
                 // A deleted account no longer waits.
                 let deleted: Vec<String> = self.waiting_plays.iter().flat_map(|wait| &wait.keys)
@@ -5034,7 +5233,8 @@ impl App {
                     self.preview_capture_sent = true;
                     return self.on_window(WindowOp::screenshot(Message::PreviewReady));
                 }
-                return Effect::batch([started, flag, open_programs, self.poll_service_status()]);
+                let relaunch = self.tend_launcher_changes(Instant::now());
+                return Effect::batch([started, flag, open_programs, relaunch, self.poll_service_status()]);
             }
             Message::PlayFlagLoaded(reading) => {
                 self.flag_schedule.finish();
@@ -5043,6 +5243,7 @@ impl App {
                 self.tend_patch_watch();
             }
             Message::CancelWait(keys) => self.cancel_wait(&keys),
+            Message::CancelStart(key) => self.clear_start(&key, true),
             Message::CancelPlayUpdate(generation) => self.cancel_play_update(generation),
             Message::ConfirmViewerUpdate => {
                 if self.play_updates.viewer_confirm.take().is_some() {
@@ -5130,10 +5331,10 @@ impl App {
             Message::Launch(key) => {
                 if let Some(features) = &self.features { features.cancel_relaunch(&key); }
                 if self.features_view.offers.remove(&key).is_some() { self.features_view.touch(); }
-                self.play(vec![key])
+                self.play_row(key)
             }
             Message::MainAction => return self.run_main_action(),
-            Message::LaunchAll => self.play(self.launch_keys(false)),
+            Message::LaunchAll => self.play_from_home("all", false),
             Message::SignIn(key) => {
                 if self.accounts.iter().any(|row| row.key == key && row.account.mode == AccountMode::Retail && row.can_play() && row.pid.is_none()) {
                     self.connect(vec![key]);
@@ -5162,7 +5363,21 @@ impl App {
                 self.cancel_account_drag();
                 if self.vault_ready && !self.vault_saving {
                     self.status = t("Enter account details, then save.").into();
-                    self.editor = Some(Editor::blank());
+                    let mut editor = Editor::blank();
+                    // A new account has no chosen region yet: the one installed edition, if one.
+                    if let Some(edition) = retail_region::only_edition(&self.pol_editions()) { editor.account.region = edition.index(); }
+                    self.editor = Some(editor);
+                }
+            }
+            Message::PolEditions(editions) => {
+                self.pol_editions = editions;
+                self.follow_installer_region();
+            }
+            Message::InstallerRegion(region) => {
+                if self.maintenance.is_none() && retail_region::RetailRegion::from_account(region).is_some() {
+                    self.settings.installer_region = Some(region);
+                    self.follow_installer_region();
+                    self.persist_settings();
                 }
             }
             Message::AccountImport(msg) => return self.import_update(msg),
@@ -5418,7 +5633,9 @@ impl App {
                 }
             }
             Message::NewsFilter(value) => self.news_filter = value,
+            Message::SearchAh if !self.settings.item_search => {}
             Message::SearchAh => return self.search_ah(),
+            Message::SearchWiki if !self.settings.item_search => {}
             Message::SearchWiki => {
                 let url = crate::ffxiah::wiki_search_url(&self.wiki_query);
                 if !self.preview {
@@ -5560,7 +5777,7 @@ impl App {
                     }
                     // The version a sign-in's update installed (`viewer_installed`).
                     let target = self.viewer_target.take();
-                    if updated && kind == MaintenanceKind::Update && self.update_scope.0 { self.viewer_installed = target; }
+                    if updated && kind == MaintenanceKind::Update && self.update_scope.0 { self.viewer_installed = target; self.viewer_updated = true; }
                     if updated {
                         self.reissue_refused(reissue);
                     } else if let Some(error) = failure.filter(|_| kind == MaintenanceKind::Update) {
@@ -5723,6 +5940,8 @@ impl App {
                         self.settings = settings;
                         self.replace_accounts(values);
                         for row in self.accounts.iter_mut().filter(|row| edited.contains(&row.key)) { row.decline_resign(); }
+                        // An idle session whose launcher or profile changed signs out and in again.
+                        self.note_launcher_changes(Instant::now());
                         // A new account's "Sign in now", under the
                         // Settings switch and never for a one-time-password account.
                         let sign_in = self.editor.as_ref()

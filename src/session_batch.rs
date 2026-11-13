@@ -131,7 +131,10 @@ fn prepare_dispatch(jobs: &mut [BatchAccount], viewer_gate: impl FnOnce() -> Res
         if job.existing_worker.is_some() { job.existing_session()?; }
         else { job.existing_worker = find(&job.config, &job.account).map(|session| session.worker); }
     }
-    if jobs.iter().any(|job| job.existing_worker.is_none()) { viewer_gate()?; }
+    // The US Viewer's readiness, for the new sign-ins that use it: an EU/JP account signs in
+    // with its own region's Viewer (`retail_region`).
+    if jobs.iter().any(|job| job.existing_worker.is_none()
+        && crate::retail_region::us_viewer_gates(job.account.mode == crate::backend::AccountMode::Retail, job.account.region)) { viewer_gate()?; }
     Ok(())
 }
 fn validate_jobs(jobs: &[BatchAccount]) -> Result<(), String> {
@@ -326,8 +329,12 @@ fn verify(item: &mut Prepared) {
     let Some(check_version) = item.version.take() else { return };
     emit_batch(&BatchEvent::Progress(item.job.key.clone(), t("Checking the game version...").into()));
     let mut check = check_version(&item.job.config, &item.launch.log);
-    // The window's update spaces its first connection from this W20's FIN (phase 2).
-    if check.as_ref().is_err_and(|message| crate::patch::is_update_refusal(message)) {
+    let region = crate::retail_region::RetailRegion::from_account(item.job.account.region).filter(|r| *r != crate::retail_region::RetailRegion::Us);
+    if let (Some(region), Err(message)) = (region, &check) {
+        // An experimental EU/JP game update is the official Viewer's (`retail_region`).
+        if let Some(official) = crate::retail_region::official_game_update(region.wire(), message) { check = Err(official); }
+    } else if check.as_ref().is_err_and(|message| crate::patch::is_update_refusal(message)) {
+        // The window's update spaces its first connection from this W20's FIN (phase 2).
         crate::patch::save_update_close(item.session.directory());
     }
     if find_in(item.session.directory()).is_none_or(|now| now.worker != item.session.worker) {
@@ -578,10 +585,11 @@ fn wait_for_window(mut shown: impl FnMut() -> bool, mut alive: impl FnMut() -> b
 /// from the host) has its window on the desktop: what the features runtime adopts as the
 /// game's window, and what the taskbar has a button for.
 fn game_window_shown(key: &str, pid: u32) -> bool {
+    // Unset, a fixture's game counts as shown: no fixture has a desktop window to wait for.
     #[cfg(test)]
-    { if let Some(shown) = tests::WINDOWS.with(|probe| probe.borrow().as_ref().map(|probe| probe(key))) { return shown; } }
-    let _ = key;
-    crate::features::game_window::find_main_window(&crate::features::game_window::process_family(pid)).is_some()
+    { let _ = pid; tests::WINDOWS.with(|probe| probe.borrow().as_ref().is_none_or(|probe| probe(key))) }
+    #[cfg(not(test))]
+    { let _ = key; crate::features::game_window::find_main_window(&crate::features::game_window::process_family(pid)).is_some() }
 }
 
 /// How often the release wait looks at the gate and at each member's processes.
@@ -591,7 +599,10 @@ const RELEASED_LIMIT: Duration = Duration::from_secs(5);
 /// How long the next game's start waits for the one before it to show its window. A game
 /// shows its window within about a second of its GameStart (the owner's history,
 /// 2026-11-11: five games, every window found within a second of the starts).
-const WINDOW_LIMIT: Duration = if cfg!(test) { Duration::from_millis(60) } else { Duration::from_secs(3) };
+/// In tests long enough that a fixture thread starved by the parallel suite still shows its
+/// "window" first (at 60 ms the Home-order test released the next game at the limit, ~1 ms
+/// after the one before it wrote its start).
+const WINDOW_LIMIT: Duration = if cfg!(test) { Duration::from_millis(500) } else { Duration::from_secs(3) };
 /// How often that wait looks for the window.
 const WINDOW_POLL: Duration = Duration::from_millis(10);
 /// A held game is released this long before its own wait for the release would end.
@@ -620,8 +631,7 @@ mod tests {
     static FIXTURE_STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     thread_local! {
         /// Whether an account's game has shown its window, for the batch this thread
-        /// coordinates (`game_window_shown`); unset, the desktop is asked, where a fixture
-        /// has no window.
+        /// coordinates (`game_window_shown`); unset, every game counts as shown.
         pub(super) static WINDOWS: std::cell::RefCell<Option<Box<dyn Fn(&str) -> bool>>> = const { std::cell::RefCell::new(None) };
     }
     fn root() -> PathBuf {
@@ -717,7 +727,10 @@ mod tests {
     #[test]
     fn a_game_with_no_window_delays_the_next_start_only_by_the_limit() {
         let root = root(); let mut events = Vec::new();
-        WINDOWS.with(|probe| *probe.borrow_mut() = Some(Box::new(|key| key != "stuck")));
+        // A window shows once its game has written its start (so the release order on disk is
+        // the order of release, whatever the fixture threads' scheduling); "stuck" never shows one.
+        let started = root.clone();
+        WINDOWS.with(|probe| *probe.borrow_mut() = Some(Box::new(move |key| key != "stuck" && started.join(format!("{key}-started")).exists())));
         let began = Instant::now();
         coordinate(vec![job(&root, "first"), job(&root, "stuck"), job(&root, "last")], Instant::now(), fixture_prepare, |e| events.push(serde_json::to_string(e).unwrap()));
         let took = began.elapsed();

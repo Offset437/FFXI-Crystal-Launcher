@@ -117,13 +117,25 @@ pub(crate) fn row_view(app: &App, item: &crate::AccountRow) -> RowView {
                 .as_ref()
                 .map(|timing| tf("since {time}", &[("time", &clock_at(timing.started()))]))
                 .unwrap_or_default();
-            view(t("In game").into(), since)
+            let mut row = view(t("In game").into(), since);
+            if item.can_shut_down() {
+                row.action = Some((t("Shut down").into(), Message::ShutdownAccount(item.key.clone()), false));
+            }
+            row
         }
         // The state alone, with the rail's working bar: the worker's step words repeat it.
-        RowState::Starting => view(t("Starting").into(), String::new()),
+        RowState::Starting => {
+            let mut row = view(t("Starting").into(), String::new());
+            // A start that has waited a while can be cleared by hand (`start_watch`).
+            if app.start_cancellable(&item.key) {
+                row.action = Some((t("Cancel").into(), Message::CancelStart(item.key.clone()), false));
+            }
+            row
+        }
         RowState::SigningIn => view(t("Signing in").into(), String::new()),
         RowState::SignedIn => {
-            let mut row = view(t("Signed in").into(), String::new());
+            // A Play this session refused (its launcher changed since it signed in) says why.
+            let mut row = view(t("Signed in").into(), if item.problem { item.status_text().into_owned() } else { String::new() });
             if item.can_play() && app.vault_ready && !app.launch_blocked() {
                 row.action = Some((t("Play now").into(), Message::Launch(item.key.clone()), true));
             }
@@ -137,7 +149,7 @@ pub(crate) fn row_view(app: &App, item: &crate::AccountRow) -> RowView {
         RowState::NeedsCode => {
             let mut row = view(
                 t("Needs a one-time password").into(),
-                if item.problem { item.status_text().into_owned() } else { String::new() },
+                if item.problem { item.status_text().into_owned() } else { app.region_mismatch(&item.account).unwrap_or_default() },
             );
             row.otp = true;
             let can_sign_in = idle && app.vault_ready && !app.launch_blocked();
@@ -160,7 +172,8 @@ pub(crate) fn row_view(app: &App, item: &crate::AccountRow) -> RowView {
             row
         }
         RowState::Idle => {
-            let mut row = view(t("Not signed in").into(), watch().map(|update| update.headline).unwrap_or_default());
+            let detail = watch().map(|update| update.headline).or_else(|| app.region_mismatch(&item.account)).unwrap_or_default();
+            let mut row = view(t("Not signed in").into(), detail);
             if idle && app.vault_ready && !app.launch_blocked() && item.can_play() {
                 row.action = Some((t("Sign in").into(), Message::SignIn(item.key.clone()), false));
             }
@@ -196,6 +209,80 @@ mod tests {
         // In game is playing, not signed in.
         app.accounts[0].game_running = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)));
         assert!(app.accounts[0].is_playing() && !signed_in(&app.accounts[0]));
+    }
+
+    /// Only an EU PlayOnline installed: a US row says to set EU, a new account starts as EU, a
+    /// saved account keeps its own region until changed. Two editions: no automatic pick.
+    #[test]
+    fn a_region_mismatch_shows_on_the_row_and_a_new_account_takes_the_one_edition() {
+        use crate::retail_region::RetailRegion;
+        crate::i18n::set(crate::i18n::Lang::En);
+        let mut app = crate::tests::app();
+        assert_eq!(app.accounts[2].account.region, 0);
+        assert!(row_view(&app, &app.accounts[2]).detail.is_empty(), "nothing known, nothing said");
+        app.pol_editions = vec![RetailRegion::Eu];
+        let note = "This PlayOnline is the EU version. Set this account to EU.";
+        assert_eq!(row_view(&app, &app.accounts[2]).detail, note);
+        let _ = app.update(Message::NewAccount);
+        assert_eq!(app.editor.as_ref().map(|editor| editor.account.region), Some(1));
+        let key = app.accounts[2].key.clone();
+        let _ = app.update(Message::EditAccount(key));
+        assert_eq!(app.editor.as_ref().map(|editor| editor.account.region), Some(0), "an explicit region is never changed silently");
+        app.accounts[2].account.region = 1;
+        assert!(row_view(&app, &app.accounts[2]).detail.is_empty());
+        app.pol_editions = vec![RetailRegion::Us, RetailRegion::Eu];
+        app.editor = None;
+        let _ = app.update(Message::NewAccount);
+        assert_eq!(app.editor.as_ref().map(|editor| editor.account.region), Some(0), "two editions: the default stays");
+    }
+
+    /// A signed-in row whose Play its session refused shows why, and still offers Play.
+    #[test]
+    fn a_signed_in_row_says_why_its_play_was_refused() {
+        crate::i18n::set(crate::i18n::Lang::En);
+        let mut app = crate::tests::app();
+        let row = &mut app.accounts[0];
+        row.pid = Some(7);
+        row.game_running = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        assert!(row_view(&app, &app.accounts[0]).detail.is_empty(), "nothing to say without a problem");
+        let refusal = t("Sign out of PlayOnline before switching launch methods, then launch again.");
+        (app.accounts[0].problem, app.accounts[0].status) = (true, refusal.into());
+        let view = row_view(&app, &app.accounts[0]);
+        assert_eq!(row_state(&app, &app.accounts[0]), RowState::SignedIn);
+        assert_eq!((view.label.as_str(), view.detail.as_str()), (t("Signed in"), refusal));
+        assert!(matches!(view.action, Some((_, Message::Launch(_), true))));
+    }
+
+    /// A row's Shut down shows only while its own game runs, closes just that game with the
+    /// current Close games instantly choice, and is gone while the close is in flight.
+    #[test]
+    fn a_running_game_row_offers_shut_down_that_ends_only_that_game_once() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        crate::i18n::set(crate::i18n::Lang::En);
+        let mut app = crate::tests::app();
+        for (i, row) in app.accounts.iter_mut().enumerate() {
+            row.pid = Some(100 + i as u32);
+            row.busy = false;
+            row.game_running = Some(Arc::new(AtomicBool::new(i < 2)));
+            row.alive = Some(Arc::new(AtomicBool::new(true)));
+        }
+        let key = app.accounts[0].key.clone();
+        let running = row_view(&app, &app.accounts[0]);
+        assert_eq!(running.label, t("In game"));
+        assert!(matches!(&running.action, Some((label, Message::ShutdownAccount(k), false)) if *label == t("Shut down") && *k == key));
+        assert!(matches!(&row_view(&app, &app.accounts[2]).action, Some((_, Message::Launch(_), true))), "a signed-in row keeps Play now");
+        // The click ends that account's game only, in the chosen mode.
+        app.settings.close_games_instantly = true;
+        assert_eq!(app.update(Message::ShutdownAccount(key)).units(), 1);
+        assert!(app.accounts[0].shutting_down && !app.accounts[1].shutting_down);
+        assert_eq!(app.accounts[0].status_text(), t("Closing FFXI…"));
+        assert_eq!(row_state(&app, &app.accounts[0]), RowState::Closing);
+        assert!(row_view(&app, &app.accounts[0]).action.is_none(), "no repeat click while it closes");
+        let again = app.accounts[0].key.clone();
+        assert_eq!(app.update(Message::ShutdownAccount(again)).units(), 0);
+        // Not running: no Shut down.
+        app.accounts[1].game_running = Some(Arc::new(AtomicBool::new(false)));
+        assert!(!matches!(row_view(&app, &app.accounts[1]).action, Some((_, Message::ShutdownAccount(_), _))));
     }
 
     /// Live 2026-11-10: a loader that never connected left the row with code boxes, which read

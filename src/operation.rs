@@ -174,7 +174,7 @@ impl WholeUpdate {
                     if progress.stage != Stage::Download || !progress.bytes { return None; }
                     step_eta?
                 } else { Duration::ZERO };
-                // Staging and six network workers overlap; applying and the
+                // Staging and the network workers overlap; applying and the
                 // full installation verification run after those workers.
                 network.max(disk).checked_add(apply)?.checked_add(verify)
             }
@@ -210,6 +210,20 @@ struct State {
 
 impl State {
     fn publish(&mut self, progress: Progress, now: Instant, rebase: bool) {
+        // A rebase within one byte count (a reused file, a delta's full-file fallback while
+        // other downloads run): shift the window by the jump so the measured rate survives.
+        // A window with no transfer in it yet restarts instead, so time spent reusing files
+        // never dilutes the rate.
+        let same_count = progress.bytes && self.progress.bytes && self.progress.stage == progress.stage
+            && self.progress.part.map(|part| part.number) == progress.part.map(|part| part.number);
+        let measured = self.samples.front().is_some_and(|(_, first)| self.progress.done > *first);
+        if rebase && same_count && measured && progress.done >= self.progress.done {
+            let jump = progress.done - self.progress.done;
+            for sample in &mut self.samples { sample.1 += jump; }
+            if let Some(update) = &mut self.update { update.observe(progress.stage, jump > 0, now); }
+            self.progress = progress;
+            return;
+        }
         let reset = rebase || self.samples.is_empty()
             || self.progress.stage != progress.stage
             || self.progress.total != progress.total

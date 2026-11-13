@@ -8,12 +8,15 @@
 
 pub mod args;
 mod auto_login;
+mod awake;
 mod boot_timing;
 mod controller_catalog;
+mod controller_record;
 mod controller_settings;
 mod feature_check;
 mod game_modules;
 mod game_shutdown;
+mod graphics;
 pub mod b64;
 pub mod wire;
 pub mod events;
@@ -319,7 +322,7 @@ fn run_session(pipe: Pipe, reader: LineReader, session: proto::Session) -> i32 {
     log_session(&session);
     log_ffxi_settings(session.ffxi_settings.as_ref());
     ffxi_settings::install(session.ffxi_settings);
-    let cfg = game::GameConfig { region: session.region, install_dir: session.install_dir, pol_install_dir: session.pol_install_dir, native_auth: Some(session.native_auth), start_game: session.start_game, keep_session: session.keep_session, viewer_gaps: session.viewer_gaps, auto_away_minutes: session.auto_away_minutes, auto_login: session.auto_login };
+    let cfg = game::GameConfig { region: session.region, ucs_area: session.ucs_area, install_dir: session.install_dir, pol_install_dir: session.pol_install_dir, native_auth: Some(session.native_auth), start_game: session.start_game, keep_session: session.keep_session, viewer_gaps: session.viewer_gaps, auto_away_minutes: session.auto_away_minutes, auto_login: session.auto_login };
     events::start(pipe, reader);
     let game = spawn_game(move || game::run(cfg));
     finish(game.and_then(join_game))
@@ -345,7 +348,7 @@ fn run_parked(pipe: Pipe, mut reader: LineReader, mut park: proto::Park) -> i32 
         park.ffxi_settings.as_ref().map_or(0, |fx| fx.len()), if park.auto_login.enabled { "on" } else { "off" });
     log_ffxi_settings(park.ffxi_settings.as_ref());
     ffxi_settings::install(park.ffxi_settings.take());
-    let cfg = game::GameConfig { region: park.region, install_dir: park.install_dir.clone(), pol_install_dir: park.pol_install_dir.clone(),
+    let cfg = game::GameConfig { region: park.region, ucs_area: park.ucs_area.clone(), install_dir: park.install_dir.clone(), pol_install_dir: park.pol_install_dir.clone(),
         native_auth: None, start_game: false, keep_session: false, viewer_gaps: false, auto_away_minutes: 0,
         auto_login: park.auto_login };
     let (ready_tx, ready) = std::sync::mpsc::channel();

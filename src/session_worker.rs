@@ -942,6 +942,15 @@ pub(crate) fn save_live_record_for_test(config: &Config, account: &Account) {
         authenticated: true, native_batch: false, otp_used: Some(false), launch_choice: None, launch_tool: None }).unwrap();
 }
 
+/// `save_live_record_for_test` for a session started with `tool`.
+#[cfg(test)]
+pub(crate) fn save_live_record_with_tool_for_test(config: &Config, account: &Account, tool: Tool) {
+    let worker = identity(std::process::id()).unwrap();
+    fs::create_dir_all(config.account_directory(account)).unwrap();
+    save_record(&record_path(config, account), &Record { worker, state: Event::Progress("signed in".into()), social_only: true,
+        authenticated: true, native_batch: true, otp_used: Some(false), launch_choice: None, launch_tool: Some(tool) }).unwrap();
+}
+
 #[cfg(test)]
 pub(crate) fn save_play_pending_for_test(directory: &Path) {
     save_json(&directory.join(PLAY_PENDING_NOTE), &identity(std::process::id()).unwrap()).unwrap();
@@ -1780,7 +1789,9 @@ pub(crate) fn launch(
     let otp = Zeroizing::new(otp);
     // Local readiness only: the Viewer's W2U goes out at Connect, inside this sign-in
     // (pol-spec 07c §1, §3), never before it.
-    if account.mode == backend::AccountMode::Retail && find(config, &account).is_none() {
+    // The US Viewer's readiness; an EU/JP account uses its own region's Viewer (`retail_region`).
+    if account.mode == backend::AccountMode::Retail && find(config, &account).is_none()
+        && crate::retail_region::us_viewer_gates(true, account.region) {
         crate::viewer::gate(&crate::viewer::local_status())?;
     }
     launch_preflighted(config, account, otp, via, clicked, progress)
@@ -1972,6 +1983,13 @@ fn launch_command(
                 crate::launch_log::append_launcher_lines(log, &crate::pol_less::launch_clock_lines(&clock, crate::launch_timing::LaunchTrigger::PreSignedPlay));
             }
             start_signed_in(config, &account, &mut progress, || {
+                // An EU/JP session: the same check to its region's name for the host, and an
+                // update left to the official Viewer (`retail_region`).
+                if !crate::retail_region::us_viewer_gates(account.mode == backend::AccountMode::Retail, account.region) {
+                    let (check, timing) = crate::patch::check_before_launch_at(&crate::pol_less::install_directory_for(config, account.region)?, crate::retail_region::game_patch_host(account.region));
+                    if let Some(log) = &log { crate::launch_log::append_launcher_lines(log, &crate::launch_timing::check_lines("FFXI check (W20)", &timing)); }
+                    return crate::retail_region::game_gate(account.region, crate::patch::gate(check));
+                }
                 let (verdict, timing) = crate::patch::gate_before_start_timed(&crate::pol_less::install_directory(config)?);
                 if let Some(log) = &log { crate::launch_log::append_launcher_lines(log, &crate::launch_timing::check_lines("FFXI check (W20)", &timing)); }
                 if verdict.as_ref().is_err_and(|message| crate::patch::is_update_refusal(message)) {

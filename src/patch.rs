@@ -294,7 +294,18 @@ impl CheckTiming {
 /// (08 §4 item 6). The W20 never retries (07d §2.3): one attempt, its failure is
 /// Unverified as before.
 pub(crate) fn check_before_launch_timed(install: &Path) -> (LaunchCheck, CheckTiming) {
-    let (check, timing) = ffxi_check(install, Product::Ffxi.host(), Product::Ffxi.port(), &mut SystemNet);
+    check_before_launch_at(install, Product::Ffxi.host())
+}
+
+/// `check_before_launch_timed` for the account's region (`retail_region::game_patch_host`):
+/// the same `W20`/`0001` frame to the host name that region's Viewer looks up (US and EU
+/// `pc001W2U.pol.com`, Japan `pc001W20.pol.com`). Only the US name's answer is remembered
+/// (`official_versions`): the Downloads page shows the US install.
+pub(crate) fn check_before_launch_at(install: &Path, host: &str) -> (LaunchCheck, CheckTiming) {
+    if host != Product::Ffxi.host() {
+        return ffxi_check(install, host, Product::Ffxi.port(), &mut RegionNet(host));
+    }
+    let (check, timing) = ffxi_check(install, host, Product::Ffxi.port(), &mut SystemNet);
     remember_game_reply(install, &check);
     // An update follows this refusal in the same session (proposal 09 phase 2): its first
     // connection keeps stock's FIN → SYN gap from this W20's FIN. The game is not starting, so
@@ -320,6 +331,13 @@ fn remember_game_reply(install: &Path, check: &LaunchCheck) {
 /// phases (session_worker::launch_command, 07d §5.3).
 pub(crate) fn gate_before_start_timed(install: &Path) -> (Result<String, String>, CheckTiming) {
     let (check, timing) = check_before_launch_timed(install);
+    (gate(check), timing)
+}
+
+/// `gate_before_start_timed` for a Japanese install: the same check sent to Japan's name for
+/// the game's patch host (`dns::GAME_PATCH_HOST_JP`).
+pub(crate) fn gate_before_start_timed_jp(install: &Path) -> (Result<String, String>, CheckTiming) {
+    let (check, timing) = check_before_launch_at(install, crate::dns::GAME_PATCH_HOST_JP);
     (gate(check), timing)
 }
 
@@ -530,9 +548,27 @@ pub(crate) fn viewer_connect_check_timed(dir: &Path) -> crate::viewer::ConnectCh
     check
 }
 
+/// An experimental EU/JP sign-in's Viewer check: the stock frame with that install's own
+/// platform tag (`W2U` for an EU Viewer, `W20` for a Japanese one: `retail_region`), title
+/// `1000` and the Viewer's applied version, to that install's own `PATCH_SERVER_DOMAIN`. The
+/// answer is not remembered: the Downloads page shows the US Viewer.
+pub(crate) fn viewer_connect_check_for(dir: &Path, host: &str, platform: [u8; 4]) -> crate::viewer::ConnectCheck {
+    let tags = crate::updater::polp::Tags { platform, title: Product::Viewer.tags().title };
+    let mut timing = CheckTiming::default();
+    let mut net = RegionNet(host);
+    let verdict = viewer_verdict(dir, &tags, |request| w2u_exchange(host, Product::Viewer.port(), request, CHECK_TIMEOUT, &mut net, &mut timing));
+    crate::viewer::ConnectCheck { verdict, timing }
+}
+
+/// `SystemNet` that also forgets a region's own patch host after a retried W2U.
+struct RegionNet<'a>(&'a str);
+impl Net for RegionNet<'_> {
+    fn forget_negative(&mut self) { crate::dns::forget(&[crate::dns::VIEWER_PATCH_HOST, crate::dns::GAME_PATCH_HOST, self.0]) }
+}
+
 fn viewer_connect_net(dir: &Path, host: &str, port: u16, limit: Duration, net: &mut dyn Net) -> crate::viewer::ConnectCheck {
     let mut timing = CheckTiming::default();
-    let verdict = viewer_verdict(dir, |request| w2u_exchange(host, port, request, limit, net, &mut timing));
+    let verdict = viewer_verdict(dir, &Product::Viewer.tags(), |request| w2u_exchange(host, port, request, limit, net, &mut timing));
     crate::viewer::ConnectCheck { verdict, timing }
 }
 
@@ -544,17 +580,18 @@ pub(crate) fn viewer_connect_at(dir: &Path, server: &str) -> crate::viewer::Conn
 
 #[cfg(test)]
 fn viewer_connect_with(dir: &Path, send: impl FnOnce(&[u8]) -> Result<Vec<u8>, String>) -> crate::viewer::ConnectVerdict {
-    viewer_verdict(dir, |request| send(request).map_err(Unanswered::Error))
+    viewer_verdict(dir, &Product::Viewer.tags(), |request| send(request).map_err(Unanswered::Error))
 }
 
-/// `W2U`/`1000` with the Viewer's own installed version and record key. The
-/// updater's read-shared lock is held across the exchange, as for W20.
-fn viewer_verdict(dir: &Path, send: impl FnOnce(&[u8]) -> Result<Vec<u8>, Unanswered>) -> crate::viewer::ConnectVerdict {
+/// The Viewer's version frame (`tags`: `W2U`/`1000` for the US Viewer) with the Viewer's own
+/// installed version and record key. The updater's read-shared lock is held across the
+/// exchange, as for W20.
+fn viewer_verdict(dir: &Path, tags: &crate::updater::polp::Tags, send: impl FnOnce(&[u8]) -> Result<Vec<u8>, Unanswered>) -> crate::viewer::ConnectVerdict {
     use crate::viewer::ConnectVerdict;
     let (local, _update_lock) = read_local_for_launch(dir, Product::Viewer);
     let request = match &local {
-        Local::Installed(version) => Product::Viewer.request(version),
-        Local::Fresh => Product::Viewer.request(""),
+        Local::Installed(version) => crate::updater::polp::version(tags, version.as_bytes()),
+        Local::Fresh => crate::updater::polp::version(tags, b""),
         // Nothing is sent for a record that cannot be vouched for (never an empty request).
         Local::Updating(error) | Local::Interrupted(error) => return ConnectVerdict::Failed(error.clone()),
         Local::Unreadable(error) => return ConnectVerdict::Failed(tf("Could not verify PlayOnline: {error}", &[("error", error)])),
@@ -579,6 +616,25 @@ pub(crate) fn viewer_report_with_remote(dir: &Path, remote: Option<&str>) -> Pat
     viewer_report(read_local(dir, Product::Viewer), remote
         .filter(|version| Product::Viewer.valid_stamp(version)).map(|version| Ok(version.to_owned()))
         .unwrap_or_else(|| Err(t("Not checked").into())))
+}
+
+/// The Viewer's report with no request, judged against `remembered`, the newest official
+/// version a real check told (`official_versions`). `(report, true)` when it surely needs
+/// an update before a sign-in: it never finished its first update (no patch.ver; stock's
+/// W2U answers outdated for an empty version), or its record is older than `remembered`
+/// (an official version never goes back). Otherwise `viewer_report_with_remote(dir, None)`.
+pub(crate) fn viewer_report_remembered(dir: &Path, remembered: Option<&crate::official_versions::Learned>) -> (PatchReport, bool) {
+    let local = read_local(dir, Product::Viewer);
+    let stale = match &local {
+        Local::Fresh => true,
+        Local::Installed(version) => crate::official_versions::compare(version, remembered) == Some(std::cmp::Ordering::Less),
+        Local::Unreadable(_) | Local::Updating(_) | Local::Interrupted(_) => false,
+    };
+    if !stale { return (viewer_report(local, Err(t("Not checked").into())), false); }
+    let official = remembered.map(|learned| learned.version.clone()).filter(|version| Product::Viewer.valid_stamp(version));
+    let mut report = viewer_report(local, Ok(official.clone().unwrap_or_default()));
+    if official.is_none() { report.remote_version = t("Not checked").into(); }
+    (report, true)
 }
 
 fn viewer_report(local: Local, remote: Result<String, String>) -> PatchReport {
@@ -1077,31 +1133,8 @@ fn decode_patch_text(cipher: &[u8], seed: u64) -> Result<String, String> {
     if cipher.len() != 288 {
         return Err("unsupported patch.ver length".into());
     }
-    let schedule = key_schedule(seed);
     let mut plain = [0u8; 288];
-    let mut checksum = 0u32;
-    for (i, chunk) in cipher.as_chunks::<8>().0.iter().enumerate() {
-        let word = schedule[i % 32];
-        let key = word.to_le_bytes();
-        let mut chain = (i as u8) ^ 0x45;
-        let mut block = [0u8; 8];
-        for (j, c) in chunk.iter().enumerate() {
-            let mut value = *c ^ chain;
-            chain = *c;
-            for k in key {
-                value = value.wrapping_add(0x78).wrapping_sub(k);
-            }
-            block[j] = value;
-        }
-        let mixed = u64::from_le_bytes(block).wrapping_sub(word) ^ counter_mask(i) ^ word;
-        block = mixed.rotate_left(32).to_le_bytes();
-        plain[i * 8..i * 8 + 8].copy_from_slice(&block);
-        if i < 35 {
-            checksum = checksum
-                .wrapping_add(u32::from(block[0]))
-                .wrapping_add(u32::from(block[4]));
-        }
-    }
+    let checksum = decode_blocks(cipher, seed, &mut plain);
     if u32::from_le_bytes(plain[280..284].try_into().unwrap()) != 280
         || u32::from_le_bytes(plain[284..288].try_into().unwrap()) != checksum
         || plain[..24].iter().any(|b| *b != 0)
@@ -1119,6 +1152,151 @@ fn decode_patch_text(cipher: &[u8], seed: u64) -> Result<String, String> {
     let version =
         std::str::from_utf8(&text[..end]).map_err(|_| "patch.ver version is not ASCII")?;
     Ok(version.to_owned())
+}
+
+/// The codec's inverse over whole 8-byte blocks of `cipher` into `plain` (same length).
+/// Returns the trailer checksum: bytes 0 and 4 of every block but the last.
+fn decode_blocks(cipher: &[u8], seed: u64, plain: &mut [u8]) -> u32 {
+    let schedule = key_schedule(seed);
+    let blocks = cipher.len() / 8;
+    let mut checksum = 0u32;
+    for (i, chunk) in cipher.as_chunks::<8>().0.iter().enumerate() {
+        let word = schedule[i % 32];
+        let key = word.to_le_bytes();
+        let mut chain = (i as u8) ^ 0x45;
+        let mut block = [0u8; 8];
+        for (j, c) in chunk.iter().enumerate() {
+            let mut value = *c ^ chain;
+            chain = *c;
+            for k in key {
+                value = value.wrapping_add(0x78).wrapping_sub(k);
+            }
+            block[j] = value;
+        }
+        let mixed = u64::from_le_bytes(block).wrapping_sub(word) ^ counter_mask(i) ^ word;
+        block = mixed.rotate_left(32).to_le_bytes();
+        plain[i * 8..i * 8 + 8].copy_from_slice(&block);
+        if i + 1 < blocks {
+            checksum = checksum
+                .wrapping_add(u32::from(block[0]))
+                .wrapping_add(u32::from(block[4]));
+        }
+    }
+    checksum
+}
+
+/// polcore's configuration-file key (8 bytes at 1009af90 in the unpacked 1.18.15e core,
+/// SHA256 73b1864b…, the same core as `decode_patch_text`). With it the patch.ver codec
+/// above (its +0x78 byte stage is that core's 256-byte table at 100715e4) decodes the
+/// installed US `data\utf\env.dat` with a valid trailer, giving `PATCH_SERVER_DOMAIN,
+/// pt008.pol.com` and `POL_UCS_AREA_KBN,01`: the values `dns::VIEWER_PATCH_HOST` and the
+/// loader's 1309 already use.
+pub(crate) const ENV_DAT_SEED: u64 = 0x9786_7564_5342_31fd;
+/// Decoded env.dat files are a few KB (US: 2,414 bytes).
+const MAX_ENV_DAT: usize = 64 * 1024;
+
+/// A PlayOnline `env.dat` (app 100198b6 via polcore 1024/472/473/1025): whole blocks, the
+/// last one `(length u32, checksum u32)`. Only a valid trailer counts as decoded, so a
+/// region whose core used another key is refused rather than misread.
+pub(crate) fn decode_env_dat(cipher: &[u8]) -> Result<Vec<u8>, String> {
+    decode_trailed(cipher, ENV_DAT_SEED).map_err(|problem| format!("env.dat {problem}"))
+}
+
+/// A PlayOnline file of whole 8-byte blocks whose last block is `(length u32, checksum u32)`,
+/// decoded with `seed`: the body, only when the trailer is valid.
+fn decode_trailed(cipher: &[u8], seed: u64) -> Result<Vec<u8>, &'static str> {
+    if cipher.len() < 16 || cipher.len() > MAX_ENV_DAT || !cipher.len().is_multiple_of(8) {
+        return Err("has an unsupported length");
+    }
+    let mut plain = vec![0u8; cipher.len()];
+    let checksum = decode_blocks(cipher, seed, &mut plain);
+    let body = plain.len() - 8;
+    let length = u32::from_le_bytes(plain[body..body + 4].try_into().unwrap()) as usize;
+    if u32::from_le_bytes(plain[body + 4..].try_into().unwrap()) != checksum || length > body {
+        return Err("trailer validation failed");
+    }
+    plain.truncate(length);
+    Ok(plain)
+}
+
+/// One title record of the Viewer's contents table is this long (polcore 1479/1189:
+/// 10019431 `add esi, 0x124`).
+const CONTENTS_RECORD: usize = 0x124;
+
+/// The patch-platform flag of title `title` in a Viewer's contents table,
+/// `data\doc\sqpolcts.bin`: the byte at +0x120 of its record. The stock Viewer reads the
+/// same byte for its own version check (app 1019b481: title 1000, `movsx` of record+0x120)
+/// and passes it to its tag picker (app 1027b731: flag 1 → `W2U`, 0 → `W20`). The file is
+/// the env.dat codec with an all-zero key (polcore 100193c0); its body is an 8-byte header
+/// (record count at +4) and 0x124-byte records that start with the title number. Decoded
+/// from each region's official installer (FFXIFullSetup_US/EU/JP, PlayOnlineViewer.msi):
+/// US and EU carry 1 for title 1000, Japan 0, and all three 0 for title 1 (FFXI).
+pub(crate) fn contents_platform_flag(cipher: &[u8], title: u32) -> Result<u8, String> {
+    let body = decode_trailed(cipher, 0).map_err(|problem| format!("sqpolcts.bin {problem}"))?;
+    let count = body.get(4..8).map(|n| u32::from_le_bytes(n.try_into().unwrap()) as usize).ok_or("sqpolcts.bin has no header")?;
+    let records = body.get(8..).unwrap_or_default();
+    if count == 0 || count > records.len() / CONTENTS_RECORD {
+        return Err("sqpolcts.bin's record count does not fit the file".into());
+    }
+    records.chunks_exact(CONTENTS_RECORD).take(count)
+        .find(|record| u32::from_le_bytes(record[..4].try_into().unwrap()) == title)
+        .map(|record| record[0x120])
+        .ok_or_else(|| format!("sqpolcts.bin has no record for title {title}"))
+}
+
+/// A contents table holding `records` as `(title, platform flag)` (test fixtures only).
+#[cfg(test)]
+pub(crate) fn encode_contents(records: &[(u32, u8)]) -> Vec<u8> {
+    let mut plain = vec![0u8; 8];
+    plain[2] = 1;
+    plain[4..8].copy_from_slice(&(records.len() as u32).to_le_bytes());
+    for (title, flag) in records {
+        let mut record = [0u8; CONTENTS_RECORD];
+        record[..4].copy_from_slice(&title.to_le_bytes());
+        record[0x120] = *flag;
+        plain.extend_from_slice(&record);
+    }
+    encode_trailed(&plain, 0)
+}
+
+/// The inverse of `decode_env_dat` (test fixtures only).
+#[cfg(test)]
+pub(crate) fn encode_env_dat(body: &[u8]) -> Vec<u8> {
+    encode_trailed(body, ENV_DAT_SEED)
+}
+
+/// The inverse of `decode_trailed` (test fixtures only).
+#[cfg(test)]
+fn encode_trailed(body: &[u8], seed: u64) -> Vec<u8> {
+    let mut plain = body.to_vec();
+    plain.resize(body.len().div_ceil(8) * 8, 0);
+    let checksum = plain.chunks(8).fold(0u32, |s, b| s.wrapping_add(u32::from(b[0])).wrapping_add(u32::from(b[4])));
+    plain.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    plain.extend_from_slice(&checksum.to_le_bytes());
+    encode_blocks(&plain, seed)
+}
+
+/// `encode_record`'s block stage over any whole number of blocks.
+#[cfg(test)]
+fn encode_blocks(plain: &[u8], seed: u64) -> Vec<u8> {
+    let schedule = key_schedule(seed);
+    let mut cipher = vec![0u8; plain.len()];
+    for i in 0..plain.len() / 8 {
+        let word = schedule[i % 32];
+        let key = word.to_le_bytes();
+        let value = u64::from_le_bytes(plain[i * 8..i * 8 + 8].try_into().unwrap()).rotate_right(32);
+        let block = ((value ^ word ^ counter_mask(i)).wrapping_add(word)).to_le_bytes();
+        let mut chain = (i as u8) ^ 0x45;
+        for j in 0..8 {
+            let mut v = block[j];
+            for k in key {
+                v = v.wrapping_sub(0x78).wrapping_add(k);
+            }
+            cipher[i * 8 + j] = v ^ chain;
+            chain = cipher[i * 8 + j];
+        }
+    }
+    cipher
 }
 
 fn parse_reply(frame: &[u8]) -> Result<String, String> {
@@ -1684,6 +1862,46 @@ mod tests {
         assert_eq!(verdict.reason(), Some("outdated"));
         assert!(verdict.message().contains("20070101_E") && verdict.message().contains("20110829_E"));
         std::fs::remove_dir_all(fresh).unwrap(); std::fs::remove_dir_all(old).unwrap();
+    }
+
+    /// The tester's case (2026-11-12): a current Japanese Viewer (20260929_0), asked about as
+    /// the US/EU Viewer (`W2U`), was told to update to that Viewer's 20261022_0. Asked about
+    /// with its own platform tag it is compared with its own product's version. The US frame
+    /// keeps its tag.
+    #[test]
+    fn an_eu_or_jp_viewer_is_asked_about_with_its_own_platform_tag() {
+        let viewer = install_with(Some("20260929_0"), false);
+        let japan = crate::updater::polp::Tags { platform: *b"W20\0", title: *b"1000" };
+        let mut sent = Vec::new();
+        let verdict = viewer_verdict(&viewer, &japan, |request| { sent = request.to_vec(); Ok(viewer_reply("20260929_0")) });
+        assert_eq!(verdict, ConnectVerdict::Current { version: "20260929_0".into() });
+        assert_eq!((sent.len(), &sent[8..12], &sent[16..24], &sent[24..34]), (88, &b"POLP"[..], &b"W20\x001000"[..], &b"20260929_0"[..]));
+        // The US frame for the same version differs in the tag (and the checksum over it) alone.
+        let us = Product::Viewer.request("20260929_0");
+        assert_eq!((&us[16..20], &us[20..]), (&b"W2U\0"[..], &sent[20..]));
+        assert_ne!(us[4..8], sent[4..8]);
+        // Its own product's newer version is still an update, named with what it has.
+        let newer = viewer_verdict(&viewer, &japan, |_| Ok(viewer_reply("20261201_0")));
+        assert_eq!(newer, ConnectVerdict::Outdated { local: "20260929_0".into(), remote: "20261201_0".into() });
+        // Japan's name for the game's patch host; the game's frame is the same everywhere.
+        assert_eq!((crate::dns::GAME_PATCH_HOST_JP, crate::dns::GAME_PATCH_HOST), ("pc001W20.pol.com", "pc001W2U.pol.com"));
+        std::fs::remove_dir_all(viewer).unwrap();
+    }
+
+    /// One real question to the Japanese Viewer's patch server, as a Japanese Viewer asks it:
+    /// `W20`/`1000` with `CRYSTAL_JP_VIEWER_VERSION` (the tester's installed 20260929_0 by
+    /// default) to pt004.pol.com:54000. Prints the server's answer for the Japanese Viewer;
+    /// "current" for a version a Japanese tester's up-to-date Viewer reports confirms the tag.
+    /// Reads no install and sends nothing but the version frame.
+    #[test]
+    #[ignore = "one read-only version check to the official Japanese Viewer patch server; requires network"]
+    fn the_japanese_viewer_stream_answers_for_its_own_tag() {
+        let version = std::env::var("CRYSTAL_JP_VIEWER_VERSION").unwrap_or_else(|_| "20260929_0".into());
+        let viewer = install_with(Some(&version), false);
+        let check = viewer_connect_check_for(&viewer, "pt004.pol.com", *b"W20\0");
+        eprintln!("pt004.pol.com:54000 W20/1000 with {version}: {:?} ({})", check.verdict, check.timing.phases().unwrap_or_default());
+        assert!(matches!(check.verdict, ConnectVerdict::Current { .. } | ConnectVerdict::Outdated { .. }), "{:?}", check.verdict);
+        std::fs::remove_dir_all(viewer).unwrap();
     }
 
     #[test]

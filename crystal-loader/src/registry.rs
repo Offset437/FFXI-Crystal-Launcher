@@ -64,7 +64,7 @@ pub fn install_folder(region: Region, id: &str) -> Option<Vec<u8>> {
             if bytes.is_empty() || bytes.contains(&0) { continue; }
             let path = std::path::PathBuf::from(crate::game::ansi_to_string(&bytes));
             let exists = match id {
-                "1000" => path.join("viewer").join("com").join(if region == Region::Eu { "polcoreEU.dll" } else { "polcore.dll" }).is_file(),
+                "1000" => path.join("viewer").join("com").join(crate::game::polcore_name(region)).is_file(),
                 "0001" => path.join("FFXi.dll").is_file(),
                 _ => path.is_dir(),
             };

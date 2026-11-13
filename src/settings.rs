@@ -19,6 +19,10 @@ pub(crate) struct Settings {
     pub installer_path: String,
     #[serde(default)]
     pub installer_selected: bool,
+    /// Downloads → Install: the official installer's region (0 US, 1 EU, 2 JP). Absent = an
+    /// installed client's region, else US (`App::installer_region`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installer_region: Option<u8>,
     #[serde(default)]
     pub(crate) selected_accounts: Option<BTreeSet<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -72,6 +76,10 @@ pub(crate) struct Settings {
     /// Older settings leave this off so closing a game also closes its host.
     #[serde(default)]
     pub sign_in_after_game: bool,
+    /// Settings → System: Crystal's shut-down action ends its game host at once (like
+    /// Windower's //terminate) instead of the in-game /shutdown countdown. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub close_games_instantly: bool,
     /// The launcher's own UI language (Settings page). Absent = follow the
     /// Windows display language. The game's language is never changed here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,6 +102,9 @@ pub(crate) struct Settings {
     pub launcher_auto_restart: bool,
     #[serde(default = "default_true")]
     pub controller_navigation: bool,
+    /// Settings → System: Home's item (FFXIAH) and wiki search. Off hides it and nothing runs.
+    #[serde(default = "default_true")]
+    pub item_search: bool,
     /// Settings → System: the window's close button keeps Crystal running in the
     /// notification area (sessions stay signed in). Off: closing quits, as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -120,6 +131,7 @@ impl Default for Settings {
             light_theme: false,
             installer_path: default_installer_path(),
             installer_selected: false,
+            installer_region: None,
             selected_accounts: None,
             account_order: Vec::new(),
             account_pol_handles: HashMap::new(),
@@ -138,6 +150,8 @@ impl Default for Settings {
             account_no_otp: BTreeSet::new(),
             auto_sign_in: true,
             sign_in_after_game: false,
+            close_games_instantly: false,
+            item_search: true,
             language: None,
             privacy: false,
             dgvoodoo: true,
@@ -154,11 +168,17 @@ impl Default for Settings {
 }
 
 fn default_installer_path() -> String {
-    Config::default()
-        .experiment
-        .join("official-installer")
-        .to_string_lossy()
-        .into_owned()
+    installer_folder(crate::retail_region::RetailRegion::Us)
+}
+
+/// The default download folder for `region`'s official installer: `official-installer` (US, as
+/// before regions), `official-installer-EU`, `official-installer-JP`.
+pub(crate) fn installer_folder(region: crate::retail_region::RetailRegion) -> String {
+    let name = match region {
+        crate::retail_region::RetailRegion::Us => "official-installer".to_owned(),
+        other => format!("official-installer-{}", other.wire()),
+    };
+    Config::default().experiment.join(name).to_string_lossy().into_owned()
 }
 
 /// `\\?\C:\x` -> `C:\x` for a path kept as text; anything else is left alone.

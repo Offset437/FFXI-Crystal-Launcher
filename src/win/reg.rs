@@ -185,6 +185,21 @@ pub(crate) fn string(hive: HKEY, path: &str, name: &str, flags: u32, capacity: u
 /// Crystal's region numbers with PlayOnline's vendor key for each.
 pub(crate) const REGIONS: [(u8, &str); 3] = [(0, "PlayOnlineUS"), (1, "PlayOnlineEU"), (2, "PlayOnline")];
 
+/// The publisher key under a PlayOnline root: `SQUARE` for Japan's `PlayOnline`, `SquareEnix`
+/// for `PlayOnlineUS` and `PlayOnlineEU`. FFXiMain's own root table (0x10350fec) is
+/// `SOFTWARE\PlayOnline\SQUARE\`, `SOFTWARE\PlayOnlineUS\SquareEnix\`,
+/// `SOFTWARE\PlayOnlineEU\SquareEnix\`, and each region's official installer writes the same
+/// keys (FINAL_FANTASY_XI.msi and PlayOnlineViewer.msi Registry tables, FFXIFullSetup_US/EU/JP).
+pub(crate) fn publisher(vendor: &str) -> &'static str {
+    if vendor.eq_ignore_ascii_case("PlayOnline") { "SQUARE" } else { "SquareEnix" }
+}
+
+/// `SOFTWARE\<vendor>\<publisher>\FinalFantasyXI`: where that region's game keeps its settings
+/// (`0000`…`0045`, `padmode000`…), relative to HKLM's 32-bit view.
+pub(crate) fn ffxi_settings_key(vendor: &str) -> String {
+    format!("SOFTWARE\\{vendor}\\{}\\FinalFantasyXI", publisher(vendor))
+}
+
 /// PlayOnline's `InstallFolder\<title>` entry (`1000` the Viewer, `0001` FFXI) for each of
 /// `regions`, read from HKLM then HKCU, each in the 32-bit then the 64-bit view. Absolute
 /// paths only, one per distinct folder, in that order.
@@ -229,6 +244,16 @@ mod tests {
             let path = wide(&self.0);
             unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, path.as_ptr()) };
         }
+    }
+
+    /// Each region's game settings key as its own installer and FFXiMain name it: US and EU
+    /// exactly as before, Japan under `SQUARE`.
+    #[test]
+    fn each_regions_game_settings_key_uses_its_own_publisher() {
+        assert_eq!(ffxi_settings_key("PlayOnlineUS"), r"SOFTWARE\PlayOnlineUS\SquareEnix\FinalFantasyXI");
+        assert_eq!(ffxi_settings_key("PlayOnlineEU"), r"SOFTWARE\PlayOnlineEU\SquareEnix\FinalFantasyXI");
+        assert_eq!(ffxi_settings_key("PlayOnline"), r"SOFTWARE\PlayOnline\SQUARE\FinalFantasyXI");
+        assert_eq!(REGIONS.map(|(_, vendor)| publisher(vendor)), ["SquareEnix", "SquareEnix", "SQUARE"]);
     }
 
     #[test]

@@ -48,6 +48,11 @@ component DgCard inherits Card {
         Icon { cross-axis-self-alignment: center; glyph: Glyph.alert-circle; size: 15px * root.s; tint: SettingsView.shade(Shade.gfx-error); }
         Text { text: SettingsView.dg.error; font-size: Theme.type-detail * root.s; color: Theme.ink; wrap: word-wrap; vertical-alignment: center; horizontal-stretch: 1; }
     }
+    if SettingsView.dg.info != "": HorizontalLayout {
+        spacing: 8px * root.s;
+        Icon { y: 1px * root.s; glyph: Glyph.info; size: 15px * root.s; tint: Theme.sub; }
+        Text { text: SettingsView.dg.info; font-size: Theme.type-detail * root.s; color: Theme.sub; wrap: word-wrap; horizontal-stretch: 1; }
+    }
     if SettingsView.dg.actions != 0: Divider { }
     if SettingsView.dg.actions != 0: HorizontalLayout {
         spacing: 6px * root.s;
@@ -55,6 +60,17 @@ component DgCard inherits Card {
             text: SettingsView.strings.dg-open;
             glyph: Glyph.settings;
             clicked => { SettingsView.dg-open(); }
+        }
+        if SettingsView.dg.actions == 1: QuietButton {
+            text: SettingsView.strings.dg-reset;
+            glyph: Glyph.refresh;
+            enabled: SettingsView.dg.remove-enabled;
+            clicked => { SettingsView.dg-reset(); }
+        }
+        if SettingsView.dg.actions == 1 && SettingsView.dg.import != "": QuietButton {
+            text: SettingsView.dg.import;
+            glyph: Glyph.download;
+            clicked => { SettingsView.dg-import(); }
         }
         if SettingsView.dg.actions == 1: QuietButton {
             text: SettingsView.strings.remove;
@@ -124,11 +140,49 @@ component RsCard inherits Card {
     if SettingsView.rs.error != "": Text { text: SettingsView.rs.error; font-size: Theme.type-caption * root.s; color: Theme.ink; wrap: word-wrap; }
 }
 
+/// The action bar's state: the unsaved changes (or "no changes") at the right of its row.
+component GcState inherits HorizontalLayout {
+    private property <float> s: Theme.scale;
+    horizontal-stretch: 1;
+    min-width: 0px;
+    if SettingsView.gc.pending: HorizontalLayout {
+        cross-axis-self-alignment: center;
+        horizontal-stretch: 1;
+        min-width: 0px;
+        alignment: end;
+        spacing: 8px * root.s;
+        Dot { cross-axis-self-alignment: center; size: 8px * root.s; tint: Theme.accent; }
+        Text { min-width: 0px; text: SettingsView.gc.pending-text; font-size: Theme.type-small * root.s; font-weight: 600; color: Theme.ink; vertical-alignment: center; overflow: elide; }
+    }
+    if !SettingsView.gc.pending: HorizontalLayout {
+        cross-axis-self-alignment: center;
+        horizontal-stretch: 1;
+        alignment: end;
+        spacing: 7px * root.s;
+        Icon { cross-axis-self-alignment: center; glyph: Glyph.check-circle; size: 15px * root.s; tint: Theme.sub; }
+        Text { text: SettingsView.strings.gc-clean; font-size: Theme.type-small * root.s; color: Theme.sub; vertical-alignment: center; }
+    }
+}
+
+/// The action bar's Apply button.
+component GcApply inherits Control {
+    private property <float> s: Theme.scale;
+    scale: root.s;
+    width: max(88px * root.s, self.preferred-width);
+    text: SettingsView.strings.gc-apply;
+    tone: Tone.primary;
+    enabled: SettingsView.gc.apply-enabled;
+    clicked => { SettingsView.gc-apply(); }
+}
+
 /// The game options' action bar: where the values go, the unsaved state and the actions.
 component ActionBar inherits Card {
     private property <float> s: Theme.scale;
     /// A quiet action's height matches the Apply button's.
     private property <length> quiet-pad-y: (36px * root.s - Theme.type-small * root.s * 1.3) / 2;
+    /// The quiet actions' side padding: tighter in the small window, where the three of them
+    /// are as wide as the card.
+    private property <length> quiet-pad-x: (Theme.small ? 5px : 11px) * root.s;
     pad-top: 16px * root.s;
     pad-bottom: 16px * root.s;
     gap: 13px * root.s;
@@ -148,35 +202,21 @@ component ActionBar inherits Card {
             }
         }
         // The state takes the rest of the row and gives way (elided) before the region chip.
+        // In the small window the region chip leaves it no room: it gets its own row below.
         Rectangle { width: 12px * root.s; }
-        if SettingsView.gc.pending: HorizontalLayout {
-            cross-axis-self-alignment: center;
-            horizontal-stretch: 1;
-            min-width: 0px;
-            alignment: end;
-            spacing: 8px * root.s;
-            Dot { cross-axis-self-alignment: center; size: 8px * root.s; tint: Theme.accent; }
-            Text { min-width: 0px; text: SettingsView.gc.pending-text; font-size: Theme.type-small * root.s; font-weight: 600; color: Theme.ink; vertical-alignment: center; overflow: elide; }
-        }
-        if !SettingsView.gc.pending: HorizontalLayout {
-            cross-axis-self-alignment: center;
-            horizontal-stretch: 1;
-            alignment: end;
-            spacing: 7px * root.s;
-            Icon { cross-axis-self-alignment: center; glyph: Glyph.check-circle; size: 15px * root.s; tint: Theme.sub; }
-            Text { text: SettingsView.strings.gc-clean; font-size: Theme.type-small * root.s; color: Theme.sub; vertical-alignment: center; }
-        }
+        if !Theme.small: GcState { }
     }
+    if Theme.small: HorizontalLayout { GcState { } }
     // The actions on their own row: the region, the state and five actions need more than the
     // detail pane's width in one.
     HorizontalLayout {
-        spacing: 6px * root.s;
+        spacing: (Theme.small ? 2px : 6px) * root.s;
         Rectangle { horizontal-stretch: 1; }
         QuietButton {
             cross-axis-self-alignment: center;
             text: SettingsView.strings.gc-defaults;
             weight: 500;
-            pad-x: 11px * root.s;
+            pad-x: root.quiet-pad-x;
             pad-y: root.quiet-pad-y;
             clicked => { SettingsView.gc-defaults(); }
         }
@@ -184,7 +224,7 @@ component ActionBar inherits Card {
             cross-axis-self-alignment: center;
             text: SettingsView.strings.gc-no-backups;
             weight: 500;
-            pad-x: 11px * root.s;
+            pad-x: root.quiet-pad-x;
             pad-y: root.quiet-pad-y;
             enabled: false;
         }
@@ -210,21 +250,18 @@ component ActionBar inherits Card {
             cross-axis-self-alignment: center;
             text: SettingsView.strings.gc-discard;
             weight: 500;
-            pad-x: 11px * root.s;
+            pad-x: root.quiet-pad-x;
             pad-y: root.quiet-pad-y;
             enabled: SettingsView.gc.discard-enabled;
             clicked => { SettingsView.gc-discard(); }
         }
-        Rectangle { width: 4px * root.s; }
-        Control {
-            cross-axis-self-alignment: center;
-            scale: root.s;
-            width: max(88px * root.s, self.preferred-width);
-            text: SettingsView.strings.gc-apply;
-            tone: Tone.primary;
-            enabled: SettingsView.gc.apply-enabled;
-            clicked => { SettingsView.gc-apply(); }
-        }
+        if !Theme.small: Rectangle { width: 4px * root.s; }
+        if !Theme.small: GcApply { cross-axis-self-alignment: center; }
+    }
+    // Four actions don't fit one row of the small window: Apply goes under them.
+    if Theme.small: HorizontalLayout {
+        Rectangle { horizontal-stretch: 1; }
+        GcApply { }
     }
     Divider { }
     VerticalLayout {

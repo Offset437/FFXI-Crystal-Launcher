@@ -110,6 +110,8 @@ pub(crate) fn detect_sources() -> Vec<ImportSource> {
     let mut sources = Vec::new();
     for (region, root) in pol_installations() {
         let path = root.join("usr/all/login_w.bin");
+        // The folder's own edition (its core file) over the registry root that named it.
+        let region = crate::retail_region::folder_region(&root, region);
         add_source(&mut sources, SourceKind::PlayOnline, path, Some(region));
     }
     if let Some(roaming) = std::env::var_os("APPDATA") {

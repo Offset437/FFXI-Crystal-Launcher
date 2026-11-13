@@ -122,7 +122,6 @@ struct Host {
 struct Shown {
     id: WindowId,
     ui: MainWindow,
-    hwnd: isize,
 }
 
 thread_local! {
@@ -319,11 +318,11 @@ impl Host {
             WindowOp::DragResize(edge) => { slint_window.with_winit_window(|w| { let _ = w.drag_resize_window(direction(edge)); }); Effect::none() }
             WindowOp::Focus => {
                 slint_window.with_winit_window(|w| w.focus_window());
-                bring_forward(shown.hwnd);
+                bring_forward(native_handle(slint_window));
                 Effect::none()
             }
             WindowOp::IsMaximized(answer) => answer(slint_window.is_maximized()),
-            WindowOp::NativeHandle(answer) => answer(shown.hwnd),
+            WindowOp::NativeHandle(answer) => answer(native_handle(slint_window)),
             WindowOp::Screenshot(answer) => match slint_window.take_snapshot() {
                 Ok(shot) => answer(Screenshot { width: shot.width(), height: shot.height(), rgba: Arc::from(shot.as_bytes()) }),
                 Err(_) => Effect::none(),
@@ -358,8 +357,13 @@ impl Host {
             if user_input(event) {
                 if let Some(message) = crate::user_activity() { post(message); }
             }
-            // The native window exists by its first event: its icons, once.
-            native_icons(native_handle(window), false);
+            // The native window exists by its first event (`show()` before or outside the
+            // event loop only queues it): its icons and window_chrome, once. Without the
+            // handle, window_chrome::is_foreground() stayed false and the controller thread
+            // polled at its 250 ms background rate.
+            let hwnd = native_handle(window);
+            if hwnd != 0 && ICONS.get().0 != hwnd { post(Message::NativeWindow(hwnd)); }
+            native_icons(hwnd, false);
             match event {
                 WindowEvent::Focused(focused) => {
                     let focused = *focused;
@@ -429,12 +433,10 @@ impl Host {
         }
         if ui.show().is_err() { return; }
         if maximized { ui.window().set_maximized(true); }
-        let hwnd = native_handle(ui.window());
-        native_icons(hwnd, false);
-        *self.window.borrow_mut() = Some(Shown { id, ui, hwnd });
+        *self.window.borrow_mut() = Some(Shown { id, ui });
         if let Some(shown) = self.window.borrow().as_ref() {
             shown.ui.window().with_winit_window(|w| w.focus_window());
-            bring_forward(hwnd);
+            bring_forward(native_handle(shown.ui.window()));
         }
         self.queue.borrow_mut().push_back(Message::WindowOpened(id));
     }

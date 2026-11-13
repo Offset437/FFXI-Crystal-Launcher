@@ -46,7 +46,9 @@ export component TitleContent inherits HorizontalLayout {
     padding-left: Theme.page-x;
     spacing: 0px;
     HorizontalLayout {
-        spacing: Theme.small ? 18px : 28px;
+        // At the 900 px minimum the English tabs plus a Friends badge are wider than the
+        // bar, which pushed the caption buttons off the window's edge: tighter gaps there.
+        spacing: Theme.small ? 12px : 28px;
         horizontal-stretch: 0;
         NavTab { text: View.strings.home; active: View.page == 0 && !Features.open; clicked => { View.navigate(0); } }
         NavTab { text: View.strings.friends; badge: View.friends-badge; active: View.page == 1 && !Features.open; clicked => { View.navigate(1); } }

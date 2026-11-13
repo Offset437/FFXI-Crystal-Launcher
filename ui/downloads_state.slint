@@ -35,7 +35,8 @@ export struct DlStrings {
     browse: string,
     install-title: string,
     step1-title: string,
-    step1-body: string,
+    installer-region: string,
+    official-page: string,
     download: string,
     step2-title: string,
     extract: string,
@@ -132,6 +133,9 @@ export struct DlInstaller {
     can-install: bool,
     can-setup: bool,
     show-parts: bool,
+    /// The region whose official installer the steps use (0 US, 1 EU, 2 JP), and its size line.
+    region: int,
+    size: string,
 }
 
 /// One installer volume's line.
@@ -227,6 +231,9 @@ export global Downloads {
     in property <DlInstaller> installer;
     in property <[DlPart]> parts;
     in-out property <string> installer-path;
+    in property <[string]> installer-regions: ["US", "EU", "JP"];
+    callback installer-region(int);
+    callback open-installer-page();
     callback change-in-settings();
     callback toggle-troubleshooting();
     callback check-files();

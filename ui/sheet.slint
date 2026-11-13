@@ -175,7 +175,20 @@ export component AccountSheet inherits SideSheet {
                     current: View.sheet.region;
                     picked(index) => { View.sheet-region(index); }
                 }
-                Note { text: View.sheet-strings.region-note; }
+                // US is verified; EU and JP say they are experimental.
+                if View.sheet.region != 0 && View.sheet.region-mismatch == "": Note { text: View.sheet-strings.region-note; }
+                // The installed PlayOnline is another edition: say which, with a one-click fix.
+                if View.sheet.region-mismatch != "": HorizontalLayout {
+                    spacing: 10px;
+                    Note { text: View.sheet.region-mismatch; }
+                    if View.sheet.region-fix != "": SmallButton {
+                        modal: true;
+                        scale: 1;
+                        cross-axis-self-alignment: center;
+                        text: View.sheet.region-fix;
+                        clicked => { View.sheet-region(View.sheet.region-fix-index); }
+                    }
+                }
             }
             if View.sheet.retail: CheckNote {
                 modal: true;

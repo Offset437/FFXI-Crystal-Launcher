@@ -190,17 +190,22 @@ fn with_age(learned: &Learned, now: i64) -> String {
 
 /// How the installed version stands against the remembered official one, when that can be
 /// told: `Equal`, or `Less` when installed is older (an official version never goes back).
+/// An earlier date is older whatever the revisions (the Viewer's are letters: `20110829_E`);
+/// on the same date only numeric revisions are compared.
 pub(crate) fn compare(installed: &str, learned: Option<&Learned>) -> Option<Ordering> {
     let learned = learned?;
-    if !is_version(installed) { return None; }
+    if !is_version(installed) || !is_version(&learned.version) { return None; }
     if installed == learned.version { return Some(Ordering::Equal); }
-    let key = |version: &str| -> Option<(u32, u32)> {
-        let (date, revision) = version.split_once('_')?;
-        Some((date.parse().ok()?, revision.parse().ok()?))
-    };
-    match (key(installed), key(&learned.version)) {
-        (Some(installed), Some(official)) if installed < official => Some(Ordering::Less),
-        _ => None,
+    let (date, revision) = installed.split_once('_')?;
+    let (official_date, official_revision) = learned.version.split_once('_')?;
+    // Both dates are 8 ASCII digits (`is_version`): text order is date order.
+    match date.cmp(official_date) {
+        Ordering::Less => Some(Ordering::Less),
+        Ordering::Greater => None,
+        Ordering::Equal => match (revision.parse::<u32>(), official_revision.parse::<u32>()) {
+            (Ok(installed), Ok(official)) if installed < official => Some(Ordering::Less),
+            _ => None,
+        },
     }
 }
 /// "Latest version" for FFXI: the version the report carries when a real check gave one,
@@ -335,5 +340,10 @@ mod tests {
         assert_eq!(compare("30260905_0", None), None);
         assert_eq!(compare("Unavailable", Some(&learned)), None);
         assert_eq!(compare("30260906_0", Some(&learned)), None, "newer than remembered says nothing");
+        // PlayOnline's letter revisions: an earlier date is older; the same date says nothing.
+        let viewer = Learned { version: "20261022_0".into(), at: 1 };
+        assert_eq!(compare("20110829_E", Some(&viewer)), Some(Ordering::Less));
+        assert_eq!(compare("20261022_A", Some(&viewer)), None);
+        assert_eq!(compare("20261101_E", Some(&viewer)), None);
     }
 }

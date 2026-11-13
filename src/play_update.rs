@@ -6,7 +6,7 @@
 //! signed-in start path with no second version check. Square Enix sees what stock POL sends
 //! in one signed-in session (capture stock-update-20261013-004932): the W20 → its FIN →
 //! ~110 ms → an idle "update?" prompt connection (`updater::PROMPT_HOLD`) → ~105 ms → the file
-//! list → one stop-and-wait download connection → no version check → GameStart.
+//! list → parallel download connections → no version check → GameStart.
 //!
 //! One job per game folder (`Job`); other accounts that share it wait at the main menu and
 //! start after it. A game running from the folder never closes: the download goes ahead and

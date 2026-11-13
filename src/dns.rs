@@ -10,14 +10,20 @@ use std::time::{Duration, Instant};
 /// The Viewer's patch host: its W2U at Connect (:54000) and PlayOnline updates. Stock looks
 /// up exactly this name (captures stock-20261013-002122 and stock-update-20261013-004932:
 /// a `pt008.pol.com` A query 0.2 s before each :54000 connection). app.dll reads it from
-/// env.dat's PATCH_SERVER_DOMAIN (pol-spec 06 §1.1); this is the US install's value. EU and
-/// JP installs' values are unverified (env.dat is encrypted); Crystal signs in US only.
+/// env.dat's PATCH_SERVER_DOMAIN (pol-spec 06 §1.1); this is the US install's value. An EU or
+/// JP sign-in reads its own install's env.dat (`retail_region`): the official installers carry
+/// `pt008.pol.com` for EU too (`EU\env.dat`) and `pt004.pol.com` for Japan.
 pub(crate) const VIEWER_PATCH_HOST: &str = "pt008.pol.com";
 /// FFXI's patch host: the W20 at Play (:53001), the update prompt's idle connection, the
 /// file list and every download. app.dll's `pc%03d%s.pol.com` with title 1 and `W2U`; the
 /// same captures show a `pc001W2U.pol.com` query (this case) 0.2 s before each W20. Both
 /// names resolve to 124.150.156.107, the address `pc001.pol.com` (used before) has too.
 pub(crate) const GAME_PATCH_HOST: &str = "pc001W2U.pol.com";
+/// The same host as a Japanese Viewer names it. app.dll (one code base in the US, EU and JP
+/// builds) fills `pc%03d%s.pol.com` with the tag its picker gives for flag 966() (app
+/// 101b6d9d-101b6dc2, 1027b731): 966() is `region != 0` (set by 965), so US and EU get `W2U`
+/// and Japan gets `W20`. The name resolves to the same address (looked up 2026-11-12).
+pub(crate) const GAME_PATCH_HOST_JP: &str = "pc001W20.pol.com";
 
 /// Where an exchange failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

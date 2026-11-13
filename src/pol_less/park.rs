@@ -213,6 +213,10 @@ pub(crate) struct Parked {
 /// next step, never leaving Windower running without its worker.
 pub(crate) fn park(config: &Config, plan: &super::Plan, account: &Account, abort: &'static std::sync::atomic::AtomicBool,
     progress: &mut dyn FnMut(&str)) -> Result<Parked, String> {
+    // Experimental EU/JP hosts sign in cold only (`retail_region`; main.rs `park_keys`).
+    if account.region != 0 {
+        return Err(t("EU and JP accounts are not parked.").into());
+    }
     let mut timing = Timeline::begin_at(Instant::now());
     let p = super::prepare_with_progress(config, plan, account, &mut timing, progress,
         &|| abort.load(std::sync::atomic::Ordering::Acquire))?;

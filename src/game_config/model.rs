@@ -78,12 +78,14 @@ pub(crate) const MANAGED: [&str; 24] = [
 
 /// Labels for the enumerated entries, in value order.
 /// The text shown is translated, the stored value (the number) never is.
-pub(crate) fn window_modes() -> [(u32, &'static str); 4] {
+/// `0034`: the three modes FINAL FANTASY XI Config offers (Fullscreen, Window Mode, Borderless
+/// Window), as it and Windower write them; 2 is no mode the game's tool sets, so a stored 2
+/// shows as "Other (2)".
+pub(crate) fn window_modes() -> [(u32, &'static str); 3] {
     [
         (0, t("Full screen")),
         (1, t("Windowed")),
-        (2, t("Borderless window")),
-        (3, t("Borderless full screen")),
+        (3, t("Borderless window")),
     ]
 }
 pub(crate) fn mip_levels() -> [(u32, &'static str); 7] {

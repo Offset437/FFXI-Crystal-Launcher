@@ -165,6 +165,7 @@ export component ImportDialog inherits DialogFrame {
             body := Flickable {
                 content-width: self.width;
                 content-height: form.preferred-height;
+                content-y: -min(SettingsView.import-scroll, max(0px, self.content-height - self.height));
                 form := VerticalLayout {
                     width: body.width;
                     padding: 24px * root.s;
@@ -246,18 +247,28 @@ export component ImportDialog inherits DialogFrame {
                     }
                     for warning in SettingsView.import-warnings: SubText { text: warning; font-size: Theme.type-caption * root.s; }
                     if SettingsView.import.no-drafts: SubText { text: SettingsView.strings.import-empty; }
-                    for draft[i] in SettingsView.import-drafts: HorizontalLayout {
-                        spacing: 12px * root.s;
-                        VerticalLayout {
-                            horizontal-stretch: 1;
+                    // A row's height is measured at the width its text really gets: a layout
+                    // measures wrapped Text at their unwrapped width, so a row laid out by a
+                    // HorizontalLayout reported one line per note and the list's scroll extent
+                    // ended short (the last accounts were unreachable). Here the text column
+                    // has an explicit width, so its preferred height counts every wrapped line.
+                    for draft[i] in SettingsView.import-drafts: Rectangle {
+                        height: max(info.preferred-height, review.height);
+                        info := VerticalLayout {
+                            x: 0px;
+                            y: 0px;
+                            width: parent.width - review.preferred-width - 12px * root.s;
+                            height: parent.height;
                             spacing: 6px * root.s;
                             alignment: center;
                             Text { text: draft.label; font-size: 15px * root.s; font-weight: 600; color: Theme.ink; wrap: word-wrap; }
                             SubText { text: draft.detail; font-size: Theme.type-caption * root.s; }
                             for note in draft.notes: SubText { text: note; font-size: Theme.type-caption * root.s; }
                         }
-                        Control {
-                            cross-axis-self-alignment: center;
+                        review := Control {
+                            width: self.preferred-width;
+                            x: parent.width - self.width;
+                            y: (parent.height - self.height) / 2;
                             scale: root.s;
                             text: SettingsView.strings.import-review;
                             enabled: !SettingsView.import.busy;

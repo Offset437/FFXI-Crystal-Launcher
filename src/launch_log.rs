@@ -110,13 +110,16 @@ pub enum LoaderEnd {
     Error(String),
     /// The pipe closed (or failed) without an exit line.
     Closed,
+    /// The user's "Close games instantly" ended the game host (`game_shutdown::terminate`).
+    Terminated,
 }
 
 /// Classify a loader session's end. `ran` is measured from when the session was handed over.
 pub fn classify_loader_end(end: &LoaderEnd, ran: Duration) -> ExitReport {
-    let during_startup = ran < STARTUP_WINDOW && !matches!(end, LoaderEnd::SignedOut);
+    let during_startup = ran < STARTUP_WINDOW && !matches!(end, LoaderEnd::SignedOut | LoaderEnd::Terminated);
     let (kind, exit_status) = match end {
         LoaderEnd::SignedOut => (ExitKind::Normal, Some(0)),
+        LoaderEnd::Terminated => (ExitKind::Normal, None),
         LoaderEnd::Exit(0) if !during_startup => (ExitKind::Normal, Some(0)),
         LoaderEnd::Exit(code) => (ExitKind::Code { code: *code }, Some(*code)),
         LoaderEnd::Error(message) => {

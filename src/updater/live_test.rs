@@ -72,7 +72,7 @@ async fn official_copy_update_repair_and_cancel_resume() {
     assert!(baseline.verified, "A clean baseline is required before introducing controlled damage");
 
     // Stock's sequence: the version request and the file list each on their own connection,
-    // then one download connection, closed like stock.
+    // then the download pool.
     let operation = Operation::new();
     let server = Product::Ffxi.server();
     let installed = crate::patch::installed_for_request(&root);
@@ -80,7 +80,6 @@ async fn official_copy_update_repair_and_cancel_resume() {
     let text = official_list(Product::Ffxi, server, &operation).await.unwrap();
     let m = parse_list(Product::Ffxi, &text).unwrap();
     assert_eq!(Product::Ffxi.latest_stamp(&m), Some(baseline.version.as_str()));
-    let mut session = Session::connect_to(Product::Ffxi, server, &operation).await.unwrap();
     let history = |path: &str| m.files.iter().find(|h| h.path == path).unwrap();
     let old_file = history("config.sys");
     let missing_file = history("patch.sin");
@@ -93,8 +92,9 @@ async fn official_copy_update_repair_and_cancel_resume() {
             && delta_bytes.is_some_and(|n| n < old_file.current().direct_len)
     }).expect("config.sys must offer a recognized old base with a cheaper delta chain");
     let old = &old_file.versions[old_index];
-    let raw = session.fetch(&old.direct, old.direct_len, &operation).await.unwrap();
-    let base = decode_payload(&raw, old.sig.len as usize).unwrap();
+    // The old version as the file's current one: its Direct payload, decoded and verified.
+    let cut = FileHistory { versions: old_file.versions[..=old_index].to_vec(), ..old_file.clone() };
+    let base = stage_one(&root, &cut, Action::Direct).await.0;
     assert_eq!(FileSig::of(&base), old.sig);
     let old_path = confined(&root, &old_file.path).unwrap();
     let missing_path = confined(&root, &missing_file.path).unwrap();
@@ -108,14 +108,14 @@ async fn official_copy_update_repair_and_cancel_resume() {
     fs::write(&modified_path, custom).unwrap();
     eprintln!("Introduced old {} ({}), missing {}, and modified {} in the copy only", old_file.path, old.stamp, missing_file.path, modified_file.path);
 
-    // This is the same delta producer used by stage_plan, with an independently
-    // downloaded full target as the byte-for-byte oracle.
-    let delta_result = produce(&mut session, &root, old_file, &Action::Deltas(old_index + 1), &operation, None).await.unwrap();
-    let direct = session.fetch(&old_file.current().direct, old_file.current().direct_len, &operation).await.unwrap();
-    let direct = decode_payload(&direct, old_file.current().sig.len as usize).unwrap();
+    // The production delta path through the pool, with an independently downloaded full
+    // target as the byte-for-byte oracle. A total equal to the chain's size proves no
+    // fallback to the full file was taken.
+    let (delta_result, total) = stage_one(&root, old_file, Action::Deltas(old_index + 1)).await;
+    assert_eq!(total, download_size(old_file, &Action::Deltas(old_index + 1)), "the delta chain was applied, not the full file");
+    let direct = stage_one(&root, old_file, Action::Direct).await.0;
     assert_eq!(delta_result, direct);
     assert_eq!(FileSig::of(&delta_result), old_file.current().sig);
-    session.close().await;
     eprintln!("Production delta output matches the independently downloaded current full file");
 
     // Cancel after Apply, while the complete-install verification is in progress.
@@ -179,4 +179,21 @@ async fn official_copy_update_repair_and_cancel_resume() {
     fs::write(root.parent().unwrap().join("result.txt"), format!(
         "{}\nReal official delta matched an independent direct download.\nCancellation after Apply restored the files and metadata.\n{}\nVerified staged downloads reused without re-downloading; the modification it doesn't change stayed.\n{}\nModified original kept in .xi-updater\\kept.\n{}\n", baseline.summary, updated.summary, repaired.summary, final_check.summary
     )).unwrap();
+}
+
+/// `history` staged by the production pool with `action` into a fresh cache beneath TEMP:
+/// the staged bytes and the download progress total.
+async fn stage_one(root: &Path, history: &FileHistory, action: Action) -> (Vec<u8>, u64) {
+    let staged = std::env::temp_dir().join(format!("crystal-live-stage-{}-{}", std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir_all(&staged).unwrap();
+    let m = Manifest { files: vec![history.clone()] };
+    let planned = [Planned { index: 0, action, original: None, keep: false }];
+    let op = Operation::new();
+    let groups = stage_groups(Product::Ffxi, &m, &planned);
+    let downloads = Downloads::new(op.clone(), vec![download_size(history, &planned[0].action)]);
+    let (ready, _) = stage_plan_shared(Product::Ffxi, Product::Ffxi.server(), root, &staged, &m, groups, &op, &downloads, 0).await.unwrap();
+    let bytes = fs::read(&ready[0].1).unwrap();
+    fs::remove_dir_all(staged).unwrap();
+    (bytes, op.snapshot().total)
 }

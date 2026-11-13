@@ -218,6 +218,11 @@ export struct Sheet {
     se-id-masked: bool,
     handles-masked: bool,
     region: int,
+    /// The installed PlayOnline is another edition ("" when it matches), and the fix button's
+    /// label ("" when no single edition to set) and region.
+    region-mismatch: string,
+    region-fix: string,
+    region-fix-index: int,
     uses-otp: bool,
     /// The authenticator key field: masked unless shown (always in privacy mode), and on a saved
     /// account that has a key, read-only until Change, like the password.
@@ -328,6 +333,8 @@ export global View {
     in property <int> ah-server;
     /// The look-up bar's site: 0 the wiki, 1 FFXIAH (with its world picker).
     in-out property <int> look-scope: 1;
+    /// Whether Home shows the look-up bar (Settings → System → Item and wiki search).
+    in property <bool> look-up: true;
     callback wiki-edited(string);
     callback wiki-search();
     callback ah-edited(string);

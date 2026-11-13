@@ -587,11 +587,11 @@ mod tests {
         let mut s = loaded();
         let _ = update(&mut s, Msg::Set(model::SOUND, 0));
         let mut current = s.original.clone();
-        current.insert(model::WINDOW_MODE.into(), Data::Dword(2)); // the game saved Borderless
+        current.insert(model::WINDOW_MODE.into(), Data::Dword(1)); // the game saved Windowed
         current.remove(model::OPENING_MOVIE);
         s.rebase(current);
         assert_eq!(s.pending(), vec![model::SOUND]);
-        assert_eq!(s.dword(model::WINDOW_MODE), 2);
+        assert_eq!(s.dword(model::WINDOW_MODE), 1);
         assert!(!s.edits.contains_key(model::OPENING_MOVIE));
     }
 

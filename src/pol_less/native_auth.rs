@@ -69,6 +69,8 @@ pub(super) struct NativeAuth {
     social_seen: AtomicBool,
     /// The one `native_play_pending` went to the loader (07d §4.3).
     play_pending_sent: AtomicBool,
+    /// US (the unchanged line), or an experimental EU/JP install (`retail_region`).
+    target: crate::retail_region::Target,
 }
 impl NativeAuth {
     pub fn new(
@@ -146,8 +148,11 @@ impl NativeAuth {
             game_running: Arc::new(AtomicBool::new(true)),
             social_seen: AtomicBool::new(false),
             play_pending_sent: AtomicBool::new(false),
+            target: crate::retail_region::Target::Us,
         })
     }
+    /// The session line's region fields: none changed for US.
+    pub fn set_target(&mut self, target: crate::retail_region::Target) { self.target = target; }
     pub fn set_social_only(&mut self, social_only: bool) {
         self.social_only = social_only;
         self.game_running.store(!social_only, Ordering::Release);
@@ -275,6 +280,9 @@ impl SignedIn for NativeAuth {
         }
         Ok(())
     }
+    fn game_terminated(&self) -> bool {
+        crate::session_worker::game_shutdown::terminated(&self.directory)
+    }
     fn take_controller_settings(&self) -> Option<Vec<u8>> {
         crate::session_worker::take_controller_settings(&self.directory)
     }
@@ -364,12 +372,21 @@ impl SignedIn for NativeAuth {
             .to_str()
             .ok_or(t("The game folder's path is not valid Unicode."))?;
         // Retention uses this same native owner and its original session services.
-        let pol = crate::discovery::find(crate::discovery::Product::PlayOnline, None);
+        // An EU/JP sign-in uses its own region's Viewer, never a discovered US one.
+        let pol = match self.target.experimental() {
+            None => crate::discovery::find(crate::discovery::Product::PlayOnline, None),
+            Some(values) => Some(values.viewer.clone()),
+        };
         let auto_login = serde_json::to_string(&self.auto_login.normalized())
             .map_err(|_| t("Could not encode character login settings."))?;
         let pol = serde_json::to_string(&pol.as_ref().map(|p| p.to_string_lossy().into_owned()))
             .map_err(|_| t("Could not encode the PlayOnline folder."))?;
-        let head=format!("{{\"type\":\"session\",\"v\":1,\"region\":\"US\",\"lang\":\"US\",\"start_game\":{},\"keep_session\":{},\"viewer_gaps\":{},\"auto_away_minutes\":{},\"auto_login\":{},\"pol_install_dir\":{},\"install_dir\":{},\"native_auth\":{{", !self.idle_first(), self.keep_session, self.viewer_gaps, self.auto_away_minutes, auto_login, pol, serde_json::to_string(install).map_err(|_| t("Could not encode the game folder."))?);
+        // US: exactly the verified line. EU/JP: their region and env.dat's POL_UCS_AREA_KBN.
+        let region = match self.target.experimental() {
+            None => "\"region\":\"US\",\"lang\":\"US\"".to_owned(),
+            Some(values) => format!("\"region\":\"{0}\",\"lang\":\"{0}\",\"ucs_area\":\"{1}\"", values.region.wire(), values.ucs_area),
+        };
+        let head=format!("{{\"type\":\"session\",\"v\":1,{region},\"start_game\":{},\"keep_session\":{},\"viewer_gaps\":{},\"auto_away_minutes\":{},\"auto_login\":{},\"pol_install_dir\":{},\"install_dir\":{},\"native_auth\":{{", !self.idle_first(), self.keep_session, self.viewer_gaps, self.auto_away_minutes, auto_login, pol, serde_json::to_string(install).map_err(|_| t("Could not encode the game folder."))?);
         self.line_with_credentials(head)
     }
     /// pol-spec 07d §1.2: what a parked host gets at Play instead of `session`: the per-Play
@@ -776,6 +793,7 @@ mod tests {
                 cache_dirty: AtomicBool::new(false),
                 status: AtomicI32::new(0), social_only: false, start_pending: AtomicBool::new(false), keep_session: false, viewer_gaps: false, auto_away_minutes: 10, auto_login: super::super::AutoLogin::default(), game_running: Arc::new(AtomicBool::new(true)),
                 social_seen: AtomicBool::new(false), play_pending_sent: AtomicBool::new(false),
+                target: crate::retail_region::Target::Us,
             } }
         }
         fn cached(&self) -> Snapshot {
@@ -1049,5 +1067,30 @@ mod tests {
         // Older window processes send no field: a cold Play.
         let plan: super::super::Plan = serde_json::from_value(serde_json::json!({"tool": super::super::Tool::Windower, "settings": super::super::ToolSettings::default(), "social_only": true})).unwrap();
         assert!(!plan.viewer_gaps);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// US keeps its verified session line; an EU/JP target names its region, its own Viewer
+    /// folder and its env.dat's POL_UCS_AREA_KBN, and nothing else changes.
+    #[test]
+    fn the_session_line_carries_the_region_only_for_an_experimental_target() {
+        let directory = std::env::temp_dir().join(format!("crystal-region-line-{}", backend::unique_id().unwrap()));
+        let us = NativeAuth::new(&play_account(), Zeroizing::new(String::new()), directory.clone()).unwrap();
+        let us_line = us.session_line(Path::new(r"C:\Games\FFXI")).unwrap();
+        assert!(us_line.starts_with(b"{\"type\":\"session\",\"v\":1,\"region\":\"US\",\"lang\":\"US\",\"start_game\":"), "{}", String::from_utf8_lossy(&us_line[..60]));
+        assert!(!us_line.windows(8).any(|w| w == b"ucs_area"));
+        let us_value: serde_json::Value = serde_json::from_slice(&us_line).unwrap();
+        for (region, wire) in [(crate::retail_region::RetailRegion::Eu, "EU"), (crate::retail_region::RetailRegion::Jp, "JP")] {
+            let mut auth = NativeAuth::new(&play_account(), Zeroizing::new(String::new()), directory.clone()).unwrap();
+            auth.set_target(crate::retail_region::Target::Experimental(crate::retail_region::Experimental {
+                region, viewer: PathBuf::from(r"D:\POL\PlayOnlineViewer"), source: "test".into(), env_file: PathBuf::from(r"D:\POL\PlayOnlineViewer\data\utf\env.dat"),
+                patch_host: "pt008.pol.com".into(), ucs_area: "02".into(), viewer_tag: Ok(*b"W2U\0") }));
+            let value: serde_json::Value = serde_json::from_slice(&auth.session_line(Path::new(r"C:\Games\FFXI")).unwrap()).unwrap();
+            assert_eq!((value["region"].as_str(), value["lang"].as_str(), value["ucs_area"].as_str()), (Some(wire), Some(wire), Some("02")));
+            assert_eq!(value["pol_install_dir"], r"D:\POL\PlayOnlineViewer", "its own region's Viewer");
+            for same in ["v", "start_game", "keep_session", "viewer_gaps", "auto_away_minutes", "auto_login", "install_dir", "native_auth"] {
+                assert_eq!(value[same], us_value[same], "{same}");
+            }
+        }
         let _ = std::fs::remove_dir_all(&directory);
     }}

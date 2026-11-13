@@ -165,10 +165,7 @@ pub(crate) fn controller_enabled() -> Option<bool> {
 fn controller_enabled_value(values: &[RegData]) -> Option<bool> {
     let value = values.iter().find(|value| value.name.eq_ignore_ascii_case("padmode000"))?;
     if value.ty != REG_SZ { return None; }
-    let text = std::str::from_utf8(value.data.split(|byte| *byte == 0).next()?).ok()?;
-    let fields: Vec<_> = text.split(',').map(str::trim).collect();
-    if fields.len() < 6 || !fields[..6].iter().all(|field| matches!(*field, "0" | "1")) { return None; }
-    Some(fields[0] == "1")
+    crate::controller_record::gamepad_enabled(std::str::from_utf8(value.data.split(|byte| *byte == 0).next()?).ok()?)
 }
 
 pub(crate) fn controller_ready() -> bool {
@@ -540,6 +537,7 @@ pub fn apply_to_ffximain() -> bool {
         return false;
     }
     crate::boot_timing::install(base);
+    crate::graphics::report(base);
     if crate::game::selected_game_directory() {
         // SAFETY: FFXiMain is loaded; retain its original injector/COM import separately
         // from FFXi.dll's import, which may have a different hook.

@@ -97,10 +97,15 @@ component DeviceBar inherits PadCard {
             }
         }
         VerticalLayout {
+            // The name gives way (elided) before the controller choices and status; the details
+            // wrap at the width the card gives them (a layout would measure one long line).
+            horizontal-stretch: 1;
+            min-width: 0px;
+            preferred-width: max(0px, root.width - (48px + 44px + 28px) * root.s);
             alignment: center;
             spacing: 2px * root.s;
-            Text { text: SettingsView.pad.title; font-size: Theme.type-heading * root.s; font-weight: 600; color: Theme.ink; }
-            Text { text: SettingsView.pad.sub; font-size: Theme.type-detail * root.s; color: Theme.sub; }
+            Text { text: SettingsView.pad.title; font-size: Theme.type-heading * root.s; font-weight: 600; color: Theme.ink; overflow: elide; }
+            Text { text: SettingsView.pad.sub; font-size: Theme.type-detail * root.s; color: Theme.sub; wrap: word-wrap; }
         }
         HorizontalLayout {
             spacing: 6px * root.s;
@@ -146,8 +151,11 @@ component LiveCard inherits PadCard {
     HorizontalLayout {
         PadHeading { text: SettingsView.strings.pad-live; vertical-alignment: center; }
         Rectangle { horizontal-stretch: 1; }
-        if SettingsView.pad.connected: Text { text: SettingsView.pad.caption; font-size: Theme.type-caption * root.s; color: Theme.sub; vertical-alignment: center; }
+        if SettingsView.pad.connected && !Theme.small: Text { text: SettingsView.pad.caption; font-size: Theme.type-caption * root.s; color: Theme.sub; vertical-alignment: center; }
     }
+    // In the small window the card is too narrow for the hint beside the heading: it goes under
+    // it and wraps at the card's width.
+    if SettingsView.pad.connected && Theme.small: Text { text: SettingsView.pad.caption; font-size: Theme.type-caption * root.s; color: Theme.sub; wrap: word-wrap; }
     // With no controller, the one line saying so under the heading: no idle drawing or readouts.
     if !SettingsView.pad.connected: Text { text: SettingsView.pad.caption; font-size: Theme.type-caption * root.s; color: Theme.sub; wrap: word-wrap; }
     if SettingsView.pad.connected: Image {
@@ -196,7 +204,7 @@ component BindingRow inherits Pressable {
         padding-left: 10px * root.s;
         padding-right: 10px * root.s;
         spacing: 6px * root.s;
-        Text { text: root.entry.label; font-size: Theme.type-small * root.s; color: Theme.ink; vertical-alignment: center; }
+        Text { min-width: 0px; text: root.entry.label; font-size: Theme.type-small * root.s; color: Theme.ink; vertical-alignment: center; overflow: elide; }
         if root.entry.changed: Rectangle {
             cross-axis-self-alignment: center;
             width: 6px * root.s;
@@ -219,6 +227,8 @@ component BindingRow inherits Pressable {
             }
         }
         if !root.entry.capturing && root.entry.kind == 0: Text {
+            min-width: 0px;
+            overflow: elide;
             text: root.entry.text;
             font-size: Theme.type-detail * root.s;
             color: Theme.sub;
@@ -245,6 +255,8 @@ component BindingRow inherits Pressable {
 
 /// FFXI's button bindings in two columns, with Reset to default.
 component BindingsCard inherits PadCard {
+    /// One column of rows (the left list, then the right) where two would overlap their text.
+    in property <bool> narrow;
     private property <float> s: Theme.scale;
     gap: 10px * root.s;
     VerticalLayout {
@@ -264,7 +276,13 @@ component BindingsCard inherits PadCard {
         }
         Text { text: SettingsView.pad.bindings-sub; font-size: Theme.type-caption * root.s; color: Theme.sub; wrap: word-wrap; }
     }
-    HorizontalLayout {
+    if root.narrow: VerticalLayout {
+        spacing: 2px * root.s;
+        alignment: start;
+        for entry in SettingsView.pad-left: BindingRow { entry: entry; }
+        for entry in SettingsView.pad-right: BindingRow { entry: entry; }
+    }
+    if !root.narrow: HorizontalLayout {
         spacing: 12px * root.s;
         VerticalLayout {
             horizontal-stretch: 1;
@@ -327,7 +345,7 @@ export component ControllerTab inherits VerticalLayout {
     if root.width-hint < 880px * root.s: VerticalLayout {
         spacing: 14px * root.s;
         LiveCard { }
-        BindingsCard { }
+        BindingsCard { narrow: root.width-hint < 560px * root.s; }
     }
     OptionsCard { }
 }

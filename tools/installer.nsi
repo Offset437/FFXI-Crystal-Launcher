@@ -26,7 +26,7 @@ OutFile "${OUTPUT_FILE}"
 InstallDir "$LOCALAPPDATA\Programs\Crystal Launcher"
 InstallDirRegKey HKCU "${UNINSTALL_KEY}" "InstallLocation"
 RequestExecutionLevel user
-SetCompressor /SOLID lzma
+SetCompressor lzma
 AllowSkipFiles off
 BrandingText "Crystal Launcher"
 ; Version information on Setup itself (APP_VERSION is x.y.z; Windows wants four parts).

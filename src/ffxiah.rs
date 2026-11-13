@@ -281,6 +281,25 @@ pub(crate) fn grouped_number(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Item and wiki search is on by default and saved; off, searches do nothing and the
+    /// open lookup closes, so no request is made.
+    #[test]
+    fn item_search_off_runs_nothing_and_is_saved() {
+        use crate::Message;
+        assert!(crate::settings::Settings::default().item_search);
+        let mut app = crate::tests::app();
+        app.preview = false;
+        let _ = app.update(Message::ItemSearch(false));
+        assert!(!app.settings.item_search);
+        app.ah_query = "copper".into();
+        assert_eq!(app.update(Message::SearchAh).units(), 0);
+        assert!(!app.ah_lookup.open && app.ah_lookup.generation == 0);
+        assert_eq!(app.update(Message::SearchWiki).units(), 0);
+        let _ = app.update(Message::ItemSearch(true));
+        assert!(app.settings.item_search);
+    }
+
     fn parse(html: &str, url: &reqwest::Url, sid: u8) -> Result<Results, String> {
         super::parse(&Html::parse_document(html), url, sid)
     }

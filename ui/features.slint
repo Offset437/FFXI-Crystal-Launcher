@@ -324,7 +324,10 @@ component TwoLines inherits VerticalLayout {
     in property <string> detail;
     in property <bool> mono-name;
     in property <bool> mono-detail;
+    in property <length> room: 0px;
     horizontal-stretch: 1;
+    min-width: 0px;
+    preferred-width: root.room;
     alignment: center;
     spacing: 2px;
     Text {
@@ -340,7 +343,9 @@ component TwoLines inherits VerticalLayout {
         font-family: root.mono-detail ? Theme.mono : Theme.sans;
         font-size: Theme.type-note;
         color: Theme.sub;
-        overflow: elide;
+        // Wrapped, not cut: a long (or Japanese) detail used to end in an ellipsis. A layout
+        // measures wrapped text at its preferred width, so `room` is the width the row gives it.
+        wrap: word-wrap;
     }
 }
 
@@ -803,6 +808,9 @@ component WindowsSection inherits VerticalLayout {
                 font-size: Theme.type-note;
                 color: Features.map-readout != "" ? Theme.sub : Theme.faint;
                 vertical-alignment: center;
+                // Wrapped, then cut only past the row's two lines: the Japanese note is longer
+                // than the line the pane gives it.
+                wrap: word-wrap;
                 overflow: elide;
             }
             if Features.can-restore: Control {
@@ -984,8 +992,8 @@ component BackupsSection inherits VerticalLayout {
                     spacing: Theme.sp-s;
                     HorizontalLayout {
                         spacing: Theme.sp-m;
-                        TwoLines { name: line.date; detail: line.detail; mono-name: true; }
-                        SmallButton {
+                        TwoLines { room: max(0px, backup.width - restore.preferred-width - Theme.sp-m); name: line.date; detail: line.detail; mono-name: true; }
+                        restore := SmallButton {
                             cross-axis-self-alignment: center;
                             scale: 1;
                             text: Features.strings.restore-action;

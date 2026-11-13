@@ -24,7 +24,20 @@ export component PrereqBanner inherits VerticalLayout {
         gap: Theme.sp-m * root.s;
         height: 44px * root.s;
         border-radius: Theme.radius-mid;
-        HorizontalLayout {
+        // In the small window the sentence is longer than the line: it wraps over the banner's
+        // two lines instead of ending in an ellipsis that hides what is wrong.
+        if Theme.small: Text {
+            horizontal-stretch: 1;
+            min-width: 0px;
+            text: View.banner-lead + " " + View.banner-rest;
+            font-size: Theme.type-small * root.s;
+            font-weight: 600;
+            color: Theme.ink;
+            vertical-alignment: center;
+            wrap: word-wrap;
+            overflow: elide;
+        }
+        if !Theme.small: HorizontalLayout {
             horizontal-stretch: 1;
             alignment: start;
             Text { text: View.banner-lead; font-size: Theme.type-small * root.s; font-weight: 600; color: Theme.ink; vertical-alignment: center; }
@@ -387,7 +400,7 @@ export component HomePage inherits Rectangle {
                 serif: View.serif-greeting;
             }
             Rectangle { height: root.look-top - root.hero-top - root.hero-h; }
-            HorizontalLayout { alignment: start; LookBar { } }
+            HorizontalLayout { alignment: start; if View.look-up: LookBar { } }
             Rectangle { height: root.section-top - root.look-top - (Theme.small ? 40px : 44px); }
             if View.first-run: SetupSection { }
             if View.first-run: Rectangle { height: 36px; }

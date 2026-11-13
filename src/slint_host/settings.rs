@@ -205,6 +205,8 @@ pub(super) fn wire(ui: &MainWindow) {
     view.on_set_nav(|on| emit(Message::ControllerNavigation(on)));
     view.on_set_sign_in(|on| emit(Message::AutoSignIn(on)));
     view.on_set_keep(|on| emit(Message::SignInAfterGame(on)));
+    view.on_set_instant(|on| emit(Message::CloseGamesInstantly(on)));
+    view.on_set_item_search(|on| emit(Message::ItemSearch(on)));
     view.on_set_start(|on| emit(Message::StartWithWindows(on)));
     view.on_set_tray(|on| emit(Message::CloseToTray(on)));
 
@@ -261,6 +263,8 @@ pub(super) fn wire(ui: &MainWindow) {
     view.on_dg_open(|| emit(Message::Dgvoodoo(Dgv::OpenSettings)));
     view.on_dg_remove(|| emit(Message::Dgvoodoo(Dgv::Remove)));
     view.on_dg_retry(|| emit(Message::Dgvoodoo(Dgv::Toggle(true))));
+    view.on_dg_reset(|| emit(Message::Dgvoodoo(Dgv::Reset)));
+    view.on_dg_import(|| emit(Message::Dgvoodoo(Dgv::Import)));
     use crate::reshade::Msg as Reshade;
     view.on_rs_toggle(|on| emit(Message::Reshade(Reshade::Toggle(on))));
     view.on_rs_setup(|| emit(Message::Reshade(Reshade::Setup)));
@@ -448,6 +452,9 @@ fn strings() -> SettingsStrings {
         sign_in_note: t("Accounts with a one-time password sign in when you press Play, unless they have an authenticator key.").into(),
         keep_label: t("Keep PlayOnline signed in after FFXI closes").into(),
         keep_note: t("Keeps the session for the next Play. Applies to new sign-ins.").into(),
+        instant_label: t("Close games instantly").into(),
+        instant_note: t("Ends the game at once, like Windower's terminate.").into(),
+        item_search_label: t("Item and wiki search").into(),
         start_label: t("Start Crystal in the background when Windows starts").into(),
         tray_label: t("Closing the window keeps Crystal running in the notification area").into(),
         tray_note: t("Quit from the notification icon to sign them out.").into(),
@@ -489,6 +496,7 @@ fn strings() -> SettingsStrings {
         dg_title: t("Use dgVoodoo (DirectX 8 → 11 wrapper)").into(),
         dg_body: t("Draws the game through Direct3D 11, which can fix black screens, stutter and alt-tab problems on newer graphics cards. Crystal downloads it from the official GitHub release, checks it, and sets it up at each launch.").into(),
         dg_open: t("Open dgVoodoo settings").into(),
+        dg_reset: t("Reset to Crystal defaults").into(),
         try_again: t("Try again").into(),
         rs_body: t("Optional color correction, sharpening and shader presets. Requires dgVoodoo; available for Vanilla, Windower and Ashita.").into(),
         rs_setup: t("Set up ReShade").into(),
@@ -569,6 +577,8 @@ fn system(view: &SettingsView, app: &App, state: &mut State) {
         nav: set.controller_navigation,
         sign_in: set.auto_sign_in,
         keep: set.sign_in_after_game,
+        instant: set.close_games_instantly,
+        item_search: set.item_search,
         start: set.start_with_windows,
         start_enabled: !app.startup_task_busy(),
         tray: set.close_to_tray,
@@ -942,6 +952,8 @@ fn graphics(view: &SettingsView, app: &App) {
         },
         remove_enabled: matches!(dg.actions, Some(Actions::Installed { remove: true })),
         note: dg.note.into(),
+        info: private(app, &dg.info.join("\n")).into(),
+        import: dg.import.unwrap_or_default().into(),
     });
 
     // reshade::view's state.
@@ -1147,6 +1159,8 @@ fn dialogs(view: &SettingsView, app: &App, state: &mut State) {
         read_label: (if import.busy { t("Reading…") } else { t("Read accounts") }).into(),
         read_enabled: !import.busy && !import.path.trim().is_empty(),
     });
+    // --preview-import-end: the account list scrolled to its end (clamped by the dialog).
+    put!(view, get_import_scroll, set_import_scroll, if crate::preview::has("--preview-import-end") { 100_000.0 } else { 0.0 });
     put!(view, get_import_path, set_import_path, crate::privacy::mask_path(&import.path).into());
     put!(view, get_import_companion, set_import_companion, crate::privacy::mask_path(&import.companion).into());
     let batch = import.batch.as_ref();
@@ -1591,5 +1605,44 @@ mod tests {
         for name in [t("Reset to default"), t("Use a controller in FFXI"), t("Keep working in the background"), row.label.as_str()] {
             assert!(names.iter().any(|n| n == name), "{name} in {names:?}");
         }
+    }
+
+    /// The UI thread's cost of one controller change on the Controller page (update, sync,
+    /// one software frame at 1440x900): `cargo test controller_change_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn controller_change_cost() {
+        use crate::gamepad::{detect::{BatteryState, Family, Input, Pad}, Msg as G};
+        use std::time::Instant;
+        let mut app = settings_app(Tab::Controller);
+        let window = super::super::sync::headless::window(1440, 900);
+        let ui = MainWindow::new().unwrap();
+        wire(&ui);
+        super::super::view::wire(&ui);
+        ui.show().unwrap();
+        let pad = |input| Pad {
+            id: 0, name: "DualSense Wireless Controller".into(), family: Family::DualSense, vid: Some(0x054C), pid: Some(0x0CE6),
+            wireless: Some(true), battery: None, battery_source: None, battery_state: BatteryState::Unknown,
+            battery_level: None, rumble: false, input,
+        };
+        let (mut update, mut synced, mut drawn) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..120 {
+            let a = (i as f32 * 0.21).sin();
+            let input = Input { buttons: if i % 10 < 5 { 1 } else { 0 }, lx: (a * 50.0).round() / 50.0, ly: 0.3, lt: (i % 7) as f32 / 7.0, ..Input::default() };
+            let t = Instant::now();
+            let _ = app.update(Message::Gamepad(G::Pads(vec![pad(input)])));
+            update.push(t.elapsed().as_secs_f64() * 1e3);
+            let t = Instant::now();
+            super::super::view::sync(&ui, &app);
+            sync(&ui, &app);
+            synced.push(t.elapsed().as_secs_f64() * 1e3);
+            let t = Instant::now();
+            super::super::sync::headless::draw(&window);
+            drawn.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let stat = |v: &mut Vec<f64>| { let s = v[10..].to_vec(); let mut s = s; s.sort_by(f64::total_cmp); (s[s.len() / 2], s[s.len() * 95 / 100], s[s.len() - 1]) };
+        println!("update p50/p95/max {:.2?} ms", stat(&mut update));
+        println!("sync   p50/p95/max {:.2?} ms", stat(&mut synced));
+        println!("draw   p50/p95/max {:.2?} ms", stat(&mut drawn));
     }
 }

@@ -25,6 +25,10 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+/// The member login host 868 resolves (app.dll's "PlayOnline NetWork Setting
+/// File" default, the US Viewer's only value).
+pub(crate) const LOGIN_HOST: &CStr = c"ci000.pol.com";
+
 // Commands are accepted only while the COM owner is idle. A click during
 // GameStart must never become a queued second game or sign out beneath FFXI.
 const GAME: u8 = 0;
@@ -504,6 +508,8 @@ pub struct NativeSession {
     area: i32,
     /// The game language 421 falls back to (app 102787d6 → 1528).
     language: u32,
+    /// 1309's POL_UCS_AREA_KBN: US "01"; EU/JP their env.dat's (game.rs `ucs_area`).
+    ucs_area: &'static CStr,
     auto_away: AutoAway,
     viewer_status: ViewerStatus,
     social: crate::native_social::Service,
@@ -538,6 +544,7 @@ impl NativeSession {
             viewer: viewer.to_path_buf(),
             area,
             language: u32::from(area != 0),
+            ucs_area: c"01",
             auto_away: AutoAway::new(auto_away_minutes),
             viewer_status: Default::default(),
             social: Default::default(),
@@ -573,14 +580,22 @@ impl NativeSession {
         regkey: &'static CStr,
         area: i32,
         language: u32,
+        ucs_area: &'static CStr,
         auto_away_minutes: u32,
     ) -> Result<Self, String> {
         let mut session = Self::new(Api::new(table), viewer, area, auto_away_minutes);
         session.language = language;
+        session.ucs_area = ucs_area;
         session.api.restore_viewer_policy()?;
         session.bootstrap_core(viewer_c, regkey)?;
         // 10050fa2 → 10057896: notification titles and texts.
-        install_message_texts(&session.api, viewer)?;
+        match install_message_texts(&session.api, viewer) {
+            Ok(()) => {}
+            // Only the US (ASCII) templates are verified. An EU/JP install whose
+            // templates this cannot pass on keeps the core's own texts.
+            Err(error) if area != 1 => log!("region area {area}: notification texts not installed ({error}); the core's defaults stay"),
+            Err(error) => return Err(error),
+        }
         log!("native POL host registered like the Viewer (824/871/1149, profile list loaded)");
         Ok(session)
     }
@@ -609,11 +624,12 @@ impl NativeSession {
     }
 
     /// app 1001a175: 965(region != 0), 1527(region == 0), 1309(POL_UCS_AREA_KBN
-    /// "01" from data\utf\env.dat, US). 420 is never called by the US Viewer.
+    /// from data\utf\env.dat: "01" for US; EU reads data\utf\EU\env.dat). 420 is
+    /// never called by the US Viewer.
     fn region_settings(&self) {
         self.api.call(965, &[usize::from(self.area != 0)]);
         self.api.call(1527, &[usize::from(self.area == 0)]);
-        self.api.call(1309, &[c"01".as_ptr() as usize]);
+        self.api.call(1309, &[self.ucs_area.as_ptr() as usize]);
     }
 
     /// 871 as app 1019b8b9 / 10050fd9: entry 1 is the core's own dispatcher
@@ -851,7 +867,7 @@ impl NativeSession {
         api.call(858, &[none.as_mut_ptr() as usize, c"".as_ptr() as usize]);
         api.call(886, &[none.as_ptr() as usize]);
         let mut host = [0u8; 0x42];
-        api.two(868, host.as_mut_ptr() as usize, c"ci000.pol.com".as_ptr() as usize);
+        api.two(868, host.as_mut_ptr() as usize, LOGIN_HOST.as_ptr() as usize);
         api.one(853, host.as_ptr() as usize);
         let code = api.zero(891);
         if code != native_profile::PROFILE_NOT_FOUND {

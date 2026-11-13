@@ -370,7 +370,7 @@ fn sheet_strings() -> SheetStrings {
         password_placeholder: t("Password").into(),
         pol_password_placeholder: t("PlayOnline password").into(),
         region: t("Region").into(),
-        region_note: t("Retail launch is currently verified with the US configuration.").into(),
+        region_note: t("EU and JP sign-in is experimental.").into(),
         uses_otp: t("Uses a one-time password (security token)").into(),
         totp_key: t("Authenticator key").into(),
         totp_key_placeholder: t("Optional").into(),
@@ -413,6 +413,7 @@ fn shell(view: &View, app: &App) {
     let page = PAGES.iter().position(|page| *page == app.page).unwrap_or(0) as i32;
     put!(view, get_page, set_page, page);
     put!(view, get_privacy, set_privacy, app.settings.privacy);
+    put!(view, get_look_up, set_look_up, app.settings.item_search);
     // The Windows components banner.
     let banner = crate::prereqs::banner_text(&app.prereqs);
     put!(view, get_banner, set_banner, banner.is_some());
@@ -1245,6 +1246,9 @@ fn sheet(view: &View, app: &App, state: &mut State) {
         ""
     };
 
+    // The Region field as set now against the installed editions.
+    let region_mismatch = app.region_mismatch(account);
+    let region_fix = region_mismatch.as_ref().and_then(|_| crate::retail_region::only_edition(&app.pol_editions()));
     let picture = editor.key.as_deref().and_then(|key| own_picture(app, key));
     let sheet = Sheet {
         portrait_shown: editing && retail && row.is_some(),
@@ -1267,6 +1271,9 @@ fn sheet(view: &View, app: &App, state: &mut State) {
         se_id_masked: privacy,
         handles_masked: privacy,
         region: i32::from(account.region.min(2)),
+        region_mismatch: region_mismatch.unwrap_or_default().into(),
+        region_fix: region_fix.map(|edition| tf("Set to {edition}", &[("edition", &edition.wire())])).unwrap_or_default().into(),
+        region_fix_index: region_fix.map_or(0, |edition| i32::from(edition.index())),
         uses_otp: flags.uses_otp,
         totp_key_masked: privacy || !flags.show_totp_key,
         totp_key_enabled: key_can_type,

@@ -1,6 +1,6 @@
 [package]
 name = "xi-launcher"
-version = "1.2.6"
+version = "1.2.7"
 edition = "2021"
 license = "GPL-3.0-only"
 publish = false
@@ -58,7 +58,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_WinSock", # stock-shaped version-check sockets (stock_socket.rs)
     "Win32_NetworkManagement_Dns", # DnsQuery_W(DNS_QUERY_BYPASS_CACHE) for W2U retries (dns.rs)
-    "Win32_Devices_DeviceAndDriverInstallation", "Win32_Devices_Properties",
+    "Win32_Devices_DeviceAndDriverInstallation", "Win32_Devices_Properties", "Win32_Devices_HumanInterfaceDevice",
     "Win32_System_Performance", "Win32_System_Power", "Win32_System_SystemInformation", # launch timing, prefetch gates
     "Win32_Security_Authorization", # admin-only scratch folder for elevated component setup
     "Win32_System_Com", # CoTaskMemFree for SHGetKnownFolderPath (that scratch folder's root)

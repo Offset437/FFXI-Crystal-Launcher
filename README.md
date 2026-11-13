@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/Offset437/FFXI-Crystal-Launcher/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Offset437/FFXI-Crystal-Launcher?style=for-the-badge"></a>
-  <a href="https://github.com/Offset437/FFXI-Crystal-Launcher/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/Offset437/FFXI-Crystal-Launcher/total?style=for-the-badge"></a>
+  <a href="https://github.com/Offset437/FFXI-Crystal-Launcher/releases"><img alt="Downloads" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FOffset437%2FFFXI-Crystal-Launcher%2Fbadges%2Fdownloads.json&style=for-the-badge"></a>
   <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-0078D6?style=for-the-badge">
   <a href="LICENSE"><img alt="License: GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-blue?style=for-the-badge"></a>
 </p>
@@ -54,15 +54,15 @@ Get the latest build from [Releases](https://github.com/Offset437/FFXI-Crystal-L
 
 | File | Use it when |
 |---|---|
-| `Crystal-Launcher-1.2.6-Setup.exe` | You want Desktop and Start menu shortcuts. Installs per user, no admin prompt. |
-| `Crystal-Launcher-1.2.6.zip` | You want a portable copy. Unzip and run. |
+| `Crystal-Launcher-1.2.7-Setup.exe` | You want Desktop and Start menu shortcuts. Installs per user, no admin prompt. |
+| `Crystal-Launcher-1.2.7.zip` | You want a portable copy. Unzip and run. |
 | `SHA256SUMS` | You want to verify the download. |
 | `launcher-update.json` | Never. The built-in updater reads it. |
 
 If SmartScreen warns you, choose **More info**, then **Run anyway**. To check the file first, compare its hash with `SHA256SUMS`:
 
 ```powershell
-Get-FileHash .\Crystal-Launcher-1.2.6-Setup.exe -Algorithm SHA256
+Get-FileHash .\Crystal-Launcher-1.2.7-Setup.exe -Algorithm SHA256
 ```
 
 Crystal updates itself. Every update is signed (Ed25519) and verified before it installs.

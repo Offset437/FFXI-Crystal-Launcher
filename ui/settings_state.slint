@@ -31,6 +31,9 @@ export struct SettingsStrings {
     sign-in-note: string,
     keep-label: string,
     keep-note: string,
+    instant-label: string,
+    instant-note: string,
+    item-search-label: string,
     start-label: string,
     tray-label: string,
     tray-note: string,
@@ -73,6 +76,7 @@ export struct SettingsStrings {
     dg-title: string,
     dg-body: string,
     dg-open: string,
+    dg-reset: string,
     try-again: string,
     rs-body: string,
     rs-setup: string,
@@ -140,6 +144,8 @@ export struct SystemState {
     nav: bool,
     sign-in: bool,
     keep: bool,
+    instant: bool,
+    item-search: bool,
     start: bool,
     start-enabled: bool,
     tray: bool,
@@ -244,6 +250,10 @@ export struct Dg {
     actions: int,
     remove-enabled: bool,
     note: string,
+    /// Kept settings and other dgVoodoo copies, one per line; empty hides it.
+    info: string,
+    /// "Import settings from …"; empty hides the button.
+    import: string,
 }
 
 /// The ReShade card.
@@ -404,6 +414,8 @@ export global SettingsView {
     callback set-nav(bool);
     callback set-sign-in(bool);
     callback set-keep(bool);
+    callback set-instant(bool);
+    callback set-item-search(bool);
     callback set-start(bool);
     callback set-tray(bool);
 
@@ -452,6 +464,8 @@ export global SettingsView {
     callback dg-open();
     callback dg-remove();
     callback dg-retry();
+    callback dg-reset();
+    callback dg-import();
     in property <Rs> rs;
     callback rs-toggle(bool);
     callback rs-setup();
@@ -507,6 +521,8 @@ export global SettingsView {
     in property <[string]> import-sources;
     in property <[string]> import-warnings;
     in property <[Draft]> import-drafts;
+    /// Where the import list scrolls to (previews); the dialog clamps it to the content.
+    in property <length> import-scroll: 0px;
     in property <[string]> regions;
     in-out property <string> import-path;
     in-out property <string> import-companion;

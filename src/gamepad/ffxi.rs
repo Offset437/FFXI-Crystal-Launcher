@@ -528,7 +528,7 @@ fn text_value(values: &crate::game_config::RegValues, name: &str) -> Option<Stri
 }
 
 fn key_location(vendor: &str) -> String {
-    format!("HKLM\\SOFTWARE\\WOW6432Node\\{vendor}\\SquareEnix\\FinalFantasyXI")
+    format!("HKLM\\SOFTWARE\\WOW6432Node\\{vendor}\\{}\\FinalFantasyXI", crate::win::reg::publisher(vendor))
 }
 
 pub(crate) fn load_retail() -> Loaded {
@@ -554,7 +554,8 @@ pub(crate) fn save_retail(config: &crate::backend::Config, base: &PadConfig, edi
     let vendor = crate::game_config::controller_region().ok_or(t("FINAL FANTASY XI's registry key was not found."))?;
     let stored = crate::game_config::read_retail(vendor)?.unwrap_or_default();
     let mut backup = format!(
-        "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\{vendor}\\SquareEnix\\FinalFantasyXI]\r\n"
+        "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\{vendor}\\{}\\FinalFantasyXI]\r\n",
+        crate::win::reg::publisher(vendor)
     );
     for name in ["padmode000", "padsin000", "padguid000", "padexsin000"] {
         if let Some(v) = text_value(&stored, name) {

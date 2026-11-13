@@ -79,16 +79,46 @@ fn write(path: &Path, bytes: &[u8], hash: &str) -> io::Result<()> {
 /// Puts the loader in `<root>\crystal` and returns the path to run. The standard
 /// `crystal\pol.exe` when it already matches or can be replaced, else `crystal\<hash8>\pol.exe`.
 pub(crate) fn extract_into(root: &Path, bytes: &[u8], hash: &str) -> io::Result<PathBuf> {
-    let standard = root.join("crystal").join("pol.exe");
-    if has_hash(&standard, hash) || write(&standard, bytes, hash).is_ok() {
-        return Ok(standard);
+    let crystal = root.join("crystal");
+    let standard = crystal.join("pol.exe");
+    let path = if has_hash(&standard, hash) || write(&standard, bytes, hash).is_ok() {
+        standard
+    } else {
+        // In use by a running game (or otherwise unreplaceable): a versioned copy beside it.
+        let versioned = crystal.join(&hash[..8.min(hash.len())]).join("pol.exe");
+        if !has_hash(&versioned, hash) {
+            write(&versioned, bytes, hash)?;
+        }
+        versioned
+    };
+    prune_versioned(&crystal, path.parent().unwrap_or(&crystal));
+    Ok(path)
+}
+
+/// Best effort: deletes the versioned `crystal\<hash8>\` folders (their old `pol.exe`, the
+/// dgVoodoo files beside it, its log) other than `keep`. A folder whose `pol.exe` cannot be
+/// deleted (Windows locks a running image) is left whole, and so is one used or written in the
+/// last hour, which another launch, possibly in another Crystal process, may be preparing.
+fn prune_versioned(crystal: &Path, keep: &Path) {
+    let recent = |p: &Path| {
+        fs::metadata(p).and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().map_or(true, |age| age < std::time::Duration::from_secs(3600)))
+    };
+    for entry in fs::read_dir(crystal).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if path == keep || name.len() != 8 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        // A plain folder only: never follow a link out of Crystal's own folder.
+        if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
+            continue;
+        }
+        let host = path.join("pol.exe");
+        if recent(&host) || recent(&path) || (host.exists() && fs::remove_file(&host).is_err()) {
+            continue;
+        }
+        let _ = fs::remove_dir_all(&path);
     }
-    // In use by a running game (or otherwise unreplaceable): a versioned copy beside it.
-    let versioned = root.join("crystal").join(&hash[..8.min(hash.len())]).join("pol.exe");
-    if !has_hash(&versioned, hash) {
-        write(&versioned, bytes, hash)?;
-    }
-    Ok(versioned)
 }
 
 #[cfg(test)]
@@ -156,6 +186,44 @@ mod tests {
         }
         assert!(has_hash(&root.join("crystal").join("pol.exe"), &hash));
         assert!(fs::read_dir(root.join("crystal")).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn stale_versioned_hosts_are_pruned_and_running_or_new_ones_kept() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::time::{Duration, SystemTime};
+        let root = temp("prune");
+        let crystal = root.join("crystal");
+        let age = |path: &Path, when: SystemTime| {
+            // FILE_WRITE_ATTRIBUTES; FILE_FLAG_BACKUP_SEMANTICS opens a folder too.
+            fs::OpenOptions::new().access_mode(0x0100).custom_flags(0x0200_0000).open(path).unwrap().set_modified(when).unwrap();
+        };
+        let old = SystemTime::now() - Duration::from_secs(7200);
+        let make = |name: &str, when: SystemTime| {
+            let dir = crystal.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            for file in ["pol.exe", "D3D8.dll", "dgVoodoo.conf"] {
+                fs::write(dir.join(file), file).unwrap();
+                age(&dir.join(file), when);
+            }
+            age(&dir, when);
+            dir
+        };
+        let stale = make("0badc0de", old);
+        let running = make("deadbeef", old);
+        let fresh = make("cafef00d", SystemTime::now());
+        let foreign = make("my-notes", old);
+        // A running image can be read but not deleted.
+        let held = fs::OpenOptions::new().read(true).share_mode(1).open(running.join("pol.exe")).unwrap();
+        let bytes = b"loader one";
+        let path = extract_into(&root, bytes, &sha256_hex(bytes)).unwrap();
+        assert_eq!(path, crystal.join("pol.exe"));
+        assert!(!stale.exists(), "an old host and its dgVoodoo files go");
+        assert!(running.join("pol.exe").exists() && running.join("D3D8.dll").exists());
+        assert!(fresh.join("pol.exe").exists());
+        assert!(foreign.join("pol.exe").exists());
+        drop(held);
         fs::remove_dir_all(&root).unwrap();
     }
 

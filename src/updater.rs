@@ -2,6 +2,7 @@
 //! The packet, manifest, and patch codecs are implemented in this crate.
 //! Downloaded manifests describe desired files; only a verified transaction can
 //! advance patch.ver. Check never creates updater state or changes the install.
+mod download;
 mod lz;
 mod manifest;
 mod installer_baseline;
@@ -46,31 +47,21 @@ const FULL_CHECK_MARKER: &str = ".xi-updater/full-check";
 const SIGNATURE_BUFFER_LEN: usize = 1 << 20;
 const MAX_CHECK_WORKERS: usize = 8;
 const ACTIVE_GAME_CHECK_WORKERS: usize = 4;
-// Patch-server traffic follows stock POL (captures 2026-10-13 00:21 and the complete
-// update stock-update-20261013-004932: stock POL updating FFXI 30260904_1 → 30261006_0
-// on pc001W2U.pol.com:53001 = 124.150.156.107, every SYN with the `stock_socket`
-// options): the W20 version request on its own connection, FIN ~100 ms
-// after its 103 B reply; a 24 B POLP command 1 on a new connection for the file list,
-// FIN ~114 ms after the reply; then ONE connection carries every download as POLP
-// command 3 requests (byte-identical to `polp::file_request`), strictly one in flight:
-// request → the whole reply (≤ one 64 KB chunk) → next request. A file is fetched as
-// consecutive 64 KB chunks from offset 0, each next chunk requested at once (median
-// 0.7 ms after the reply); the next file follows its predecessor's local processing
-// (median 18 ms, growing with size, 3-239 ms). 422 requests for 360 files (298 deltas,
-// 62 full files), 14 MB, FIN 100 ms after the last reply. No version check followed the
-// update. Crystal used 8 parallel plain sockets before. Each rule here is one setting.
-// Every wire-visible pause runs on a high-resolution timer (`precise_sleep`).
-// Downloads use that one stop-and-wait connection (`stage_plan_shared`, `Session::exchange`).
-/// Least time from the last reply of one file to the request for the next file, drawn per
-/// file by what the previous file was (`next_file_pause`); Crystal's own processing of the
-/// finished file counts toward it. Stock's gap there is processing time
-/// (stock-update-20261013-004932, 359 new-file requests): after a delta never under
-/// 11.5 ms (delta → delta min 13.4, median 19.4, n=245; delta → direct min 11.5, n=52),
-/// longer after big files; after a 24 B direct file median 8.4, min 3.3 (n=46).
-const PAUSE_AFTER_DELTA: (Duration, Duration) = (Duration::from_millis(12), Duration::from_millis(25));
-const PAUSE_AFTER_SMALL_DIRECT: (Duration, Duration) = (Duration::from_millis(3), Duration::from_millis(9));
-/// A direct file up to this transfer size is "small" for `next_file_pause`.
-const SMALL_DIRECT: u64 = 1024;
+// Patch-server traffic: the W20 version request and the file list (POLP command 1) each
+// use their own stock-shaped connection (`stock_socket`), closed ~100 ms after the reply,
+// as stock POL does (captures 2026-10-13). Downloads then run on up to
+// `MAX_DOWNLOAD_WORKERS` plain connections (`download`, owner decision 2026-11-12: downloads
+// are not stock-shaped), all serving one queue of 64 KB chunks (POLP command 3,
+// `polp::file_request`) with up to `download::MAX_DEPTH` requests pipelined on each: the
+// server answers pipelined requests in order (live probe, docs/downloader-design.md 2.2).
+/// Download connections at most. In a slow period each flow is bandwidth-limited, so
+/// throughput grows with connections: 2026-11-12 `download_concurrency_bench`,
+/// 1/4/8/12/16 → 0.01/0.04/0.11/0.17/0.24 MB/s, 8 again 0.13.
+const MAX_DOWNLOAD_WORKERS: usize = 16;
+/// Estimated decode buffers (`download_memory_mib`), held while a downloaded group is decoded
+/// and verified. A scheduling bound so large files never decode at once, not a process memory
+/// limit; the network side streams to part files and needs none of it.
+const DOWNLOAD_BUDGET_MIB: u32 = 1024;
 /// From Crystal's FIN on a patch connection to the SYN of its next connection to the same
 /// server. Stock (captures 2026-10-13 00:21 and 00:49): W20 FIN → idle prompt SYN +109 and
 /// +110 ms, its FIN → file-list SYN +107 and +105 ms; never a SYN within 100 ms of a FIN.
@@ -298,6 +289,9 @@ async fn run_combined_at(viewer: Option<PathBuf>, game: Option<PathBuf>, mode: M
         path.map(|path| { ensure_plain(&path)?; fs::canonicalize(path).map_err(|e| e.to_string()) }).transpose()
     };
     let (viewer, game) = (canonical(viewer)?, canonical(game)?);
+    // The manifest, tags and deployment here are the US Viewer's: an EU or Japanese Viewer is
+    // never checked against them or given their files.
+    if let Some(viewer) = &viewer { crate::retail_region::refuse_update(viewer)?; }
     if let (Some(viewer), Some(game)) = (&viewer, &game) {
         if viewer == game || viewer.starts_with(game) || game.starts_with(viewer) {
             return Err(t("Choose separate PlayOnline and FINAL FANTASY XI installation folders.").to_owned().into());
@@ -420,7 +414,7 @@ async fn prepare_with(product: Product, install: PathBuf, mode: Mode, operation:
             Some(play) => {
                 if !product.valid_stamp(&play.official) { return Err(t("Official version response is invalid").into()); }
                 operation.progress(Stage::Manifest, 0, 1, t("Starting the update"));
-                hold_prompt(product, server, play.prompt, operation).await?;
+                hold_prompt(server, play.prompt, operation).await?;
                 play.official.clone()
             }
             None => {
@@ -523,7 +517,7 @@ fn parse_list(product: Product, text: &[u8]) -> Result<Manifest, String> {
 /// The version request on its own stock connection, closed like stock after the reply
 /// (capture 2026-10-13 00:21: 88 B request, 103 B reply, FIN ~110 ms later).
 async fn official_version(product: Product, server: &str, installed: &str, operation: &Operation) -> Result<String, String> {
-    let mut session = Session::connect_to(product, server, operation).await?;
+    let mut session = Session::connect_to(server, operation).await?;
     let frame = session.exchange(&polp::version(&product.tags(), installed.as_bytes()), polp::kind::VERSION_REPLY, operation).await?;
     session.close().await;
     let version = polp::parse_version_reply(&frame[16..])?;
@@ -536,8 +530,8 @@ async fn official_version(product: Product, server: &str, installed: &str, opera
 /// The idle connection stock opens while its "update?" prompt shows (`PROMPT_HOLD`): connect
 /// (after `NEXT_CONNECTION_GAP` from the W20's FIN), send nothing for `hold`, then FIN. A
 /// cancel closes it at once.
-async fn hold_prompt(product: Product, server: &str, hold: Duration, operation: &Operation) -> Result<(), String> {
-    let session = Session::connect_to(product, server, operation).await?;
+async fn hold_prompt(server: &str, hold: Duration, operation: &Operation) -> Result<(), String> {
+    let session = Session::connect_to(server, operation).await?;
     let held = tokio::select! {
         _ = tokio::time::sleep(hold) => Ok(()),
         cancelled = operation.cancelled_wait() => Err(cancelled),
@@ -549,7 +543,7 @@ async fn hold_prompt(product: Product, server: &str, hold: Duration, operation: 
 /// The file list (POLP command 1, 24 B) on a new stock connection, closed like stock
 /// ~0.1 s after the reply. Returns the decoded list text.
 async fn official_list(product: Product, server: &str, operation: &Operation) -> Result<Vec<u8>, String> {
-    let mut session = Session::connect_to(product, server, operation).await?;
+    let mut session = Session::connect_to(server, operation).await?;
     let frame = session.exchange(&polp::hello(&product.tags()), polp::kind::MANIFEST_REPLY, operation).await?;
     session.close().await;
     decode_payload(&frame[16..], MAX_MANIFEST)
@@ -699,7 +693,7 @@ const VIEWER_FREE_WAIT: Duration = Duration::from_secs(15);
 /// version that W2U's reply named). Stock's Viewer updates itself at Connect, before any
 /// credentials go out, with the patch client FFXI's update uses (capture
 /// stock-update-20261013-004932): no second version request, the idle prompt connection,
-/// the file list, one stop-and-wait download connection, then the install. The sign-in that
+/// the file list, parallel download connections, then the install. The sign-in that
 /// follows asks its own W2U, as the restarted stock Viewer does at its next Connect.
 /// Nothing is sent while PlayOnline's files are in use (`viewer_in_use`).
 pub(crate) async fn update_viewer_after_connect(viewer: PathBuf, official: String, operation: Operation) -> Result<CombinedReport, CombinedFailure> {
@@ -759,9 +753,10 @@ async fn stage_updates(updates: Vec<PreparedUpdate>, operation: &Operation) -> R
         let op = operation.component(update.product.label());
         let staged = confined(&update.root, &format!("{STATE_DIR}/staged"))?;
         fs::create_dir_all(&staged).map_err(|e| e.to_string())?;
+        let count = groups.len();
         let (ready, bytes) = stage_plan_shared(update.product, &update.server, &update.root, &staged, &update.manifest,
-            &groups, &op, &downloads, first).await?;
-        first += groups.len(); update.report.bytes = bytes;
+            groups, &op, &downloads, first).await?;
+        first += count; update.report.bytes = bytes;
         staged_updates.push((update, ready));
     }
     Ok(staged_updates)
@@ -889,14 +884,16 @@ impl Downloads {
     }
 }
 impl FileProgress {
-    fn advance(&self, bytes: u64, detail: String, reused: bool) {
+    /// `rebased`: bytes not transferred now (a verified copy, `u64::MAX` for all of it, or a
+    /// resumed part), which advance the fraction without counting toward the network rate.
+    fn advance(&self, bytes: u64, detail: String, rebased: bool) {
         let mut state = self.downloads.state.lock().unwrap_or_else(|e| e.into_inner());
         let (received, expected) = state.files[self.index];
-        let next = if reused { expected } else { received.saturating_add(bytes).min(expected) };
+        let next = received.saturating_add(bytes).min(expected);
         state.files[self.index].0 = next;
         state.done += next - received;
         // Published under this lock, so progress stays monotonic.
-        if reused {
+        if rebased {
             self.operation.progress_bytes_rebased(Stage::Download, state.done, state.total, detail);
         } else {
             self.operation.progress_bytes(Stage::Download, state.done, state.total, detail);
@@ -931,13 +928,29 @@ async fn stage_plan(
     let groups = stage_groups(product, m, planned);
     let downloads = Downloads::new(op.clone(), groups.iter()
         .map(|g| download_size(&m.files[g.source.index], &g.source.action)).collect());
-    stage_plan_shared(product, product.server(), root, staged, m, &groups, op, &downloads, 0).await
+    stage_plan_shared(product, product.server(), root, staged, m, groups, op, &downloads, 0).await
 }
 
-/// Stage `groups` (`stage_groups`) in order into the verified cache `staged`: each one reused
-/// when its verified copy is there, else downloaded on the one stop-and-wait connection
-/// (opened at the first download, closed like stock at the end). `first` is the first group's
-/// index in `downloads`.
+/// Estimated peak buffers of one download, in MiB: the encoded transfer, decoded output with
+/// Vec growth, a delta's base, and the full-file fallback. A file past the budget runs alone.
+fn download_memory_mib(history: &FileHistory, action: &Action) -> u32 {
+    let output = |sig: FileSig| sig.len.saturating_add(1).saturating_mul(2);
+    let current = history.current();
+    let mut peak = current.direct_len.saturating_add(output(current.sig));
+    if let Action::Deltas(from) = action {
+        let mut base = history.versions[from - 1].sig;
+        for version in &history.versions[*from..] {
+            let raw = version.indirect.as_ref().map_or(0, |delta| delta.len);
+            peak = peak.max(output(base).saturating_add(raw).saturating_add(output(version.sig)));
+            base = version.sig;
+        }
+    }
+    peak.saturating_add(2 * SIGNATURE_BUFFER_LEN as u64).div_ceil(1 << 20).clamp(1, DOWNLOAD_BUDGET_MIB as u64) as u32
+}
+
+/// Stage `groups` (`stage_groups`) into the verified cache `staged` through the download pool
+/// (`download::stage`). Returns what is ready, in group order, and the decoded bytes staged.
+/// `first` is the first group's index in `downloads`.
 #[allow(clippy::too_many_arguments)]
 async fn stage_plan_shared(
     product: Product,
@@ -945,66 +958,12 @@ async fn stage_plan_shared(
     root: &Path,
     staged: &Path,
     m: &Manifest,
-    groups: &[StageGroup],
+    groups: Vec<StageGroup>,
     op: &Operation,
     downloads: &Downloads,
     first: usize,
 ) -> Result<(Vec<Ready>, u64), String> {
-    let mut session: Option<Session> = None;
-    let mut ready = Vec::new();
-    let mut bytes = 0u64;
-    for (n, group) in groups.iter().enumerate() {
-        op.check_cancelled()?;
-        let item = &group.source;
-        let history = &m.files[item.index];
-        let current = history.current();
-        let transfer = downloads.file_scoped(first + n, op.clone());
-        let cache = staged.join(format!(
-            "{}-{}.bin",
-            hex_md5(if product == Product::Viewer { current.direct.as_bytes() } else { history.path.as_bytes() }),
-            hex_md5(format!("{:?}", current.sig).as_bytes())
-        ));
-        ensure_plain(&cache)?;
-        if cache.is_file() && signature(&cache, op)? == current.sig {
-            transfer.advance(0, tf("Reusing verified {path}", &[("path", &history.path)]), true);
-        } else {
-            if session.is_none() { session = Some(Session::connect_to(product, server, op).await?); }
-            let produced = produce(session.as_mut().unwrap(), root, history, &item.action, op, Some(&transfer)).await;
-            let data = match produced {
-                Ok(data) => data,
-                Err(e) if matches!(item.action, Action::Deltas(_)) && !op.cancelled() => {
-                    transfer.fallback(
-                        current.direct_len,
-                        tf("Delta failed for {path}; using full file ({error})", &[("path", &history.path), ("error", &e)]),
-                    );
-                    // A connection whose exchange stopped partway may still carry that reply:
-                    // close it like stock and open a new one, never a second request on it.
-                    if session.as_ref().is_none_or(|session| session.broken || session.stream.is_none()) {
-                        if let Some(old) = session.take() { old.close().await; }
-                        session = Some(Session::connect_to(product, server, op).await?);
-                    }
-                    produce(session.as_mut().unwrap(), root, history, &Action::Direct, op, Some(&transfer)).await?
-                }
-                Err(e) => return Err(e),
-            };
-            if FileSig::of(&data) != current.sig {
-                return Err(tf("{path}: downloaded signature mismatch", &[("path", &history.path)]));
-            }
-            op.check_cancelled()?;
-            save(&cache, &data)?;
-            if signature(&cache, op)? != current.sig {
-                return Err(tf("{path}: staged file did not verify", &[("path", &history.path)]));
-            }
-            bytes = bytes.saturating_add(data.len() as u64);
-        }
-        for target in &group.targets {
-            let history = &m.files[target.index];
-            op.complete_update_work(UpdateWork::Staging, staging_work(history, target), None);
-            ready.push((history.path.clone(), cache.clone(), current.sig, target.original));
-        }
-    }
-    if let Some(session) = session { session.close().await; }
-    Ok((ready, bytes))
+    download::stage(product, server, root, staged, m, groups, op, downloads, first, download::Tuning::default(), Default::default()).await
 }
 
 #[cfg(test)]
@@ -1393,43 +1352,23 @@ fn read_local_file(mut file: impl Read, op: &Operation, buffer: &mut [u8]) -> Re
     }, md5: d })
 }
 
-/// One patch-server connection on a stock-shaped socket (`stock_socket`: bound, 64 KB
-/// SO_RCVBUF/SO_SNDBUF before connect, Nagle and delayed ACK left alone). One request
-/// is in flight at a time: `exchange` writes a request and reads its whole reply.
+/// One patch-server connection. The version and list connections use a stock-shaped socket
+/// (`stock_socket`: bound, 64 KB SO_RCVBUF/SO_SNDBUF before connect) spaced
+/// `NEXT_CONNECTION_GAP` from the last FIN; download connections (`connect_download`) are
+/// plain no-delay sockets with Windows receive-window auto-tuning, opened by the download pool.
+/// The version and list connections `exchange` one request for its whole reply; a download
+/// connection pipelines requests (`send`) and reads their replies in order (`read_frame`).
 /// Every end closes like stock (`close`, or the same close on its own thread on `Drop`).
 struct Session {
     /// `None` once closed.
     stream: Option<tokio::net::TcpStream>,
-    product: Product,
     server: Arc<str>,
-    /// When the last reply on this connection ended: paces the next file
-    /// (`next_file_pause`) and times the close (`stock_socket::CLOSE_AFTER_REPLY`).
+    /// When the last reply on this connection ended: times the close
+    /// (`stock_socket::CLOSE_AFTER_REPLY`).
     replied: Option<Instant>,
-    /// The last file fetched on this connection, for `next_file_pause`.
-    previous: Option<Transfer>,
     /// An exchange stopped partway (I/O error, timeout or cancel): the stream may still carry
     /// that reply, so nothing is sent on it again, and its close reads the rest first.
     broken: bool,
-}
-/// One file a fetch asks for: a direct (full) file of its transfer size, or a delta.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Transfer { Direct(u64), Delta }
-
-/// The pause before a new file, by the previous one (`PAUSE_AFTER_DELTA`).
-fn next_file_pause(previous: Option<Transfer>) -> (Duration, Duration) {
-    match previous {
-        Some(Transfer::Direct(len)) if len <= SMALL_DIRECT => PAUSE_AFTER_SMALL_DIRECT,
-        _ => PAUSE_AFTER_DELTA,
-    }
-}
-
-/// A wire-visible pause on a high-resolution timer. tokio's timer on Windows wakes only on
-/// the ~15.6 ms system tick (its GetQueuedCompletionStatusEx timeout: 7 ms waits ~15.6,
-/// 115 ms up to ~131) unless the process raised the timer resolution, which Crystal never
-/// does; std's sleep uses a high-resolution waitable timer.
-async fn precise_sleep(duration: Duration) {
-    if duration.is_zero() { return; }
-    let _ = tokio::task::spawn_blocking(move || std::thread::sleep(duration)).await;
 }
 
 /// When Crystal last closed a connection to each patch server (`NEXT_CONNECTION_GAP`).
@@ -1538,9 +1477,16 @@ fn wait_closing(server: &str, limit: Duration) {
 }
 
 impl Session {
-    async fn connect_to(product: Product, server: &str, op: &Operation) -> Result<Self, String> {
-        let stream = cancel_io(stock_connect(server.to_owned()), op).await?;
-        Ok(Self { stream: Some(stream), product, server: server.into(), replied: None, previous: None, broken: false })
+    async fn connect_to(server: &str, op: &Operation) -> Result<Self, String> {
+        Self::open(server, false, op).await
+    }
+    /// A download connection: a plain socket, opened without waiting on other connections.
+    async fn connect_download(server: &str, op: &Operation) -> Result<Self, String> {
+        Self::open(server, true, op).await
+    }
+    async fn open(server: &str, plain: bool, op: &Operation) -> Result<Self, String> {
+        let stream = cancel_io(patch_connect(server.to_owned(), plain), op).await?;
+        Ok(Self { stream: Some(stream), server: server.into(), replied: None, broken: false })
     }
     /// The open stream (a closed session has none).
     fn stream(&mut self) -> Result<&mut tokio::net::TcpStream, String> {
@@ -1550,9 +1496,6 @@ impl Session {
     /// timed and sent on one blocking thread (`stock_socket::close_after_reply`). Returns
     /// after the FIN, which a next connection to this server spaces itself from.
     async fn close(mut self) {
-        self.shut().await;
-    }
-    async fn shut(&mut self) {
         let Some(stream) = self.stream.take() else { return };
         let (replied, broken) = (self.replied, self.broken);
         let closed = match stream.into_std() {
@@ -1562,45 +1505,12 @@ impl Session {
         };
         note_closed(&self.server, closed);
     }
-    /// Close this connection like stock, then open a new one to the same server (after
-    /// `NEXT_CONNECTION_GAP` from that FIN). A failed connect leaves the session closed.
-    async fn reconnect(&mut self, op: &Operation) -> Result<(), String> {
-        self.shut().await;
-        let mut fresh = Self::connect_to(self.product, &self.server.clone(), op).await?;
-        self.stream = fresh.stream.take();
-        (self.replied, self.broken) = (None, false);
-        Ok(())
-    }
-    async fn exchange(
-        &mut self,
-        request: &[u8],
-        expected: u32,
-        op: &Operation,
-    ) -> Result<Vec<u8>, String> {
+    /// One request and its whole reply (the version and list connections).
+    async fn exchange(&mut self, request: &[u8], expected: u32, op: &Operation) -> Result<Vec<u8>, String> {
         if self.broken { return Err(std::io::Error::from(std::io::ErrorKind::NotConnected).to_string()); }
-        // Until the whole reply is read, an early return leaves it on the wire.
-        self.broken = true;
-        let stream = self.stream()?;
-        cancel_io(stream.write_all(request), op).await?;
-        let mut head = [0u8; 4];
-        cancel_io(stream.read_exact(&mut head), op).await?;
-        let len = polp::declared_len(&head);
-        let cap = if expected == polp::kind::MANIFEST_REPLY {
-            16 * 1024 * 1024
-        } else {
-            128 * 1024
-        };
-        if !(16..=cap).contains(&len) {
-            return Err(tf("Invalid patch frame length {length}", &[("length", &len)]));
-        }
-        let mut data = vec![0u8; len];
-        data[..4].copy_from_slice(&head);
-        if expected == polp::kind::MANIFEST_REPLY {
-            read_manifest_body(stream, &mut data, op, Duration::from_secs(30)).await?;
-        } else {
-            cancel_io(stream.read_exact(&mut data[4..]), op).await?;
-        }
-        self.replied = Some(Instant::now());
+        self.send(request, op).await?;
+        let manifest = expected == polp::kind::MANIFEST_REPLY;
+        let data = self.read_frame(if manifest { 16 * 1024 * 1024 } else { 128 * 1024 }, Duration::from_secs(30), op, manifest).await?;
         self.broken = false;
         let p = polp::parse(&data)?;
         if p.kind != expected {
@@ -1611,101 +1521,77 @@ impl Session {
         }
         Ok(data)
     }
-    /// A direct (full) file.
-    #[cfg(test)]
-    async fn fetch(&mut self, path: &str, len: u64, op: &Operation) -> Result<Vec<u8>, String> {
-        self.fetch_tracked(path, len, Transfer::Direct(len), op, None).await
+    /// Write requests. Until their replies are read, the session is `broken`: an early return
+    /// leaves them on the wire.
+    async fn send(&mut self, requests: &[u8], op: &Operation) -> Result<(), String> {
+        self.broken = true;
+        cancel_io(self.stream()?.write_all(requests), op).await
     }
-    async fn fetch_tracked(&mut self, path: &str, len: u64, kind: Transfer, op: &Operation, progress: Option<&FileProgress>) -> Result<Vec<u8>, String> {
-        if len > MAX_FILE {
-            return Err(t("Download exceeds file limit").into());
+    /// Read one frame of at most `cap` bytes, failing after `idle` without a byte (never on a
+    /// slow frame that keeps arriving). `manifest`: publish the file list's progress.
+    async fn read_frame(&mut self, cap: usize, idle: Duration, op: &Operation, manifest: bool) -> Result<Vec<u8>, String> {
+        let stream = self.stream()?;
+        let mut head = [0u8; 4];
+        cancel_io_with_timeout(stream.read_exact(&mut head), op, idle).await?;
+        let len = polp::declared_len(&head);
+        if !(16..=cap).contains(&len) {
+            return Err(tf("Invalid patch frame length {length}", &[("length", &len)]));
         }
-        let mut data = Vec::with_capacity(len as usize);
-        if let Some(replied) = self.replied {
-            // A new file: stock asks for it after processing the last one.
-            let pause = crate::stock_socket::uniform(next_file_pause(self.previous)).saturating_sub(replied.elapsed());
-            precise_sleep(pause).await;
-        }
-        while (data.len() as u64) < len {
-            op.check_cancelled()?;
-            let offset = data.len() as u32;
-            let want = (len - data.len() as u64).min(polp::CHUNK_LEN as u64) as u32;
-            let request = polp::file_request(&self.product.tags(), path, offset, want);
-            // Up to 3 attempts per chunk. After a failed exchange the old connection closes
-            // like stock (its leftover reply read first) before the next SYN, and the new
-            // connection asks for the same chunk at the same offset.
-            let mut attempt = 0;
-            let frame = loop {
-                match self.exchange(&request, polp::kind::FILE_REPLY, op).await {
-                    Ok(frame) => break frame,
-                    Err(_) if attempt < 2 => {
-                        op.check_cancelled()?;
-                        attempt += 1;
-                        self.reconnect(op).await?;
-                    }
-                    Err(error) => return Err(tf("{path}: {error}", &[("path", &path), ("error", &error)])),
-                }
-            };
-            let body = &frame[16..];
-            let (got, chunk) = polp::file_chunk(body)?;
-            let name_len = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
-            let echoed = body
-                .get(12..12 + name_len)
-                .ok_or(t("Invalid echoed patch path"))?;
-            if got != offset
-                || chunk.len() != want as usize
-                || echoed != [path.as_bytes(), &[0]].concat()
-                || body.len() != 12 + name_len + chunk.len()
-            {
-                return Err(t("Patch chunk path, offset, or size mismatch").into());
-            }
-            data.extend_from_slice(chunk);
-            if let Some(progress) = progress {
-                progress.advance(chunk.len() as u64, path.to_owned(), false);
-            } else {
-                op.progress_bytes(Stage::Download, data.len() as u64, len, path.to_owned());
-            }
-        }
-        self.previous = Some(kind);
+        let mut data = vec![0u8; len];
+        data[..4].copy_from_slice(&head);
+        read_body(stream, &mut data, op, idle, manifest).await?;
+        self.replied = Some(Instant::now());
         Ok(data)
     }
 }
 /// Resolve `server` through the system resolver (A records only, `dns::resolve_server`),
-/// then connect a `stock_socket` after `NEXT_CONNECTION_GAP` from Crystal's last FIN to that
-/// server (on the blocking pool, so on a high-resolution clock) and hand it to tokio.
-async fn stock_connect(server: String) -> std::io::Result<tokio::net::TcpStream> {
+/// then connect on the blocking pool and hand the stream to tokio. A stock connection is a
+/// `stock_socket` opened `NEXT_CONNECTION_GAP` after Crystal's last FIN to that server; a
+/// `plain` (download) one is a default socket, opened at once.
+async fn patch_connect(server: String, plain: bool) -> std::io::Result<tokio::net::TcpStream> {
     let stream = tokio::task::spawn_blocking(move || {
         let addresses = crate::dns::resolve_server(&server)?;
-        // A drained close takes at most ~1 s (`drain` idle reads plus the stock close delay).
-        wait_closing(&server, Duration::from_secs(2));
-        std::thread::sleep(connect_gap(&server));
+        if !plain {
+            // A drained close takes at most ~1 s (`drain` idle reads plus the stock close delay).
+            wait_closing(&server, Duration::from_secs(2));
+            std::thread::sleep(connect_gap(&server));
+        }
         let started = Instant::now();
         let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, t("no address"));
         for address in addresses {
             let left = CONNECT_LIMIT.saturating_sub(started.elapsed());
             if left.is_zero() { break; }
-            match crate::stock_socket::connect(&address, left) {
+            let connected = if plain {
+                std::net::TcpStream::connect_timeout(&address.into(), left)
+            } else {
+                crate::stock_socket::connect(&address, left)
+            };
+            match connected {
                 Ok(stream) => return Ok(stream),
                 Err(error) => last = error,
             }
         }
         Err(last)
     }).await.map_err(std::io::Error::other)??;
+    // A pipeline is topped up one small request at a time: never wait for an ACK to send one.
+    if plain { stream.set_nodelay(true)?; }
     stream.set_nonblocking(true)?;
     tokio::net::TcpStream::from_std(stream)
 }
 
-// A manifest can take longer than 30 seconds while bytes keep arriving. Limit
-// inactivity between reads, not the duration of the entire bounded frame.
-async fn read_manifest_body<R: tokio::io::AsyncRead + Unpin>(
+// A manifest can take longer than 30 seconds, and a 64 KB chunk in a slow period several,
+// while bytes keep arriving. Limit inactivity between reads, not the duration of the entire
+// bounded frame. `manifest`: publish the file list's progress.
+async fn read_body<R: tokio::io::AsyncRead + Unpin>(
     stream: &mut R,
     data: &mut [u8],
     op: &Operation,
     idle_limit: Duration,
+    manifest: bool,
 ) -> Result<(), String> {
     let mut received = 4;
     let detail = t("Downloading the official file manifest");
-    op.progress_bytes(Stage::Manifest, received as u64, data.len() as u64, detail);
+    if manifest { op.progress_bytes(Stage::Manifest, received as u64, data.len() as u64, detail); }
     while received < data.len() {
         op.check_cancelled()?;
         let end = (received + 64 * 1024).min(data.len());
@@ -1714,7 +1600,7 @@ async fn read_manifest_body<R: tokio::io::AsyncRead + Unpin>(
             return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).to_string());
         }
         received += count;
-        op.progress_bytes(Stage::Manifest, received as u64, data.len() as u64, detail);
+        if manifest { op.progress_bytes(Stage::Manifest, received as u64, data.len() as u64, detail); }
     }
     Ok(())
 }
@@ -1762,38 +1648,6 @@ fn decode_payload(data: &[u8], max: usize) -> Result<Vec<u8>, String> {
     }
     Ok(out)
 }
-async fn produce(
-    session: &mut Session,
-    root: &Path,
-    h: &FileHistory,
-    action: &Action,
-    op: &Operation,
-    progress: Option<&FileProgress>,
-) -> Result<Vec<u8>, String> {
-    match action {
-        Action::Direct => {
-            let len = h.current().direct_len;
-            let raw = session
-                .fetch_tracked(&h.current().direct, len, Transfer::Direct(len), op, progress)
-                .await?;
-            decode_payload(&raw, h.current().sig.len as usize)
-        }
-        Action::Deltas(from) => {
-            let mut data = read_delta_base(&confined(root, &h.path)?, h.versions[from - 1].sig, op)?;
-            for v in &h.versions[*from..] {
-                op.check_cancelled()?;
-                let d = v.indirect.as_ref().ok_or(t("Missing delta"))?;
-                let raw = session.fetch_tracked(&d.path, d.len, Transfer::Delta, op, progress).await?;
-                data = lz::apply_indirect_bounded(&raw, &data, v.sig.len as usize)?;
-                if FileSig::of(&data) != v.sig {
-                    return Err(tf("{path}: delta signature mismatch", &[("path", &h.path)]));
-                }
-            }
-            Ok(data)
-        }
-    }
-}
-
 fn read_delta_base(path: &Path, expected: FileSig, op: &Operation) -> Result<Vec<u8>, String> {
     op.check_cancelled()?;
     ensure_plain(path)?;
@@ -2582,7 +2436,7 @@ mod tests {
         assert_eq!((op.snapshot().done, op.snapshot().total), (30, 320));
         delta.advance(90, "full file".into(), false);
         assert_eq!((op.snapshot().done, op.snapshot().total), (120, 320));
-        downloads.file(1).advance(0, "verified cache".into(), true);
+        downloads.file(1).advance(u64::MAX, "verified cache".into(), true);
         assert_eq!((op.snapshot().done, op.snapshot().total), (320, 320));
         assert_eq!(op.snapshot().remaining, Some(Duration::ZERO));
     }
@@ -2611,7 +2465,7 @@ mod tests {
                 assert_eq!(progress.total, expected.len() as u64);
             }
         };
-        let received = read_manifest_body(&mut reader, &mut data, &op, idle_limit);
+        let received = read_body(&mut reader, &mut data, &op, idle_limit, true);
         let ((), result) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(send, received)
         }).await.expect("the progressing manifest must complete");
@@ -2626,11 +2480,11 @@ mod tests {
         let (mut reader, writer) = tokio::io::duplex(64);
         let mut data = [0; 32];
         let op = Operation::new();
-        let error = read_manifest_body(&mut reader, &mut data, &op, Duration::from_millis(40)).await.unwrap_err();
+        let error = read_body(&mut reader, &mut data, &op, Duration::from_millis(40), true).await.unwrap_err();
         assert_eq!(error, t("Patch server timed out"));
         assert_eq!(op.snapshot().done, 4);
         drop(writer);
-        let error = read_manifest_body(&mut reader, &mut data, &op, Duration::from_secs(30)).await.unwrap_err();
+        let error = read_body(&mut reader, &mut data, &op, Duration::from_secs(30), true).await.unwrap_err();
         assert_eq!(error, std::io::Error::from(std::io::ErrorKind::UnexpectedEof).to_string());
         let (mut reader, _writer) = tokio::io::duplex(64);
         let result = tokio::time::timeout(Duration::from_secs(1), async {
@@ -2639,7 +2493,7 @@ mod tests {
                 op.cancel();
             };
             let (_, result) = tokio::join!(cancel,
-                read_manifest_body(&mut reader, &mut data, &op, Duration::from_secs(30)));
+                read_body(&mut reader, &mut data, &op, Duration::from_secs(30), true));
             result
         }).await;
         assert!(result.expect("cancellation must interrupt the pending read").is_err());

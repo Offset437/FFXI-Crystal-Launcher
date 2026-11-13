@@ -19,6 +19,17 @@ fn a_sign_in_marks_itself_done_before_its_completion_is_sent() {
     assert_eq!(events.try_iter().count(), 2);
 }
 #[test]
+fn the_row_shut_down_ends_only_its_own_game() {
+    let mut app=app();
+    for (i,row) in app.accounts.iter_mut().enumerate() {
+        row.pid=Some(100+i as u32); row.busy=false; row.selected=true;
+        row.game_running=Some(Arc::new(AtomicBool::new(true)));
+        row.alive=Some(Arc::new(AtomicBool::new(true)));
+    }
+    assert_eq!(app.update(Message::ShutdownAccount(app.accounts[1].key.clone())).units(),1);
+    assert!(app.accounts[1].shutting_down && !app.accounts[0].shutting_down);
+}
+#[test]
 fn game_shutdown_selection_is_scoped_and_stays_signed_out_with_the_setting_off() {
     let mut app=app();
     for (i,row) in app.accounts.iter_mut().enumerate() {
@@ -49,6 +60,58 @@ fn game_shutdown_selection_is_scoped_and_stays_signed_out_with_the_setting_off()
     app.accounts[1].launch_generation+=1; app.accounts[1].pid=Some(999);
     let _=app.update(Message::GameShutdownFinished(key,generation,Ok(())));
     assert_eq!(app.accounts[1].pid,Some(999),"a stale result cannot clear a fresh launch");
+}
+
+#[test]
+fn close_games_instantly_is_off_by_default_persists_and_picks_the_instant_shutdown() {
+    use session_worker::game_shutdown::Mode;
+    let root = std::env::temp_dir().join(format!("crystal-instant-close-{}", backend::unique_id().unwrap()));
+    let mut saved = app();
+    assert!(!saved.settings.close_games_instantly);
+    assert!(serde_json::to_value(Settings::default()).unwrap().get("close_games_instantly").is_none(), "older files stay unchanged");
+    saved.config = Config { experiment: root.clone(), repository: root.join("runtime"), game_install: None, dat_overlays: Vec::new() };
+    saved.preview = false;
+    let _ = saved.update(Message::CloseGamesInstantly(true));
+    assert!(load_settings(&saved.config).unwrap().close_games_instantly, "the switch is saved");
+    let _ = saved.update(Message::CloseGamesInstantly(false));
+    assert!(!load_settings(&saved.config).unwrap().close_games_instantly);
+    drop(saved);
+    std::fs::remove_dir_all(&root).unwrap();
+    assert_eq!(Mode::from_setting(false), Mode::Graceful);
+    assert_eq!(Mode::from_setting(true), Mode::Instant);
+
+    // Shut down (one game, then all) takes the instant path while the switch is on.
+    let mut app = app();
+    app.settings.close_games_instantly = true;
+    for (i, row) in app.accounts.iter_mut().enumerate() {
+        row.pid = Some(100 + i as u32); row.busy = false; row.selected = i == 0;
+        row.game_running = Some(Arc::new(AtomicBool::new(true)));
+        row.alive = Some(Arc::new(AtomicBool::new(true)));
+    }
+    assert_eq!(app.update(Message::ShutdownSelected).units(), 1);
+    assert!(app.accounts[0].shutting_down && app.accounts[0].shutdown_mode == Mode::Instant);
+    assert_eq!(app.accounts[0].status_text(), t("Closing FFXI…"));
+    app.settings.close_games_instantly = false;
+    let others = app.shutdown_count(false);
+    assert_eq!(others, app.accounts.iter().filter(|row| row.is_playing()).count() - 1, "the running instant close is not repeated");
+    assert_eq!(app.update(Message::ShutdownAll).units(), others);
+    assert_eq!(app.accounts[1].shutdown_mode, Mode::Graceful);
+    assert_eq!(app.accounts[1].status_text(), t("Shutting down FFXI…"));
+    assert_eq!(app.accounts[0].shutdown_mode, Mode::Instant);
+
+    // The ended host reports a normal close: no problem, no crash recovery, no network wait.
+    let key = app.accounts[0].key.clone(); let generation = app.accounts[0].launch_generation;
+    let _ = app.update(Message::GameShutdownFinished(key, generation, Ok(())));
+    let report = launch_log::classify_loader_end(&launch_log::LoaderEnd::Terminated, Duration::from_secs(1));
+    assert!(!report.is_problem() && !report.during_startup);
+    *app.accounts[0].outcome.get_or_insert_with(Default::default).lock().unwrap() = Some(report.clone());
+    app.accounts[0].alive.as_ref().unwrap().store(false, Ordering::Release);
+    let _ = app.update(Message::Tick);
+    let row = &app.accounts[0];
+    assert!(row.pid.is_none() && !row.problem && !row.shutting_down);
+    assert_eq!(row.status_text(), t("Game closed normally"));
+    assert!(row.network_wait.is_none());
+    assert_eq!(features::recovery::classify(Some(&report), false, false), features::recovery::EndKind::UserClosed);
 }
 
 #[test]
@@ -881,6 +944,101 @@ fn a_playonline_update_that_cannot_run_says_why_on_the_row() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// `index`'s sign-in (started by `trigger`) ends with `error`.
+fn sign_in_fails(app: &mut App, index: usize, trigger: launch_timing::LaunchTrigger, error: &str) {
+    let row = &mut app.accounts[index];
+    (row.busy, row.preparing_session, row.presign_login) = (true, trigger.is_presign(), trigger.is_presign());
+    row.launch_trigger = Some(trigger);
+    let key = row.key.clone();
+    app.worker_event(WorkerEvent::Complete(key, Err(error.to_owned())));
+}
+
+/// Live 2026-11-12 17:56 (Crystal 1.2.6): a reinstalled PlayOnline, older than a version a real
+/// check told, or never updated. The pre-launch gate refuses it from local evidence, before any
+/// host starts, and that Play runs PlayOnline's update exactly as a W2U's "outdated" does,
+/// except that the update asks the server for its version itself (no version to trust). A
+/// sign-in Crystal starts again after that update, still refused, starts no second update.
+#[test]
+fn an_outdated_install_refused_before_the_host_updates_playonline_from_that_play() {
+    use launch_timing::LaunchTrigger;
+    i18n::set(i18n::Lang::En);
+    let (mut app, root) = play_update_app("viewer-stale", None);
+    app.patch = None;
+    let key = app.accounts[0].key.clone();
+    let refusal = viewer::stale_message("Not initialized");
+    sign_in_fails(&mut app, 0, LaunchTrigger::Play, &refusal);
+    assert!(app.maintenance == Some(MaintenanceKind::Update), "{}", app.status);
+    assert_eq!(app.update_scope, (true, false), "PlayOnline only");
+    assert_eq!(app.play_updates.viewer_started, [None], "no W2U answer to reuse: the update asks the server once");
+    assert!(app.viewer.as_ref().is_some_and(|status| status.stale && status.requires_update()));
+    assert_eq!(account_row::row_state(&app, &app.accounts[0]), account_row::RowState::ViewerUpdating);
+    assert!(!app.accounts[0].problem);
+    let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Ok("Updated".into()), None));
+    assert_eq!(app.launches.as_ref().unwrap().len(), 1);
+    assert_eq!(app.launches.as_ref().unwrap()[0].0, [key.clone()]);
+    // Its start again is still refused: no loop.
+    sign_in_fails(&mut app, 0, LaunchTrigger::ReissuedPlay, &refusal);
+    assert!(app.maintenance.is_none() && app.refused_plays.is_empty() && app.play_updates.viewer_started.len() == 1);
+    assert!(app.accounts[0].problem && app.accounts[0].status == refusal, "{}", app.accounts[0].status);
+    // The user's next Play tries the update once more.
+    sign_in_fails(&mut app, 0, LaunchTrigger::Play, &refusal);
+    assert!(app.maintenance == Some(MaintenanceKind::Update) && app.play_updates.viewer_started.len() == 2);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// The host's core check is the safety net: an old core it refuses (the owner's "service 463
+/// (PlayOnline sign-in) is missing from the function table") reads as PlayOnline's update, which
+/// runs from the sign-in that hit it (Crystal's own startup sign-in too). The row never shows
+/// the service number. A core still refused right after a successful update keeps the host's
+/// own reason and starts nothing more.
+#[test]
+fn a_core_check_that_finds_an_old_core_updates_playonline() {
+    use launch_timing::LaunchTrigger;
+    i18n::set(i18n::Lang::En);
+    let (mut app, root) = play_update_app("viewer-core", None);
+    app.patch = None;
+    let keys: Vec<String> = app.accounts.iter().map(|row| row.key.clone()).collect();
+    app.settings.auto_sign_in = true;
+    app.settings.account_no_otp.extend(keys.iter().cloned());
+    let core = "Game loader error during startup: PlayOnline core check failed: service 463 (PlayOnline sign-in) is missing from the function table. (Windower 4 via crystal-loader).";
+    sign_in_fails(&mut app, 0, LaunchTrigger::StartupSignIn, core);
+    assert!(app.maintenance == Some(MaintenanceKind::Update), "{}", app.status);
+    assert_eq!(app.play_updates.viewer_started, [None]);
+    assert!(app.viewer.as_ref().is_some_and(|status| status.stale && status.requires_update()));
+    assert!(!app.status.contains("service 463"), "{}", app.status);
+    assert!(app.accounts.iter().all(|row| !row.status.contains("service 463")));
+    let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Ok("Updated".into()), None));
+    let started: Vec<_> = app.launches.as_ref().unwrap().iter().map(|(keys, social, _, trigger)| (keys.clone(), *social, *trigger)).collect();
+    assert_eq!(started, [(vec![keys[0].clone()], true, Some(LaunchTrigger::StartupSignIn))], "signs in again as it was");
+    // The same core refused again after that update: the host's reason, no second update.
+    sign_in_fails(&mut app, 0, LaunchTrigger::StartupSignIn, core);
+    assert!(app.maintenance.is_none() && app.refused_plays.is_empty() && app.play_updates.viewer_started.len() == 1);
+    assert!(app.accounts[0].problem && app.accounts[0].status.contains("service 463"), "{}", app.accounts[0].status);
+    // Another core failure (a patched core) is not an update.
+    let patched = "Game loader error during startup: PlayOnline core check failed: service 463 (PlayOnline sign-in) does not point into the core's code. (Windower 4 via crystal-loader).";
+    let (mut other, other_root) = play_update_app("viewer-core-patched", None);
+    sign_in_fails(&mut other, 0, LaunchTrigger::Play, patched);
+    assert!(other.maintenance.is_none() && other.refused_plays.is_empty() && other.accounts[0].status == patched);
+    std::fs::remove_dir_all(other_root).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// No host parks against a PlayOnline known to need its update (its core may be too old to
+/// park, and the update closes every park), nor while sign-ins wait for that update.
+#[test]
+fn no_park_starts_while_playonline_needs_its_update() {
+    let mut app = app();
+    app.viewer = Some(viewer_report(patch::PatchState::Current));
+    assert_eq!(app.park_keys().len(), 3);
+    app.viewer = Some(viewer::stale(app.viewer.take()));
+    assert!(app.park_keys().is_empty());
+    app.viewer = Some(viewer_report(patch::PatchState::Required));
+    assert!(app.park_keys().is_empty());
+    app.viewer = None;
+    app.refused_plays.push(RefusedSignIn { key: app.accounts[0].key.clone(), clicked: Instant::now(), sign_in: None });
+    assert!(app.park_keys().is_empty(), "sign-ins wait for that update");
+}
+
 
 #[test]
 fn reshade_toggle_preserves_a_running_sessions_renderer() {
@@ -1251,7 +1409,8 @@ fn successful_official_setup_rescans_installation_and_failed_setup_does_not() {
     let mut app = app();
     app.preview = false;
     app.maintenance = Some(MaintenanceKind::Setup);
-    assert_eq!(app.update(Message::MaintenanceFinished(MaintenanceKind::Setup, Ok("Setup closed".into()), None)).units(), 2);
+    // The installation, the Viewer, and the installed PlayOnline editions.
+    assert_eq!(app.update(Message::MaintenanceFinished(MaintenanceKind::Setup, Ok("Setup closed".into()), None)).units(), 3);
     assert!(app.installation_loading && app.viewer_loading);
     app.installation_loading = false;
     app.maintenance = Some(MaintenanceKind::Setup);
@@ -1842,10 +2001,44 @@ fn installer_buttons_select_their_folder_on_click_and_report_invalid_paths() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// Downloads → Install's region: US with nothing installed, an installed client's region until one
+/// is chosen, then the saved choice. The default folder follows it; a picked folder stays.
+#[test]
+fn the_installer_region_defaults_to_the_installed_client_and_the_choice_is_saved() {
+    use retail_region::RetailRegion::{Eu, Jp, Us};
+    let root = std::env::temp_dir().join(format!("crystal-installer-region-{}", backend::unique_id().unwrap()));
+    let mut app = app();
+    app.preview = false;
+    app.config.experiment = root.clone();
+    app.viewer = None;
+    app.settings.installer_path = settings::installer_folder(Us);
+    assert_eq!(app.installer_region(), Us);
+    let _ = app.update(Message::PolEditions(vec![Eu]));
+    assert_eq!((app.installer_region(), app.settings.installer_path.clone()), (Eu, settings::installer_folder(Eu)));
+    assert!(app.settings.installer_path.ends_with("official-installer-EU"));
+    let _ = app.update(Message::InstallerRegion(2));
+    assert_eq!((app.installer_region(), app.settings.installer_path.clone()), (Jp, settings::installer_folder(Jp)));
+    let saved = load_settings(&app.config).unwrap();
+    assert_eq!((saved.installer_region, saved.installer_path), (Some(2), settings::installer_folder(Jp)));
+    // A saved choice outranks the installed client; a folder the user picked is kept.
+    let _ = app.update(Message::PolEditions(vec![Us]));
+    assert_eq!(app.installer_region(), Jp);
+    app.settings.installer_path = root.join("mine").to_string_lossy().into_owned();
+    let _ = app.update(Message::InstallerRegion(0));
+    assert_eq!((app.installer_region(), app.settings.installer_path.clone()), (Us, root.join("mine").to_string_lossy().into_owned()));
+    // Not while an installer step runs, nor an unknown region.
+    app.maintenance = Some(MaintenanceKind::Download);
+    let _ = app.update(Message::InstallerRegion(1));
+    app.maintenance = None;
+    let _ = app.update(Message::InstallerRegion(7));
+    assert_eq!(app.settings.installer_region, Some(0));
+    let _ = std::fs::remove_dir_all(root);
+}
+
 fn viewer_report(state: patch::PatchState) -> viewer::Status {
     viewer::Status { folder: Some(PathBuf::from(r"C:\fixture\PlayOnlineViewer")),
         version: patch::PatchReport { state, local_version: "20070101_E".into(), remote_version: "20110829_E".into(),
-            detail: "Viewer fixture".into(), files_verified: None }, core_error: None }
+            detail: "Viewer fixture".into(), files_verified: None }, core_error: None, stale: false }
 }
 
 #[test]
@@ -2041,6 +2234,40 @@ fn a_ready_update_restarts_by_itself_only_when_no_game_runs_and_nobody_uses_crys
     // Older settings files without the switch turn it on.
     let settings: Settings = serde_json::from_str(r#"{"install_path":""}"#).unwrap();
     assert!(settings.launcher_auto_restart);
+}
+
+/// 1.2.2 field report: FFXI returned to the Viewer, a batch Play relaunched it in the same
+/// signed-in sessions, and Crystal restarted for its update while those games were starting
+/// (every game closed). The batch's Ready clears busy and batch_pending, so `can_restart_launcher`
+/// alone said yes; a download landing then applied at once.
+#[test]
+fn an_update_never_restarts_while_a_game_relaunches_in_a_signed_in_session() {
+    use self_update::auto::COUNTDOWN;
+    let mut app = app_with_ready();
+    let downloaded = self_update::Msg::Downloaded(Ok(self_update::tests::fixture_stage("9.0.0")));
+    // Signed in at the Viewer after FFXI returned: nothing is lost by restarting.
+    let game = Arc::new(AtomicBool::new(false));
+    app.accounts[0].pid = Some(1234);
+    app.accounts[0].alive = Some(Arc::new(AtomicBool::new(true)));
+    app.accounts[0].game_running = Some(game.clone());
+    assert!(!app.game_active() && app.self_update_can_restart(&downloaded));
+    // Batch Play into that session: preparing.
+    app.accounts[0].batch_pending = true;
+    app.accounts[0].busy = true;
+    assert!(app.game_active() && !app.self_update_can_restart(&downloaded));
+    // The batch reported Ready (busy and batch_pending clear) and the game is starting.
+    app.accounts[0].batch_pending = false;
+    app.accounts[0].busy = false;
+    game.store(true, Ordering::Release);
+    assert!(app.can_restart_launcher(), "Crystal itself has no work in flight");
+    assert!(app.game_active());
+    assert!(!app.self_update_can_restart(&downloaded), "a finished download waits for the games");
+    assert!(app.self_update_can_restart(&self_update::Msg::Apply), "the pill's own click is unchanged");
+    // Ready meanwhile: the automatic restart never schedules while it runs.
+    let start = Instant::now();
+    assert!(matches!(app.auto_restart_step(start), Effect::None));
+    assert!(matches!(app.auto_restart_step(start + COUNTDOWN), Effect::None));
+    assert!(app.auto_restart.remaining(start + COUNTDOWN).is_none());
 }
 
 fn app_with_ready() -> App {
@@ -4870,4 +5097,51 @@ fn malicious_and_non_http_links_cannot_open() {
     ] {
         assert!(!allowed_link(url));
     }
+}
+
+/// Live 2026-11-13: three accounts were switched from Ashita to Windower while their Ashita
+/// sessions were signed in. Each Play was refused by the session ("before switching launch
+/// methods"), but the refusal sank the whole batch and no row said why. The refused row now
+/// says so, keeps no start flag, and can play again once signed out.
+#[test]
+fn a_play_refused_for_a_changed_launcher_flags_nothing_and_says_so() {
+    crate::i18n::set(crate::i18n::Lang::En);
+    let (mut app, root) = play_update_app("changed-launcher", None);
+    app.launches = None;
+    let key = idle_signed_in(&mut app, 0, 301);
+    let config = app.settings.config_for(&app.config, &app.accounts[0].account);
+    session_worker::save_live_record_with_tool_for_test(&config, &app.accounts[0].account, pol_less::Tool::Ashita);
+    app.accounts[0].account.launch_with = Some(backend::LaunchWith::Windower);
+    let _ = app.update(Message::Launch(key.clone()));
+    let row = &app.accounts[0];
+    assert!(row.problem && !row.busy && !row.batch_pending && !row.batch_requested && row.queued_play.is_none(), "{}", row.status);
+    assert!(row.can_play(), "nothing holds the row");
+    assert!(row.status.contains("before switching launch methods"), "{}", row.status);
+    assert!(app.status.contains("before switching launch methods"), "{}", app.status);
+    let view = crate::account_row::row_view(&app, &app.accounts[0]);
+    assert!(view.detail.contains("before switching launch methods"), "{}", view.detail);
+    assert!(matches!(view.action, Some((_, Message::Launch(_), true))), "Play is still offered");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// One refused account in a multi-account Play leaves the others to start together.
+#[test]
+fn one_refused_account_does_not_stop_the_others() {
+    let (mut app, root) = play_update_app("one-refused", None);
+    let count = app.accounts.len();
+    assert!(count >= 3, "{count}");
+    let mut keys = Vec::new();
+    for index in 0..count {
+        keys.push(idle_signed_in(&mut app, index, 310 + index as u32));
+        app.accounts[index].account.launch_with = Some(backend::LaunchWith::Ashita);
+        let config = app.settings.config_for(&app.config, &app.accounts[index].account);
+        session_worker::save_live_record_with_tool_for_test(&config, &app.accounts[index].account, pol_less::Tool::Ashita);
+    }
+    app.accounts[1].account.launch_with = Some(backend::LaunchWith::Windower);
+    let left = app.refuse_changed_launchers(keys.clone());
+    let expected: Vec<String> = keys.iter().enumerate().filter(|(index, _)| *index != 1).map(|(_, key)| key.clone()).collect();
+    assert_eq!(left, expected);
+    assert!(app.accounts[1].problem && app.accounts.iter().enumerate().all(|(index, row)| index == 1 || !row.problem));
+    assert_eq!(app.coordinated_keys(&left).len(), count - 1, "the others still go as one batch");
+    std::fs::remove_dir_all(root).unwrap();
 }

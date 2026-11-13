@@ -2,7 +2,7 @@
 //! FFXiEntry, and `GameStart`. Everything here runs on
 //! the game thread, which is a COM single-threaded apartment.
 
-use std::ffi::{c_void, CString};
+use std::ffi::{c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -22,6 +22,9 @@ type HRESULT = i32;
 
 use crate::pol_core::TABLE_LEN;
 
+// Each region's class and interface, as its official installer registers the class
+// (PlayOnlineViewer.msi Registry table: US and JP `polcore.dll`, EU `polcoreEU.dll`) and as
+// its core holds them: the three cores are one build that differs in these identifiers alone.
 const CLSID_POLCORE: [GUID; 3] = [
     GUID::from_u128(0x07974581_0DF6_4EF0_BD05_604B3ADA9BE9), // JP
     GUID::from_u128(0x3501F5DD_7894_42DF_866A_A2B6527D8049), // US
@@ -59,6 +62,70 @@ fn pol_language(area: i32, registry_language: i32) -> u32 {
     match area { 0 => 0, 1 => 1, _ => u32::try_from(registry_language).unwrap_or(1) }
 }
 
+/// The regional core in `viewer\com`: EU's own `polcoreEU.dll` (the US
+/// manifest's `patchfiles/playonlineviewer/viewer/com/polcoreeu.dll`, which
+/// app.dll's region filter keeps for EU only), else `polcore.dll`.
+pub(crate) fn polcore_name(region: Region) -> &'static str {
+    if region == Region::Eu { "polcoreEU.dll" } else { "polcore.dll" }
+}
+
+/// The regional Viewer app beside it (`appeu.dll` in the same manifest).
+fn app_name(region: Region) -> &'static str {
+    if region == Region::Eu { "appEU.dll" } else { "app.dll" }
+}
+
+/// US `POL_UCS_AREA_KBN`, decoded from the installed US `data\utf\env.dat`
+/// (pol-spec 01 §2.3). Kept for US whatever the session says.
+const US_UCS_AREA: &str = "01";
+
+/// Slot 1309's argument: US its verified value; EU/JP the value the launcher
+/// read from that install's env.dat, never a guess.
+fn ucs_area(region: Region, sent: Option<&str>) -> Result<&'static CStr, String> {
+    let value = match (region, sent) {
+        (Region::Us, _) => US_UCS_AREA,
+        (_, Some(value)) if value.len() == 2 && value.bytes().all(|b| b.is_ascii_digit()) => value,
+        _ => return Err(format!("PlayOnline region {}: POL_UCS_AREA_KBN is unknown, so the sign-in cannot start.", region.name())),
+    };
+    Ok(Box::leak(CString::new(value).expect("digits").into_boxed_c_str()))
+}
+
+fn guid_text(guid: &GUID) -> String {
+    let d = guid.data4;
+    format!("{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        guid.data1, guid.data2, guid.data3, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7])
+}
+
+/// The region-specific values an experimental (EU/JP) host uses, one log line
+/// each, so a tester's loader log shows exactly what was sent where. Nothing
+/// secret: identifiers, file and key names, and public config values.
+fn region_value_lines(region: Region, viewer: &Path, registry_language: i32, ucs_area: &str) -> Vec<String> {
+    let area = region.area_code();
+    let name = region.name();
+    let vendor = if region == Region::Jp { "Square" } else { "SquareEnix" };
+    vec![
+        format!("region {name} (experimental): area code {area} (SetAreaCode, CLSID/IID index)"),
+        format!("region {name}: polcore CLSID {} IID {}", guid_text(&CLSID_POLCORE[area as usize]), guid_text(&IID_POLCORE[area as usize])),
+        format!("region {name}: core {}, Viewer app {} (frame source)", viewer.join("viewer").join("com").join(polcore_name(region)).display(), app_name(region)),
+        format!("region {name}: registry root {} (slot 367); Viewer language {}\\{vendor}\\PlayOnlineViewer\\Settings Language = {registry_language}",
+            registry::playonline_key(region), registry::playonline_key(region)),
+        format!("region {name}: game language 1528({})", pol_language(area, registry_language)),
+        format!("region {name}: 965({}), 1527({}), 1309(POL_UCS_AREA_KBN \"{ucs_area}\")", u8::from(area != 0), u8::from(area == 0)),
+        // The US, EU and JP Viewer apps hold this one name (FFXIFullSetup_US/EU/JP app builds).
+        format!("region {name}: member login host {} (slot 868; the same in the US, EU and JP Viewer)", crate::native_auth::LOGIN_HOST.to_string_lossy()),
+    ]
+}
+
+/// An experimental host's step result in its log (US logs as before).
+fn region_step<T>(region: Region, step: &str, result: Result<T, String>) -> Result<T, String> {
+    if region.experimental() {
+        match &result {
+            Ok(_) => log!("region {}: {step}: ok", region.name()),
+            Err(error) => log!("region {}: {step}: failed: {error}", region.name()),
+        }
+    }
+    result
+}
+
 /// The core's COM interface, checked by structure before any of its methods
 /// runs (`pol_core::check_com`). Returns the core's layout for the table check.
 unsafe fn check_core_interface(core: &Com, module: HMODULE) -> Result<crate::pol_core::Layout, String> {
@@ -86,7 +153,7 @@ fn check_function_table(layout: &crate::pol_core::Layout, table: *mut usize) -> 
 /// frame-counted timers (auto-away, mail) run on.
 fn adopt_viewer_frame(viewer: &Path, region: Region) {
     let folder = viewer.join("viewer").join("com");
-    let file = if region == Region::Eu && folder.join("appEU.dll").is_file() { folder.join("appEU.dll") } else { folder.join("app.dll") };
+    let file = if folder.join(app_name(region)).is_file() { folder.join(app_name(region)) } else { folder.join("app.dll") };
     match std::fs::read(&file).map_err(|e| e.to_string()).and_then(|bytes| crate::pol_core::viewer_ticker(&bytes)) {
         Ok(us) => {
             crate::native_jobs::set_stock_frame_us(us);
@@ -109,6 +176,8 @@ pub struct GameOutcome {
 
 pub struct GameConfig {
     pub region: Region,
+    /// EU/JP: the install's POL_UCS_AREA_KBN from the session (`ucs_area`).
+    pub ucs_area: Option<String>,
     pub install_dir: Option<String>,
     pub pol_install_dir: Option<String>,
     pub native_auth: Option<proto::NativeCredentials>,
@@ -362,8 +431,7 @@ fn same_dll_path(a: &Path, b: &Path) -> bool {
 fn viewer_directory(selected: Option<&str>, registered: Option<&str>, region: Region) -> Result<PathBuf, String> {
     let directory = selected.or(registered).ok_or("PlayOnline Viewer folder not found; select an installed PlayOnline folder in Crystal.")?;
     let directory = PathBuf::from(directory);
-    let core = if region == Region::Eu { "polcoreEU.dll" } else { "polcore.dll" };
-    if !directory.is_absolute() || !directory.join("viewer").join("com").join(core).is_file() {
+    if !directory.is_absolute() || !directory.join("viewer").join("com").join(polcore_name(region)).is_file() {
         return Err("The selected PlayOnline folder does not contain the installed PlayOnline core.".into());
     }
     Ok(directory)
@@ -481,19 +549,19 @@ fn run_with(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<GameOutc
 }
 
 fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<GameOutcome, String> {
-    crate::controller_catalog::prefetch();
     let region = cfg.region;
     let area = region.area_code();
-    if region != Region::Us {
-        log!("warning: region {} is not verified; only US is", region.name());
+    if region.experimental() {
+        log!("note: region {} is experimental; its region values follow", region.name());
     }
+    let ucs_area = region_step(region, "POL_UCS_AREA_KBN", ucs_area(region, cfg.ucs_area.as_deref()))?;
 
     // --- selected/discovered paths, then read-only registry fallback ---
     let registered_viewer = registry::install_folder(region, "1000").map(|bytes| ansi_to_string(&bytes));
-    let viewer = viewer_directory(cfg.pol_install_dir.as_deref(), registered_viewer.as_deref(), region)?;
+    let viewer = region_step(region, "PlayOnline Viewer folder", viewer_directory(cfg.pol_install_dir.as_deref(), registered_viewer.as_deref(), region))?;
     let viewer_ansi = ansi_path(&viewer)?;
     let reg_ffxi = registry::install_folder(region, "0001").map(|b| ansi_to_string(&b));
-    let ffxi_dir = game_directory(cfg.install_dir.as_deref(), reg_ffxi.as_deref())?;
+    let ffxi_dir = region_step(region, "FINAL FANTASY XI folder", game_directory(cfg.install_dir.as_deref(), reg_ffxi.as_deref()))?;
     select_game_directory(ffxi_dir.clone())?;
     if let (Some(d), Some(r)) = (&cfg.install_dir, &reg_ffxi) {
         if !d.eq_ignore_ascii_case(r) {
@@ -502,16 +570,19 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
     }
     let lang = registry::viewer_language(region);
     log!("stage: paths: viewer={} ffxi={} area={area} lang={lang}", viewer.display(), ffxi_dir.display());
+    if region.experimental() {
+        for line in region_value_lines(region, &viewer, lang, &ucs_area.to_string_lossy()) { log!("{line}"); }
+    }
 
     // --- polcore ---
-    let polcore_name = if region == Region::Eu { "polcoreEU.dll" } else { "polcore.dll" };
+    let polcore_name = polcore_name(region);
     let polcore_path = viewer.join("viewer").join("com").join(polcore_name);
     let polcore_started = Instant::now();
-    let polcore = if cfg.pol_install_dir.is_some() {
-        create_from_dll(&CLSID_POLCORE[area as usize], &IID_POLCORE[area as usize], &polcore_path, "polcore")?
+    let polcore = region_step(region, "polcore creation", if cfg.pol_install_dir.is_some() {
+        create_from_dll(&CLSID_POLCORE[area as usize], &IID_POLCORE[area as usize], &polcore_path, "polcore")
     } else {
-        create(&CLSID_POLCORE[area as usize], &IID_POLCORE[area as usize], &polcore_path, "polcore")?
-    };
+        create(&CLSID_POLCORE[area as usize], &IID_POLCORE[area as usize], &polcore_path, "polcore")
+    })?;
     // Includes polcore's second-boundary spin (0.1-0.7 s; 08 §2), which a park absorbs.
     let polcore_time = polcore_started.elapsed();
     log!("local launch timing: polcore created in {:.3}s", polcore_time.as_secs_f64());
@@ -522,7 +593,7 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
         return Err(format!("{polcore_name} is not loaded after creating polcore"));
     }
     // SAFETY: a live core interface; only its vtable and methods are read.
-    let layout = match unsafe { check_core_interface(&polcore, pmod) } {
+    let layout = match region_step(region, "core interface check", unsafe { check_core_interface(&polcore, pmod) }) {
         Ok(layout) => layout,
         Err(error) => {
             crate::feature_check::report_pol(crate::pol_core::Layout::live(pmod as usize).ok().as_ref(), Err(&error));
@@ -559,7 +630,7 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
         }
         t
     };
-    let checked = check_function_table(&layout, tbl);
+    let checked = region_step(region, "SetAreaCode/SetParamInit and function table check", check_function_table(&layout, tbl));
     crate::feature_check::report_pol(Some(&layout), checked.as_ref().map_err(|e| e.as_str()));
     let checked = checked?;
     log!("{}", checked.summary(&layout));
@@ -581,9 +652,10 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
     // --- native: the Viewer's own startup and sign-in (pol-spec 01 §8) ---
     // SAFETY: the supported core owns this table and outlives the session's
     // scope; the leaked strings outlive the core.
-    let mut session = unsafe { crate::native_auth::NativeSession::bootstrap(table, &checked, &viewer, viewer_c, regkey, area, pol_language(area, lang), cfg.auto_away_minutes)? };
+    let mut session = region_step(region, "Viewer bootstrap (1528/125/367/965/1527/1309/871/824)",
+        unsafe { crate::native_auth::NativeSession::bootstrap(table, &checked, &viewer, viewer_c, regkey, area, pol_language(area, lang), ucs_area, cfg.auto_away_minutes) })?;
     session.set_viewer_gaps(cfg.viewer_gaps);
-    let signed_in = session.sign_in(credentials);
+    let signed_in = region_step(region, "sign-in", session.sign_in(credentials));
     if let Err(error) = signed_in {
         // The launcher's startup sign-out is the user's choice, not a
         // failure: end cleanly (exit 0) after the session's sign-out.
@@ -624,8 +696,11 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
             break GameOutcome { code: 0, message: String::new(), game_returned: false, modules_released: false };
         };
         events_game_ended(&outcome);
-        if !retain_native_session(cfg.keep_session, &outcome) {
-            if cfg.keep_session && outcome.game_returned && !outcome.modules_released {
+        let windower = windower_hook_loaded();
+        if !retain_native_session(cfg.keep_session, windower, &outcome) {
+            if cfg.keep_session && outcome.game_returned && windower {
+                log!("stage: this host ends after its game because Windower's Hook.dll keeps that game's state; the next game signs in a new host");
+            } else if cfg.keep_session && outcome.game_returned && !outcome.modules_released {
                 log!("stage: this host ends after its game because the game DLLs stayed loaded; the next game signs in a new host");
             }
             break outcome;
@@ -650,9 +725,18 @@ fn successful_native_return(hr: HRESULT, has_message_object: bool, message: &str
     hr == 0 && !has_message_object && message.is_empty()
 }
 
-/// Another game may follow in this host only on fresh game DLLs.
-fn retain_native_session(enabled: bool, outcome: &GameOutcome) -> bool {
-    enabled && outcome.game_returned && outcome.modules_released && matches!(outcome.code, 0 | -14)
+/// Another game may follow in this host only on fresh game DLLs, and never
+/// under Windower: Hook.dll stays loaded with the first game's state while
+/// FFXiMain reloads at a new base, and a second game there dies 16-20 s in.
+fn retain_native_session(enabled: bool, windower: bool, outcome: &GameOutcome) -> bool {
+    enabled && !windower && outcome.game_returned && outcome.modules_released && matches!(outcome.code, 0 | -14)
+}
+
+fn windower_hook_loaded() -> bool {
+    #[cfg(target_arch = "x86")]
+    return crate::hook_layout::hook_base().is_some();
+    #[cfg(not(target_arch = "x86"))]
+    false
 }
 
 /// `None`: the launcher's startup sign-out (acknowledged to it) came before the game took over.
@@ -663,6 +747,8 @@ fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], session: &mut crate
     // A game never starts on an earlier game's memory: both game DLLs must be
     // absent here, so this GameStart maps fresh copies.
     crate::game_modules::refuse_reuse()?;
+    // Before FFXiMain binds its d3d8.dll import.
+    crate::graphics::preload();
     // --- FFXi.dll ---
     let _boot_timing = crate::boot_timing::Run::begin();
     if let Err(e) = std::env::set_current_dir(ffxi_dir) {
@@ -696,6 +782,7 @@ fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], session: &mut crate
     let shutdown = crate::game_shutdown::Worker::start();
     #[cfg(target_arch = "x86")]
     crate::windower_plugin_settings::game_starting();
+    let awake = crate::awake::Awake::begin();
     log!("stage: calling FFXiEntry::GameStart");
     let mut message: *mut c_void = std::ptr::null_mut();
     // SAFETY: IFFXiEntry::GameStart(this, IUnknown* pol, IUnknown** msg); blocks for the session.
@@ -703,6 +790,7 @@ fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], session: &mut crate
         let start: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> HRESULT = ffxi.method(VT_GAME_START);
         start(ffxi.0, polcore.0, &mut message)
     };
+    drop(awake);
     log!("stage: GameStart returned hr={hr:#010x}");
     // Stop all input before game callbacks/interfaces can be detached or freed.
     log!("stage: stopping background shutdown worker");
@@ -978,6 +1066,45 @@ mod tests {
     }
 
     #[test]
+    fn region_tables_pick_each_regions_core_registry_and_ucs_area() {
+        // US exactly as before.
+        assert_eq!((polcore_name(Region::Us), app_name(Region::Us), registry::playonline_key(Region::Us)), ("polcore.dll", "app.dll", r"SOFTWARE\PlayOnlineUS"));
+        assert_eq!(ucs_area(Region::Us, None).unwrap().to_bytes(), b"01");
+        assert_eq!(ucs_area(Region::Us, Some("07")).unwrap().to_bytes(), b"01", "US never takes another value");
+        assert_eq!(Region::Us.area_code(), 1);
+        assert_eq!(guid_text(&CLSID_POLCORE[1]), "{3501F5DD-7894-42DF-866A-A2B6527D8049}");
+        // EU and JP: their own tables, never a guessed POL_UCS_AREA_KBN.
+        assert_eq!((polcore_name(Region::Eu), app_name(Region::Eu), registry::playonline_key(Region::Eu)), ("polcoreEU.dll", "appEU.dll", r"SOFTWARE\PlayOnlineEU"));
+        assert_eq!((polcore_name(Region::Jp), app_name(Region::Jp), registry::playonline_key(Region::Jp)), ("polcore.dll", "app.dll", r"SOFTWARE\PlayOnline"));
+        assert_eq!((Region::Jp.area_code(), Region::Eu.area_code()), (0, 2));
+        assert_eq!(guid_text(&CLSID_POLCORE[0]), "{07974581-0DF6-4EF0-BD05-604B3ADA9BE9}");
+        assert_eq!(guid_text(&IID_POLCORE[2]), "{DFEC2E93-4971-4A54-B8ED-63815C208C5A}");
+        // All six, in area-code order (JP 0, US 1, EU 2): the classes each region's
+        // PlayOnlineViewer.msi registers and the interfaces each region's core answers.
+        assert_eq!(CLSID_POLCORE.map(|guid| guid_text(&guid)), ["{07974581-0DF6-4EF0-BD05-604B3ADA9BE9}",
+            "{3501F5DD-7894-42DF-866A-A2B6527D8049}", "{E5966FB3-C97B-42EB-84BF-37F95EE54A9F}"]);
+        assert_eq!(IID_POLCORE.map(|guid| guid_text(&guid)), ["{9A30D565-A74C-4B56-B971-DCF02185B10D}",
+            "{E0516654-EF77-435D-AA7D-50D2C069CE34}", "{DFEC2E93-4971-4A54-B8ED-63815C208C5A}"]);
+        // Each installer's env.dat value is a session's `ucs_area`: EU 02, Japan 00.
+        assert_eq!(ucs_area(Region::Eu, Some("02")).unwrap().to_bytes(), b"02");
+        assert_eq!(ucs_area(Region::Jp, Some("00")).unwrap().to_bytes(), b"00");
+        for region in [Region::Eu, Region::Jp] {
+            assert!(ucs_area(region, None).unwrap_err().contains("POL_UCS_AREA_KBN is unknown"));
+            assert!(ucs_area(region, Some("1")).is_err());
+            assert_eq!(ucs_area(region, Some("02")).unwrap().to_bytes(), b"02");
+        }
+        let lines = region_value_lines(Region::Eu, Path::new(r"C:\POL"), 3, "02");
+        let text = lines.join("\n");
+        for expected in ["area code 2", "{E5966FB3-C97B-42EB-84BF-37F95EE54A9F}", r"C:\POL\viewer\com\polcoreEU.dll", "appEU.dll",
+            r"SOFTWARE\PlayOnlineEU (slot 367)", r"SOFTWARE\PlayOnlineEU\SquareEnix\PlayOnlineViewer\Settings Language = 3",
+            "1528(3)", "965(1), 1527(0), 1309(POL_UCS_AREA_KBN \"02\")", "ci000.pol.com"] {
+            assert!(text.contains(expected), "{expected} in {text}");
+        }
+        let jp = region_value_lines(Region::Jp, Path::new(r"C:\POL"), 0, "00").join("\n");
+        assert!(jp.contains(r"SOFTWARE\PlayOnline\Square\PlayOnlineViewer\Settings") && jp.contains("965(0), 1527(1)") && jp.contains("1528(0)"), "{jp}");
+    }
+
+    #[test]
     fn the_vtable_indices_called_here_are_the_ones_the_core_check_covers() {
         let checked: Vec<usize> = crate::pol_core::COM_METHODS.iter().map(|m| m.0).collect();
         for index in [0, VT_RELEASE, VT_SET_PARAM_INIT, VT_GET_COMMON_FUNCTION_TABLE, VT_POL_VIEWER_EXEC, VT_SET_AREA_CODE] {
@@ -997,17 +1124,20 @@ mod tests {
     }
 
     #[test]
-    fn only_clean_native_game_returns_can_reuse_the_signed_in_owner() {
+    fn only_clean_non_windower_game_returns_can_reuse_the_signed_in_owner() {
         for code in [0, -14, -1, 19] {
             for returned in [false, true] {
                 for released in [false, true] {
                     let outcome = GameOutcome { code, message: String::new(), game_returned: returned, modules_released: released };
                     // A game whose DLLs stayed loaded ends its host: no game runs on its memory.
-                    assert_eq!(retain_native_session(true, &outcome), returned && released && matches!(code, 0 | -14));
-                    assert!(!retain_native_session(false, &outcome));
+                    assert_eq!(retain_native_session(true, false, &outcome), returned && released && matches!(code, 0 | -14));
+                    assert!(!retain_native_session(false, false, &outcome));
+                    // Windower's Hook.dll outlives the game: every Windower game gets a fresh host.
+                    assert!(!retain_native_session(true, true, &outcome));
                 }
             }
         }
+        assert!(!windower_hook_loaded(), "no Hook.dll in the test process");
     }
 
     #[test]
@@ -1026,6 +1156,10 @@ mod tests {
         assert!(viewer_directory(Some("relative"), Some(global), Region::Us).is_err());
         assert!(viewer_directory(None, None, Region::Us).is_err());
         assert!(viewer_directory(Some(chosen), Some(global), Region::Eu).is_err());
+        assert_eq!(viewer_directory(Some(chosen), Some(global), Region::Jp).unwrap(), selected, "JP's core is polcore.dll");
+        std::fs::write(selected.join("viewer/com/polcoreEU.dll"), b"fixture").unwrap();
+        assert_eq!(viewer_directory(Some(chosen), Some(global), Region::Eu).unwrap(), selected);
+        std::fs::remove_file(selected.join("viewer/com/polcoreEU.dll")).unwrap();
         assert_eq!(ansi_to_string(&ansi_path(&selected).unwrap()), chosen);
         std::fs::remove_file(selected.join("viewer/com/polcore.dll")).unwrap();
         assert!(viewer_directory(Some(chosen), Some(global), Region::Us).is_err());

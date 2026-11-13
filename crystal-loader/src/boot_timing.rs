@@ -2,7 +2,7 @@
 //! Forward the same calls and arguments, with one exception: the game's own
 //! game-controller query skips discovery when the account's game settings
 //! disable the gamepad (the same answer as no attached controller), and
-//! otherwise may be answered from a verified prefetch (controller_catalog.rs).
+//! otherwise may be answered from the launcher's verified catalog (controller_catalog.rs).
 use std::{ffi::c_void, sync::{atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}, Mutex}, time::{Duration, Instant}};
 use windows_sys::{core::GUID, Win32::{Foundation::{GetLastError, SetLastError, HWND}, System::Threading::{GetCurrentProcess, GetProcessTimes, GetProcessIoCounters, IO_COUNTERS}}};
 

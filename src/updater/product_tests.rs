@@ -72,6 +72,11 @@ fn each_product_uses_its_own_stock_packet_tags() {
         "5800000061d437a3504f4c5007000000573230003030303133303236303930345f31000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
 }
 
+/// The liveness guard for these fixture roots. The production ensure_idle scans the machine's real
+/// processes and treats an uninspectable one (an elevated game) as using any folder, so a test that
+/// ran it failed whenever a game was open.
+fn idle(_: &Path) -> Result<(), String> { Ok(()) }
+
 fn history(product: Product, path: &str, bytes: &[u8]) -> FileHistory {
     let stamp = match product { Product::Viewer => "20110829_E", Product::Ffxi => "30260904_1" };
     FileHistory { path: path.into(), optional: false, versions: vec![manifest::Version { stamp: stamp.into(), sig: FileSig::of(bytes),
@@ -106,7 +111,7 @@ async fn one_operation_synchronizes_both_dll_targets_then_updates_the_game() {
     assert_eq!(stage_groups(Product::Viewer, &viewer.manifest, &viewer.planned).len(), 1);
     let game = prepared(Product::Ffxi, ffxi.clone(), Manifest { files: vec![history(Product::Ffxi, "game.dat", new)] }, new);
     let op = Operation::new(); op.begin_update();
-    let reports = execute(vec![viewer, game], &op, true, ensure_idle).await.unwrap();
+    let reports = execute(vec![viewer, game], &op, true, idle).await.unwrap();
     assert_eq!(reports.len(), 2); assert!(reports.iter().all(|r| r.verified));
     assert_eq!(fs::read(pol.join(&stage.path)).unwrap(), fs::read(pol.join(&live.path)).unwrap());
     assert_eq!(fs::read(ffxi.join("game.dat")).unwrap(), new);
@@ -129,7 +134,7 @@ fn final_verification_failure_rolls_back_live_and_staged_dlls_together() {
     }
     let mut update = prepared(Product::Viewer, pol.clone(), Manifest { files: vec![stage.clone(), live.clone()] }, new);
     update.manifest.files.push(history(Product::Viewer, "missing-final-file", new));
-    assert!(commit(update, ready, &Operation::new()).is_err());
+    assert!(commit_with_guard(update, ready, &Operation::new(), idle).is_err());
     for h in [&stage, &live] { assert_eq!(fs::read(pol.join(&h.path)).unwrap(), old); }
     assert!(!pol.join("patch.ver").exists());
     fs::remove_dir_all(pol).unwrap();
@@ -142,7 +147,7 @@ async fn second_component_failure_retains_verified_pol_and_does_not_finish_the_o
     let mut game = prepared(Product::Ffxi, ffxi.clone(), Manifest { files: vec![history(Product::Ffxi, "game.dat", new)] }, new);
     game.manifest.files.push(history(Product::Ffxi, "missing-final-file", new));
     let op = Operation::new(); op.begin_update();
-    assert!(execute(vec![viewer, game], &op, true, ensure_idle).await.is_err());
+    assert!(execute(vec![viewer, game], &op, true, idle).await.is_err());
     assert_eq!(crate::patch::installed_for_request_for(&pol, crate::updater::Product::Viewer), "20110829_E");
     assert_eq!(fs::read(pol.join("pol.exe")).unwrap(), new);
     assert!(!ffxi.join("patch.ver").exists()); assert!(!ffxi.join("game.dat").exists());

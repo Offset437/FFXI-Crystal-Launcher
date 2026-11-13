@@ -47,6 +47,8 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Pipes",
+    # SetThreadExecutionState around the game, as stock pol.exe (awake.rs).
+    "Win32_System_Power",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
@@ -54,7 +56,7 @@ windows-sys = { version = "=0.61.2", features = [
     # Scoped game-window verification and optional login-menu input.
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
-    # Controller discovery: Raw Input device fingerprint (controller_catalog.rs).
+    # Controller discovery: Raw Input device fingerprint (controller_record.rs).
     "Win32_UI_Input",
 ] }
 

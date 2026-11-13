@@ -212,6 +212,7 @@ pub(super) fn boot(mut app: App) -> (App, Effect<Message>) {
                 files_verified: None,
             },
             core_error: None,
+            stale: false,
         });
         if has("--preview-fresh") {
             app.patch = Some(patch::PatchReport {
@@ -258,6 +259,7 @@ pub(super) fn boot(mut app: App) -> (App, Effect<Message>) {
                 detail: String::new(), files_verified: Some(true),
             },
             core_error: None,
+            stale: false,
         });
         app.patch = Some(patch::PatchReport {
             state: patch::PatchState::Required,
@@ -355,6 +357,11 @@ pub(super) fn boot(mut app: App) -> (App, Effect<Message>) {
                     draft("Main account", &[], true),
                     draft("Crafting account", &[t("The saved PlayOnline password was imported. Square Enix passwords are not stored in this file.")], true),
                     draft("Old alt", &[t("This PlayOnline member has no saved PlayOnline password. Square Enix passwords are not stored in this file.")], false),
+                    draft("Fourth account", &[t("The saved PlayOnline password was imported. Square Enix passwords are not stored in this file.")], true),
+                    draft("Fifth account", &[t("This PlayOnline member has no saved PlayOnline password. Square Enix passwords are not stored in this file.")], false),
+                    draft("Sixth account", &[t("The saved PlayOnline password was imported. Square Enix passwords are not stored in this file.")], true),
+                    draft("Seventh account", &[t("This PlayOnline member has no saved PlayOnline password. Square Enix passwords are not stored in this file.")], false),
+                    draft("Eighth account", &[t("The saved PlayOnline password was imported. Square Enix passwords are not stored in this file.")], true),
                 ],
                 warnings: Vec::new(),
             });

@@ -528,7 +528,7 @@ pub(crate) fn update(app: &mut App, msg: Msg) -> Effect<Message> {
         Msg::Refresh if !app.preview && !app.reshade.busy => {
             app.reshade.generation = app.reshade.generation.wrapping_add(1);
             let generation = app.reshade.generation;
-            return Effect::perform(
+            let check = Effect::perform(
                 async {
                     tokio::task::spawn_blocking(|| status(&root()))
                         .await
@@ -536,6 +536,8 @@ pub(crate) fn update(app: &mut App, msg: Msg) -> Effect<Message> {
                 },
                 move |(ready, preset)| message(Msg::Checked(generation, ready, preset)),
             );
+            // Graphics opened: the dgVoodoo card looks for other copies at the same time.
+            return Effect::batch([check, crate::dgvoodoo::update(app, crate::dgvoodoo::Msg::Scan)]);
         }
         Msg::Checked(generation, ready, preset)
             if generation == app.reshade.generation && !app.reshade.busy =>

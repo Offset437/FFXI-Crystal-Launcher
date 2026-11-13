@@ -6,6 +6,38 @@ use std::time::{Duration, Instant};
 
 #[path = "hardware.rs"]
 mod hardware;
+#[path = "hid.rs"]
+mod hid;
+
+/// Vendor/product ids from a PnP instance id or HID interface path: USB
+/// `VID_054C&PID_0CE6`, Bluetooth `VID&0002054C_PID&0CE6` (a vendor-id
+/// source then the id; LE paths use a two-digit source, `VID&02054C`).
+fn device_ids(id: &str) -> Option<(u16, u16)> {
+    let id = id.to_ascii_uppercase();
+    let sep = |c: u8| matches!(c, b'\\' | b'#' | b'&' | b'_');
+    let field = |key: &str, widths: &[usize]| -> Option<u16> {
+        let mut found = None;
+        for (at, _) in id.match_indices(key) {
+            if at > 0 && !sep(id.as_bytes()[at - 1]) {
+                continue;
+            }
+            let rest = &id[at + key.len()..];
+            let len = rest.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(rest.len());
+            if !widths.contains(&len) || rest.as_bytes().get(len).is_some_and(|c| !sep(*c)) {
+                return None;
+            }
+            let value = u16::from_str_radix(&rest[len - 4..len], 16).ok()?;
+            if found.is_some_and(|f| f != value) {
+                return None;
+            }
+            found = Some(value);
+        }
+        found
+    };
+    let vid = field("VID_", &[4]).or_else(|| field("VID&", &[6, 8]))?;
+    let pid = field("PID_", &[4]).or_else(|| field("PID&", &[4]))?;
+    Some((vid, pid))
+}
 
 /// Logical controls in SDL's positional naming (South is the bottom face
 /// button: A on Xbox, Cross on PlayStation, B on Nintendo).
@@ -322,12 +354,15 @@ fn read_pad(id: gilrs::GamepadId, g: &gilrs::Gamepad, hardware: &hardware::Snaps
     }
 }
 
-fn snapshot(gilrs: &gilrs::Gilrs, hardware: &hardware::Snapshot) -> Vec<Pad> {
-    gilrs
+fn snapshot(gilrs: &gilrs::Gilrs, hardware: &hardware::Snapshot, hid: &hid::HidPads) -> Vec<Pad> {
+    let mut pads: Vec<Pad> = gilrs
         .gamepads()
         .filter(|(_, g)| g.is_connected())
         .map(|(id, g)| read_pad(id, &g, hardware))
-        .collect()
+        .collect();
+    let unlisted = hid.pads(&pads);
+    pads.extend(unlisted);
+    pads
 }
 
 fn publish_change(last: &mut Option<Vec<Pad>>, now: Vec<Pad>, emit: &mut impl FnMut(Vec<Pad>) -> bool) -> bool {
@@ -367,6 +402,14 @@ fn play_rumble(gilrs: &mut gilrs::Gilrs, id: usize) -> Option<gilrs::ff::Effect>
     Some(effect)
 }
 
+/// The wait between passes. Input drives the launcher only while its window is in front
+/// (controller navigation, the Controller page's live view): 8 ms there keeps input-to-view
+/// under 20 ms with a full software frame (measured 8.4 ms at 1440x900) against Sony pads'
+/// 4 ms reports. Behind a game, a slow look for (dis)connects.
+fn pass_interval(in_front: bool) -> Duration {
+    Duration::from_millis(if in_front { 8 } else { 250 })
+}
+
 /// Runs the controller thread, calling `emit` with the full list whenever a
 /// controller connects, disconnects, changes input, or changes reported power
 /// or transport. Returns when `emit` reports the receiver is gone, or as soon
@@ -391,10 +434,19 @@ pub(crate) fn run(mut emit: impl FnMut(Vec<Pad>) -> bool, keep_going: impl Fn() 
     let mut effects: Vec<(Instant, gilrs::ff::Effect)> = Vec::new();
     let mut hardware = hardware::Snapshot::refresh();
     let mut last_power = Instant::now();
+    // WGI can miss PlayStation pads entirely (a Bluetooth DualSense, seen
+    // live); those are read from their HID collection instead.
+    let mut hid = hid::HidPads::default();
+    hid.refresh();
+    let mut last_hid = Instant::now();
     while keep_going() {
         // gilrs updates pad state only while events are drained, so with no
         // event and no hardware refresh the pads are unchanged.
-        let mut changed = last.is_none();
+        let mut changed = last.is_none() | hid.poll();
+        if last_hid.elapsed() >= Duration::from_secs(2) {
+            changed |= hid.refresh();
+            last_hid = Instant::now();
+        }
         let mut topology_changed = false;
         while let Some(event) = gilrs.next_event() {
             changed = true;
@@ -413,12 +465,10 @@ pub(crate) fn run(mut emit: impl FnMut(Vec<Pad>) -> bool, keep_going: impl Fn() 
             last_power = Instant::now();
             changed = true;
         }
-        if changed && !publish_change(&mut last, snapshot(&gilrs, &hardware), &mut emit) {
+        if changed && !publish_change(&mut last, snapshot(&gilrs, &hardware, &hid), &mut emit) {
             break;
         }
-        // Input drives the launcher only while its window is in front (controller navigation,
-        // the Controller page's live view): behind a game, a slow look for (dis)connects.
-        std::thread::sleep(Duration::from_millis(if crate::window_chrome::is_foreground() || !effects.is_empty() { 16 } else { 250 }));
+        std::thread::sleep(pass_interval(crate::window_chrome::is_foreground() || !effects.is_empty()));
     }
     // A newer thread may have installed its own sender meanwhile; keep that one.
     if let Ok(mut guard) = commands().lock() {
@@ -497,6 +547,56 @@ mod tests {
         assert_eq!(published.len(), 3);
     }
 
+    /// Live, read-only timing probe:
+    /// `cargo test gamepad_probe_timing -- --ignored --nocapture`.
+    /// The enumerations' cost and a Sony pad's report rate (blocking reads, nothing written).
+    #[test]
+    #[ignore]
+    fn gamepad_probe_timing() {
+        use std::io::Read;
+        use std::os::windows::fs::OpenOptionsExt;
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+        let mut spans = Vec::new();
+        for _ in 0..10 {
+            let t = Instant::now();
+            let _ = hid::win_interfaces_for_probe();
+            spans.push(ms(t));
+        }
+        println!("hid interfaces (SetupDi): {spans:.1?} ms");
+        let mut spans = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            let _ = hardware::Snapshot::refresh();
+            spans.push(ms(t));
+        }
+        println!("hardware snapshot: {spans:.1?} ms");
+        let mut g = gilrs::Gilrs::new().ok();
+        let t = Instant::now();
+        if let Some(g) = g.as_mut() { while g.next_event().is_some() {} }
+        println!("gilrs drain: {:.2} ms", ms(t));
+        for path in hid::win_interfaces_for_probe() {
+            let Some((0x054C, pid)) = device_ids(&path) else { continue };
+            if !hid::known_pid(pid) { continue }
+            // FILE_SHARE_READ | FILE_SHARE_WRITE, read access only.
+            let Ok(mut file) = std::fs::OpenOptions::new().read(true).share_mode(3).open(&path) else { continue };
+            let mut buf = [0u8; 128];
+            let (start, mut n, mut gaps, mut last) = (Instant::now(), 0u32, Vec::new(), Instant::now());
+            let mut changes = 0u32;
+            let mut prev = Vec::new();
+            while start.elapsed() < Duration::from_secs(3) {
+                let Ok(len) = file.read(&mut buf) else { break };
+                gaps.push(ms(last));
+                last = Instant::now();
+                n += 1;
+                if buf[..len] != prev[..] { changes += 1; prev = buf[..len].to_vec(); }
+            }
+            gaps.sort_by(f64::total_cmp);
+            let pct = |p: f64| gaps.get(((gaps.len() as f64 - 1.0) * p) as usize).copied().unwrap_or(0.0);
+            println!("{path}\n  {n} reports in {:.0} ms ({:.0} Hz), {changes} distinct; gap p50 {:.2} p95 {:.2} max {:.2} ms",
+                ms(start), f64::from(n) / start.elapsed().as_secs_f64(), pct(0.5), pct(0.95), pct(1.0));
+        }
+    }
+
     #[test]
     fn gamepad_classifies_by_usb_ids() {
         assert_eq!(classify(Some(0x045E), Some(0x0B12), "Controller"), Family::Xbox);
@@ -506,6 +606,41 @@ mod tests {
         assert_eq!(classify(Some(0x057E), Some(0x2009), ""), Family::SwitchPro);
         assert_eq!(classify(None, None, "Xbox One For Windows"), Family::Xbox);
         assert_eq!(classify(Some(0x0F0D), Some(0x0001), "Arcade Stick"), Family::Generic);
+    }
+
+    #[test]
+    fn gamepad_device_ids_parse_usb_and_bluetooth_forms() {
+        let bt = r"BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\B&8B3D9EE&0&4CB99BAD249B_C00000000";
+        assert_eq!(device_ids(bt), Some((0x054C, 0x0CE6)));
+        let hid = r"HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\C&34BFB810&E&0000";
+        assert_eq!(device_ids(hid), Some((0x054C, 0x0CE6)));
+        let path = r"\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&0002054c_pid&09cc#c&1&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        assert_eq!(device_ids(path), Some((0x054C, 0x09CC)));
+        assert_eq!(device_ids(r"HID\{00001812-0000-1000-8000-00805F9B34FB}_DEV_VID&02045E_PID&0B13_REV&0509\X"), Some((0x045E, 0x0B13)));
+        assert_eq!(device_ids(r"USB\VID_054C&PID_0DF2\5&1"), Some((0x054C, 0x0DF2)));
+        assert_eq!(device_ids(r"HID\VID_045E&PID_0B12&IG_00\8&1"), Some((0x045E, 0x0B12)));
+        for bad in [
+            r"USB\VID_045EX&PID_0B12\x",
+            r"USB\VID_045E\x",
+            r"HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&002054C_PID&0CE6\x",
+            r"USB\VID_045E&PID_0B12&VID_054C\x",
+            r"SWD\SYNTHETICGAMEPADENUM\SYNTHETICGAMEPAD0",
+        ] {
+            assert_eq!(device_ids(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn gamepad_bluetooth_ids_classify_like_usb() {
+        let ids = |s| device_ids(s).unzip();
+        let (vid, pid) = ids(r"HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0CE6\C&1");
+        assert_eq!(classify(vid, pid, "Wireless Controller"), Family::DualSense);
+        let (vid, pid) = ids(r"HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&0DF2\C&1");
+        assert_eq!(classify(vid, pid, ""), Family::DualSenseEdge);
+        let (vid, pid) = ids(r"HID\{00001124-0000-1000-8000-00805F9B34FB}_VID&0002054C_PID&09CC\C&1");
+        assert_eq!(classify(vid, pid, "Wireless Controller"), Family::DualShock4);
+        let (vid, pid) = ids(r"HID\{00001812-0000-1000-8000-00805F9B34FB}_DEV_VID&02045E_PID&0B13\X");
+        assert_eq!(classify(vid, pid, ""), Family::Xbox);
     }
 
     #[test]

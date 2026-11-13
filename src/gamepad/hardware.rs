@@ -130,25 +130,10 @@ fn physical_usb_ids(instance: &str) -> Option<(u16, u16)> {
         return None;
     }
     let hardware = parts.next()?;
-    let mut vid = None;
-    let mut pid = None;
-    for token in hardware.split('&') {
-        if token.starts_with("MI_") {
-            return None;
-        }
-        if let Some(value) = token.strip_prefix("VID_") {
-            if value.len() != 4 || vid.is_some() {
-                return None;
-            }
-            vid = u16::from_str_radix(value, 16).ok();
-        } else if let Some(value) = token.strip_prefix("PID_") {
-            if value.len() != 4 || pid.is_some() {
-                return None;
-            }
-            pid = u16::from_str_radix(value, 16).ok();
-        }
+    if hardware.split('&').any(|token| token.starts_with("MI_")) {
+        return None;
     }
-    Some((vid?, pid?))
+    super::device_ids(hardware)
 }
 
 fn is_usb_root_hub(instance: &str) -> bool {

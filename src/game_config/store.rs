@@ -2,7 +2,8 @@
 //!
 //! Retail installs (and Windower, Ashita, the official client) read the
 //! registry: `HKLM\SOFTWARE\WOW6432Node\<vendor>\SquareEnix\FinalFantasyXI`,
-//! `<vendor>` being PlayOnlineUS, PlayOnlineEU or PlayOnline (Japan).
+//! `<vendor>` being PlayOnlineUS or PlayOnlineEU; Japan's is
+//! `…\PlayOnline\SQUARE\FinalFantasyXI` (`win::reg::ffxi_settings_key`).
 use super::model::{self, Data, Values};
 use crate::i18n::{t, tf};
 use std::path::{Path, PathBuf};
@@ -39,7 +40,7 @@ impl Region {
         tf("Windows registry · {region}", &[("region", &self.label())])
     }
     pub(crate) fn location(self) -> String {
-        format!("HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\{}\\SquareEnix\\FinalFantasyXI", self.vendor())
+        format!("HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\{}\\{}\\FinalFantasyXI", self.vendor(), crate::win::reg::publisher(self.vendor()))
     }
 }
 
@@ -279,7 +280,7 @@ mod registry {
     /// The 32-bit view, where the 32-bit game and its tools keep the key
     /// (WOW6432Node to a 64-bit process).
     fn open(vendor: &str, access: u32) -> Result<Key, u32> {
-        Key::open(HKEY_LOCAL_MACHINE, &format!("SOFTWARE\\{vendor}\\SquareEnix\\FinalFantasyXI"), access | KEY_WOW64_32KEY)
+        Key::open(HKEY_LOCAL_MACHINE, &crate::win::reg::ffxi_settings_key(vendor), access | KEY_WOW64_32KEY)
     }
 
     pub(super) fn read(vendor: &str) -> Result<Option<Values>, String> {

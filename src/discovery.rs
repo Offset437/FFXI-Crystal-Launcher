@@ -57,9 +57,13 @@ impl Product {
 pub(crate) fn is_install(product: Product, folder: &Path) -> bool {
     match product {
         Product::Ffxi => ["FFXi.dll", "FFXiMain.dll", "ROM/0/0.DAT"].iter().any(|p| folder.join(p).is_file()),
+        // The US Viewer: an EU or Japanese Viewer has the same layout (and Japan's the same
+        // file names) but is another product on the patch server, which Crystal's status,
+        // gate and updater must never take for the US one (`retail_region::foreign_viewer`).
         Product::PlayOnline => {
-            ["viewer/com/polcore.dll", "viewer/com/app.dll"].iter().any(|p| folder.join(p).is_file())
-                || (folder.join("pol.exe").is_file() && folder.join("viewer").is_dir())
+            (crate::retail_region::core_file(folder).is_ok() || folder.join("viewer/com/app.dll").is_file()
+                || (folder.join("pol.exe").is_file() && folder.join("viewer").is_dir()))
+                && crate::retail_region::foreign_viewer(folder).is_none()
         }
         Product::Windower => folder.join("Windower.exe").is_file(),
         Product::Ashita => folder.join("Ashita-cli.exe").is_file(),

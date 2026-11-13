@@ -13,18 +13,91 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const INSTRUCTIONS_URL: &str =
-    "https://www.playonline.com/ff11us/download/media/install_win.html";
-const BASE_URL: &str = "https://gdl.square-enix.com/ffxi/download/us/";
-// Downloads use current server metadata, never stored lengths: historical lengths
-// cannot establish provenance, so untracked local volumes must be downloaded officially.
-const PARTS: [&str; 5] = [
-    "FFXIFullSetup_US.part1.exe",
-    "FFXIFullSetup_US.part2.rar",
-    "FFXIFullSetup_US.part3.rar",
-    "FFXIFullSetup_US.part4.rar",
-    "FFXIFullSetup_US.part5.rar",
+use crate::retail_region::RetailRegion;
+
+/// One volume of a region's official installer: its name, and the length and SHA-256 of the
+/// file Square Enix serves. Downloads use current server metadata, never these: historical
+/// lengths cannot establish provenance, so untracked local volumes must be downloaded
+/// officially. A downloaded volume of the pinned length must also have the pinned hash.
+pub(crate) struct Volume {
+    pub name: &'static str,
+    pub length: u64,
+    sha256: &'static str,
+}
+
+/// A region's official Windows client download (FFXIFullSetup_US / _EU / _JP), as that region's
+/// PlayOnline download page links it. Checked 2026-11-13: each page links these five URLs, each
+/// HEAD answers 200 with the length below, and the hashes are of the files it serves.
+pub(crate) struct Official {
+    pub region: RetailRegion,
+    pub info_url: &'static str,
+    base_url: &'static str,
+    /// The folder the self-extractor creates, which holds FFXISetup.exe.
+    pub folder: &'static str,
+    pub volumes: [Volume; 5],
+}
+
+const fn volume(name: &'static str, length: u64, sha256: &'static str) -> Volume {
+    Volume { name, length, sha256 }
+}
+
+/// In account order (`RetailRegion::index`).
+const OFFICIAL: [Official; 3] = [
+    Official {
+        region: RetailRegion::Us,
+        info_url: "https://www.playonline.com/ff11us/download/media/install_win.html",
+        base_url: "https://gdl.square-enix.com/ffxi/download/us/",
+        folder: "FFXIFullSetup_US",
+        volumes: [
+            volume("FFXIFullSetup_US.part1.exe", 1_610_626_088, "8b7abd42aa7c3cc4378f1fa02e3ea1e6019d2041bc8b77931f03a3f8202ceec9"),
+            volume("FFXIFullSetup_US.part2.rar", 1_610_612_736, "e2a0fb85cc33b82bcf40d84bf7b8c6d87e75aaaa7560598479711f3138c7da46"),
+            volume("FFXIFullSetup_US.part3.rar", 1_610_612_736, "ec582b38c52a6656cef569a89457d61d06bf722ad474dc929407bc5688c71983"),
+            volume("FFXIFullSetup_US.part4.rar", 1_610_612_736, "55cc35ee76fae44a2b02d57bd1883aaea535fff39761b995b57bb99c28602013"),
+            volume("FFXIFullSetup_US.part5.rar", 1_291_746_416, "675fa16fdb18ee711174a4f6b5521b1d158786540d28cb4348cce56e16a7f903"),
+        ],
+    },
+    Official {
+        region: RetailRegion::Eu,
+        info_url: "https://www.playonline.com/ff11eu/download/media/install_win.html",
+        base_url: "https://gdl.square-enix.com/ffxi/download/eu/",
+        folder: "FFXIFullSetup_EU",
+        volumes: [
+            volume("FFXIFullSetup_EU.part1.exe", 1_610_626_088, "05b882953f57831cd39af2b3fa042fdc828f84b58f0fd4b3c5aefc63753dbf69"),
+            volume("FFXIFullSetup_EU.part2.rar", 1_610_612_736, "6051a2fe46e9f347f92e3ffa852cb43929d4795546c04e34c74f0761226d111e"),
+            volume("FFXIFullSetup_EU.part3.rar", 1_610_612_736, "9566805eec715a8d3db4fbf79d810381582134fa1d8445fab1924e0e339cb771"),
+            volume("FFXIFullSetup_EU.part4.rar", 1_610_612_736, "1ebcaba1c0ffc7dc1b57ea7a87e255f6d8dbfd472152322052045611b5c60670"),
+            volume("FFXIFullSetup_EU.part5.rar", 1_292_087_528, "b08895bf20f6c5b19cbea98b6b09f5669540c496b7d86ff0db725b9c3b7ad034"),
+        ],
+    },
+    Official {
+        region: RetailRegion::Jp,
+        info_url: "https://www.playonline.com/ff11/download/media/install_win.html",
+        base_url: "https://gdl.square-enix.com/ffxi/download/jp/",
+        folder: "FFXIFullSetup_JP",
+        volumes: [
+            volume("FFXIFullSetup_JP.part1.exe", 1_610_626_088, "6e843cfa63cf3e04a0452dcacd2b587236ecd37876bb4a0e8802699ee6ebe697"),
+            volume("FFXIFullSetup_JP.part2.rar", 1_610_612_736, "ee050f2c54959495adb834bb87450fe60131a146e09e744d94181fc3e8fafe32"),
+            volume("FFXIFullSetup_JP.part3.rar", 1_610_612_736, "920b972e3df031718c866ff1a501d6cf26e385f56b30591264965faf647a84e5"),
+            volume("FFXIFullSetup_JP.part4.rar", 1_610_612_736, "63e2d56dc5c321f9e7f58671466c15382aae1f90515c7c6205024fb420717250"),
+            volume("FFXIFullSetup_JP.part5.rar", 1_339_572_151, "b5e8081da12bd5049e02e0ebde92651baa2f58afb58463804ac53eecb8c7674f"),
+        ],
+    },
 ];
+
+/// `region`'s official installer.
+pub(crate) fn official(region: RetailRegion) -> &'static Official {
+    &OFFICIAL[usize::from(region.index())]
+}
+
+impl Official {
+    fn url(&self, name: &str) -> String {
+        format!("{}{name}", self.base_url)
+    }
+    /// The five volumes' bytes together.
+    pub(crate) fn total(&self) -> u64 {
+        self.volumes.iter().map(|volume| volume.length).sum()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Metadata {
@@ -231,20 +304,21 @@ fn download_lock(dir: &Path) -> Result<File, String> {
 /// volumes are retained; interrupted `.part` files resume only with validators.
 /// This function does not start extraction or modify an installed game.
 /// The summary line of a completed download.
-pub async fn download(dir: PathBuf, operation: Operation) -> Result<String, String> {
+pub async fn download(dir: PathBuf, region: RetailRegion, operation: Operation) -> Result<String, String> {
     operation.check_cancelled()?;
     let dir = safe_directory(&dir)?;
     let _lock = download_lock(&dir)?;
     let client = client()?;
+    let official = official(region);
     let mut volumes = Vec::new();
-    for (index, name) in PARTS.iter().enumerate() {
+    for (index, name) in official.volumes.iter().map(|volume| volume.name).enumerate() {
         operation.progress_part(
             Stage::InstallerMetadata,
             index as u64,
-            PARTS.len() as u64,
+            official.volumes.len() as u64,
             Part { number: index as u8 + 1, name, state: PartState::Checking },
         );
-        let url = format!("{BASE_URL}{name}");
+        let url = official.url(name);
         let head = cancellable(
             client
                 .head(&url)
@@ -263,10 +337,10 @@ pub async fn download(dir: PathBuf, operation: Operation) -> Result<String, Stri
         identity_encoding(head.headers())?;
         let length = length_header(head.headers())?;
         if length == 0 {
-            return Err(tf("Official {name} is empty", &[("name", name)]));
+            return Err(tf("Official {name} is empty", &[("name", &name)]));
         }
         volumes.push((
-            *name,
+            name,
             Metadata {
                 url,
                 length,
@@ -457,7 +531,7 @@ pub async fn download(dir: PathBuf, operation: Operation) -> Result<String, Stri
     }
     let verify_dir = dir.clone();
     let verify_op = operation.clone();
-    tokio::task::spawn_blocking(move || validate_volumes(&verify_dir, Some(&verify_op)))
+    tokio::task::spawn_blocking(move || validate_volumes(&verify_dir, official, Some(&verify_op)))
         .await
         .map_err(|e| e.to_string())??;
     operation.check_cancelled()?;
@@ -558,8 +632,9 @@ fn publish(partial: &Path, target: &Path) -> Result<(), String> {
         .map_err(|error| tf("Publish installer file: {error}", &[("error", &error)]))
 }
 
-fn validate_volumes(dir: &Path, operation: Option<&Operation>) -> Result<(), String> {
-    for name in PARTS {
+fn validate_volumes(dir: &Path, official: &Official, operation: Option<&Operation>) -> Result<(), String> {
+    for pinned in &official.volumes {
+        let name = pinned.name;
         let sidecar = dir.join(format!("{name}.download.json"));
         let metadata = match file_length(&sidecar)? {
             Some(_) => {
@@ -568,7 +643,7 @@ fn validate_volumes(dir: &Path, operation: Option<&Operation>) -> Result<(), Str
                         .map_err(|_| {
                             tf("{name} has invalid download metadata; download again", &[("name", &name)])
                         })?;
-                if metadata.url != format!("{BASE_URL}{name}")
+                if metadata.url != official.url(name)
                     || metadata.length == 0
                     || !metadata.complete
                     || metadata.format != 1
@@ -593,46 +668,53 @@ fn validate_volumes(dir: &Path, operation: Option<&Operation>) -> Result<(), Str
                 &[("name", &name)],
             ));
         }
+        // The size Square Enix serves today with other bytes: damaged in transfer or on disk.
+        if metadata.length == pinned.length && actual != pinned.sha256 {
+            return Err(tf("{name} does not match the official file. Download it again.", &[("name", &name)]));
+        }
     }
     Ok(())
 }
 
 /// Runs the official self-extractor interactively, waiting for its exit. The
 /// extraction destination is selected in that program. Run on a worker thread.
-pub fn extract(dir: &Path) -> Result<(), String> {
+pub fn extract(dir: &Path, region: RetailRegion) -> Result<(), String> {
     let dir = fs::canonicalize(dir).map_err(|e| tf("Installer folder: {error}", &[("error", &e)]))?;
     let _lock = download_lock(&dir)?;
-    validate_volumes(&dir, None)?;
-    launch(&dir.join(PARTS[0]), &dir)
+    let official = official(region);
+    validate_volumes(&dir, official, None)?;
+    launch(&dir.join(official.volumes[0].name), &dir, official)
 }
 
 /// Runs and waits for the official client installer interactively, preserving DirectX,
 /// PlayOnline, FFXI registration and dependency installation behavior.
 /// Accept either the download/extraction parent or the extracted folder itself.
-pub fn install(dir: &Path) -> Result<(), String> {
-    let executable = setup_executable(dir)?;
-    launch(&executable, executable.parent().expect("setup has a parent"))
+pub fn install(dir: &Path, region: RetailRegion) -> Result<(), String> {
+    let official = official(region);
+    let executable = setup_executable(dir, official)?;
+    launch(&executable, executable.parent().expect("setup has a parent"), official)
 }
 
-fn setup_executable(dir: &Path) -> Result<PathBuf, String> {
+fn setup_executable(dir: &Path, official: &Official) -> Result<PathBuf, String> {
     let root = fs::canonicalize(dir).map_err(|_| t("Installer folder does not exist. Extract the official download first, then browse to the folder containing FFXISetup.exe.").to_owned())?;
     // The extractor allows any destination. Inspect contents rather than the
     // folder's leaf name so directly selected or renamed setup folders work.
-    for executable in [root.join("FFXISetup.exe"), root.join("FFXIFullSetup_US/FFXISetup.exe")] {
+    for executable in [root.join("FFXISetup.exe"), root.join(official.folder).join("FFXISetup.exe")] {
         if file_length(&executable)?.unwrap_or(0) > 0 {
             return Ok(executable);
         }
     }
-    Err(t("FFXISetup.exe was not found or is empty. Extract the official download, then browse to its FFXIFullSetup_US folder. In setup, select PlayOnline Viewer and FINAL FANTASY XI.").into())
+    Err(tf("FFXISetup.exe was not found or is empty. Extract the official download, then browse to its {folder} folder. In setup, select PlayOnline Viewer and FINAL FANTASY XI.",
+        &[("folder", &official.folder)]))
 }
 
-fn launch(executable: &Path, cwd: &Path) -> Result<(), String> {
+fn launch(executable: &Path, cwd: &Path, official: &Official) -> Result<(), String> {
     use crate::prereqs::wait_exit_code;
     use crate::win::{shell_execute, ShellError};
     // The verified read handle stays open until the installer exits.
     let _file = {
         let file = lock_executable(executable)?;
-        verify_authenticode(executable, &file)?;
+        verify_authenticode(executable, &file, official.info_url)?;
         file
     };
     let untracked = || t("Could not track the official installer; wait for it to close before continuing.").to_owned();
@@ -661,7 +743,7 @@ fn lock_executable(executable: &Path) -> Result<File, String> {
         .map_err(|e| tf("Run official installer: {error}", &[("error", &e)]))
 }
 
-fn verify_authenticode(executable: &Path, file: &File) -> Result<(), String> {
+fn verify_authenticode(executable: &Path, file: &File, info_url: &str) -> Result<(), String> {
     let status = crate::prereqs::win_verify_trust(executable, file, |status, _| status);
     // WinRAR self-extractors may legitimately have no signature. HTTPS origin
     // and transfer checks do not imply Authenticode; do not claim they do.
@@ -672,7 +754,7 @@ fn verify_authenticode(executable: &Path, file: &File) -> Result<(), String> {
             &[
                 ("path", &executable.display()),
                 ("code", &format!("0x{:08X}", status as u32)),
-                ("url", &INSTRUCTIONS_URL),
+                ("url", &info_url),
             ],
         ));
     }
@@ -737,8 +819,73 @@ fn embedded_signature_directory(optional: &[u8], file_length: u64) -> Result<boo
 mod tests {
     use super::*;
 
-    /// The volumes' lengths, verified with official HTTPS HEAD responses on 2026-10-02.
+    /// The US volumes' lengths, verified with official HTTPS HEAD responses on 2026-10-02.
     const BASELINE_LENGTHS: [u64; 5] = [1_610_626_088, 1_610_612_736, 1_610_612_736, 1_610_612_736, 1_291_746_416];
+    fn us() -> &'static Official { official(RetailRegion::Us) }
+    /// The US volume names, as the tests before regions named them.
+    fn parts() -> [&'static str; 5] { us().volumes.each_ref().map(|volume| volume.name) }
+
+    /// Each region's pins: its own host path, info page, extracted folder and volume names, the
+    /// lengths its HEADs answered on 2026-11-13, and SHA-256 digests (64 hex digits each).
+    #[test]
+    fn each_region_has_its_own_official_urls_names_lengths_and_hashes() {
+        let expect = [
+            (RetailRegion::Us, "us", "US", "ff11us", 7_734_210_712u64),
+            (RetailRegion::Eu, "eu", "EU", "ff11eu", 7_734_551_824),
+            (RetailRegion::Jp, "jp", "JP", "ff11", 7_782_036_447),
+        ];
+        for (region, path, tag, page, total) in expect {
+            let official = official(region);
+            assert_eq!(official.region, region);
+            assert_eq!(official.info_url, format!("https://www.playonline.com/{page}/download/media/install_win.html"));
+            assert_eq!(official.folder, format!("FFXIFullSetup_{tag}"));
+            assert_eq!(official.total(), total, "{tag}");
+            for (n, volume) in official.volumes.iter().enumerate() {
+                let name = format!("FFXIFullSetup_{tag}.part{}.{}", n + 1, if n == 0 { "exe" } else { "rar" });
+                assert_eq!(volume.name, name);
+                let url = Url::parse(&official.url(volume.name)).unwrap();
+                assert_eq!(url.as_str(), format!("https://gdl.square-enix.com/ffxi/download/{path}/{name}"));
+                assert!(official_url(&url), "{url}");
+                assert!(volume.sha256.len() == 64 && volume.sha256.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+            }
+            // Parts 1-4 are the same length in every region; part 5 differs.
+            assert_eq!(official.volumes[..4].iter().map(|v| v.length).collect::<Vec<_>>(), BASELINE_LENGTHS[..4]);
+        }
+        assert_eq!(us().volumes.iter().map(|v| v.length).collect::<Vec<_>>(), BASELINE_LENGTHS);
+    }
+
+    /// The EU volumes, all tracked as downloaded, are refused for a US (or JP) extraction: their
+    /// names and URLs are another region's. A volume of the pinned length with other bytes is refused.
+    #[test]
+    fn another_regions_volumes_and_a_damaged_pinned_volume_are_refused() {
+        crate::i18n::set(crate::i18n::Lang::En);
+        let dir = fixture("regions");
+        let eu = official(RetailRegion::Eu);
+        for volume in &eu.volumes {
+            fs::write(dir.join(volume.name), b"abc").unwrap();
+            let metadata = Metadata { url: eu.url(volume.name), length: 3, etag: Some("\"t\"".into()), modified: None,
+                complete: false, sha256: Some(hex_digest(hash_file(&dir.join(volume.name), 3, None).unwrap())), format: 1 };
+            save_metadata(&dir.join(format!("{}.download.json", volume.name)), &metadata, true).unwrap();
+        }
+        assert!(validate_volumes(&dir, eu, None).is_ok());
+        for other in [RetailRegion::Us, RetailRegion::Jp] {
+            assert!(validate_volumes(&dir, official(other), None).unwrap_err().contains("no official-download metadata"), "{other:?}");
+        }
+        // An EU name recorded with the US URL is not an official EU download either.
+        let name = eu.volumes[0].name;
+        let mut forged: Metadata = serde_json::from_slice(&fs::read(dir.join(format!("{name}.download.json"))).unwrap()).unwrap();
+        forged.url = us().url(name);
+        save_metadata(&dir.join(format!("{name}.download.json")), &forged, true).unwrap();
+        assert!(validate_volumes(&dir, eu, None).unwrap_err().contains("invalid download metadata"));
+        // A volume of the pinned length whose bytes hash otherwise (a 3-byte pin stands in for 1.6 GB).
+        let pinned = Volume { name, length: 3, sha256: "0000000000000000000000000000000000000000000000000000000000000000" };
+        let test = Official { volumes: [pinned, volume(eu.volumes[1].name, 0, ""), volume(eu.volumes[2].name, 0, ""),
+            volume(eu.volumes[3].name, 0, ""), volume(eu.volumes[4].name, 0, "")], ..*eu };
+        forged.url = test.url(name);
+        save_metadata(&dir.join(format!("{name}.download.json")), &forged, true).unwrap();
+        assert_eq!(validate_volumes(&dir, &test, None).unwrap_err(), format!("{name} does not match the official file. Download it again."));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn fixture(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("crystal-installer-{label}-{}-{}",
@@ -750,11 +897,11 @@ mod tests {
     #[test]
     fn a_completed_partial_is_flushed_published_and_tracked_without_downloading() {
         let dir = fixture("complete-part");
-        let target = dir.join(PARTS[0]);
-        let partial = dir.join(format!("{}.part", PARTS[0]));
-        let sidecar = dir.join(format!("{}.download.json", PARTS[0]));
+        let target = dir.join(parts()[0]);
+        let partial = dir.join(format!("{}.part", parts()[0]));
+        let sidecar = dir.join(format!("{}.download.json", parts()[0]));
         fs::write(&partial, b"complete archive fixture").unwrap();
-        let mut metadata = Metadata { url: format!("{BASE_URL}{}", PARTS[0]),
+        let mut metadata = Metadata { url: us().url(parts()[0]),
             length: 24, etag: Some("\"fixture\"".into()), modified: None,
             complete: false, sha256: None, format: 1 };
         save_metadata(&sidecar, &metadata, false).unwrap();
@@ -776,7 +923,7 @@ mod tests {
         let lock = download_lock(&dir).unwrap();
         assert!(download_lock(&dir).is_err());
         // Refusal occurs before volume validation and before any process launch.
-        assert!(extract(&dir).unwrap_err().contains("already in use"));
+        assert!(extract(&dir, RetailRegion::Us).unwrap_err().contains("already in use"));
         drop(lock);
         assert!(download_lock(&dir).is_ok());
         fs::remove_dir_all(dir).unwrap();
@@ -799,16 +946,17 @@ mod tests {
     #[ignore = "read-only official HTTPS installer metadata and bounded range probe"]
     async fn official_installer_metadata_and_first_bytes_are_reachable() {
         let client = client().unwrap();
-        for name in PARTS {
-            let url = format!("{BASE_URL}{name}");
-            let head = client.head(&url).header(header::ACCEPT_ENCODING, "identity").send().await
-                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        // Every region's volumes answer with their pinned lengths.
+        for volume in OFFICIAL.iter().flat_map(|official| official.volumes.iter().map(move |volume| (official, volume))) {
+            let (official, volume) = volume;
+            let head = client.head(official.url(volume.name)).header(header::ACCEPT_ENCODING, "identity").send().await
+                .unwrap_or_else(|error| panic!("{}: {error:?}", volume.name));
             assert_eq!(head.status(), StatusCode::OK);
             assert!(official_url(head.url()));
             identity_encoding(head.headers()).unwrap();
-            assert!(length_header(head.headers()).unwrap() > 0);
+            assert_eq!(length_header(head.headers()).unwrap(), volume.length, "{}", volume.name);
         }
-        let mut response = client.get(format!("{BASE_URL}{}", PARTS[0]))
+        let mut response = client.get(us().url(parts()[0]))
             .header(header::ACCEPT_ENCODING, "identity").header(header::RANGE, "bytes=0-4095")
             .send().await.unwrap_or_else(|error| panic!("installer range: {error:?}"));
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
@@ -831,14 +979,14 @@ mod tests {
         fs::create_dir_all(&extracted).unwrap();
         let setup = extracted.join("FFXISetup.exe");
         fs::write(&setup, b"fixture, never executed").unwrap();
-        assert_eq!(setup_executable(&root).unwrap(), fs::canonicalize(&setup).unwrap());
-        assert_eq!(setup_executable(&extracted).unwrap(), fs::canonicalize(&setup).unwrap());
+        assert_eq!(setup_executable(&root, us()).unwrap(), fs::canonicalize(&setup).unwrap());
+        assert_eq!(setup_executable(&extracted, us()).unwrap(), fs::canonicalize(&setup).unwrap());
         let renamed = root.join("My extracted installer");
         fs::rename(&extracted, &renamed).unwrap();
-        assert_eq!(setup_executable(&renamed).unwrap(), fs::canonicalize(renamed.join("FFXISetup.exe")).unwrap());
+        assert_eq!(setup_executable(&renamed, us()).unwrap(), fs::canonicalize(renamed.join("FFXISetup.exe")).unwrap());
         fs::write(renamed.join("FFXISetup.exe"), []).unwrap();
-        assert!(setup_executable(&renamed).unwrap_err().contains("not found or is empty"));
-        assert!(setup_executable(&root.join("missing")).unwrap_err().contains("does not exist"));
+        assert!(setup_executable(&renamed, us()).unwrap_err().contains("not found or is empty"));
+        assert!(setup_executable(&root.join("missing"), us()).unwrap_err().contains("does not exist"));
         fs::remove_dir_all(root).unwrap();
     }
     fn headers(length: u64, range: Option<&str>) -> header::HeaderMap {
@@ -904,7 +1052,7 @@ mod tests {
     #[test]
     fn resume_metadata_requires_identity_validator() {
         let current = Metadata {
-            url: format!("{BASE_URL}{}", PARTS[0]),
+            url: us().url(parts()[0]),
             length: BASELINE_LENGTHS[0],
             etag: Some("\"one\"".into()),
             modified: None,
@@ -931,7 +1079,7 @@ mod tests {
     #[test]
     fn only_official_https_without_credentials() {
         assert!(official_url(
-            &Url::parse(&format!("{BASE_URL}{}", PARTS[0])).unwrap()
+            &Url::parse(&us().url(parts()[0])).unwrap()
         ));
         for url in [
             "http://gdl.square-enix.com/x",
@@ -939,6 +1087,10 @@ mod tests {
             "https://user@gdl.square-enix.com/x",
             "https://gdl.square-enix.com:444/x",
             "https://example.org/x",
+            // The EU and JP downloads are held to the same host.
+            "http://gdl.square-enix.com/ffxi/download/eu/FFXIFullSetup_EU.part1.exe",
+            "https://gdl.square-enix.eu/ffxi/download/eu/FFXIFullSetup_EU.part1.exe",
+            "https://dl.square-enix.co.jp/ffxi/download/jp/FFXIFullSetup_JP.part1.exe",
         ] {
             assert!(!official_url(&Url::parse(url).unwrap()));
         }
@@ -948,6 +1100,7 @@ mod tests {
         assert!(safe_directory(Path::new("relative-folder")).is_err());
         assert!(validate_volumes(
             &std::env::temp_dir().join("missing-official-installer-test"),
+            us(),
             None
         )
         .is_err());
@@ -963,11 +1116,11 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("xi-installer-hash-{}-{unique}", std::process::id()));
         fs::create_dir(&dir).unwrap();
-        for name in PARTS {
+        for name in parts() {
             let path = dir.join(name);
             fs::write(&path, b"abc").unwrap();
             let metadata = Metadata {
-                url: format!("{BASE_URL}{name}"),
+                url: us().url(name),
                 length: 3,
                 etag: Some("\"test\"".into()),
                 modified: None,
@@ -977,13 +1130,13 @@ mod tests {
             };
             save_metadata(&dir.join(format!("{name}.download.json")), &metadata, true).unwrap();
         }
-        assert!(validate_volumes(&dir, None).is_ok());
-        fs::write(dir.join(PARTS[0]), b"xyz").unwrap();
-        assert!(validate_volumes(&dir, None)
+        assert!(validate_volumes(&dir, us(), None).is_ok());
+        fs::write(dir.join(parts()[0]), b"xyz").unwrap();
+        assert!(validate_volumes(&dir, us(), None)
             .unwrap_err()
             .contains("changed after"));
-        fs::remove_file(dir.join(format!("{}.download.json", PARTS[0]))).unwrap();
-        assert!(validate_volumes(&dir, None)
+        fs::remove_file(dir.join(format!("{}.download.json", parts()[0]))).unwrap();
+        assert!(validate_volumes(&dir, us(), None)
             .unwrap_err()
             .contains("no official-download metadata"));
         fs::remove_dir_all(&dir).unwrap();

@@ -1,6 +1,126 @@
-//! One-shot, session-bound graceful game shutdown. No credentials, process
-//! termination, window activation or POL controls are used to stop the game.
+//! One-shot, session-bound game shutdown. The graceful path uses no credentials,
+//! process termination, window activation or POL controls to stop the game. The
+//! instant path ("Close games instantly") ends only this session's own game host,
+//! by the exact process identity its worker recorded, like Windower's //terminate.
 use super::*;
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
+
+/// What Crystal's shut-down action does (Settings → System → "Close games instantly").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// The game's own /shutdown command and logout countdown.
+    Graceful,
+    /// End the game host at once. Its PlayOnline session ends with it.
+    Instant,
+}
+impl Mode {
+    pub(crate) fn from_setting(instant: bool) -> Self {
+        if instant { Self::Instant } else { Self::Graceful }
+    }
+    pub(crate) fn run(self, session: &BackgroundSession) -> Result<(), String> {
+        match self {
+            Self::Graceful => request(session),
+            Self::Instant => terminate(session),
+        }
+    }
+}
+
+/// Written just before the instant path ends `host`: the worker reads it when its loader
+/// pipe closes, so the end is a normal close and not a crash (`terminated`).
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Terminate {
+    worker: Identity,
+    host: Identity,
+}
+const TERMINATE_FILE: &str = "game-terminate.json";
+const HOST_EXIT_LIMIT: Duration = Duration::from_secs(5);
+const WORKER_EXIT_LIMIT: Duration = Duration::from_secs(15);
+
+/// Crystal's own game host for `worker`: the loader image (`pol.exe`), started after it.
+fn crystal_host(process: &OwnedHandle, host: Identity, worker: Identity) -> bool {
+    host.created > worker.created
+        && crate::win::process::image_path_of(process).ok().is_some_and(|path| {
+            path.file_name().is_some_and(|name| name.eq_ignore_ascii_case("pol.exe"))
+        })
+}
+
+pub(crate) fn terminate(session: &BackgroundSession) -> Result<(), String> {
+    terminate_within(session, &crystal_host, HOST_EXIT_LIMIT, WORKER_EXIT_LIMIT)
+}
+
+fn terminate_within(
+    session: &BackgroundSession,
+    owned: &dyn Fn(&OwnedHandle, Identity, Identity) -> bool,
+    host_limit: Duration,
+    worker_limit: Duration,
+) -> Result<(), String> {
+    use crate::win::process::{created, open, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE};
+    use windows_sys::Win32::System::Threading::{TerminateProcess, PROCESS_TERMINATE};
+    let refused = || t("Could not close FFXI.").to_owned();
+    current(session)?;
+    let record = read_record(&session.path)
+        .filter(|record| record.worker == session.worker)
+        .ok_or(t("The selected game session ended before shutdown could be requested."))?;
+    let Event::Started(started) = record.state else {
+        return Err(t("Wait for FFXI to finish starting before requesting shutdown.").into());
+    };
+    let directory = session.path.parent().ok_or(t("This game session has no account directory."))?;
+    let _delivery = exclusive(&directory.join("game-shutdown-delivery.lock"))
+        .map_err(|_| t("Shutdown is already being requested for this account."))?;
+    // One handle is checked and terminated: a reused PID can never be the one ended.
+    let process = open(started.pid, PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE)
+        .map_err(|_| refused())?;
+    let host = Identity { pid: started.pid, created: created(&process).ok_or_else(refused)? };
+    if !owned(&process, host, session.worker) {
+        return Err(refused());
+    }
+    let host_watch = ProcessWatch(process);
+    if host_watch.ended()? {
+        return Ok(());
+    }
+    let worker_watch = ProcessWatch::open(session.worker)?;
+    let marker = directory.join(TERMINATE_FILE);
+    save_json(&marker, &Terminate { worker: session.worker, host })?;
+    let forget = || { let _ = fs::remove_file(&marker); };
+    if let Err(error) = current(session) {
+        forget();
+        return Err(error);
+    }
+    if unsafe { TerminateProcess(host_watch.0.as_raw_handle() as _, 0) } == 0 && !host_watch.ended()? {
+        forget();
+        return Err(refused());
+    }
+    // The marker stays for the worker: it is bound to this worker and this host only.
+    let until = Instant::now() + host_limit;
+    while !host_watch.ended()? {
+        if Instant::now() >= until { return Err(refused()); }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The worker records the normal end and closes; the window's monitor shows it either way.
+    let until = Instant::now() + worker_limit;
+    while !worker_watch.ended()? && session.active() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
+}
+
+/// In the worker: whether this session's game host was ended by the instant path. True at
+/// most once, and only for this worker and the host its record names.
+pub(crate) fn terminated(directory: &Path) -> bool {
+    let path = directory.join(TERMINATE_FILE);
+    let Some(marker) = read_bounded(&path, FRAME_LIMIT).and_then(|bytes| serde_json::from_slice::<Terminate>(&bytes).ok())
+    else { return false };
+    let Some(worker) = identity(std::process::id()) else { return false };
+    let host = read_record(&directory.join("session.json"))
+        .filter(|record| record.worker == worker)
+        .and_then(|record| match record.state { Event::Started(started) => Some(started.pid), _ => None });
+    let ours = marker.worker == worker && host == Some(marker.host.pid);
+    if ours {
+        let _ = fs::remove_file(&path);
+    }
+    ours
+}
 
 const FRAME_LIMIT: usize = 2048;
 const CLOSE_LIMIT: Duration = Duration::from_secs(90);
@@ -397,6 +517,17 @@ mod tests {
         .unwrap();
         publish(&directory, 0, 7, true, "").unwrap();
         fs::write(root.join("ready"), b"").unwrap();
+        if root.join("terminate").exists() {
+            // As the worker's supervisor, once the loader pipe closes: how did the game end?
+            let until = Instant::now() + Duration::from_secs(10);
+            while !(directory.join(TERMINATE_FILE).exists() && identity(host).is_none()) {
+                assert!(Instant::now() < until, "the host was not ended");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let kind = if terminated(&directory) { "normal" } else { "unknown" };
+            fs::write(root.join("classified"), kind).unwrap();
+            return;
+        }
         let until = Instant::now() + Duration::from_secs(5);
         let frame = loop {
             if let Some(frame) = take(&directory) {
@@ -424,6 +555,50 @@ mod tests {
             ended(&directory, 7).unwrap();
         }
         wait_file(&root, "close-worker");
+    }
+    #[test]
+    fn instant_close_ends_only_the_verified_host_and_its_worker_records_a_normal_close() {
+        let root = Root::new();
+        fs::write(root.0.join("terminate"), b"").unwrap();
+        let mut host = helper(&root.0, "host", 0);
+        let mut worker = helper(&root.0, "worker", host.0.id());
+        wait_file(&root.0, "ready");
+        let (config, account, directory) = fixture(&root.0);
+        let session = find(&config, &account).unwrap();
+        // The real check refuses a process that is not a pol.exe started after the worker.
+        assert!(terminate(&session).unwrap_err().contains("Could not close FFXI"));
+        assert!(host.0.try_wait().unwrap().is_none() && !directory.join(TERMINATE_FILE).exists());
+        let (host_pid, owner) = (host.0.id(), session.worker);
+        terminate_within(&session, &|_, found, worker| found.pid == host_pid && worker == owner,
+            Duration::from_secs(5), Duration::from_secs(5)).unwrap();
+        assert!(host.0.try_wait().unwrap().is_some(), "the host was ended");
+        assert!(worker.0.wait().unwrap().success());
+        assert_eq!(fs::read_to_string(root.0.join("classified")).unwrap(), "normal");
+        assert!(!directory.join(TERMINATE_FILE).exists() && !terminated(&directory), "consumed once");
+    }
+    #[test]
+    fn a_terminate_marker_for_another_worker_or_host_is_not_a_normal_close() {
+        let root = Root::new();
+        let (config, account, directory) = fixture(&root.0);
+        let worker = identity(std::process::id()).unwrap();
+        let started = |pid| Record {
+            worker,
+            state: Event::Started(Started { pid, detail: "fixture".into(), log: root.0.join("fixture.log"), timing: String::new() }),
+            social_only: false, authenticated: true, native_batch: false, otp_used: Some(false),
+            launch_choice: None, launch_tool: None,
+        };
+        save_record(&record_path(&config, &account), &started(worker.pid)).unwrap();
+        let other = Identity { created: worker.created.wrapping_add(1), ..worker };
+        for marker in [Terminate { worker: other, host: worker }, Terminate { worker, host: Identity { pid: worker.pid + 4, ..worker } }] {
+            save_json(&directory.join(TERMINATE_FILE), &marker).unwrap();
+            assert!(!terminated(&directory));
+            assert!(directory.join(TERMINATE_FILE).exists(), "a foreign marker is left alone");
+        }
+        save_json(&directory.join(TERMINATE_FILE), &Terminate { worker, host: worker }).unwrap();
+        assert!(terminated(&directory) && !terminated(&directory));
+        let report = crate::launch_log::classify_loader_end(&crate::launch_log::LoaderEnd::Terminated, Duration::from_secs(1));
+        assert_eq!(report.kind, crate::launch_log::ExitKind::Normal);
+        assert_eq!(report.summary, "Game closed normally");
     }
     #[test]
     fn retained_pol_completes_shutdown_only_for_the_ended_game_and_keeps_both_processes_alive() {

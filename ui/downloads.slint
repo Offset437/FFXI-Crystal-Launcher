@@ -7,7 +7,7 @@
 import { Theme } from "theme.slint";
 import { View, Ink } from "state.slint";
 import { Downloads, DlPart } from "downloads_state.slint";
-import { Glyph, Icon, Pressable, Control, Tone, IconButton, Rule, ScrollThumb, Field, FormLabel, Note, Bar, SmallButton, Spinner, SectionHeader, Panel, CrystalGauge } from "widgets.slint";
+import { Glyph, Icon, Pressable, Control, Tone, IconButton, Rule, ScrollThumb, Field, FormLabel, Note, Bar, SmallButton, Spinner, SectionHeader, Panel, CrystalGauge, Segmented, QuietButton } from "widgets.slint";
 import { PrereqBanner } from "home.slint";
 
 export { Downloads }
@@ -391,6 +391,24 @@ component InstallerSection inherits VerticalLayout {
         spacing: Theme.sp-s;
         padding-left: 14px;
         padding-right: 14px;
+        // Which region's official installer: its own files, folder and download page.
+        FormLabel { text: Downloads.strings.installer-region; color: Theme.ink2; }
+        HorizontalLayout {
+            spacing: Theme.sp-s;
+            Segmented {
+                max-width: 220px;
+                items: Downloads.installer-regions;
+                current: Downloads.installer.region;
+                picked(index) => { Downloads.installer-region(index); }
+            }
+            QuietButton {
+                text: Downloads.strings.official-page;
+                glyph: Glyph.external-link;
+                trailing: true;
+                clicked => { Downloads.open-installer-page(); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
         FormLabel { text: Downloads.strings.installer-folder; color: Theme.ink2; }
         HorizontalLayout {
             spacing: Theme.sp-s;
@@ -428,7 +446,7 @@ component InstallerSection inherits VerticalLayout {
             action-w: root.action-w;
             number: "1";
             title: Downloads.strings.step1-title;
-            body: Downloads.strings.step1-body;
+            body: Downloads.installer.size;
             glyph: Glyph.download;
             action: Downloads.strings.download;
             enabled: Downloads.installer.can-install;

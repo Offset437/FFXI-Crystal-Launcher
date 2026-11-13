@@ -43,6 +43,8 @@ struct State {
     can_cancel: bool,
     installer_editable: bool,
     can_browse_installer: bool,
+    /// The selected region's official download page.
+    installer_page: &'static str,
     install_editable: bool,
     can_find: bool,
     can_browse_game: bool,
@@ -94,6 +96,8 @@ where
     dl.on_download(|| act(|s| s.can_install.then_some(Message::StartMaintenance(MaintenanceKind::Download))));
     dl.on_extract(|| act(|s| s.can_install.then_some(Message::StartMaintenance(MaintenanceKind::Extract))));
     dl.on_run_setup(|| act(|s| s.can_setup.then_some(Message::StartMaintenance(MaintenanceKind::Setup))));
+    dl.on_installer_region(|i| act(|s| (s.can_install && (0..3).contains(&i)).then_some(Message::InstallerRegion(i as u8))));
+    dl.on_open_installer_page(|| act(|s| Some(Message::OpenUrl(s.installer_page.into()))));
 
     // ---- the launcher settings dialog ----
     dl.on_close_settings(|| send(Message::ToggleSettings));
@@ -187,7 +191,8 @@ fn strings() -> DlStrings {
         browse: t("Browse…").into(),
         install_title: t("Install PlayOnline and FFXI").into(),
         step1_title: t("Download official installer").into(),
-        step1_body: t("Five files, about 7.7 GB.").into(),
+        installer_region: t("Region").into(),
+        official_page: t("Official download page").into(),
         download: t("Download").into(),
         step2_title: t("Extract").into(),
         extract: t("Extract").into(),
@@ -415,6 +420,17 @@ fn activity(dl: &Downloads, app: &App, state: &mut State, private: &Private) {
             view.gauge_label = format!("{}%", (fraction * 100.0).round() as u32).into();
         }
     }
+    else if let Some(job) = app.play_updates.jobs.iter().find(|job| job.blocked.is_none()) {
+        // An update a Play started: the figure the footer shows lights the crystal.
+        view.running = true;
+        view.kind = t("Updating FINAL FANTASY XI").into();
+        if let Some(percent) = crate::play_update::maintenance_percent(&job.op.snapshot()) {
+            view.gauge = f32::from(percent) / 100.0;
+            view.gauge_label = format!("{percent}%").into();
+        } else {
+            view.gauge = 0.0;
+        }
+    }
     if !app.maintenance_result.is_empty() {
         let (glyph, ink) = result_look(app.maintenance_tone);
         view.result = private.text(&app.maintenance_result).into();
@@ -474,8 +490,10 @@ fn installer(dl: &Downloads, app: &App, state: &mut State, private: &Private) {
     state.can_browse_installer = idle;
     state.can_install = idle;
     state.can_setup = idle && !app.has_sessions();
-    if state.part_names.is_empty() {
-        state.part_names = (1..=PARTS).map(|n| format!("FFXIFullSetup_US.part{n}.{}", if n == 1 { "exe" } else { "rar" }).into()).collect();
+    let official = crate::installer::official(app.installer_region());
+    state.installer_page = official.info_url;
+    if state.part_names.first().map(SharedString::as_str) != Some(official.volumes[0].name) {
+        state.part_names = official.volumes.iter().map(|volume| volume.name.into()).collect();
     }
     let rows = parts(&app.maintenance_progress, app.maintenance == Some(MaintenanceKind::Download), &state.part_names);
     let view = DlInstaller {
@@ -485,6 +503,8 @@ fn installer(dl: &Downloads, app: &App, state: &mut State, private: &Private) {
         can_install: state.can_install,
         can_setup: state.can_setup,
         show_parts: rows.is_some(),
+        region: i32::from(official.region.index()),
+        size: tf("Five files, about {size} GB.", &[("size", &format!("{:.1}", official.total() as f64 / 1e9))]).into(),
     };
     put!(dl, get_installer, set_installer, view);
     sync_model(&state.parts, rows.unwrap_or_default());
@@ -736,6 +756,27 @@ mod tests {
     }
 
     #[test]
+    fn the_crystal_follows_a_play_started_update() {
+        let _window = headless(1440, 900);
+        let mut app = downloads_app();
+        let ui = page(&app);
+        let dl = ui.global::<Downloads>();
+        let key = app.accounts[0].key.clone();
+        app.play_updates.begin(std::path::PathBuf::from(r"C:\fixture\FINAL FANTASY XI"), &key, "30261006_0".into(), std::time::Instant::now(), Vec::new(), false);
+        // A fresh operation has no whole-update estimate yet, so the step's share is the figure.
+        app.play_updates.jobs[0].op = crate::operation::Operation::new();
+        app.play_updates.jobs[0].op.progress(Stage::InstallerDownload, 45, 100, "");
+        resync(&ui, &app);
+        let activity = dl.get_activity();
+        assert!(activity.running);
+        assert!((activity.gauge - 0.45).abs() < 0.001 && activity.gauge_label == "45%", "{} {}", activity.gauge, activity.gauge_label);
+        // Maintenance wins when both run.
+        downloading(&mut app);
+        resync(&ui, &app);
+        assert_eq!(dl.get_activity().gauge_label, "50%");
+    }
+
+    #[test]
     fn the_page_shows_the_state_and_every_control_sends_its_message() {
         let _window = headless(1440, 900);
         let mut app = downloads_app();
@@ -816,6 +857,34 @@ mod tests {
         assert!(take().is_empty());
     }
 
+    /// The region switch shows the chosen region's size, volume names and download page, and
+    /// sends its pick only while no installer step runs.
+    #[test]
+    fn the_installer_region_switch_follows_the_region_and_sends_its_pick() {
+        let _window = headless(1440, 900);
+        let mut app = downloads_app();
+        let ui = page(&app);
+        let dl = ui.global::<Downloads>();
+        assert_eq!((dl.get_installer().region, dl.get_installer().size.as_str()), (0, "Five files, about 7.7 GB."));
+        app.settings.installer_region = Some(2);
+        downloading(&mut app);
+        resync(&ui, &app);
+        let installer = dl.get_installer();
+        assert_eq!((installer.region, installer.size.as_str()), (2, "Five files, about 7.8 GB."));
+        let names: Vec<String> = dl.get_parts().iter().map(|part| part.name.to_string()).collect();
+        assert_eq!(names[0], "FFXIFullSetup_JP.part1.exe");
+        assert_eq!(names[4], "FFXIFullSetup_JP.part5.rar");
+        dl.invoke_installer_region(1);
+        dl.invoke_open_installer_page();
+        assert!(matches!(take().as_slice(), [Message::OpenUrl(url)] if url == "https://www.playonline.com/ff11/download/media/install_win.html"),
+            "no region change while the download runs");
+        app.maintenance = None;
+        resync(&ui, &app);
+        dl.invoke_installer_region(1);
+        dl.invoke_installer_region(5);
+        assert!(matches!(take().as_slice(), [Message::InstallerRegion(1)]));
+    }
+
     #[test]
     fn privacy_mode_masks_paths_and_identities_but_keeps_messages_readable() {
         let _window = headless(1440, 900);
@@ -838,6 +907,7 @@ mod tests {
             folder: Some(r"C:\Users\Jane\PlayOnline\SquareEnix\PlayOnlineViewer".into()),
             version: report("Main account: viewer checked"),
             core_error: None,
+            stale: false,
         });
         app.patch = Some(report("Main account: files checked"));
         crate::privacy::set(true);

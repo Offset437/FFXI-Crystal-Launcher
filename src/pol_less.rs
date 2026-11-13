@@ -188,6 +188,8 @@ pub(crate) trait SignedIn: Send + Sync + 'static {
     fn take_game_shutdown(&self) -> Option<Vec<u8>> { None }
     fn game_shutdown_result(&self, _id: u64, _game: u64, _ok: bool, _message: &str) -> Result<(), String> { Ok(()) }
     fn native_game_ended(&self, _game: u64, _returned: bool) -> Result<(), String> { Ok(()) }
+    /// The window's "Close games instantly" ended this session's host (consumed once).
+    fn game_terminated(&self) -> bool { false }
     fn controller_result(&self, _id: u64, _ok: bool, _message: &str) -> Result<(), String> { Ok(()) }
     /// A pending control and its "also for my groups" choice.
     fn take_native_control(&self) -> Option<(crate::session_worker::NativeControl, bool)> { None }
@@ -242,9 +244,12 @@ pub(crate) fn launch(
     mut timing: Timeline,
     progress: &mut impl FnMut(&str),
 ) -> Result<LaunchResult, String> {
-    let auth = native_auth_for(config, plan, &account, otp)?;
+    let mut auth = native_auth_for(config, plan, &account, otp)?;
     let prepared = prepare_with_progress(config, plan, &account, &mut timing, progress, &|| false)?;
     drop(account);
+    // The account editor shows the same line for an EU/JP account.
+    if prepared.target.experimental().is_some() { progress(t("EU and JP sign-in is experimental.")); }
+    auth.set_target(prepared.target.clone());
     // beside the exact loader this launch runs; never fails the launch.
     if let Some(line) = crate::dgvoodoo::sync_for_launch(&prepared.loader, plan.settings.dgvoodoo) {
         progress(&line);
@@ -259,8 +264,9 @@ pub(crate) fn launch(
 /// Play: the region check and credential/code validation. No lookup runs ahead of the W2U
 /// and polcore's own, as with the stock Viewer.
 fn native_auth_for(config: &Config, plan: &Plan, account: &Account, otp: Zeroizing<String>) -> Result<native_auth::NativeAuth, String> {
-    if account.region != 0 {
-        return Err(t("Retail login currently supports the verified US install only. EU and JP protocol region values are not verified yet.").into());
+    // EU and JP are experimental: their values are read in `prepare` (`retail_region`).
+    if crate::retail_region::RetailRegion::from_account(account.region).is_none() {
+        return Err(t("The account's region is not US, EU or JP.").into());
     }
     let mut auth = native_auth::NativeAuth::new(account, otp, config.account_directory(account))?;
     configure(&mut auth, plan);
@@ -305,6 +311,8 @@ struct Prepared {
     check: GameCheck,
     /// The Viewer check the loader asks for at Connect (replaced in tests).
     viewer_check: ViewerCheck,
+    /// The verified US install, or an experimental EU/JP one with its own values.
+    target: crate::retail_region::Target,
     /// Windower only: the inputs a saved startup snapshot must match, or why
     /// private startup can't apply (an unsupported Hook.dll build, unreadable files).
     bootstrap_key: Result<windower_parallel::Key, &'static str>,
@@ -318,9 +326,9 @@ struct Prepared {
 /// The stock FFXI check for a game folder: `Ok(note)` to start, `Err(message)` to stop,
 /// with the phases of its exchange (07d §2.2: logged on every path).
 type GameCheck = fn(&Path) -> (Result<String, String>, crate::patch::CheckTiming);
-/// One stock W2U (:54000) for this sign-in, with its "network not ready" retries and the
-/// phases of every attempt; returns after the last socket closed (07c §1.2, 07d §2.3).
-type ViewerCheck = fn() -> crate::viewer::ConnectCheck;
+/// One stock W2U (:54000) for this sign-in's target, with its "network not ready" retries
+/// and the phases of every attempt; returns after the last socket closed (07c §1.2, 07d §2.3).
+type ViewerCheck = fn(&crate::retail_region::Target) -> crate::viewer::ConnectCheck;
 
 enum CheckTask {
     Waiting,
@@ -341,6 +349,7 @@ struct GameVersionCheck {
     directory: Option<PathBuf>,
     check: GameCheck,
     viewer: ViewerCheck,
+    target: crate::retail_region::Target,
     task: CheckTask,
     /// Why this sign-in's W2U got no answer, for the error if the sign-in then fails
     /// (07d §5.6 step 4: the loader goes on after an unanswered W2U).
@@ -349,7 +358,7 @@ struct GameVersionCheck {
 impl GameVersionCheck {
     fn new(prepared: &Prepared) -> Self {
         Self { install: prepared.install_dir.clone(), directory: prepared.friends_directory.clone(), check: prepared.check,
-            viewer: prepared.viewer_check, task: CheckTask::Waiting, viewer_cause: None }
+            viewer: prepared.viewer_check, target: prepared.target.clone(), task: CheckTask::Waiting, viewer_cause: None }
     }
 
     /// Typed authentication: published for status only. W20 waits for the main menu. No
@@ -372,9 +381,18 @@ impl GameVersionCheck {
         if !matches!(self.task, CheckTask::Waiting) { return; }
         log.line("Viewer main menu reached; checking the FFXI version.");
         let (install, check, directory) = (self.install.clone(), self.check, self.directory.clone());
+        let region = self.target.experimental().map(|values| values.region.wire());
         self.task = match std::thread::Builder::new().name("ffxi-version-check".into())
             .spawn(move || {
-                let (result, timing) = check(&install);
+                let (mut result, timing) = check(&install);
+                // An EU/JP game update is the official Viewer's (`retail_region`): never
+                // Crystal's Update button, and no updater spacing note.
+                if let Some(region) = region {
+                    if let Err(message) = &result {
+                        if let Some(official) = crate::retail_region::official_game_update(region, message) { result = Err(official); }
+                    }
+                    return (result, Instant::now(), timing);
+                }
                 // The window runs the update this refusal asks for: it spaces its first
                 // connection from this W20's FIN (proposal 09 phase 2).
                 if let (Err(message), Some(directory)) = (&result, &directory) {
@@ -412,6 +430,8 @@ fn prepare(config: &Config, plan: &Plan, account: &Account) -> Result<Prepared, 
 fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, timing: &mut Timeline, progress: &mut dyn FnMut(&str),
     aborted: &dyn Fn() -> bool) -> Result<Prepared, String> {
     timing.stage("preparation: entered");
+    // US: nothing read. EU/JP: their install's values, or the missing piece named.
+    let target = crate::retail_region::Target::for_account(account.region)?;
     let tool = plan.tool;
     let settings = &plan.settings;
     let configured = match tool {
@@ -448,7 +468,7 @@ fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, timing
     let loader = crate::reshade::loader_for_launch(&loader, &settings.reshade, settings.dgvoodoo)?;
     let loader = plain_windows_path(&fs::canonicalize(&loader).unwrap_or(loader));
     timing.stage("preparation: loader resolved");
-    let install_dir = install_directory(config)?;
+    let install_dir = install_directory_for(config, account.region)?;
     timing.stage("preparation: game directory resolved");
     let tool_dir = tool_dir.unwrap_or_else(|| install_dir.clone());
     let mut base_ini = None;
@@ -528,8 +548,12 @@ fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, timing
             log: logs.join(format!("{}.crystal.log", unique_id()?)),
         },
         friends_directory: Some(config.account_directory(account)),
-        check: crate::patch::gate_before_start_timed,
-        viewer_check: crate::viewer::check_at_connect_timed,
+        // The same W20/0001 frame; a Japanese install's Viewer names the host pc001W20.
+        check: if target.experimental().is_some_and(|values| values.region == crate::retail_region::RetailRegion::Jp) {
+            crate::patch::gate_before_start_timed_jp
+        } else { crate::patch::gate_before_start_timed },
+        viewer_check: crate::viewer::check_at_connect_for,
+        target,
         bootstrap_key,
         private_bootstrap: None,
         trigger: plan.trigger,
@@ -559,6 +583,16 @@ pub(crate) fn install_directory(config: &Config) -> Result<PathBuf, String> {
         }
     }
     Ok(dir)
+}
+
+/// `install_directory` for an account's region. US: exactly `install_directory`. EU/JP: the
+/// folder chosen on Downloads, else their own region's registered game folder
+/// (`retail_region::game_folder`), else what `install_directory` finds.
+pub(crate) fn install_directory_for(config: &Config, account_region: u8) -> Result<PathBuf, String> {
+    if config.game_install.is_none() {
+        if let Some(dir) = crate::retail_region::game_folder(account_region) { return Ok(plain_windows_path(&dir)); }
+    }
+    install_directory(config)
 }
 
 fn registry_install_dir() -> Option<PathBuf> {
@@ -773,6 +807,7 @@ fn spawn_injector(p: &Prepared, pipe: &str, log: &mut SessionLog) -> Result<Inje
         Tool::Windower => {
             if let Some(snapshot) = &p.private_bootstrap {
                 let mut command = tools::vanilla_command(&p.loader, &snapshot.viewer_directory()?, pipe, pid);
+                // Windower.exe's Injector.Launch sets the same before it creates pol.exe.
                 command.env("__COMPAT_LAYER", "HighDpiAware").stdout(Stdio::null()).stderr(Stdio::null());
                 return command.spawn().map(Injector::NativeWindower).map_err(|e| start_error(&p.loader, e));
             }
@@ -869,7 +904,7 @@ fn net_error_text(error: &crate::dns::NetError) -> String {
 /// A first attempt that failed instantly and locally was retried with fresh DNS (07d §2.3).
 fn answer_viewer_check(pipe: &mut LoaderPipe, log: &mut SessionLog, game: &mut GameVersionCheck) -> Result<(), LoaderEnd> {
     log.line("The loader reached Connect; checking the PlayOnline Viewer version (W2U).");
-    let crate::viewer::ConnectCheck { verdict, timing } = (game.viewer)();
+    let crate::viewer::ConnectCheck { verdict, timing } = (game.viewer)(&game.target);
     if let Some(first) = timing.attempts.first().and_then(|attempt| attempt.error.as_ref()).filter(|error| error.network_not_ready()) {
         log.line(&format!("Viewer check (W2U): network not ready ({}); retrying with fresh DNS for up to {} s.",
             net_error_text(first), crate::patch::NETWORK_WAIT.as_secs()));
@@ -1010,9 +1045,9 @@ fn handle_event(event: LoaderEvent, auth: &impl SignedIn, log: &mut SessionLog) 
             Step::End(LoaderEnd::Error(message))
         }
         // Something the host could not provide (FFXIDB's settings protection on a build it
-        // does not know): said in the history, and the game goes on.
+        // does not know, or whether dgVoodoo loaded): said in the history, and the game goes on.
         LoaderEvent::Notice(message) => {
-            log.line(&message);
+            log.line(&crate::dgvoodoo::loader_notice(&message).unwrap_or(message));
             Step::Continue
         }
         LoaderEvent::Closed => {
@@ -1366,6 +1401,7 @@ fn supervise<A: SignedIn>(p: &Prepared, auth: A) -> Result<Supervision<A>, Strin
             if let Ok((mut pipe, auth, mut log, started, launch_timing, mut game_check)) = receiver.recv() {
                 let end = watch(&mut pipe, auth.as_ref(), &mut log, &mut game_check);
                 drop(pipe);
+                let end = user_terminated(end, auth.as_ref());
                 let report = classify_loader_end(&end, started.elapsed());
                 log.line(&format!("Session over: {}. Closing the sign-in session.", report.summary));
                 session.record(&noted(&report.summary, &launch_timing));
@@ -1378,6 +1414,11 @@ fn supervise<A: SignedIn>(p: &Prepared, auth: A) -> Result<Supervision<A>, Strin
         })
         .map_err(|_| t("Could not start the retail session supervisor."))?;
     Ok(Supervision { auth, game_running, log_path: p.session.log.clone(), sender, alive, outcome, game_check: GameVersionCheck::new(p), tool: p.tool })
+}
+
+/// A host the user's "Close games instantly" ended is a normal close, whatever its pipe saw.
+fn user_terminated<A: SignedIn + ?Sized>(end: LoaderEnd, auth: &A) -> LoaderEnd {
+    if end != LoaderEnd::SignedOut && auth.game_terminated() { LoaderEnd::Terminated } else { end }
 }
 
 /// A started tool whose loader connected, said hello and runs the expected image.
@@ -1469,6 +1510,7 @@ fn start_host_once(p: &mut Prepared, log: &mut SessionLog, timing: &mut Timeline
     let mut pipe = LoaderPipe::create().map_err(|e| tf("Could not create the session pipe ({error}).", &[("error", &e)]))?;
     progress(&tf("Starting {tool}...", &[("tool", &p.tool.name())]));
     let files = (p.tool == Tool::Windower && p.private_bootstrap.is_none()).then(|| tools::windower_files(&p.tool_dir));
+    refresh_controller_catalog(p);
     let spawned = Instant::now();
     let injector = spawn(p, pipe.name(), log)?;
     let mut injector = LaunchedInjector { injector, profile_access: p.profile_access.take(), stop_on_drop: p.tool == Tool::Windower };
@@ -1496,6 +1538,26 @@ fn start_host_once(p: &mut Prepared, log: &mut SessionLog, timing: &mut Timeline
     // may go now, whatever its profile (see `TurnGate`).
     drop(turn);
     Ok(Host { pipe, pid, injector })
+}
+
+#[path = "../crystal-loader/src/controller_record.rs"]
+mod controller_record;
+
+/// The game host replays this catalog to the game's controller query and never scans
+/// itself, so the scan runs here, beside the host's start (controller_record.rs). Skipped
+/// when the launch's settings turn the gamepad off: the host skips that query then.
+fn refresh_controller_catalog(p: &Prepared) {
+    // Launch tests run fake hosts; they never scan this machine's controllers.
+    if cfg!(test) || p.ffxi_settings.as_ref().is_some_and(|settings| gamepad_off(&settings.json)) { return; }
+    let history = p.session.history.clone();
+    let _ = std::thread::Builder::new().name("xi-controller-catalog".into()).spawn(move || {
+        if let Some(line) = controller_record::refresh() { crate::launch_log::append_history(&history, "Crystal", &line, None); }
+    });
+}
+
+fn gamepad_off(settings: &str) -> bool {
+    let settings: serde_json::Value = serde_json::from_str(settings).unwrap_or_default();
+    settings.get("padmode000").and_then(serde_json::Value::as_str).and_then(controller_record::gamepad_enabled) == Some(false)
 }
 
 /// A spawned tool's connect, verified hello and handoff (private Windower readiness, or
@@ -1632,6 +1694,7 @@ fn run<A: SignedIn>(
     limits: Timeouts,
 ) -> Result<LaunchResult, String> {
     let mut log = open_launch_log(&p, &mut timing, None)?;
+    for line in p.target.log_lines() { log.line(&line); }
     let supervision = supervise(&p, auth)?;
     let auth = supervision.auth.clone();
     let log_path = supervision.log_path.clone();
@@ -1795,6 +1858,16 @@ pub(crate) fn detect_all(settings: &ToolSettings) -> Detected {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The launcher scans controllers unless the launch's own settings turn the gamepad off,
+    /// exactly when the host would skip the game's controller query.
+    #[test]
+    fn the_controller_scan_follows_the_launch_gamepad_setting() {
+        assert!(gamepad_off(r#"{"padmode000":"0,0,0,0,1,0"}"#));
+        assert!(!gamepad_off(r#"{"padmode000":"1,0,0,0,1,0"}"#));
+        assert!(!gamepad_off(&ffxi_settings::menu_settings(Some((1280, 720))).json), "no padmode: the registry's, so scan");
+        assert!(!gamepad_off(r#"{"padmode000":"0,0"}"#) && !gamepad_off("not json"));
+    }
 
     /// pol-spec 07c §1: the launcher's answer, as crystal-loader proto.rs parses it.
     #[test]
@@ -1978,7 +2051,8 @@ mod tests {
             session: Session { history: dir.join("history.log"), label: "Fake".into(), log: dir.join("a.crystal.log") },
             friends_directory: None,
             check: |_| (Ok("Game version matches.".into()), Default::default()),
-            viewer_check: || panic!("this fixture loader never asks for the Viewer check"),
+            viewer_check: |_| panic!("this fixture loader never asks for the Viewer check"),
+            target: Default::default(),
             bootstrap_key: Err("fixture"),
             private_bootstrap: None,
             trigger: crate::launch_timing::LaunchTrigger::Play,
@@ -3201,7 +3275,7 @@ mod tests {
             CALLS.store(0, Ordering::SeqCst);
             *VERDICT.lock().unwrap() = Some(verdict.clone());
             let (mut prepared, dir) = fixture(Tool::Windower);
-            prepared.viewer_check = || {
+            prepared.viewer_check = |_| {
                 CALLS.fetch_add(1, Ordering::SeqCst);
                 // A lost SYN on the connect (07d §4.5): its loss note reaches the launch log.
                 let attempt = crate::patch::Attempt { resolve: Some(Duration::from_millis(3)), connect: Some(Duration::from_millis(1180)),
@@ -3557,7 +3631,7 @@ mod tests {
     #[test]
     fn a_parked_host_gets_credentials_only_at_play_then_signs_in_like_a_cold_one() {
         let (mut prepared, dir) = fixture(Tool::Windower);
-        prepared.viewer_check = || crate::viewer::ConnectCheck { verdict: crate::viewer::ConnectVerdict::Current { version: "20110829_E".into() }, timing: Default::default() };
+        prepared.viewer_check = |_| crate::viewer::ConnectCheck { verdict: crate::viewer::ConnectVerdict::Current { version: "20110829_E".into() }, timing: Default::default() };
         prepared.check = |_| (Ok("Game version matches.".into()), Default::default());
         let windower = Arc::new(AtomicBool::new(false));
         let (done, got) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(Vec::new())));

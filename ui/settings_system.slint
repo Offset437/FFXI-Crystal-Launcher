@@ -354,6 +354,15 @@ export component SystemTab inherits VerticalLayout {
         }
     }
 
+    // Home's search bar.
+    Card {
+        SwitchNotes {
+            text: SettingsView.strings.item-search-label;
+            on: SettingsView.system.item-search;
+            toggled(on) => { SettingsView.set-item-search(on); }
+        }
+    }
+
     // Sign-in.
     Card {
         gap: 16px * root.s;
@@ -368,6 +377,12 @@ export component SystemTab inherits VerticalLayout {
             on: SettingsView.system.keep;
             note-1: SettingsView.strings.keep-note;
             toggled(on) => { SettingsView.set-keep(on); }
+        }
+        SwitchNotes {
+            text: SettingsView.strings.instant-label;
+            on: SettingsView.system.instant;
+            note-1: SettingsView.strings.instant-note;
+            toggled(on) => { SettingsView.set-instant(on); }
         }
     }
 

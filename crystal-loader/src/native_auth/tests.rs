@@ -188,6 +188,9 @@ fake_table!(125 126 163 164 165 166 167 169 171 172 173 175 176 190 195 196 199 
 fn script(slot: usize, values: &[i32]) {
     FAKE.with(|f| f.borrow_mut().scripted.entry(slot).or_default().extend(values.iter().map(|v| *v as usize)));
 }
+/// Script a sign-in's two reads of the selected handle (190): the portrait probe's, with no
+/// handle selected so it stays silent, then the presence decision's (a character is selected, so it publishes).
+fn script_publish() { script(190, &[-1, 0]); }
 fn set_linked(linked: i32) { FAKE.with(|f| f.borrow_mut().linked = linked); }
 fn raw_calls() -> Vec<(usize, Vec<usize>)> { FAKE.with(|f| f.borrow().calls.clone()) }
 fn clear_calls() { FAKE.with(|f| f.borrow_mut().calls.clear()); }
@@ -278,7 +281,7 @@ fn default_build_steps_sign_in_mail_presence_return_and_idle_at_the_viewer_frame
     viewer_check_current();
     // Exercise a pending poll in every startup request stage, including mail.
     for poll in [375, 164, 330, 377] { script(poll, &[0, 1]); }
-    script(190, &[0]); // actually publish presence
+    script_publish(); // actually publish presence
     let pauses = CapturePauses::start();
     s.sign_in_core(50, &credentials()).unwrap();
     let calls = raw_calls();
@@ -340,10 +343,10 @@ fn sign_in_drives_the_core_in_the_stock_viewer_order() {
         "1032(1)", "871(*)", "374()", "375(0)", "163()", "171()", "175()", "383()", "164(1)", "172(2)", "176(3)", "384(4)",
     ]);
     let raw = raw_calls();
-    // Main menu entry after the lists: the mail list, then the Viewer presence
+    // After the lists: the portrait probe reads the selected handle (190); then main menu entry:${nl}    // the mail list, then the Viewer presence
     // decision (already the Viewer here, so nothing is published).
     let tail = &calls[calls.iter().position(|c| c == "384(4)").unwrap() + 1..];
-    assert_eq!(&tail[..5], ["1304()", "329(*,200)", "330(7)", "190()", "207()"]);
+    assert_eq!(&tail[..6], ["190()", "1304()", "329(*,200)", "330(7)", "190()", "207()"]);
     // A6: no status request of our own and no 420 at sign-in.
     assert!(!raw.iter().any(|(s, _)| [195, 196, 376, 377, 420].contains(s)));
     // A4/A9: Open(0) then Open(1); each 815 follows that frame's 818.
@@ -583,7 +586,7 @@ fn viewer_gaps_restore_the_two_viewer_pauses_as_owner_frames_only_when_asked() {
         let mut s = bootstrapped(&viewer);
         viewer_check_current();
         s.set_viewer_gaps(gaps);
-        script(190, &[0]); // publish presence
+        script_publish(); // publish presence
         let pauses = CapturePauses::start();
         s.sign_in_core(50, &credentials()).unwrap();
         let calls = raw_calls();
@@ -594,7 +597,7 @@ fn viewer_gaps_restore_the_two_viewer_pauses_as_owner_frames_only_when_asked() {
         let status = position(&calls, 374, None).unwrap();
         // Mail-list response (its last 330) → the publish decision (190).
         let mail = calls.iter().rposition(|(s, _)| *s == 330).unwrap();
-        let publish = position(&calls, 190, None).unwrap();
+        let publish = calls.iter().rposition(|(s, _)| *s == 190).unwrap(); // the presence decision, after the portrait probe's read
         assert!(delivery < status && mail < publish);
         if gaps {
             // The Viewer's frame counts (08 §4 item 5), as owner frames.
@@ -653,7 +656,7 @@ fn a_queued_or_requested_play_ends_the_viewer_gaps_at_the_next_frame() {
         let delivery = position(&calls, 1032, Some(1)).unwrap();
         let status = position(&calls, 374, None).unwrap();
         let mail = calls.iter().rposition(|(s, _)| *s == 330).unwrap();
-        let publish = position(&calls, 190, None).unwrap();
+        let publish = calls.iter().rposition(|(s, _)| *s == 190).unwrap(); // the presence decision, after the portrait probe's read
         assert_eq!(frames(delivery, status), at, "the first gap stops at the frame the Play arrived on");
         assert_eq!(frames(mail, publish), 0, "the second gap is skipped");
         assert_eq!(trace(&[818, 838, 1103]), reference, "the same requests as without gaps");
@@ -693,7 +696,7 @@ fn every_sign_in_request_logs_its_start_end_polls_and_attempts() {
     viewer_check_current();
     for poll in [375, 164, 330, 377] { script(poll, &[0, 1]); }
     script(171, &[SLOTS_FULL]); // handles: one full-table reissue
-    script(190, &[0]); // publish presence
+    script_publish(); // publish presence
     let _pauses = CapturePauses::start();
     let lines = crate::log::capture(|| s.sign_in_core(50, &credentials()).unwrap());
     for (name, result, polls, attempts) in [("open-network", 30, 3, 1), ("open-member", 30, 15, 1), ("status", 1, 2, 1),
@@ -790,7 +793,7 @@ fn a_launcher_gone_during_a_viewer_gap_starts_neither_the_next_request_nor_a_can
         let mut s = bootstrapped(&viewer);
         viewer_check_current();
         s.set_viewer_gaps(true);
-        script(190, &[0]); // presence would publish
+        script_publish(); // presence would publish
         FAKE.with(|f| f.borrow_mut().close_on = Some(close_on));
         let error = s.sign_in_core(50, &credentials()).unwrap_err();
         events::set_closed_for_test(false);
@@ -814,7 +817,7 @@ fn a_launcher_gone_without_viewer_gaps_starts_neither_the_next_request_nor_a_can
         let viewer = fixture();
         let mut s = bootstrapped(&viewer);
         viewer_check_current();
-        script(190, &[0]); // presence would publish
+        script_publish(); // presence would publish
         FAKE.with(|f| f.borrow_mut().close_on = Some(close_on));
         let error = s.sign_in_core(50, &credentials()).unwrap_err();
         events::set_closed_for_test(false);
@@ -833,7 +836,7 @@ fn main_menu_follows_the_publish_with_its_code_on_sign_in_and_on_return() {
     let viewer = fixture();
     let mut s = bootstrapped(&viewer);
     viewer_check_current();
-    script(190, &[0]); // publish: 376 ticket 5, 377 completes with 1
+    script_publish(); // publish: 376 ticket 5, 377 completes with 1
     let events = events::capture(|| s.sign_in_core(50, &credentials()).unwrap());
     let events: Vec<_> = events.into_iter().filter(|e| !e.contains("native_auth_stage")).collect();
     assert_eq!(events[1..], ["{\"type\":\"authenticated\"}\n", "{\"type\":\"native_main_menu\",\"code\":1,\"returned\":false}\n"]);

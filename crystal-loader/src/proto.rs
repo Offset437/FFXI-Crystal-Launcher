@@ -38,6 +38,28 @@ impl Region {
             Region::Eu => "EU",
         }
     }
+
+    /// EU and JP sign-ins are experimental: their region values are logged
+    /// for testers (game.rs `log_region_values`).
+    pub fn experimental(self) -> bool { self != Region::Us }
+}
+
+/// The install's `POL_UCS_AREA_KBN` (slot 1309's argument, app 1001a1ea):
+/// two ASCII digits. US sends none (the loader keeps its verified "01");
+/// EU and JP must send the value the launcher read from their env.dat.
+fn parse_ucs_area(value: Option<&Value<'_>>, region: Region) -> Result<Option<String>, ProtoError> {
+    match (value, region) {
+        (None, Region::Us) => Ok(None),
+        (Some(_), Region::Us) => Err(ProtoError::Field("ucs_area", "only an EU or JP session carries it")),
+        (None, _) => Err(ProtoError::Missing("ucs_area")),
+        (Some(value), _) => {
+            let raw = plain_str(Some(value), "ucs_area")?.ok_or(ProtoError::Field("ucs_area", "must be a string"))?;
+            if raw.len() != 2 || !raw.iter().all(u8::is_ascii_digit) {
+                return Err(ProtoError::Field("ucs_area", "must be two digits"));
+            }
+            Ok(Some(String::from_utf8(raw.to_vec()).expect("ASCII digits")))
+        }
+    }
 }
 
 pub use crate::wire::{FRIENDS_LEN, FRIEND_RECORD_LEN, FRIEND_SLOTS};
@@ -212,6 +234,8 @@ pub fn parse_service_event(line: &[u8]) -> Result<Option<ServiceEvent>, ProtoErr
 #[derive(Debug)]
 pub struct Session {
     pub region: Region,
+    /// EU/JP only: the install's `POL_UCS_AREA_KBN` (`parse_ucs_area`).
+    pub ucs_area: Option<String>,
     /// FFXI install folder as the launcher sees it; `None` if empty/absent.
     pub install_dir: Option<String>,
     /// Explicit discovered POL installation, including portable installations.
@@ -387,6 +411,7 @@ pub fn parse_session(line: &[u8]) -> Result<Session, ProtoError> {
         Some(_) => return Err(ProtoError::Field("region", "must be US, EU or JP")),
         None => return Err(ProtoError::Missing("region")),
     };
+    let ucs_area = parse_ucs_area(get("ucs_area"), region)?;
     // Accepted and checked, not used: the game language comes from the
     // Viewer's registry (registry::viewer_language).
     match get("lang") {
@@ -414,8 +439,8 @@ pub fn parse_session(line: &[u8]) -> Result<Session, ProtoError> {
     // Every session is a native sign-in by the installed core. Launcher-made
     // session keys and records (the retired offline path) are refused.
     let native_auth = get("native_auth").filter(|value| !matches!(value, Value::Null)).ok_or(ProtoError::Missing("native_auth"))?;
-    if region != Region::Us || LEGACY_FIELDS.iter().any(|k| get(k).is_some()) {
-        return Err(ProtoError::Field("native_auth", "requires a US session without supplied session keys or records"));
+    if LEGACY_FIELDS.iter().any(|k| get(k).is_some()) {
+        return Err(ProtoError::Field("native_auth", "requires a session without supplied session keys or records"));
     }
     let native_auth = parse_native_credentials(native_auth)?;
 
@@ -435,7 +460,7 @@ pub fn parse_session(line: &[u8]) -> Result<Session, ProtoError> {
     let viewer_gaps = flag("viewer_gaps", false)?;
     let auto_away_minutes = auto_away_minutes(get("auto_away_minutes"))?;
     let auto_login = parse_auto_login(get("auto_login"))?;
-    Ok(Session { region, install_dir, pol_install_dir, native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, auto_login, ffxi_settings })
+    Ok(Session { region, ucs_area, install_dir, pol_install_dir, native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, auto_login, ffxi_settings })
 }
 
 /// Viewer auto-Away minutes: 0 off, else 10..=60; absent = 10.
@@ -459,6 +484,7 @@ pub const PARK: bool = true;
 #[derive(Debug)]
 pub struct Park {
     pub region: Region,
+    pub ucs_area: Option<String>,
     pub install_dir: Option<String>,
     pub pol_install_dir: Option<String>,
     pub auto_login: AutoLogin,
@@ -498,7 +524,7 @@ impl Park {
     pub fn into_session(self, unpark: Unpark) -> Session {
         let Unpark { native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes } = unpark;
         Session {
-            region: self.region, install_dir: self.install_dir, pol_install_dir: self.pol_install_dir,
+            region: self.region, ucs_area: self.ucs_area, install_dir: self.install_dir, pol_install_dir: self.pol_install_dir,
             native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes,
             auto_login: self.auto_login, ffxi_settings: self.ffxi_settings,
         }
@@ -513,7 +539,7 @@ const SECRET_FIELDS: [&str; 6] = ["v_key", "auth_code", "account_id", "pol_recor
 /// Per-Play flags: only in `credentials` (or a direct `session`).
 const PLAY_FIELDS: [&str; 4] = ["start_game", "keep_session", "viewer_gaps", "auto_away_minutes"];
 /// Host fields: only in `park` (or a direct `session`).
-const HOST_FIELDS: [&str; 6] = ["region", "lang", "install_dir", "pol_install_dir", "ffxi_settings", "auto_login"];
+const HOST_FIELDS: [&str; 7] = ["region", "lang", "install_dir", "pol_install_dir", "ffxi_settings", "auto_login", "ucs_area"];
 
 /// Parses the first launcher line: `session` (unchanged) or `park`.
 pub fn parse_first_line(line: &[u8]) -> Result<FirstLine, ProtoError> {
@@ -578,12 +604,14 @@ fn parse_park(root: &Value<'_>) -> Result<Park, ProtoError> {
     }
     let version = get("v").ok_or(ProtoError::Missing("v"))?.as_i64().ok_or(ProtoError::Field("v", "not an integer"))?;
     if version != PROTOCOL_VERSION { return Err(ProtoError::UnsupportedVersion(version)); }
-    // A park exists only for a native sign-in, which is verified for US only.
     let region = match plain_str(get("region"), "region")? {
         Some(b"US") => Region::Us,
-        Some(_) => return Err(ProtoError::Field("region", "a park requires the US region")),
+        Some(b"EU") => Region::Eu,
+        Some(b"JP") => Region::Jp,
+        Some(_) => return Err(ProtoError::Field("region", "must be US, EU or JP")),
         None => return Err(ProtoError::Missing("region")),
     };
+    let ucs_area = parse_ucs_area(get("ucs_area"), region)?;
     let text = |k: &'static str| -> Result<Option<String>, ProtoError> {
         match get(k) {
             Some(Value::Str(s)) => Ok(Some(s.decode().map_err(|_| ProtoError::Field(k, "bad string"))?).filter(|s| !s.is_empty())),
@@ -603,7 +631,7 @@ fn parse_park(root: &Value<'_>) -> Result<Park, ProtoError> {
         Some(_) => return Err(ProtoError::Field("ffxi_settings", "must be an object or null")),
     };
     let auto_login = parse_auto_login(get("auto_login"))?;
-    Ok(Park { region, install_dir, pol_install_dir, auto_login, ffxi_settings })
+    Ok(Park { region, ucs_area, install_dir, pol_install_dir, auto_login, ffxi_settings })
 }
 
 /// Parses the `credentials` line a parked host waits for (no timeout).
@@ -982,7 +1010,30 @@ mod tests {
         assert!(matches!(parse_session(region.as_bytes()), Err(ProtoError::Field("region", _))));
         for region in ["EU", "JP"] {
             let other = line(&native).replace("\"region\":\"US\"", &format!("\"region\":\"{region}\""));
-            assert!(matches!(parse_session(other.as_bytes()), Err(ProtoError::Field("native_auth", _))), "{region}");
+            assert_eq!(parse_session(other.as_bytes()).unwrap_err(), ProtoError::Missing("ucs_area"), "{region}");
+            for legacy in [keys(), "\"pol_records\":null".into()] {
+                let other = line(&format!("{native},\"ucs_area\":\"02\",{legacy}")).replace("\"region\":\"US\"", &format!("\"region\":\"{region}\""));
+                assert!(matches!(parse_session(other.as_bytes()), Err(ProtoError::Field("native_auth", _))), "{region} {legacy}");
+            }
+        }
+    }
+
+    #[test]
+    fn eu_and_jp_sessions_carry_their_ucs_area_and_us_sessions_never_do() {
+        let native = native_fields();
+        let us = parse_session(line(&native).as_bytes()).unwrap();
+        assert_eq!((us.region, us.ucs_area.as_deref(), us.region.experimental()), (Region::Us, None, false));
+        assert!(matches!(parse_session(line(&format!("{native},\"ucs_area\":\"01\"")).as_bytes()), Err(ProtoError::Field("ucs_area", _))),
+            "US keeps its verified value and its unchanged line");
+        for (region, expected) in [("EU", Region::Eu), ("JP", Region::Jp)] {
+            let other = |area: &str| line(&format!("{native},\"ucs_area\":{area}")).replace("\"region\":\"US\"", &format!("\"region\":\"{region}\""));
+            let parsed = parse_session(other("\"03\"").as_bytes()).unwrap();
+            assert_eq!((parsed.region, parsed.ucs_area.as_deref(), parsed.region.experimental()), (expected, Some("03"), true));
+            for bad in ["\"3\"", "\"003\"", "\"a1\"", "3", "null", "\"\\u0030\\u0031\""] {
+                assert!(parse_session(other(bad).as_bytes()).is_err(), "{region} {bad}");
+            }
+            let twice = line(&format!("{native},\"ucs_area\":\"03\",\"ucs_area\":\"03\"")).replace("\"region\":\"US\"", &format!("\"region\":\"{region}\""));
+            assert_eq!(parse_session(twice.as_bytes()).unwrap_err(), ProtoError::DuplicateField("ucs_area"));
         }
     }
 
@@ -1108,7 +1159,14 @@ mod tests {
             let error = parse_first_line(bad.as_bytes()).unwrap_err().to_string();
             assert!(!error.contains("fake password"), "{error}");
         }
-        assert!(parse_first_line(PARK_LINE.replace("\"US\",\"lang\"", "\"EU\",\"lang\"").as_bytes()).is_err(), "US only");
+        assert!(parse_first_line(PARK_LINE.replace("\"US\",\"lang\"", "\"EU\",\"lang\"").as_bytes()).is_err(), "EU needs its ucs_area");
+        let eu = PARK_LINE.replace("\"US\",\"lang\"", "\"EU\",\"ucs_area\":\"02\",\"lang\"");
+        let Ok(FirstLine::Park(park)) = parse_first_line(eu.as_bytes()) else { panic!("an EU park parses") };
+        assert_eq!((park.region, park.ucs_area.as_deref()), (Region::Eu, Some("02")));
+        let session = park.into_session(parse_credentials(credentials_line("").as_bytes()).unwrap());
+        assert_eq!((session.region, session.ucs_area.as_deref()), (Region::Eu, Some("02")));
+        assert!(parse_first_line(PARK_LINE.replace("\"lang\":\"US\"", "\"lang\":\"US\",\"ucs_area\":\"01\"").as_bytes()).is_err(), "never for US");
+        assert!(parse_credentials(credentials_line(",\"ucs_area\":\"02\"").as_bytes()).is_err(), "a host field");
         assert!(parse_first_line(PARK_LINE.replace("\"v\":1", "\"v\":2").as_bytes()).is_err());
         assert!(parse_first_line(PARK_LINE.replace("\"lang\":\"US\"", "\"lang\":\"US\",\"lang\":\"US\"").as_bytes()).is_err());
         for extra in [",\"region\":\"US\"", ",\"install_dir\":\"C:\\\\x\"", ",\"ffxi_settings\":{}", ",\"auto_login\":{}", ",\"pol_records\":null"] {
