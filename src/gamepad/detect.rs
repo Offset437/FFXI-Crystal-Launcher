@@ -468,7 +468,7 @@ pub(crate) fn run(mut emit: impl FnMut(Vec<Pad>) -> bool, keep_going: impl Fn() 
         if changed && !publish_change(&mut last, snapshot(&gilrs, &hardware, &hid), &mut emit) {
             break;
         }
-        std::thread::sleep(pass_interval(crate::window_chrome::is_foreground() || !effects.is_empty()));
+        std::thread::park_timeout(pass_interval(crate::window_chrome::is_foreground() || !effects.is_empty()));
     }
     // A newer thread may have installed its own sender meanwhile; keep that one.
     if let Ok(mut guard) = commands().lock() {

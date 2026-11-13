@@ -8,6 +8,8 @@ Cargo.lock files record Rust dependencies and versions. Each dependency retains 
 
 The optional Windows installer is built with [NSIS](https://nsis.sourceforge.io/License) using its zlib compressor.
 
+Crystal uses a pinned [Gilrs 0.11.2 fork](https://gitlab.com/bpellin/gilrs) that stops the force feedback thread when its owner is dropped. The release's dependency notices include the Apache 2.0 and MIT licenses and the SDL controller database license.
+
 ## Square Enix materials
 
 The `assets/portal-wordmark-*` images and `assets/sky/crowd-mask.png` (the party silhouette cut from the FFXI portal art) contain FINAL FANTASY XI artwork and logos belonging to Square Enix. These assets and news text and images loaded from PlayOnline at runtime are excluded from Crystal's code license. News parser test fixtures contain independently authored fictional material. The copyright and trademark notices appear in README.md and in the launcher. Square Enix's [FFXI Materials Usage License](https://support.na.square-enix.com/rule.php?id=20&la=1&tag=authc) describes its conditions for community uses; it is not a blanket license for software redistribution.

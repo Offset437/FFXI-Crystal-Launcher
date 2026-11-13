@@ -46,7 +46,18 @@ def license_files(package):
     fallback = root / 'licenses/cargo' / (revision or f"{package['name']}-{package['version']}")
     if not candidates and fallback.is_dir():
         candidates.update(file for file in fallback.iterdir() if file.is_file())
-    if not candidates and (package.get('source') or '').startswith('git+https://github.com/bpellin/accesskit.git?'):
+    source = package.get('source') or ''
+    if source.startswith('git+https://gitlab.com/bpellin/gilrs.git?'):
+        # The Git checkout keeps Gilrs's license texts at its workspace root.
+        for name in ('LICENSE-APACHE', 'LICENSE-MIT'):
+            license_path = directory.parent / name
+            if license_path.is_file():
+                candidates.add(license_path)
+    if package['name'] == 'gilrs':
+        mappings_license = directory / 'SDL_GameControllerDB' / 'LICENSE'
+        if mappings_license.is_file():
+            candidates.add(mappings_license)
+    if not candidates and source.startswith('git+https://github.com/bpellin/accesskit.git?'):
         # AccessKit's Git workspace keeps the licenses for its member crates at the root.
         for parent in directory.parents:
             apache = parent / 'LICENSE-APACHE'

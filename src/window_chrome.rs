@@ -12,6 +12,39 @@ pub(crate) fn is_foreground() -> bool {
     hwnd != 0 && unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() } as isize == hwnd
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Activation {
+    #[default]
+    Unknown,
+    Foreground,
+    OtherWindow,
+    Minimized,
+}
+
+impl Activation {
+    pub(crate) fn focused(self, winit_focused: bool) -> bool {
+        match self {
+            Self::Unknown => winit_focused,
+            Self::Foreground => true,
+            Self::OtherWindow | Self::Minimized => false,
+        }
+    }
+}
+
+/// Check the Win32 state even if winit missed an activation or minimize event.
+pub(crate) fn activation() -> Activation {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsIconic};
+    let hwnd = HWND.load(Ordering::Relaxed);
+    if hwnd == 0 { return Activation::Unknown; }
+    if unsafe { IsIconic(hwnd as _) } != 0 { return Activation::Minimized; }
+    let foreground = unsafe { GetForegroundWindow() } as isize;
+    match foreground {
+        0 => Activation::Unknown,
+        foreground if foreground == hwnd => Activation::Foreground,
+        _ => Activation::OtherWindow,
+    }
+}
+
 /// The window closed (Crystal runs in the background): nothing is foreground any more.
 pub(crate) fn detach() {
     HWND.store(0, Ordering::Relaxed);

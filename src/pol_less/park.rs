@@ -167,11 +167,12 @@ pub(crate) fn fingerprint(config: &Config, plan: &super::Plan) -> Fingerprint {
 /// The `park` line (`\n`-terminated): no credentials, keys, records or per-Play flags.
 /// Field order is fixed; crystal-loader proto.rs tests parse this exact shape.
 pub(crate) fn park_line(install_dir: &Path, pol_install_dir: Option<&Path>, auto_login: AutoLogin,
-    ffxi_settings_json: Option<&str>) -> Result<Zeroizing<Vec<u8>>, String> {
+    ffxi_settings_json: Option<&str>, reduce_background_usage: bool) -> Result<Zeroizing<Vec<u8>>, String> {
     let install = install_dir.to_str().ok_or("The game folder's path is not valid Unicode.")?;
     let failed = |_| "Could not encode the park line.".to_owned();
     let pol = serde_json::to_string(&pol_install_dir.map(|p| p.to_string_lossy().into_owned())).map_err(failed)?;
-    let line = format!("{{\"type\":\"park\",\"v\":{},\"region\":\"US\",\"lang\":\"US\",\"pol_install_dir\":{pol},\"install_dir\":{},\"auto_login\":{}}}\n",
+    let savings = if reduce_background_usage { ",\"reduce_background_usage\":true" } else { "" };
+    let line = format!("{{\"type\":\"park\",\"v\":{},\"region\":\"US\",\"lang\":\"US\",\"pol_install_dir\":{pol},\"install_dir\":{},\"auto_login\":{}{savings}}}\n",
         super::pipe::PROTOCOL, serde_json::to_string(install).map_err(failed)?, serde_json::to_string(&auto_login.normalized()).map_err(failed)?);
     let line = Zeroizing::new(line.into_bytes());
     match ffxi_settings_json {
@@ -211,7 +212,7 @@ pub(crate) struct Parked {
 /// `park` line and `parked` within PARKED_LIMIT. `account` carries no passwords. `abort` is
 /// set when the window closes the park meanwhile (its stdin ended): the park stops at the
 /// next step, never leaving Windower running without its worker.
-pub(crate) fn park(config: &Config, plan: &super::Plan, account: &Account, abort: &'static std::sync::atomic::AtomicBool,
+pub(crate) fn park(config: &Config, plan: &super::Plan, account: &Account, reduce_background_usage: bool, abort: &'static std::sync::atomic::AtomicBool,
     progress: &mut dyn FnMut(&str)) -> Result<Parked, String> {
     // Experimental EU/JP hosts sign in cold only (`retail_region`; main.rs `park_keys`).
     if account.region != 0 {
@@ -225,12 +226,12 @@ pub(crate) fn park(config: &Config, plan: &super::Plan, account: &Account, abort
     }
     let profile = ParkKey::for_plan(account, plan).profile;
     park_prepared(p, &profile, plan.auto_login, timing, progress, &mut super::spawn_injector, &super::launch_gate,
-        super::Timeouts { abort: Some(abort), ..super::TIMEOUTS }, PARKED_LIMIT)
+        super::Timeouts { abort: Some(abort), ..super::TIMEOUTS }, PARKED_LIMIT, reduce_background_usage)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn park_prepared(mut p: Prepared, profile: &str, auto_login: AutoLogin, mut timing: Timeline, progress: &mut dyn FnMut(&str),
-    spawn: &mut super::Spawner<'_>, turns: &super::TurnGate<'_>, limits: super::Timeouts, parked_limit: Duration) -> Result<Parked, String> {
+    spawn: &mut super::Spawner<'_>, turns: &super::TurnGate<'_>, limits: super::Timeouts, parked_limit: Duration, reduce_background_usage: bool) -> Result<Parked, String> {
     let started = Instant::now();
     let mut log = super::open_launch_log(&p, &mut timing, Some(&format!("park start: {} {profile}", p.tool.name())))?;
     let log_path = p.session.log.clone();
@@ -256,7 +257,8 @@ pub(super) fn park_prepared(mut p: Prepared, profile: &str, auto_login: AutoLogi
     parked.log.line(&format!("crystal-loader connected: PID {}, image verified.", parked.info.loader_pid));
     parked.log.reached(&mut timing, Milestone::Hello);
     let pol = crate::discovery::find(crate::discovery::Product::PlayOnline, None);
-    let line = park_line(&parked.p.install_dir, pol.as_deref(), auto_login, parked.p.ffxi_settings.as_ref().map(|settings| settings.json.as_str()));
+    let line = park_line(&parked.p.install_dir, pol.as_deref(), auto_login,
+        parked.p.ffxi_settings.as_ref().map(|settings| settings.json.as_str()), reduce_background_usage);
     if let Some(settings) = &parked.p.ffxi_settings { super::note_ffxi_settings(&parked.p, settings, &mut parked.log); }
     let sent = line.and_then(|line| parked.host.pipe.send(&line, Instant::now() + limits.send)
         .map_err(|_| t("crystal-loader did not accept the park line.").to_owned()));
@@ -294,10 +296,16 @@ pub(super) fn park_prepared(mut p: Prepared, profile: &str, auto_login: AutoLogi
 }
 
 impl Parked {
+    pub(crate) fn listen_for_frames(&mut self, wake: Option<crate::session_worker::CommandWake>) {
+        self.host.pipe.listen_for_commands(wake);
+    }
+
+    pub(crate) fn frame_notifications(&self) -> bool { self.host.pipe.has_command_wake() }
+
     /// While parked: `Some(why)` once the host is gone (the pipe closed, an error or an exit),
-    /// `None` when nothing happened within `wait`.
-    pub(crate) fn watch(&mut self, wait: Duration) -> Option<String> {
-        match self.host.pipe.next_event(Some(Instant::now() + wait)) {
+    /// `None` on a frame notification or when the optional timeout expires.
+    pub(crate) fn watch(&mut self, wait: Option<Duration>) -> Option<String> {
+        match self.host.pipe.next_event(wait.map(|wait| Instant::now() + wait)) {
             Err(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted) => None,
             Err(_) | Ok(Ok(LoaderEvent::Closed | LoaderEvent::Exit(_))) => Some(t("The parked game host ended.").into()),
             Ok(Ok(LoaderEvent::Error(message))) => {
@@ -349,7 +357,7 @@ impl Parked {
             parked.kill();
             cold(account, otp, progress)
         };
-        if let Some(why) = self.watch(Duration::ZERO) {
+        if let Some(why) = self.watch(Some(Duration::ZERO)) {
             drop(auth);
             return lost(self, &why, progress, fallback);
         }
@@ -668,10 +676,11 @@ mod tests {
     #[test]
     fn the_park_line_carries_host_fields_only_in_the_loaders_shape() {
         let line = park_line(Path::new(r"C:\Games\SquareEnix\FINAL FANTASY XI"), Some(Path::new(r"C:\Games\PlayOnlineViewer")),
-            AutoLogin { enabled: true, character_slot: 3 }, Some(r#"{"0001":1920,"padmode000":"0,0,0,0,1,0"}"#)).unwrap();
+            AutoLogin { enabled: true, character_slot: 3 }, Some(r#"{"0001":1920,"padmode000":"0,0,0,0,1,0"}"#), false).unwrap();
         // crystal-loader proto.rs tests::PARK_LINE, byte for byte.
         assert_eq!(std::str::from_utf8(&line).unwrap(), concat!(r#"{"type":"park","v":1,"region":"US","lang":"US","pol_install_dir":"C:\\Games\\PlayOnlineViewer","install_dir":"C:\\Games\\SquareEnix\\FINAL FANTASY XI","auto_login":{"enabled":true,"character_slot":3},"ffxi_settings":{"0001":1920,"padmode000":"0,0,0,0,1,0"}}"#, "\n"));
-        let value: serde_json::Value = serde_json::from_slice(&park_line(Path::new(r"C:\x"), None, AutoLogin::default(), None).unwrap()).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&park_line(Path::new(r"C:\x"), None, AutoLogin::default(), None, true).unwrap()).unwrap();
+        assert_eq!(value["reduce_background_usage"], true);
         assert_eq!(value["pol_install_dir"], serde_json::Value::Null);
         for secret in ["native_auth", "v_key", "auth_code", "account_id", "pol_records", "content_ids", "start_game", "viewer_gaps", "auto_away_minutes"] {
             assert!(value.get(secret).is_none(), "{secret}");

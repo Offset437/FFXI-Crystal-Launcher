@@ -670,11 +670,12 @@ pub(crate) enum Message {
     TrimMemory,
     /// Settings → System: closing the window keeps Crystal in the notification area.
     CloseToTray(bool),
+    ReduceBackgroundUsage(bool),
     /// Settings → System: start Crystal in the background when Windows starts.
     StartWithWindows(bool),
     /// The scheduled task was registered (`true`) or removed, or why not.
     StartupTaskSet(bool, Result<(), String>),
-    NativeWindow(isize),
+    NativeWindow(WindowId, isize),
     WindowMaximized(bool),
     TitlePressed,
     TitleMoved,
@@ -700,7 +701,7 @@ pub(crate) enum Message {
     /// Keyboard or mouse input reached the window (throttled at the source).
     UserInput,
     /// The window gained (`true`) or lost the keyboard focus (minimising loses it).
-    WindowFocus(bool),
+    WindowFocus(WindowId, bool),
     FriendsQuery(String),
     /// Open a conversation, the Mailbox or the block list (None: nothing).
     FriendsSelect(Option<friends::Pane>),
@@ -1029,6 +1030,8 @@ pub(crate) struct App {
     pub self_update: self_update::State,
     /// The automatic restart that installs a downloaded update (`self_update::auto`).
     pub(crate) auto_restart: self_update::auto::AutoRestart,
+    window_activation: window_chrome::Activation,
+    background_status_logged: Option<BackgroundStatus>,
     pub controller_nav: controller_nav::State,
     /// The launcher features beside Play (`features`); `None` in previews and tests.
     pub(crate) features: Option<features::Runtime>,
@@ -1036,6 +1039,12 @@ pub(crate) struct App {
     features_sessions: Vec<String>,
     /// The features' screens' own state (`features::ui`).
     pub(crate) features_view: features::ui::State,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackgroundStatus {
+    Tray,
+    Window { winit_focused: bool, activation: window_chrome::Activation },
 }
 
 impl App {
@@ -1046,6 +1055,7 @@ impl App {
         // `--preview-idle` measures the background too: its close button hides the window.
         if preview_idle() { app.settings.close_to_tray = true; }
         let live = !app.preview || preview_idle();
+        if live { session_worker::use_status_notifications(app.settings.reduce_background_usage); }
         let background = live && std::env::args().any(|a| a == startup_task::BACKGROUND_ARG);
         if live { tray::start(); }
         // `--preview-idle` too, so the idle footprint is measured with the features' threads.
@@ -1173,6 +1183,8 @@ impl App {
             reshade: reshade::State::default(),
             self_update: self_update::State::default(),
             auto_restart: self_update::auto::AutoRestart::default(),
+            window_activation: window_chrome::Activation::Unknown,
+            background_status_logged: None,
             controller_nav: controller_nav::State::default(),
             features: None,
             features_sessions: Vec::new(),
@@ -1264,17 +1276,68 @@ impl App {
             || !self.held_plays.is_empty()
             || !self.play_updates.jobs.is_empty()
             || self.accounts.iter().any(|a| a.busy || a.batch_pending);
-        let tick = Duration::from_millis(if busy { 100 } else { 1000 });
+        let quiet = !busy && self.tick_quiet();
+        let tick = if busy { Duration::from_millis(100) }
+            else if quiet && self.background_savings_active() { tick_gate::BACKGROUND_INTERVAL }
+            else { Duration::from_secs(1) };
         // Ticks that would change nothing are not sent (each message redraws the window).
-        tick_gate::set_quiet(!busy && self.tick_quiet(), self.watched_flags(), self.next_timed_work());
+        let activation = (self.settings.reduce_background_usage && self.window.is_some()).then_some(self.window_activation);
+        tick_gate::set_quiet(quiet, self.watched_flags(), self.next_timed_work(), activation);
         Schedule {
             tick,
-            // The controller thread polls only while there is a window to drive.
-            gamepad: self.window.is_some(),
+            gamepad: self.controller_monitoring(),
             // Pointer input goes to a reorder or to a paint drag (`selection`): a release ends it.
             account_drag: self.account_drag.source.is_some() || self.selection.painting(),
             controller_repeat: self.controller_nav.repeating(),
         }
+    }
+
+    fn background_savings_active(&self) -> bool {
+        self.settings.reduce_background_usage && !self.window_focused()
+    }
+
+    fn window_focused(&self) -> bool {
+        if self.window.is_none() { return false; }
+        if self.settings.reduce_background_usage {
+            self.window_activation.focused(self.auto_restart.focused)
+        } else {
+            self.auto_restart.focused
+        }
+    }
+
+    fn log_background_status(&mut self) {
+        let status = self.settings.reduce_background_usage.then(|| {
+            self.window.map_or(BackgroundStatus::Tray, |_| BackgroundStatus::Window {
+                winit_focused: self.auto_restart.focused,
+                activation: self.window_activation,
+            })
+        });
+        if status == self.background_status_logged { return; }
+        self.background_status_logged = status;
+        let line = match status {
+            None => "background savings: disabled".to_owned(),
+            Some(BackgroundStatus::Tray) => "background savings: active (window closed to tray)".to_owned(),
+            Some(BackgroundStatus::Window { winit_focused, activation }) => {
+                let mode = if activation.focused(winit_focused) { "paused" } else { "active" };
+                format!("background savings: {mode} (winit focused: {winit_focused}, Win32: {activation:?})")
+            }
+        };
+        launch_log::append_history(&self.config.history_path(), "Crystal", &line, None);
+    }
+
+    fn controller_monitoring(&self) -> bool {
+        self.window.is_some() && (!self.settings.reduce_background_usage
+            || !self.background_savings_active() && (self.settings.controller_navigation
+                || self.page == Page::Settings && self.settings_tab == settings_page::Tab::Controller))
+    }
+
+    fn friends_refresh_visible(&self) -> bool {
+        self.page == Page::Friends && !self.background_savings_active()
+    }
+
+    fn suspend_controller(&mut self) {
+        self.controller_nav.reset_input();
+        self.gamepad.suspend();
     }
 
     /// The Start with Windows task is being registered or removed (its switch waits).
@@ -3783,7 +3846,7 @@ impl App {
         if let Some(next) = self.parks.next(&wanted, now) {
             let (config, account, plan) = &next.payload;
             let (key, row, fingerprint) = (next.key.clone(), next.row.clone(), next.fingerprint.clone());
-            match session_worker::spawn_park(config, account, plan) {
+            match session_worker::spawn_park(config, account, plan, self.settings.reduce_background_usage) {
                 Ok(worker) => self.parks.insert(key, row, fingerprint, worker),
                 Err(error) => self.park_note(&row, &error),
             }
@@ -3979,6 +4042,7 @@ impl App {
         }
         let id = WindowId::unique();
         self.window = Some(id);
+        self.window_activation = window_chrome::Activation::Unknown;
         Effect::window(id, WindowOp::Open { size: self.viewport, maximized: self.maximized })
     }
 
@@ -4066,7 +4130,7 @@ impl App {
     /// The Tick has no timed work: nothing waits to start, retry or expire (`tick_gate`).
     /// Busy states are checked by the caller.
     fn tick_quiet(&self) -> bool {
-        self.page != Page::Friends
+        !self.friends_refresh_visible()
             && !self.startup_signin_pending && self.startup_waiting.is_empty()
             && self.waiting_plays.is_empty() && self.play_updates.jobs.is_empty() && self.launcher_changes.is_empty()
             && self.recovering.is_none() && !self.closing && self.parks_settled
@@ -4080,7 +4144,10 @@ impl App {
     /// and the next version check.
     fn next_timed_work(&self) -> Option<Instant> {
         let status = (!self.preview).then(|| self.refreshed + self.status_interval());
-        let parks = (!self.parks.is_empty()).then(|| self.park_checked.map_or_else(Instant::now, |at| at + pol_less::park::FINGERPRINT_EVERY));
+        let parks = (!self.parks.is_empty()).then(|| {
+            let fingerprint = self.park_checked.map_or_else(Instant::now, |at| at + pol_less::park::FINGERPRINT_EVERY);
+            self.park_tended.map_or(fingerprint, |at| fingerprint.max(at + Duration::from_secs(1)))
+        });
         let flag = (!self.preview && self.flag_wanted()).then(|| self.flag_schedule.next()).flatten();
         // A downloaded update's restart countdown, postponement or input grace (none otherwise).
         let restart = (!self.preview).then(|| { let now = Instant::now(); self.auto_restart.next_due(self.auto_conditions(now), now) }).flatten();
@@ -4288,7 +4355,7 @@ impl App {
         }
         // Off the page a read only follows the request in flight; the next
         // conversation request waits until the page is open again.
-        if self.page == Page::Friends {
+        if self.friends_refresh_visible() {
             let _ = self.drive_sync();
         }
     }
@@ -4803,8 +4870,34 @@ impl App {
     /// (`self_update::auto`): every event that can change its answer (a game ending, work
     /// finishing, focus, input, the tray) arrives as a message, so it needs no polling.
     fn update(&mut self, message: Message) -> Effect<Message> {
+        self.update_with_activation(message, window_chrome::activation)
+    }
+
+    fn update_with_activation(&mut self, message: Message, activation: impl Fn() -> window_chrome::Activation) -> Effect<Message> {
+        let monitoring = self.controller_monitoring();
+        let savings_were_active = self.background_savings_active();
+        // Sample before housekeeping so a missed deactivation also stops Friends refreshes.
+        let sample_before = matches!(message, Message::Tick);
+        let sample_after = match message {
+            Message::WindowFocus(id, _) | Message::NativeWindow(id, _) => self.window == Some(id),
+            Message::ReduceBackgroundUsage(true) => true,
+            _ => false,
+        };
+        if sample_before && self.settings.reduce_background_usage && self.window.is_some() {
+            self.window_activation = activation();
+        }
         let effect = self.handle(message);
+        if sample_after && self.settings.reduce_background_usage && self.window.is_some() {
+            self.window_activation = activation();
+        }
+        if savings_were_active && self.settings.reduce_background_usage && self.friends_refresh_visible() {
+            self.load_friends();
+        }
+        if self.settings.reduce_background_usage && monitoring && !self.controller_monitoring() {
+            self.suspend_controller();
+        }
         if self.preview { return effect; }
+        if !self.closing { self.log_background_status(); }
         let auto = self.auto_restart_step(Instant::now());
         Effect::batch([effect, auto])
     }
@@ -5118,7 +5211,11 @@ impl App {
                     }
                 }
             }
-            Message::WindowFocus(focused) => self.auto_restart.focused = focused && self.window.is_some(),
+            Message::WindowFocus(id, focused) => {
+                if self.window == Some(id) {
+                    self.auto_restart.focused = focused;
+                }
+            }
             Message::UserInput => {
                 self.auto_restart.last_input = Some(Instant::now());
                 // Only signed-in sessions whose game is closed; the worker
@@ -5152,6 +5249,10 @@ impl App {
             Message::Reshade(m) => return reshade::update(self, m),
             Message::Logs(m) => return log_export::update(self, m),
             Message::Gamepad(m) => {
+                if self.settings.reduce_background_usage
+                    && matches!(&m, gamepad::Msg::Pads(_)) && !self.controller_monitoring() {
+                    return Effect::none();
+                }
                 let captured = self.gamepad.capturing();
                 let task = gamepad::update(&mut self.gamepad, m, &self.config).map(Message::Gamepad);
                 self.poll_controller(captured);
@@ -5223,7 +5324,7 @@ impl App {
                 // fills message by message; otherwise every two seconds. It is
                 // followed off the page too: its time limit runs on every page.
                 let every = if self.friends.pending.is_some() { Duration::from_millis(250) } else { Duration::from_secs(2) };
-                if (self.page == Page::Friends || self.friends.pending.is_some()) && self.friends_checked.elapsed() >= every {
+                if (self.friends_refresh_visible() || self.friends.pending.is_some()) && self.friends_checked.elapsed() >= every {
                     self.load_friends();
                 }
                 if let Some(op) = &self.active_operation {
@@ -5329,10 +5430,12 @@ impl App {
             }
             Message::WindowMaximized(maximized) => self.maximized = maximized,
             Message::WindowOpened(id) => {
-                if self.window == Some(id) { return self.on_window(WindowOp::native_handle(Message::NativeWindow)); }
+                if self.window == Some(id) {
+                    return self.on_window(WindowOp::native_handle(move |hwnd| Message::NativeWindow(id, hwnd)));
+                }
             }
-            Message::NativeWindow(hwnd) => {
-                window_chrome::attach(hwnd, self.settings.light_theme)
+            Message::NativeWindow(id, hwnd) => {
+                if self.window == Some(id) { window_chrome::attach(hwnd, self.settings.light_theme); }
             }
             Message::MinimizeWindow => return self.on_window(WindowOp::Minimize(true)),
             Message::MaximizeWindow => return self.on_window(WindowOp::ToggleMaximize),
@@ -5352,7 +5455,7 @@ impl App {
                 if self.features_view.open { self.features_view.open = false; self.features_view.recording = None; self.features_view.touch(); }
                 self.show_settings = false;
                 self.show_details = false;
-                if page == Page::Friends { self.load_friends(); }
+                if self.friends_refresh_visible() { self.load_friends(); }
                 if page == Page::Settings && self.settings_tab == settings_page::Tab::Graphics {
                     return reshade::update(self, reshade::Msg::Refresh);
                 }
@@ -6093,6 +6196,7 @@ impl App {
             Message::WindowClosed(id) => {
                 if self.window == Some(id) {
                     self.window = None;
+                    self.auto_restart.focused = false;
                     window_chrome::detach();
                     tray::set_icon(true);
                 }
@@ -6109,6 +6213,12 @@ impl App {
             }
             Message::CloseToTray(on) => {
                 self.settings.close_to_tray = on;
+                self.persist_settings();
+            }
+            Message::ReduceBackgroundUsage(on) => {
+                self.settings.reduce_background_usage = on;
+                if !self.preview { session_worker::use_status_notifications(on); }
+                if !on && self.friends_refresh_visible() { self.load_friends(); }
                 self.persist_settings();
             }
             Message::StartWithWindows(on) => {

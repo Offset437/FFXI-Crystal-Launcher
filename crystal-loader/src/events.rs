@@ -5,11 +5,13 @@
 //! Both threads share one overlapped handle, each operation with its own
 //! OVERLAPPED, so a pending read never holds up a write.
 
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use windows_sys::Win32::System::Threading::SetEvent;
 
 use crate::log;
 use crate::pipe::{LineReader, Pipe, PipeError};
@@ -17,12 +19,15 @@ use crate::proto;
 
 struct Sink {
     tx: Sender<String>,
-    thread: JoinHandle<()>,
+    writer: JoinHandle<()>,
+    reader: JoinHandle<()>,
+    reader_stop: Option<Arc<OwnedHandle>>,
 }
 
 static SINK: Mutex<Option<Sink>> = Mutex::new(None);
 static CLOSED: AtomicBool = AtomicBool::new(false);
 static STOP_READER: AtomicBool = AtomicBool::new(false);
+const READER_POLL: Duration = Duration::from_millis(250);
 
 #[cfg(test)]
 thread_local! { static CAPTURE: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) }; }
@@ -54,11 +59,26 @@ fn mark_closed(why: &str) {
 
 /// Starts the writer and continues the existing reader on the connected pipe.
 /// It may already hold commands following the session or credentials line.
-pub fn start(pipe: Pipe, mut reader: LineReader) {
+pub fn start(pipe: Pipe, mut reader: LineReader, reduce_background_usage: bool) {
+    let reader_stop = if reduce_background_usage {
+        match crate::win::manual_reset_event() {
+            Ok(event) => {
+                log!("background savings: command reader uses pipe and shutdown events");
+                Some(Arc::new(event))
+            }
+            Err(error) => {
+                log!("background savings: command reader event unavailable ({error}); using 250 ms polling");
+                None
+            }
+        }
+    } else {
+        log!("background savings: command reader uses 250 ms polling");
+        None
+    };
     let pipe = Arc::new(pipe);
     let (tx, rx) = mpsc::channel::<String>();
     let writer_pipe = Arc::clone(&pipe);
-    let thread = std::thread::Builder::new()
+    let writer = std::thread::Builder::new()
         .name("crystal-events".into())
         .spawn(move || {
             for line in rx {
@@ -76,13 +96,21 @@ pub fn start(pipe: Pipe, mut reader: LineReader) {
             }
         })
         .expect("spawn event writer");
-    // A buffered command can reply as soon as the reader starts.
-    *SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Sink { tx, thread });
-    std::thread::Builder::new()
+    // A buffered command can reply as soon as the reader starts. It waits for
+    // this lock until the sink is installed.
+    let mut sink = SINK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut stop = reader_stop.clone();
+    let reader = std::thread::Builder::new()
         .name("crystal-replies".into())
         .spawn(move || {
             while !STOP_READER.load(Ordering::Acquire) {
-                match reader.read_parsed(&pipe, Some(Duration::from_millis(250)), proto::parse_service_event) {
+                let command = if let Some(event) = &stop {
+                    reader.read_parsed_until_stopped(&pipe, event, proto::parse_service_event)
+                } else {
+                    reader.read_parsed(&pipe, Some(READER_POLL), proto::parse_service_event)
+                };
+                if STOP_READER.load(Ordering::Acquire) { return; }
+                match command {
                     Ok(parsed) => match parsed {
                         Ok(Some(proto::ServiceEvent::NativeActivity)) => crate::native_auth::note_activity(),
                         Ok(Some(proto::ServiceEvent::NativeStartGame)) => crate::native_auth::request_start_game(),
@@ -103,6 +131,11 @@ pub fn start(pipe: Pipe, mut reader: LineReader) {
                         Err(e) => log!("ignoring a malformed launcher line: {e}"),
                     },
                     Err(PipeError::Timeout(_)) => {}
+                    Err(PipeError::Stopped) => return,
+                    Err(PipeError::WaitUnavailable(error)) => {
+                        log!("background savings: command reader event wait failed ({error}); using 250 ms polling");
+                        stop = None;
+                    }
                     Err(PipeError::Closed) => {
                         mark_closed("read");
                         return;
@@ -116,6 +149,7 @@ pub fn start(pipe: Pipe, mut reader: LineReader) {
             }
         })
         .expect("spawn reply reader");
+    *sink = Some(Sink { tx, writer, reader, reader_stop });
 }
 
 /// Queues one line (must end in `\n`). A no-op before `start` or after `finish`.
@@ -131,16 +165,24 @@ pub fn send(line: String) {
 pub fn finish(timeout: Duration) {
     STOP_READER.store(true, Ordering::Release);
     let sink = SINK.lock().unwrap_or_else(|e| e.into_inner()).take();
-    if let Some(Sink { tx, thread }) = sink {
+    if let Some(Sink { tx, writer, reader, reader_stop }) = sink {
+        if let Some(stop) = &reader_stop {
+            unsafe { SetEvent(stop.as_raw_handle()); }
+        }
         drop(tx);
         let deadline = Instant::now() + timeout;
-        while !thread.is_finished() && Instant::now() < deadline {
+        while (!writer.is_finished() || reader_stop.is_some() && !reader.is_finished()) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
-        if thread.is_finished() {
-            let _ = thread.join();
+        if writer.is_finished() {
+            let _ = writer.join();
         } else {
             log!("launcher did not drain the pipe in time; exiting anyway");
+        }
+        if reader.is_finished() {
+            let _ = reader.join();
+        } else if reader_stop.is_some() {
+            log!("command reader did not stop in time; exiting anyway");
         }
     }
 }

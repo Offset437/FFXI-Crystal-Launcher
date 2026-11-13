@@ -522,10 +522,10 @@ pub fn run(mut cfg: GameConfig) -> Result<GameOutcome, String> {
 /// `cfg` carries the host fields; `play` gives the rest. A main thread that
 /// gives up (pipe closed, credentials rejected) ends it with EXIT_PIPE; nothing
 /// was networked and no polcore entry was called.
-pub fn run_parked(mut cfg: GameConfig, ready: std::sync::mpsc::Sender<std::time::Duration>, play: std::sync::mpsc::Receiver<Play>) -> Result<GameOutcome, String> {
+pub(crate) fn run_parked(mut cfg: GameConfig, ready: std::sync::mpsc::Sender<std::time::Duration>, play: crate::park::PlayReceiver<Play>) -> Result<GameOutcome, String> {
     let mut park = move |cfg: &mut GameConfig, polcore: std::time::Duration| {
         let _ = ready.send(polcore);
-        let Some(play) = crate::park::wait_for_play(&play, crate::park::PUMP, &mut crate::native_auth::pump_idle_messages) else { return false };
+        let Some(play) = play.wait(&mut crate::native_auth::pump_idle_messages) else { return false };
         cfg.native_auth = Some(play.native_auth);
         (cfg.start_game, cfg.keep_session, cfg.viewer_gaps, cfg.auto_away_minutes, cfg.dismiss_disconnect) =
             (play.start_game, play.keep_session, play.viewer_gaps, play.auto_away_minutes, play.dismiss_disconnect);

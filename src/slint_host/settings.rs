@@ -209,6 +209,7 @@ pub(super) fn wire(ui: &MainWindow) {
     view.on_set_item_search(|on| emit(Message::ItemSearch(on)));
     view.on_set_start(|on| emit(Message::StartWithWindows(on)));
     view.on_set_tray(|on| emit(Message::CloseToTray(on)));
+    view.on_set_reduce_background(|on| emit(Message::ReduceBackgroundUsage(on)));
 
     use crate::launch_tools::Msg as Tools;
     view.on_tools_detect(|| emit(Message::LaunchTools(Tools::Detect)));
@@ -460,6 +461,8 @@ fn strings() -> SettingsStrings {
         start_label: t("Start Crystal in the background when Windows starts").into(),
         tray_label: t("Closing the window keeps Crystal running in the notification area").into(),
         tray_note: t("Quit from the notification icon to sign them out.").into(),
+        reduce_background_label: t("Reduce resource use in the background").into(),
+        reduce_background_note: t("Pauses controller monitoring and routine Friends refreshes when Crystal is out of focus. PlayOnline stays signed in.").into(),
         tools_title: t("Launch tools").into(),
         tools_sub: t("Leave a tool folder empty to find it automatically.").into(),
         detect_again: t("Detect again").into(),
@@ -588,6 +591,7 @@ fn system(view: &SettingsView, app: &App, state: &mut State) {
         start: set.start_with_windows,
         start_enabled: !app.startup_task_busy(),
         tray: set.close_to_tray,
+        reduce_background: set.reduce_background_usage,
         updates_status: std::mem::take(&mut shown.updates_status),
         updates_action: std::mem::take(&mut shown.updates_action),
     };
@@ -1241,6 +1245,7 @@ mod tests {
         assert_eq!(view.get_tabs().row_count(), 4);
         let system = view.get_system();
         assert!(system.sign_in && !system.tray);
+        assert!(!system.reduce_background);
         assert_eq!(view.get_strings().title, t("Settings"));
         assert_eq!(view.get_programs().row_count(), 1);
         assert_eq!(view.get_programs().row_data(0).unwrap().path, r"C:\Tools\Voice.exe");
@@ -1264,6 +1269,12 @@ mod tests {
         assert!(matches!(messages[5], Message::OpenWithGame(crate::open_with_game::Msg::Enabled(0, false))));
         assert!(matches!(messages[6], Message::OpenWithGame(crate::open_with_game::Msg::Add)));
         assert!(matches!(messages[7], Message::SetLanguage(Lang::Ja)));
+        view.invoke_set_reduce_background(true);
+        let messages = sent();
+        assert!(matches!(messages.as_slice(), [Message::ReduceBackgroundUsage(true)]));
+        app.settings.reduce_background_usage = true;
+        sync(&ui, &app);
+        assert!(view.get_system().reduce_background);
     }
 
     #[test]

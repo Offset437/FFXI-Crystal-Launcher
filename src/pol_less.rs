@@ -261,6 +261,8 @@ pub(crate) fn launch(
     progress: &mut impl FnMut(&str),
 ) -> Result<LaunchResult, String> {
     let mut auth = native_auth_for(config, plan, &account, otp)?;
+    auth.set_reduce_background_usage(crate::settings::load_settings(config)
+        .is_ok_and(|settings| settings.reduce_background_usage));
     let prepared = prepare_with_progress(config, plan, &account, &mut timing, progress, &|| false)?;
     drop(account);
     // The account editor shows the same line for an EU/JP account.
@@ -314,7 +316,7 @@ pub(crate) fn play_lines_for_test(config: &Config, plan: &Plan, account: &Accoun
     pol_install_dir: &Path) -> Result<[serde_json::Value; 3], String> {
     let json = |bytes: &[u8]| serde_json::from_slice::<serde_json::Value>(bytes).map_err(|e| e.to_string());
     let session = native_auth_for(config, plan, account, Zeroizing::default())?.session_line(install_dir)?;
-    let park = park::park_line(install_dir, Some(pol_install_dir), plan.auto_login, None)?;
+    let park = park::park_line(install_dir, Some(pol_install_dir), plan.auto_login, None, false)?;
     let credentials = native_auth_for(config, plan, account, Zeroizing::default())?.credentials_line()?;
     Ok([json(&session)?, json(&park)?, json(&credentials)?])
 }
@@ -3788,7 +3790,7 @@ mod tests {
             Ok(Injector::Fake(windower.clone()))
         };
         let parked = park::park_prepared(prepared, "Main", AutoLogin { enabled: true, character_slot: 2 }, Timeline::begin(),
-            &mut |_| {}, &mut spawn, test_turns(), FAST, Duration::from_secs(5)).unwrap();
+            &mut |_| {}, &mut spawn, test_turns(), FAST, Duration::from_secs(5), true).unwrap();
         parked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(parked.info.polcore_ms, Some(420));
         assert_eq!(parked.info.loader_pid, std::process::id());
@@ -3797,6 +3799,7 @@ mod tests {
         assert_eq!(before.len(), 1, "nothing but the park line before Play: {before:?}");
         let park: serde_json::Value = serde_json::from_str(&before[0]).unwrap();
         assert_eq!((park["type"].as_str(), park["auto_login"]["character_slot"].as_u64()), (Some("park"), Some(2)));
+        assert_eq!(park["reduce_background_usage"], true);
         for secret in ["native_auth", "start_game", "pol_password", "otp"] { assert!(!before[0].contains(secret), "{secret}"); }
         assert!(windower.load(Ordering::SeqCst), "the verified injector closes before any profile-save wait");
         let config = Config { experiment: dir.clone(), repository: dir.clone(), game_install: None, dat_overlays: Vec::new() };
@@ -3847,8 +3850,8 @@ mod tests {
             }));
             Ok(Injector::Fake(windower.clone()))
         };
-        let mut parked = park::park_prepared(prepared, "", AutoLogin::default(), Timeline::begin(), &mut |_| {}, &mut spawn, test_turns(), FAST, Duration::from_secs(5)).unwrap();
-        assert!(parked.watch(Duration::from_millis(50)).is_none(), "still parked");
+        let mut parked = park::park_prepared(prepared, "", AutoLogin::default(), Timeline::begin(), &mut |_| {}, &mut spawn, test_turns(), FAST, Duration::from_secs(5), false).unwrap();
+        assert!(parked.watch(Some(Duration::from_millis(50))).is_none(), "still parked");
         parked.kill();
         loader.unwrap().join().unwrap();
         assert_eq!(*order.lock().unwrap(), Some(true), "Windower.exe is stopped before the host");
@@ -3888,7 +3891,7 @@ mod tests {
             let closer = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(150)); abort.store(true, Ordering::Release); });
             let started = Instant::now();
             let limits = Timeouts { connect: Duration::from_secs(20), abort: Some(abort), ..FAST };
-            let result = park::park_prepared(prepared, "", AutoLogin::default(), Timeline::begin(), &mut |_| {}, &mut spawn, test_turns(), limits, Duration::from_secs(20));
+            let result = park::park_prepared(prepared, "", AutoLogin::default(), Timeline::begin(), &mut |_| {}, &mut spawn, test_turns(), limits, Duration::from_secs(20), false);
             closer.join().unwrap();
             let error = result.err().unwrap();
             assert!(error.starts_with(park::ABORTED), "{phase}: {error}");
@@ -3925,7 +3928,7 @@ mod tests {
         let started = Instant::now();
         let limits = Timeouts { abort: Some(abort), ..FAST };
         let result = park::park_prepared(prepared, "", AutoLogin::default(), Timeline::begin(),
-            &mut |line| if line.contains("Windower") { saw.store(true, Ordering::SeqCst) }, &mut spawn, &gate, limits, Duration::from_secs(20));
+            &mut |line| if line.contains("Windower") { saw.store(true, Ordering::SeqCst) }, &mut spawn, &gate, limits, Duration::from_secs(20), false);
         closer.join().unwrap();
         let error = result.err().unwrap();
         assert!(error.starts_with(park::ABORTED), "{error}");
@@ -3971,14 +3974,14 @@ mod tests {
                 }));
                 Ok(Injector::Detached)
             };
-            let result = park::park_prepared(prepared, "", AutoLogin::default(), Timeline::begin(), &mut |_| {}, &mut spawn, test_turns(), FAST, Duration::from_millis(300));
+            let result = park::park_prepared(prepared, "", AutoLogin::default(), Timeline::begin(), &mut |_| {}, &mut spawn, test_turns(), FAST, Duration::from_millis(300), false);
             match case {
                 "unsupported" => assert_eq!(result.err().unwrap(), park::UNSUPPORTED),
                 "error" => assert_eq!(result.err().unwrap(), "polcore could not be created"),
                 "ended" => assert!(result.err().unwrap().contains("did not park within"), "never parked"),
                 _ => {
                     let mut parked = result.unwrap();
-                    assert!(parked.watch(Duration::from_secs(5)).is_some(), "a host that ends while parked is reported");
+                    assert!(parked.watch(Some(Duration::from_secs(5))).is_some(), "a host that ends while parked is reported");
                     parked.kill();
                 }
             }
@@ -4016,7 +4019,7 @@ mod tests {
             }));
             Ok(Injector::Detached)
         };
-        let parked = park::park_prepared(prepared, "", AutoLogin::default(), Timeline::begin(), &mut |_| {}, &mut spawn, test_turns(), FAST, Duration::from_secs(5)).unwrap();
+        let parked = park::park_prepared(prepared, "", AutoLogin::default(), Timeline::begin(), &mut |_| {}, &mut spawn, test_turns(), FAST, Duration::from_secs(5), false).unwrap();
         gone_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         loader.unwrap().join().unwrap();
         let config = Config { experiment: dir.clone(), repository: dir.clone(), game_install: None, dat_overlays: Vec::new() };

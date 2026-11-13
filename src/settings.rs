@@ -112,6 +112,8 @@ pub(crate) struct Settings {
     /// notification area (sessions stay signed in). Off: closing quits, as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub close_to_tray: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reduce_background_usage: bool,
     /// Settings → System: a logon scheduled task starts Crystal with `--background`
     /// (`startup_task`). Off by default.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -164,6 +166,7 @@ impl Default for Settings {
             launcher_auto_restart: true,
             controller_navigation: true,
             close_to_tray: false,
+            reduce_background_usage: false,
             start_with_windows: false,
             open_with_game: Vec::new(),
             ah_server: None,

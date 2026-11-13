@@ -254,6 +254,8 @@ pub struct Session {
     pub native_auth: NativeCredentials,
     pub start_game: bool,
     pub keep_session: bool,
+    /// Use event waits for idle host work. Absent on older launcher lines.
+    pub reduce_background_usage: bool,
     /// Restore the Viewer's machine-paced UI gaps (op7 → 374 ≈1.05 s, mail
     /// list → publish ≈1.6 s; pol-spec 07a stock-faithful-pacing). Sent true
     /// only for a sign-in-only (pre-sign-in) session, never on a cold Play
@@ -476,7 +478,8 @@ pub fn parse_session(line: &[u8]) -> Result<Session, ProtoError> {
     let dismiss_disconnect = flag("dismiss_disconnect", false)?;
     let pad_hide = crate::pad_hide::parse(get("pad_hide"))?;
     let auto_login = parse_auto_login(get("auto_login"))?;
-    Ok(Session { region, ucs_area, install_dir, pol_install_dir, native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, dismiss_disconnect, pad_hide, auto_login, ffxi_settings })
+    let reduce_background_usage = flag("reduce_background_usage", false)?;
+    Ok(Session { region, ucs_area, install_dir, pol_install_dir, native_auth, start_game, keep_session, reduce_background_usage, viewer_gaps, auto_away_minutes, dismiss_disconnect, pad_hide, auto_login, ffxi_settings })
 }
 
 /// Viewer auto-Away minutes: 0 off, else 10..=60; absent = 10.
@@ -503,6 +506,7 @@ pub struct Park {
     pub ucs_area: Option<String>,
     pub install_dir: Option<String>,
     pub pol_install_dir: Option<String>,
+    pub reduce_background_usage: bool,
     pub auto_login: AutoLogin,
     pub ffxi_settings: Option<FfxiSettings>,
 }
@@ -544,6 +548,7 @@ impl Park {
         Session {
             region: self.region, ucs_area: self.ucs_area, install_dir: self.install_dir, pol_install_dir: self.pol_install_dir,
             native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, dismiss_disconnect, pad_hide,
+            reduce_background_usage: self.reduce_background_usage,
             auto_login: self.auto_login, ffxi_settings: self.ffxi_settings,
         }
     }
@@ -557,7 +562,7 @@ const SECRET_FIELDS: [&str; 6] = ["v_key", "auth_code", "account_id", "pol_recor
 /// Per-Play flags: only in `credentials` (or a direct `session`).
 const PLAY_FIELDS: [&str; 6] = ["start_game", "keep_session", "viewer_gaps", "auto_away_minutes", "dismiss_disconnect", "pad_hide"];
 /// Host fields: only in `park` (or a direct `session`).
-const HOST_FIELDS: [&str; 7] = ["region", "lang", "install_dir", "pol_install_dir", "ffxi_settings", "auto_login", "ucs_area"];
+const HOST_FIELDS: [&str; 8] = ["region", "lang", "install_dir", "pol_install_dir", "ffxi_settings", "auto_login", "ucs_area", "reduce_background_usage"];
 
 /// Parses the first launcher line: `session` (unchanged) or `park`.
 pub fn parse_first_line(line: &[u8]) -> Result<FirstLine, ProtoError> {
@@ -649,7 +654,12 @@ fn parse_park(root: &Value<'_>) -> Result<Park, ProtoError> {
         Some(_) => return Err(ProtoError::Field("ffxi_settings", "must be an object or null")),
     };
     let auto_login = parse_auto_login(get("auto_login"))?;
-    Ok(Park { region, ucs_area, install_dir, pol_install_dir, auto_login, ffxi_settings })
+    let reduce_background_usage = match get("reduce_background_usage") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        _ => return Err(ProtoError::Field("reduce_background_usage", "must be a boolean")),
+    };
+    Ok(Park { region, ucs_area, install_dir, pol_install_dir, reduce_background_usage, auto_login, ffxi_settings })
 }
 
 /// Parses the `credentials` line a parked host waits for (no timeout).
@@ -1186,6 +1196,7 @@ mod tests {
         assert_eq!((session.start_game, session.keep_session, session.viewer_gaps, session.auto_away_minutes, session.auto_login),
             (direct.start_game, direct.keep_session, direct.viewer_gaps, direct.auto_away_minutes, direct.auto_login));
         assert_eq!(session.ffxi_settings.as_ref().map(|s| s.len()), direct.ffxi_settings.as_ref().map(|s| s.len()));
+        assert!(!session.reduce_background_usage && !direct.reduce_background_usage);
         let (a, b) = (&session.native_auth, &direct.native_auth);
         assert_eq!((a.pol_id, a.otp, &a.profile_key), (b.pol_id, b.otp, &b.profile_key));
         // The direct session line still parses as before.
@@ -1226,6 +1237,26 @@ mod tests {
         assert_eq!(park.auto_login, on);
         let parked = park.into_session(parse_credentials(with_credentials(credentials).as_bytes()).unwrap());
         assert_eq!((parked.auto_login, parked.dismiss_disconnect), (on, true));
+    }
+
+    #[test]
+    fn background_savings_are_optional_host_fields_in_both_start_paths() {
+        let park_fields = PARK_LINE.strip_suffix('}').unwrap();
+        for enabled in [true, false] {
+            let park_line = format!("{park_fields},\"reduce_background_usage\":{enabled}}}");
+            let FirstLine::Park(park) = parse_first_line(park_line.as_bytes()).unwrap() else { panic!("expected park") };
+            let unpark = parse_credentials(credentials_line("").as_bytes()).unwrap();
+            assert_eq!(park.into_session(unpark).reduce_background_usage, enabled);
+            let direct = line(&format!("{},\"reduce_background_usage\":{enabled}", native_fields()));
+            assert_eq!(parse_session(direct.as_bytes()).unwrap().reduce_background_usage, enabled);
+        }
+        for malformed in ["null", "1", "\"true\"", "true,\"reduce_background_usage\":false"] {
+            let park = format!("{park_fields},\"reduce_background_usage\":{malformed}}}");
+            let session = line(&format!("{},\"reduce_background_usage\":{malformed}", native_fields()));
+            assert!(parse_first_line(park.as_bytes()).is_err());
+            assert!(parse_session(session.as_bytes()).is_err());
+        }
+        assert!(parse_credentials(credentials_line(",\"reduce_background_usage\":true").as_bytes()).is_err());
     }
 
     #[test]

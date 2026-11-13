@@ -6,14 +6,20 @@
 //! main thread sends `parked`, then waits for `credentials` with no timeout;
 //! from them on the host runs exactly the cold sign-in.
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
+use std::sync::{mpsc::{self, Receiver, RecvTimeoutError, SendError, Sender, TryRecvError}, Arc};
 use std::time::{Duration, Instant};
+use windows_sys::Win32::{
+    Foundation::{HANDLE, WAIT_OBJECT_0},
+    System::Threading::{SetEvent, INFINITE},
+    UI::WindowsAndMessaging::{MsgWaitForMultipleObjectsEx, MWMO_INPUTAVAILABLE, QS_ALLINPUT},
+};
 
 use crate::pipe::PipeError;
 use crate::{log, proto};
 
-/// While parked the game thread dispatches its window messages at least this
-/// often (COM, the injector's windows) and does nothing else (07d §1.3 step 3).
+/// How often to service COM and tool messages when the event wait is disabled
+/// or unavailable (07d §1.3 step 3).
 pub(crate) const PUMP: Duration = Duration::from_millis(100);
 
 /// Game thread, parked: `pump` (window messages only), then wait up to
@@ -26,6 +32,77 @@ pub(crate) fn wait_for_play<T>(play: &Receiver<T>, interval: Duration, pump: &mu
             Ok(play) => return Some(play),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
+pub(crate) struct PlaySender<T> {
+    sender: Option<Sender<T>>,
+    wake: Option<Arc<OwnedHandle>>,
+}
+
+impl<T> PlaySender<T> {
+    pub(crate) fn send(self, play: T) -> Result<(), SendError<T>> {
+        // Drop signals after the value is visible in the channel.
+        self.sender.as_ref().expect("the Play sender is live").send(play)
+    }
+}
+
+impl<T> Drop for PlaySender<T> {
+    fn drop(&mut self) {
+        // Close the channel before waking, so the game thread also sees EOF.
+        drop(self.sender.take());
+        if let Some(wake) = &self.wake {
+            unsafe { SetEvent(wake.as_raw_handle()); }
+        }
+    }
+}
+
+pub(crate) struct PlayReceiver<T> {
+    receiver: Receiver<T>,
+    wake: Option<Arc<OwnedHandle>>,
+}
+
+pub(crate) fn play_channel<T>(reduce_background_usage: bool) -> (PlaySender<T>, PlayReceiver<T>) {
+    let wake = if reduce_background_usage {
+        match crate::win::manual_reset_event() {
+            Ok(wake) => Some(Arc::new(wake)),
+            Err(error) => {
+                log!("background savings: parked event unavailable ({error}); using 100 ms polling");
+                None
+            }
+        }
+    } else {
+        log!("background savings: parked wait uses 100 ms polling");
+        None
+    };
+    let (sender, receiver) = mpsc::channel();
+    (PlaySender { sender: Some(sender), wake: wake.clone() }, PlayReceiver { receiver, wake })
+}
+
+impl<T> PlayReceiver<T> {
+    pub(crate) fn wait(&self, pump: &mut dyn FnMut()) -> Option<T> {
+        if let Some(wake) = &self.wake {
+            log!("background savings: parked wait uses Play and window events");
+            return wait_for_play_or_message(&self.receiver, wake.as_raw_handle(), pump);
+        }
+        wait_for_play(&self.receiver, PUMP, pump)
+    }
+}
+
+fn wait_for_play_or_message<T>(play: &Receiver<T>, wake: HANDLE, pump: &mut dyn FnMut()) -> Option<T> {
+    loop {
+        pump();
+        match play.try_recv() {
+            Ok(value) => return Some(value),
+            Err(TryRecvError::Disconnected) => return None,
+            Err(TryRecvError::Empty) => {}
+        }
+        // Stay responsive on the STA, including when the bounded pump left messages queued.
+        let result = unsafe { MsgWaitForMultipleObjectsEx(1, &wake, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
+        if result != WAIT_OBJECT_0 && result != WAIT_OBJECT_0 + 1 {
+            log!("background savings: parked event wait failed ({}); using 100 ms polling", std::io::Error::last_os_error());
+            return wait_for_play(play, PUMP, pump);
         }
     }
 }
@@ -82,6 +159,64 @@ pub(crate) fn await_credentials(
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn event_wait_dispatches_a_queued_message_then_wakes_for_play() {
+        use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PeekMessageW, PostThreadMessageW, MSG, PM_REMOVE, WM_APP};
+        let (sender, receiver) = play_channel(true);
+        assert!(receiver.wake.is_some());
+        let (ready, thread_id) = mpsc::channel();
+        let (dispatched, saw_message) = mpsc::channel();
+        let (done, result) = mpsc::channel();
+        let game = std::thread::spawn(move || {
+            let mut message: MSG = unsafe { std::mem::zeroed() };
+            // Create the message queue before another thread can post to it.
+            unsafe { PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE); }
+            ready.send(unsafe { GetCurrentThreadId() }).unwrap();
+            let play = receiver.wait(&mut || {
+                if unsafe { PeekMessageW(&mut message, std::ptr::null_mut(), WM_APP, WM_APP, PM_REMOVE) } != 0 {
+                    dispatched.send(message.wParam).unwrap();
+                }
+            });
+            done.send(play).unwrap();
+        });
+        let id = thread_id.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_ne!(unsafe { PostThreadMessageW(id, WM_APP, 42, 0) }, 0);
+        assert_eq!(saw_message.recv_timeout(Duration::from_secs(2)).unwrap(), 42);
+        sender.send(7).unwrap();
+        assert_eq!(result.recv_timeout(Duration::from_secs(2)).unwrap(), Some(7));
+        game.join().unwrap();
+    }
+
+    #[test]
+    fn event_wait_sleeps_without_messages_and_wakes_on_disconnect() {
+        let (sender, receiver) = play_channel::<()>(true);
+        let (pump, pumped) = mpsc::channel();
+        let (done, result) = mpsc::channel();
+        let game = std::thread::spawn(move || {
+            let play = receiver.wait(&mut || { pump.send(()).unwrap(); });
+            done.send(play).unwrap();
+        });
+        pumped.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(pumped.recv_timeout(PUMP * 3), Err(mpsc::RecvTimeoutError::Timeout));
+        drop(sender);
+        assert_eq!(result.recv_timeout(Duration::from_secs(2)).unwrap(), None);
+        game.join().unwrap();
+    }
+
+    #[test]
+    fn failed_event_wait_falls_back_to_pumping_while_parked() {
+        let (sender, receiver) = mpsc::channel();
+        let mut sender = Some(sender);
+        let mut pumped = 0;
+        let play = wait_for_play_or_message(&receiver, std::ptr::null_mut(), &mut || {
+            pumped += 1;
+            if pumped == 3 { sender.take().unwrap().send(7).unwrap(); }
+        });
+        assert_eq!(play, Some(7));
+        assert_eq!(pumped, 3);
+    }
 
     fn credentials() -> String {
         use crate::b64::encode;
