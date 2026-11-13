@@ -12,3 +12,4 @@ directories.json
 __pycache__/
 *.pyc
 /THIRD_PARTY_LICENSES.txt
+docs/downloader-design.md
