@@ -2,11 +2,12 @@
 //! (including tests/startup_handoff.rs) use to stand in for the launcher.
 //!
 //! Both ends are overlapped handles: the reply reader blocks in one kernel
-//! wait (with its timeout) while the event writer writes on the same handle,
-//! each with its own OVERLAPPED. No polling.
+//! wait while the event writer writes on the same handle, each with its own
+//! OVERLAPPED.
 
 use std::fmt;
 use std::io;
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
@@ -22,7 +23,7 @@ use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeServerProcessId, WaitNamedPipeW,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
-use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+use windows_sys::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects, WaitForSingleObject, INFINITE};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -32,6 +33,8 @@ use crate::proto::MAX_LINE;
 pub enum PipeError {
     Io(&'static str, io::Error),
     Timeout(&'static str),
+    Stopped,
+    WaitUnavailable(io::Error),
     Closed,
     LineTooLong,
     WrongServer { expected: u32, actual: u32 },
@@ -42,6 +45,8 @@ impl fmt::Display for PipeError {
         match self {
             PipeError::Io(what, e) => write!(f, "{what}: {e}"),
             PipeError::Timeout(what) => write!(f, "timed out {what}"),
+            PipeError::Stopped => write!(f, "the pipe reader was stopped"),
+            PipeError::WaitUnavailable(e) => write!(f, "waiting for the read or stop event: {e}"),
             PipeError::Closed => write!(f, "the launcher closed the pipe"),
             PipeError::LineTooLong => write!(f, "line longer than {MAX_LINE} bytes"),
             PipeError::WrongServer { expected, actual } => {
@@ -228,22 +233,33 @@ impl Pipe {
         Ok(())
     }
 
-    /// Reads what arrives first, waiting at most `timeout` (None: forever).
+    /// Reads what arrives first, with an optional timeout or shutdown event.
     /// Never returns while the kernel may still write into `out`.
-    fn read_some(&self, out: &mut [u8], timeout: Option<Duration>) -> Result<usize, PipeError> {
+    fn read_some(&self, out: &mut [u8], timeout: Option<Duration>, stop: Option<HANDLE>) -> Result<usize, PipeError> {
         let mut op = Overlapped::new()?;
         let len = out.len().min(u32::MAX as usize) as u32;
+        let mut interrupted = None;
         // SAFETY: `out` and `op` outlive the read: it completes or is
         // cancelled and then waited for below before this returns.
         if unsafe { ReadFile(self.h, out.as_mut_ptr(), len, std::ptr::null_mut(), &mut op.ov) } == 0 {
             // SAFETY: plain FFI.
             let code = unsafe { GetLastError() };
             if code != ERROR_IO_PENDING { return Err(io_error(code, "reading from the pipe")); }
-            let ms = timeout.map_or(INFINITE, |t| t.as_millis().min(u128::from(INFINITE - 1)) as u32);
-            // SAFETY: the operation's own event. Anything but completion (a
-            // timeout, or a failed wait) cancels, so the blocking collect below
-            // always ends.
-            if unsafe { WaitForSingleObject(op.event, ms) } != WAIT_OBJECT_0 {
+            if let Some(stop) = stop {
+                let handles = [stop, op.event];
+                let result = unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) };
+                interrupted = match result {
+                    WAIT_OBJECT_0 => Some(PipeError::Stopped),
+                    completed if completed == WAIT_OBJECT_0 + 1 => None,
+                    _ => Some(PipeError::WaitUnavailable(io::Error::last_os_error())),
+                };
+            } else {
+                let ms = timeout.map_or(INFINITE, |t| t.as_millis().min(u128::from(INFINITE - 1)) as u32);
+                if unsafe { WaitForSingleObject(op.event, ms) } != WAIT_OBJECT_0 {
+                    interrupted = Some(PipeError::Timeout("waiting for a line from the pipe"));
+                }
+            }
+            if interrupted.is_some() {
                 // SAFETY: cancels only this read; the result is collected below.
                 unsafe { CancelIoEx(self.h, &op.ov) };
             }
@@ -251,10 +267,12 @@ impl Pipe {
         let mut n = 0;
         // SAFETY: waits until the kernel is done with `out` (a cancelled read
         // may still have completed with data in the race window).
-        if unsafe { GetOverlappedResult(self.h, &op.ov, &mut n, 1) } == 0 {
+        let completed = unsafe { GetOverlappedResult(self.h, &op.ov, &mut n, 1) };
+        if matches!(interrupted, Some(PipeError::Stopped)) { return Err(PipeError::Stopped); }
+        if completed == 0 {
             // SAFETY: plain FFI.
             match unsafe { GetLastError() } {
-                ERROR_OPERATION_ABORTED if n == 0 => return Err(PipeError::Timeout("waiting for a line from the pipe")),
+                ERROR_OPERATION_ABORTED if n == 0 => return Err(interrupted.unwrap_or(PipeError::Timeout("waiting for a line from the pipe"))),
                 ERROR_MORE_DATA => {}
                 code => return Err(io_error(code, "reading from the pipe")),
             }
@@ -295,13 +313,25 @@ impl LineReader {
     /// Parses one owned message, then immediately wipes its source bytes while
     /// retaining any following lines already read from the byte-stream pipe.
     pub fn read_parsed<T>(&mut self, pipe: &Pipe, timeout: Option<Duration>, parse: impl FnOnce(&[u8]) -> T) -> Result<T, PipeError> {
-        let parsed = parse(self.read_line(pipe, timeout)?);
+        self.parse_line(pipe, timeout, None, parse)
+    }
+
+    pub(crate) fn read_parsed_until_stopped<T>(&mut self, pipe: &Pipe, stop: &OwnedHandle, parse: impl FnOnce(&[u8]) -> T) -> Result<T, PipeError> {
+        self.parse_line(pipe, None, Some(stop.as_raw_handle()), parse)
+    }
+
+    fn parse_line<T>(&mut self, pipe: &Pipe, timeout: Option<Duration>, stop: Option<HANDLE>, parse: impl FnOnce(&[u8]) -> T) -> Result<T, PipeError> {
+        let parsed = parse(self.read_line_with(pipe, timeout, stop)?);
         self.discard_consumed();
         Ok(parsed)
     }
 
     /// Returns the next line without its `\n`. `timeout: None` waits forever.
     pub fn read_line(&mut self, pipe: &Pipe, timeout: Option<Duration>) -> Result<&[u8], PipeError> {
+        self.read_line_with(pipe, timeout, None)
+    }
+
+    fn read_line_with(&mut self, pipe: &Pipe, timeout: Option<Duration>, stop: Option<HANDLE>) -> Result<&[u8], PipeError> {
         self.discard_consumed();
         let deadline = timeout.map(|t| Instant::now() + t);
         loop {
@@ -314,7 +344,7 @@ impl LineReader {
             }
             let remaining = deadline.map(|d| d.saturating_duration_since(Instant::now()));
             let end = self.buf.len();
-            let n = pipe.read_some(&mut self.buf[self.len..end], remaining)?;
+            let n = pipe.read_some(&mut self.buf[self.len..end], remaining, stop)?;
             self.len += n;
         }
     }
@@ -455,6 +485,74 @@ mod tests {
         client.write_all(b"from client\n").unwrap();
         reader.join().unwrap();
         t.join().unwrap();
+    }
+
+    #[test]
+    fn an_event_read_handles_fragments_and_can_stop_without_canceling_the_writer() {
+        use std::sync::{mpsc, Arc};
+        use windows_sys::Win32::System::Threading::SetEvent;
+        let path = random_pipe_path();
+        let server = Pipe::create_server(&path).unwrap();
+        let launcher = std::thread::spawn(move || {
+            server.accept().unwrap();
+            server.write_all(b"command ").unwrap();
+            let mut replies = LineReader::default();
+            let limit = Some(Duration::from_secs(2));
+            assert_eq!(replies.read_line(&server, limit).unwrap(), b"during read");
+            server.write_all(b"data\npartial").unwrap();
+            assert_eq!(replies.read_line(&server, limit).unwrap(), b"final status");
+        });
+        let client = Arc::new(Pipe::connect(&path, std::process::id(), Duration::from_secs(2)).unwrap());
+        let stop = Arc::new(crate::win::manual_reset_event().unwrap());
+        let (seen, command) = mpsc::channel();
+        let (ended, outcome) = mpsc::channel();
+        let reader = std::thread::spawn({
+            let client = client.clone();
+            let stop = stop.clone();
+            move || {
+                let mut reader = LineReader::default();
+                let line = reader.read_parsed_until_stopped(&client, &stop, <[u8]>::to_vec).unwrap();
+                seen.send(line).unwrap();
+                ended.send(reader.read_parsed_until_stopped(&client, &stop, <[u8]>::to_vec)).unwrap();
+            }
+        });
+        client.write_all(b"during read\n").unwrap();
+        assert_eq!(command.recv_timeout(Duration::from_secs(2)).unwrap(), b"command data");
+        assert!(matches!(outcome.recv_timeout(Duration::from_millis(300)), Err(mpsc::RecvTimeoutError::Timeout)));
+        assert_ne!(unsafe { SetEvent(stop.as_raw_handle()) }, 0);
+        client.write_all(b"final status\n").unwrap();
+        assert!(matches!(outcome.recv_timeout(Duration::from_secs(2)).unwrap(), Err(PipeError::Stopped)));
+        reader.join().unwrap();
+        launcher.join().unwrap();
+    }
+
+    #[test]
+    fn a_failed_event_wait_keeps_fragments_for_polling_and_detects_disconnect() {
+        let path = random_pipe_path();
+        let server = Pipe::create_server(&path).unwrap();
+        let (sent, fragment) = std::sync::mpsc::channel();
+        let launcher = std::thread::spawn(move || {
+            server.accept().unwrap();
+            server.write_all(b"first ").unwrap();
+            sent.send(()).unwrap();
+            let mut replies = LineReader::default();
+            assert_eq!(replies.read_line(&server, Some(Duration::from_secs(2))).unwrap(), b"retry");
+            server.write_all(b"line\n").unwrap();
+            assert_eq!(replies.read_line(&server, Some(Duration::from_secs(2))).unwrap(), b"close");
+        });
+        let client = Pipe::connect(&path, std::process::id(), Duration::from_secs(2)).unwrap();
+        let mut reader = LineReader::default();
+        fragment.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(reader.read_line(&client, Some(Duration::from_millis(250))), Err(PipeError::Timeout(_))));
+        assert_eq!(reader.len, b"first ".len());
+        let invalid = Some(std::ptr::null_mut());
+        assert!(matches!(reader.read_line_with(&client, None, invalid), Err(PipeError::WaitUnavailable(_))));
+        client.write_all(b"retry\n").unwrap();
+        assert_eq!(reader.read_line(&client, Some(Duration::from_secs(2))).unwrap(), b"first line");
+        let stop = crate::win::manual_reset_event().unwrap();
+        client.write_all(b"close\n").unwrap();
+        launcher.join().unwrap();
+        assert!(matches!(reader.read_parsed_until_stopped(&client, &stop, <[u8]>::to_vec), Err(PipeError::Closed)));
     }
 
     #[test]

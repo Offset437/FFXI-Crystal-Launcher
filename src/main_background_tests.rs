@@ -1,4 +1,5 @@
 use super::*;
+use std::fs;
 
 fn live_app(name: &str) -> App {
     let mut app = tests::app();
@@ -197,9 +198,117 @@ fn background_settings_are_off_by_default_and_saved_only_when_on() {
     assert!(!settings.close_to_tray && !settings.start_with_windows);
     let json = serde_json::to_string(&settings).unwrap();
     assert!(!json.contains("close_to_tray") && !json.contains("start_with_windows"));
+    assert!(!settings.reduce_background_usage && !json.contains("reduce_background_usage"));
+    assert!(!serde_json::from_str::<Settings>(&json).unwrap().reduce_background_usage);
     let on = Settings { close_to_tray: true, start_with_windows: true, ..Settings::default() };
     let back: Settings = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
     assert!(back.close_to_tray && back.start_with_windows);
+}
+
+#[test]
+fn background_savings_persist_and_follow_window_focus() {
+    let mut app = live_app("background-savings");
+    app.page = Page::Home;
+    app.startup_signin_pending = false;
+    app.startup_waiting.clear();
+    let id = app.window.unwrap();
+    let _ = app.update(Message::WindowFocus(id, true));
+    assert!(app.controller_monitoring());
+
+    let _ = app.update(Message::ReduceBackgroundUsage(true));
+    assert!(load_settings(&app.config).unwrap().reduce_background_usage);
+    let _ = app.update(Message::WindowFocus(id, false));
+    assert!(!app.controller_monitoring());
+    assert_eq!(app.schedule().tick, tick_gate::BACKGROUND_INTERVAL);
+    app.accounts[0].queued_play = Some(Instant::now());
+    assert_eq!(app.schedule().tick, Duration::from_secs(1));
+    app.accounts[0].queued_play = None;
+    app.accounts[0].busy = true;
+    assert_eq!(app.schedule().tick, Duration::from_millis(100));
+    app.accounts[0].busy = false;
+
+    let _ = app.update(Message::WindowFocus(id, true));
+    assert!(app.controller_monitoring());
+    assert_eq!(app.schedule().tick, Duration::from_secs(1));
+    let _ = app.update(Message::ControllerNavigation(false));
+    assert!(!app.controller_monitoring());
+    app.page = Page::Settings;
+    app.settings_tab = settings_page::Tab::Controller;
+    assert!(app.controller_monitoring());
+
+    app.settings.close_to_tray = true;
+    let _ = app.update(Message::CloseRequested);
+    assert!(!app.controller_monitoring());
+    let _ = app.update(Message::Tray(tray::Command::Open));
+    let _ = app.update(Message::WindowFocus(id, true));
+    assert!(!app.controller_monitoring(), "a stale focus event cannot activate a reopened window");
+    let _ = app.update(Message::WindowFocus(app.window.unwrap(), true));
+    assert!(app.controller_monitoring());
+
+    let _ = app.update(Message::WindowFocus(app.window.unwrap(), false));
+    let _ = app.update(Message::ReduceBackgroundUsage(false));
+    assert!(!load_settings(&app.config).unwrap().reduce_background_usage);
+    assert!(app.controller_monitoring());
+    assert_eq!(app.schedule().tick, Duration::from_secs(1));
+}
+
+#[test]
+fn native_activation_recovers_from_missed_winit_focus_events() {
+    use window_chrome::Activation;
+
+    let mut app = live_app("native-activation");
+    app.page = Page::Home;
+    app.startup_signin_pending = false;
+    let id = app.window.unwrap();
+    let _ = app.update(Message::WindowFocus(id, true));
+    let _ = app.update_with_activation(Message::ReduceBackgroundUsage(true), || Activation::Foreground);
+    assert!(app.controller_monitoring());
+
+    let _ = app.update_with_activation(Message::Tick, || Activation::OtherWindow);
+    assert!(app.auto_restart.focused, "winit missed focus loss");
+    assert!(app.background_savings_active());
+    assert!(!app.controller_monitoring());
+    assert_eq!(app.schedule().tick, tick_gate::BACKGROUND_INTERVAL);
+
+    let _ = app.update_with_activation(Message::WindowFocus(id, false), || Activation::Minimized);
+    let _ = app.update_with_activation(Message::Tick, || Activation::Foreground);
+    assert!(!app.auto_restart.focused, "winit missed focus gain");
+    assert!(app.controller_monitoring());
+
+    let _ = app.update_with_activation(Message::Tick, || Activation::Unknown);
+    assert!(app.background_savings_active(), "Win32 can temporarily report no foreground window");
+    let _ = app.update_with_activation(Message::WindowFocus(id, true), || Activation::Unknown);
+    assert!(app.controller_monitoring(), "winit remains the fallback");
+
+    let history = fs::read_to_string(app.config.history_path()).unwrap();
+    assert!(history.contains("background savings: active (winit focused: true, Win32: OtherWindow)"));
+    assert!(history.contains("background savings: active (winit focused: false, Win32: Minimized)"));
+    assert!(history.contains("background savings: paused (winit focused: false, Win32: Foreground)"));
+    let _ = app.update_with_activation(Message::Tick, || Activation::Unknown);
+    assert_eq!(fs::read_to_string(app.config.history_path()).unwrap(), history);
+
+    let _ = app.update(Message::ReduceBackgroundUsage(false));
+    let _ = app.update_with_activation(Message::Tick, || panic!("Win32 sampling must be opt-in"));
+    assert!(app.controller_monitoring());
+}
+
+#[test]
+fn background_friends_follow_submitted_requests_and_refresh_on_focus() {
+    let (mut app, directory, mut snapshot) = friends_session("friends-background");
+    app.settings.reduce_background_usage = true;
+    let id = app.window.unwrap();
+    let _ = app.update(Message::WindowFocus(id, true));
+    let _ = app.update(Message::WindowFocus(id, false));
+    answer_inbox(&directory, &mut snapshot);
+    tick_until(&mut app, |app| app.friends.pending.is_none() && !app.friends.loading);
+    assert!(app.friends.pending.is_none() && app.friends.error.is_empty());
+
+    let checked = Instant::now() - Duration::from_secs(3);
+    app.friends_checked = checked;
+    let _ = app.update(Message::Tick);
+    assert_eq!(app.friends_checked, checked);
+    let _ = app.update(Message::WindowFocus(id, true));
+    assert!(app.friends_checked > checked && app.friends.loading);
 }
 
 #[test]

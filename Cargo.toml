@@ -83,6 +83,12 @@ slint = { version = "=1.18.1", default-features = false, features = ["renderer-s
 [workspace]
 exclude = ["crystal-loader"]
 
+[patch.crates-io]
+gilrs = { git = "https://gitlab.com/bpellin/gilrs.git", rev = "00d9a8c723d10cdd3a460597f1171112515b9699" } # Stop the force feedback worker on drop.
+# Slint and the patched winit adapter must share the same AccessKit types.
+accesskit = { git = "https://github.com/bpellin/accesskit.git", rev = "c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3" }
+accesskit_winit = { git = "https://github.com/bpellin/accesskit.git", rev = "c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3" }
+
 [profile.dev]
 debug = 0
 

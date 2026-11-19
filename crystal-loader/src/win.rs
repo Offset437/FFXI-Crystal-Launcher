@@ -1,11 +1,19 @@
 //! Small Win32 helpers shared across the loader: NUL-terminated wide strings
 //! and module lookups. None of these take a module reference.
 
-use std::{ffi::{OsStr, OsString}, os::windows::ffi::{OsStrExt, OsStringExt}, path::PathBuf};
+use std::{ffi::{OsStr, OsString}, io, os::windows::{ffi::{OsStrExt, OsStringExt}, io::{FromRawHandle, OwnedHandle}}, path::PathBuf};
 use windows_sys::Win32::{
     Foundation::HMODULE,
     System::{LibraryLoader::{GetModuleFileNameW, GetModuleHandleW}, SystemInformation::GetSystemDirectoryW},
 };
+
+/// An initially nonsignaled, unnamed event. Once signaled it stays set.
+pub(crate) fn manual_reset_event() -> io::Result<OwnedHandle> {
+    use windows_sys::Win32::System::Threading::CreateEventW;
+    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    if event.is_null() { return Err(io::Error::last_os_error()); }
+    Ok(unsafe { OwnedHandle::from_raw_handle(event) })
+}
 
 /// `s` as a NUL-terminated UTF-16 string.
 pub(crate) fn wide(s: &str) -> Vec<u16> {

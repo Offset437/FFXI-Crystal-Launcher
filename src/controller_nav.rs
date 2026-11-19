@@ -44,6 +44,10 @@ impl State {
         self.pending().clear();
         self.input.repeat_at = None;
     }
+    pub(crate) fn reset_input(&mut self) {
+        self.clear();
+        self.input = InputState::default();
+    }
     pub(crate) fn repeating(&self) -> bool {
         self.input.repeat_at.is_some()
     }

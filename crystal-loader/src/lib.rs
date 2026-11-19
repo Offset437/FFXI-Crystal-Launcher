@@ -348,7 +348,7 @@ fn run_session(pipe: Pipe, reader: LineReader, session: proto::Session) -> i32 {
     log_ffxi_settings(session.ffxi_settings.as_ref());
     ffxi_settings::install(session.ffxi_settings);
     let cfg = game::GameConfig { region: session.region, ucs_area: session.ucs_area, install_dir: session.install_dir, pol_install_dir: session.pol_install_dir, native_auth: Some(session.native_auth), start_game: session.start_game, keep_session: session.keep_session, viewer_gaps: session.viewer_gaps, auto_away_minutes: session.auto_away_minutes, dismiss_disconnect: session.dismiss_disconnect, auto_login: session.auto_login };
-    events::start(pipe, reader);
+    events::start(pipe, reader, session.reduce_background_usage);
     let game = spawn_game(move || game::run(cfg));
     finish(game.and_then(join_game))
 }
@@ -377,7 +377,7 @@ fn run_parked(pipe: Pipe, mut reader: LineReader, mut park: proto::Park) -> i32 
         native_auth: None, start_game: false, keep_session: false, viewer_gaps: false, auto_away_minutes: 0,
         dismiss_disconnect: false, auto_login: park.auto_login };
     let (ready_tx, ready) = std::sync::mpsc::channel();
-    let (play, play_rx) = std::sync::mpsc::channel();
+    let (play, play_rx) = park::play_channel(park.reduce_background_usage);
     let game = match spawn_game(move || game::run_parked(cfg, ready_tx, play_rx)) {
         Ok(game) => game,
         Err(e) => return game_failed(&pipe, e),
@@ -406,8 +406,8 @@ fn run_parked(pipe: Pipe, mut reader: LineReader, mut park: proto::Park) -> i32 
     };
     let session = park.into_session(unpark);
     log_session(&session);
-    let proto::Session { native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, dismiss_disconnect, .. } = session;
-    events::start(pipe, reader);
+    let proto::Session { native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, dismiss_disconnect, reduce_background_usage, .. } = session;
+    events::start(pipe, reader, reduce_background_usage);
     // The game thread is parked waiting for exactly this; its sign-in follows.
     let sent = play.send(game::Play { native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, dismiss_disconnect });
     let result = join_game(game);

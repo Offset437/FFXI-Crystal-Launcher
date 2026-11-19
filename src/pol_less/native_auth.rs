@@ -65,6 +65,7 @@ pub(super) struct NativeAuth {
     dismiss_disconnect: bool,
     /// The lines' `pad_hide`: the controller buttons the game hides (absent when empty).
     pad_hide: Vec<[u32; 2]>,
+    reduce_background_usage: bool,
     auto_away_minutes: u8,
     auto_login: super::AutoLogin,
     game_running: Arc<AtomicBool>,
@@ -147,6 +148,7 @@ impl NativeAuth {
             social_only: false,
             start_pending: AtomicBool::new(false),
             keep_session: false, viewer_gaps: false, dismiss_disconnect: false, pad_hide: Vec::new(),
+            reduce_background_usage: false,
             auto_away_minutes: super::default_auto_away(),
             auto_login: super::AutoLogin::default(),
             game_running: Arc::new(AtomicBool::new(true)),
@@ -176,6 +178,7 @@ impl NativeAuth {
         let entries: Vec<String> = self.pad_hide.iter().map(|[mods, trigger]| format!("[{mods},{trigger}]")).collect();
         format!(",\"pad_hide\":[{}]", entries.join(","))
     }
+    pub(super) fn set_reduce_background_usage(&mut self, enabled: bool) { self.reduce_background_usage = enabled; }
     /// 0 = off, else one of the Viewer's 10..60-minute choices.
     pub fn set_auto_away(&mut self, minutes: u8) {
         self.auto_away_minutes = if super::AUTO_AWAY_CHOICES.contains(&minutes) { minutes } else { super::default_auto_away() };
@@ -409,7 +412,8 @@ impl SignedIn for NativeAuth {
             None => "\"region\":\"US\",\"lang\":\"US\"".to_owned(),
             Some(values) => format!("\"region\":\"{0}\",\"lang\":\"{0}\",\"ucs_area\":\"{1}\"", values.region.wire(), values.ucs_area),
         };
-        let head=format!("{{\"type\":\"session\",\"v\":1,{region},\"start_game\":{},\"keep_session\":{},\"viewer_gaps\":{},\"auto_away_minutes\":{},\"dismiss_disconnect\":{}{},\"auto_login\":{},\"pol_install_dir\":{},\"install_dir\":{},\"native_auth\":{{", !self.idle_first(), self.keep_session, self.viewer_gaps, self.auto_away_minutes, self.dismiss_disconnect, self.pad_hide_field(), auto_login, pol, serde_json::to_string(install).map_err(|_| t("Could not encode the game folder."))?);
+        let savings = if self.reduce_background_usage { ",\"reduce_background_usage\":true" } else { "" };
+        let head=format!("{{\"type\":\"session\",\"v\":1,{region}{savings},\"start_game\":{},\"keep_session\":{},\"viewer_gaps\":{},\"auto_away_minutes\":{},\"dismiss_disconnect\":{}{},\"auto_login\":{},\"pol_install_dir\":{},\"install_dir\":{},\"native_auth\":{{", !self.idle_first(), self.keep_session, self.viewer_gaps, self.auto_away_minutes, self.dismiss_disconnect, self.pad_hide_field(), auto_login, pol, serde_json::to_string(install).map_err(|_| t("Could not encode the game folder."))?);
         self.line_with_credentials(head)
     }
     /// pol-spec 07d §1.2: what a parked host gets at Play instead of `session`: the per-Play
@@ -832,6 +836,7 @@ mod tests {
                 control_errors: Mutex::new(BTreeMap::new()),
                 cache_dirty: AtomicBool::new(false),
                 status: AtomicI32::new(0), social_only: false, start_pending: AtomicBool::new(false), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, pad_hide: Vec::new(), auto_away_minutes: 10, auto_login: super::super::AutoLogin::default(), game_running: Arc::new(AtomicBool::new(true)),
+                reduce_background_usage: false,
                 social_seen: AtomicBool::new(false), play_pending_sent: AtomicBool::new(false),
                 target: crate::retail_region::Target::Us,
             } }
@@ -1058,9 +1063,11 @@ mod tests {
             let mut auth = NativeAuth::new(&play_account(), Zeroizing::new("123456".into()), directory.clone()).unwrap();
             auth.set_deferred_start(true);
             auth.set_auto_away(20);
+            auth.set_reduce_background_usage(true);
             auth
         };
         let session: serde_json::Value = serde_json::from_slice(&make().session_line(Path::new(r"C:\Games\FFXI")).unwrap()).unwrap();
+        assert_eq!(session["reduce_background_usage"], true);
         let auth = make();
         let line = auth.credentials_line().unwrap();
         assert!(line.ends_with(b"}}\n"));
@@ -1070,7 +1077,7 @@ mod tests {
         for flag in ["start_game", "keep_session", "viewer_gaps", "auto_away_minutes", "dismiss_disconnect"] {
             assert_eq!(value[flag], session[flag], "{flag}");
         }
-        for host in ["v", "region", "lang", "install_dir", "pol_install_dir", "auto_login", "ffxi_settings"] {
+        for host in ["v", "region", "lang", "install_dir", "pol_install_dir", "auto_login", "ffxi_settings", "reduce_background_usage"] {
             assert!(value.get(host).is_none(), "{host} belongs in the park line");
         }
         assert!(auth.credentials_line().is_err() && auth.session_line(Path::new(r"C:\Games\FFXI")).is_err(), "one use");

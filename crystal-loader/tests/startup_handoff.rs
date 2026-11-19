@@ -6,10 +6,11 @@ use crystal_loader::{b64, events, pipe::{random_pipe_path, LineReader, Pipe}, pr
 use std::{sync::mpsc, time::Duration};
 
 #[test]
-fn buffered_startup_sign_out_reaches_native_control_and_its_ready_writer() {
+fn event_reader_handles_a_buffered_command_and_stops_while_final_status_flushes() {
     let path = random_pipe_path();
     let server = Pipe::create_server(&path).unwrap();
     let (sent, written) = mpsc::channel();
+    let (answered, answer) = mpsc::channel();
     let writer = std::thread::spawn(move || {
         server.accept().unwrap();
         let session = format!("{{\"type\":\"session\",\"v\":1,\"region\":\"US\",\"lang\":\"US\",\"start_game\":false,\"native_auth\":{{\"pol_id\":\"{}\",\"pol_password\":\"{}\",\"se_id\":\"{}\",\"se_secret\":\"{}\",\"otp\":null,\"profile_key\":\"{}\"}}}}\n",
@@ -19,13 +20,16 @@ fn buffered_startup_sign_out_reaches_native_control_and_its_ready_writer() {
         let mut replies = LineReader::default();
         assert_eq!(replies.read_line(&server, Some(Duration::from_secs(2))).unwrap(),
             b"{\"type\":\"native_control_result\",\"action\":\"sign_out\",\"code\":0}");
+        answered.send(()).unwrap();
+        assert_eq!(replies.read_line(&server, Some(Duration::from_secs(2))).unwrap(), b"{\"type\":\"exit\",\"code\":0}");
     });
     let client = Pipe::connect(&path, std::process::id(), Duration::from_secs(5)).unwrap();
     written.recv_timeout(Duration::from_secs(5)).unwrap();
     let mut reader = LineReader::default();
     assert!(matches!(reader.read_parsed(&client, Some(Duration::from_secs(2)), proto::parse_first_line).unwrap().unwrap(), proto::FirstLine::Session(_)));
-    events::start(client, reader);
-    let result = writer.join();
+    events::start(client, reader, true);
+    answer.recv_timeout(Duration::from_secs(2)).unwrap();
+    events::send(proto::exit_line(0));
     events::finish(Duration::from_secs(2));
-    result.unwrap();
+    writer.join().unwrap();
 }

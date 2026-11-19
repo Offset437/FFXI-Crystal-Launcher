@@ -33,7 +33,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The renderer used unless SLINT_BACKEND names one: the first compiled-in of skia, femtovg,
@@ -77,6 +77,8 @@ pub(crate) fn run() -> Result<(), slint::PlatformError> {
         tick_generation: Arc::new(AtomicU64::new(0)),
         gamepad: Cell::new(false),
         gamepad_generation: Arc::new(AtomicU64::new(0)),
+        gamepad_lifetime: Arc::new(Mutex::new(())),
+        gamepad_thread: RefCell::new(None),
         jobs: RefCell::new(jobs::Jobs::default()),
         repeat: slint::Timer::default(),
         account_drag: Cell::new(false),
@@ -113,6 +115,9 @@ struct Host {
     gamepad: Cell<bool>,
     /// Bumped to stop the running controller thread.
     gamepad_generation: Arc<AtomicU64>,
+    /// The next backend waits off the UI thread until the previous one has shut down.
+    gamepad_lifetime: Arc<Mutex<()>>,
+    gamepad_thread: RefCell<Option<std::thread::Thread>>,
     /// The Windows components and dgVoodoo jobs.
     jobs: RefCell<jobs::Jobs>,
     /// A held controller direction's repeat (ControllerTick every 50 ms while it is held).
@@ -196,6 +201,9 @@ impl Host {
             theme.set_light(app.settings.light_theme);
             theme.set_scale(scale(&app));
             theme.set_small(small(&app));
+            let focused = app.window_focused();
+            theme.set_animate(focused);
+            sky::focused(&shown.ui, focused);
             view::sync(&shown.ui, &app);
             pick::sync(&shown.ui, &app);
             friends::sync(&shown.ui, &app);
@@ -245,17 +253,30 @@ impl Host {
     fn set_gamepad(&self, on: bool) {
         if self.gamepad.replace(on) == on { return; }
         let generation = self.gamepad_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Some(thread) = self.gamepad_thread.borrow_mut().take() { thread.unpark(); }
         if !on { return; }
-        let (current, still) = (self.gamepad_generation.clone(), self.gamepad_generation.clone());
-        let _ = std::thread::Builder::new().name("gamepad".into()).spawn(move || {
+        let current = self.gamepad_generation.clone();
+        let lifetime = self.gamepad_lifetime.clone();
+        if let Ok(worker) = std::thread::Builder::new().name("gamepad".into()).spawn(move || {
+            let _backend = lifetime.lock().unwrap_or_else(|error| error.into_inner());
+            if current.load(Ordering::Acquire) != generation { return; }
             crate::gamepad::detect::run(
                 |pads| {
+                    let delivered = current.clone();
                     current.load(Ordering::Acquire) == generation
-                        && slint::invoke_from_event_loop(move || send(Message::Gamepad(crate::gamepad::Msg::Pads(pads)))).is_ok()
+                        && slint::invoke_from_event_loop(move || {
+                            if delivered.load(Ordering::Acquire) == generation {
+                                send(Message::Gamepad(crate::gamepad::Msg::Pads(pads)));
+                            }
+                        }).is_ok()
                 },
-                || still.load(Ordering::Acquire) == generation,
+                || current.load(Ordering::Acquire) == generation,
             );
-        });
+        }) {
+            *self.gamepad_thread.borrow_mut() = Some(worker.thread().clone());
+        } else {
+            self.gamepad.set(false);
+        }
     }
 
     /// Runs `effect`: messages are queued for this drain, window commands run now, futures go
@@ -281,7 +302,7 @@ impl Host {
             Effect::Exit => {
                 self.close_window();
                 self.tick_generation.fetch_add(1, Ordering::AcqRel);
-                self.gamepad_generation.fetch_add(1, Ordering::AcqRel);
+                self.set_gamepad(false);
                 self.repeat.stop();
                 self.jobs.borrow_mut().stop();
                 let _ = slint::quit_event_loop();
@@ -294,10 +315,18 @@ impl Host {
         if self.tick.replace(Some(every)) == Some(every) { return; }
         let generation = self.tick_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let current = self.tick_generation.clone();
+        let delivered = current.clone();
         crate::runtime::spawn(crate::tick_gate::run(
             every,
             move || current.load(Ordering::Acquire) == generation,
-            || async { slint::invoke_from_event_loop(|| send(Message::Tick)).is_ok() },
+            move || {
+                let delivered = delivered.clone();
+                async move {
+                    slint::invoke_from_event_loop(move || {
+                        if delivered.load(Ordering::Acquire) == generation { send(Message::Tick); }
+                    }).is_ok()
+                }
+            },
         ));
     }
 
@@ -315,7 +344,14 @@ impl Host {
         let slint_window = shown.ui.window();
         match op {
             WindowOp::Open { .. } | WindowOp::Close => Effect::none(),
-            WindowOp::Minimize(on) => { slint_window.set_minimized(on); Effect::none() }
+            WindowOp::Minimize(on) => {
+                slint_window.set_minimized(on);
+                if on {
+                    Effect::done(Message::WindowFocus(id, false))
+                } else {
+                    Effect::none()
+                }
+            }
             WindowOp::ToggleMaximize => { slint_window.set_maximized(!slint_window.is_maximized()); Effect::none() }
             WindowOp::Drag => { slint_window.with_winit_window(|w| { let _ = w.drag_window(); }); Effect::none() }
             WindowOp::DragResize(edge) => { slint_window.with_winit_window(|w| { let _ = w.drag_resize_window(direction(edge)); }); Effect::none() }
@@ -355,7 +391,7 @@ impl Host {
             send(Message::CloseRequested);
             slint::CloseRequestResponse::KeepWindowShown
         });
-        window.on_winit_window_event(|window, event| {
+        window.on_winit_window_event(move |window, event| {
             use winit::event::{ElementState, MouseButton, WindowEvent};
             // Keyboard and pointer input: one UserInput per ACTIVITY_INTERVAL.
             if user_input(event) {
@@ -366,21 +402,15 @@ impl Host {
             // handle, window_chrome::is_foreground() stayed false and the controller thread
             // polled at its 250 ms background rate.
             let hwnd = native_handle(window);
-            if hwnd != 0 && ICONS.get().0 != hwnd { post(Message::NativeWindow(hwnd)); }
+            if hwnd != 0 && ICONS.get().0 != hwnd { post(Message::NativeWindow(id, hwnd)); }
             native_icons(hwnd, false);
             match event {
                 WindowEvent::Focused(focused) => {
                     let focused = *focused;
                     // The automatic update restart waits while the window is in use.
-                    post(Message::WindowFocus(focused));
-                    if let Some(host) = host() {
-                        if let Some(shown) = host.window.borrow().as_ref() {
-                            shown.ui.global::<Theme>().set_animate(focused);
-                            sky::focused(&shown.ui, focused);
-                        }
-                        // account_order::input: losing the focus cancels a drag.
-                        if !focused && host.account_drag.get() { post(Message::AccountDragCancel); }
-                    }
+                    post(Message::WindowFocus(id, focused));
+                    // account_order::input: losing the focus cancels a drag.
+                    if !focused && host().is_some_and(|host| host.account_drag.get()) { post(Message::AccountDragCancel); }
                     // A hotkey field records only while the window is in front.
                     if !focused && features::recording() { let _ = slint::invoke_from_event_loop(features::window_left); }
                 }
@@ -442,6 +472,9 @@ impl Host {
         if let Some(shown) = self.window.borrow().as_ref() {
             shown.ui.window().with_winit_window(|w| w.focus_window());
             bring_forward(native_handle(shown.ui.window()));
+            shown.ui.window().with_winit_window(|w| {
+                self.queue.borrow_mut().push_back(Message::WindowFocus(id, w.has_focus()));
+            });
         }
         self.queue.borrow_mut().push_back(Message::WindowOpened(id));
     }
@@ -654,19 +687,73 @@ fn native_handle(window: &slint::Window) -> isize {
     }
 }
 
-/// The window's top-left for `size` centred on the primary monitor's work area (physical px).
-fn centred(size: Size) -> Option<slint::PhysicalPosition> {
+/// The primary display's usable area, in physical pixels, and its DPI scale.
+struct WorkArea {
+    rect: windows_sys::Win32::Foundation::RECT,
+    scale: f64,
+}
+
+impl WorkArea {
+    fn width(&self) -> i32 {
+        self.rect.right - self.rect.left
+    }
+
+    fn height(&self) -> i32 {
+        self.rect.bottom - self.rect.top
+    }
+
+    fn physical_size(&self, size: Size) -> (i32, i32) {
+        (
+            (f64::from(size.width) * self.scale).round() as i32,
+            (f64::from(size.height) * self.scale).round() as i32,
+        )
+    }
+
+    fn fits(&self, size: Size) -> bool {
+        let (width, height) = self.physical_size(size);
+        width <= self.width() && height <= self.height()
+    }
+
+    fn centred(&self, size: Size) -> slint::PhysicalPosition {
+        let (width, height) = self.physical_size(size);
+        slint::PhysicalPosition::new(
+            self.rect.left + (self.width() - width).max(0) / 2,
+            self.rect.top + (self.height() - height).max(0) / 2,
+        )
+    }
+}
+
+fn primary_work_area() -> Option<WorkArea> {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
     use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETWORKAREA};
-    let mut area = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-    if unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, (&mut area as *mut RECT).cast(), 0) } == 0 { return None; }
-    let scale = unsafe { GetDpiForSystem() } as f32 / 96.0;
-    let (w, h) = ((size.width * scale) as i32, (size.height * scale) as i32);
-    Some(slint::PhysicalPosition::new(
-        area.left + ((area.right - area.left - w) / 2).max(0),
-        area.top + ((area.bottom - area.top - h) / 2).max(0),
-    ))
+    let mut rect = RECT::default();
+    if unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, (&mut rect as *mut RECT).cast(), 0) } == 0 {
+        return None;
+    }
+    let dpi = unsafe { GetDpiForSystem() };
+    if dpi == 0 || rect.right <= rect.left || rect.bottom <= rect.top {
+        return None;
+    }
+    Some(WorkArea { rect, scale: f64::from(dpi) / 96.0 })
+}
+
+/// The window's top-left for `size` centred on the primary monitor's work area (physical px).
+fn centred(size: Size) -> Option<slint::PhysicalPosition> {
+    primary_work_area().map(|area| area.centred(size))
+}
+
+pub(super) fn desktop_window_size() -> Size {
+    window_size_for_work_area(primary_work_area().as_ref())
+}
+
+fn window_size_for_work_area(work_area: Option<&WorkArea>) -> Size {
+    use crate::{DEFAULT_WINDOW_SIZE, SMALL_WINDOW_SIZE};
+    if work_area.is_some_and(|area| !area.fits(DEFAULT_WINDOW_SIZE)) {
+        SMALL_WINDOW_SIZE
+    } else {
+        DEFAULT_WINDOW_SIZE
+    }
 }
 
 /// A window opened from the background (the tray, a second start) comes to the front.

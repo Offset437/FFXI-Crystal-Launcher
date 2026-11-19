@@ -1,39 +1,60 @@
 //! The window's logic Tick, delivered only when it can do something. Every message
 //! syncs the view and can redraw the window, so an idle launcher that ticked at 1 Hz drew a
 //! frame a second for nothing (most of its idle GPU time). While the window reports itself
-//! quiet (`set_quiet`: no sign-in, wait, park start or other timed work pending), the timer
-//! still runs at its usual rate but a Tick is only sent when
+//! quiet (`set_quiet`: no sign-in, wait, park start or other timed work pending), a Tick is
+//! only sent when
 //! * a worker event arrived (`EventSender::send` counts them), or
 //! * a watched session flag changed (a game or session started or ended), or
+//! * the opt-in native foreground check changed, or
 //! * the window's next timed work is due (the official status read every few minutes,
 //!   parked hosts' fingerprints), or
 //! * SAFETY_NET passed since the last one (files another process wrote, a parked host
 //!   that ended on its own).
 //!
-//! Nothing that ran on a Tick before is skipped for good, and a busy window ticks exactly as
-//! it did.
-use crate::WorkerEvent;
+//! Opt-in background mode wakes immediately for worker events and deadlines, with a slower
+//! sweep for flags and files that do not send notifications.
+use crate::{window_chrome, WorkerEvent};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The longest a quiet window goes without a Tick.
 pub(crate) const SAFETY_NET: Duration = Duration::from_secs(60);
+pub(crate) const BACKGROUND_INTERVAL: Duration = Duration::from_secs(2);
 
 static QUIET: AtomicBool = AtomicBool::new(false);
 static EVENTS: AtomicU64 = AtomicU64::new(0);
-struct Watch { flags: Vec<(Arc<AtomicBool>, bool)>, due: Option<Instant> }
-static WATCHED: Mutex<Watch> = Mutex::new(Watch { flags: Vec::new(), due: None });
+static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+struct Watch {
+    flags: Vec<(Arc<AtomicBool>, bool)>,
+    due: Option<Instant>,
+    activation: Option<window_chrome::Activation>,
+}
+static WATCHED: Mutex<Watch> = Mutex::new(Watch { flags: Vec::new(), due: None, activation: None });
 
 /// After every update: whether the window is quiet, the session flags (with their current
-/// values) whose change needs a Tick at once, and when its next timed work is due.
-pub(crate) fn set_quiet(quiet: bool, flags: Vec<(Arc<AtomicBool>, bool)>, due: Option<Instant>) {
+/// values) whose change needs a Tick, when its next timed work is due, and the last
+/// native activation state to compare on timer turns (if background savings are on).
+pub(crate) fn set_quiet(
+    quiet: bool,
+    flags: Vec<(Arc<AtomicBool>, bool)>,
+    due: Option<Instant>,
+    activation: Option<window_chrome::Activation>,
+) {
     QUIET.store(quiet, Ordering::Release);
-    if let Ok(mut watch) = WATCHED.lock() { *watch = Watch { flags, due }; }
+    if let Ok(mut watch) = WATCHED.lock() {
+        let deadline_changed = watch.due != due;
+        *watch = Watch { flags, due, activation };
+        if deadline_changed { WAKE.notify_waiters(); }
+    }
 }
 
 fn watched_changed() -> bool {
-    WATCHED.lock().is_ok_and(|watch| watch.flags.iter().any(|(flag, seen)| flag.load(Ordering::Acquire) != *seen))
+    let Ok(watch) = WATCHED.lock() else { return false };
+    if watch.flags.iter().any(|(flag, seen)| flag.load(Ordering::Acquire) != *seen) { return true; }
+    let activation = watch.activation;
+    drop(watch);
+    activation.is_some_and(|seen| window_chrome::activation() != seen)
 }
 
 fn next_due() -> Option<Instant> { WATCHED.lock().ok().and_then(|watch| watch.due) }
@@ -76,6 +97,10 @@ where
     D: std::future::Future<Output = bool>,
 {
     let mut gate = Gate::new(Instant::now());
+    if every == BACKGROUND_INTERVAL {
+        run_background(&mut gate, alive, deliver).await;
+        return;
+    }
     let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -89,6 +114,39 @@ where
     }
 }
 
+async fn run_background<F, D>(gate: &mut Gate, alive: impl Fn() -> bool, mut deliver: F)
+where
+    F: FnMut() -> D,
+    D: std::future::Future<Output = bool>,
+{
+    let mut sweep = Instant::now() + BACKGROUND_INTERVAL;
+    loop {
+        let wake = WAKE.notified();
+        if !alive() { return; }
+        let now = Instant::now();
+        let events = EVENTS.load(Ordering::Acquire);
+        let deadline = next_due().filter(|at| *at > gate.last);
+        if events != gate.events_seen || now >= sweep || deadline.is_some_and(|at| now >= at) {
+            sweep = now + BACKGROUND_INTERVAL;
+            if gate.due(now, QUIET.load(Ordering::Acquire), events, watched_changed(), deadline)
+                && !deliver().await {
+                return;
+            }
+        } else {
+            let until = deadline.map_or(sweep, |at| at.min(sweep));
+            tokio::select! {
+                _ = wake => {},
+                _ = tokio::time::sleep_until(until.into()) => {},
+            }
+        }
+    }
+}
+
+pub(crate) fn notify_session_change() {
+    EVENTS.fetch_add(1, Ordering::AcqRel);
+    WAKE.notify_waiters();
+}
+
 /// The worker-event channel's sending half: also wakes a quiet window's next Tick.
 #[derive(Clone)]
 pub(crate) struct EventSender(mpsc::Sender<WorkerEvent>);
@@ -97,7 +155,7 @@ impl EventSender {
     pub(crate) fn new(sender: mpsc::Sender<WorkerEvent>) -> Self { Self(sender) }
     pub(crate) fn send(&self, event: WorkerEvent) -> Result<(), mpsc::SendError<WorkerEvent>> {
         let result = self.0.send(event);
-        EVENTS.fetch_add(1, Ordering::AcqRel);
+        if result.is_ok() { notify_session_change(); }
         result
     }
 }
@@ -154,6 +212,21 @@ mod tests {
         assert!(gate.due(at(9), true, 0, false, Some(at(9))), "the next one");
     }
 
+    #[tokio::test]
+    async fn a_worker_event_wakes_background_ticks_before_the_next_sweep() {
+        let (events, _receiver) = mpsc::channel();
+        let sender = EventSender::new(events);
+        let (first, ready) = tokio::sync::oneshot::channel();
+        let mut first = Some(first);
+        let task = tokio::spawn(run(BACKGROUND_INTERVAL, || true, move || {
+            let first = first.take();
+            async move { first.is_some_and(|first| first.send(()).is_ok()) }
+        }));
+        ready.await.unwrap();
+        sender.send(WorkerEvent::Notice("background wake".into())).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task).await.expect("worker wake before the two-second sweep").unwrap();
+    }
+
     #[test]
     fn sending_an_event_counts_it() {
         let (sender, receiver) = mpsc::channel();
@@ -168,10 +241,10 @@ mod tests {
     fn a_watched_flag_that_changed_is_seen() {
         let flag = Arc::new(AtomicBool::new(true));
         // Only this test sets the watch list; other tests read the counters only.
-        set_quiet(false, vec![(flag.clone(), true)], None);
+        set_quiet(false, vec![(flag.clone(), true)], None, None);
         assert!(!watched_changed());
         flag.store(false, Ordering::Release);
         assert!(watched_changed());
-        set_quiet(false, Vec::new(), None);
+        set_quiet(false, Vec::new(), None, None);
     }
 }

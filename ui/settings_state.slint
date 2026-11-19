@@ -37,6 +37,8 @@ export struct SettingsStrings {
     start-label: string,
     tray-label: string,
     tray-note: string,
+    reduce-background-label: string,
+    reduce-background-note: string,
     tools-title: string,
     tools-sub: string,
     detect-again: string,
@@ -153,6 +155,7 @@ export struct SystemState {
     start: bool,
     start-enabled: bool,
     tray: bool,
+    reduce-background: bool,
 }
 
 /// One launch tool's folder or file (launch_tools::tool_row).
@@ -422,6 +425,7 @@ export global SettingsView {
     callback set-item-search(bool);
     callback set-start(bool);
     callback set-tray(bool);
+    callback set-reduce-background(bool);
 
     in property <ToolsState> tools;
     in property <[string]> launchers;

@@ -21,8 +21,7 @@ checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 [[package]]
 name = "accesskit"
 version = "0.24.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3b7f7f85a7e5f68090000ed7622545829afd484d210358702ae4cb97dd0c320"
+source = "git+https://github.com/bpellin/accesskit.git?rev=c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3#c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3"
 dependencies = [
  "uuid",
 ]
@@ -30,8 +29,7 @@ dependencies = [
 [[package]]
 name = "accesskit_atspi_common"
 version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "023da0e5097f46df7092d5280b02efb9bbf8d93298daeced42652463e357d636"
+source = "git+https://github.com/bpellin/accesskit.git?rev=c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3#c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -44,8 +42,7 @@ dependencies = [
 [[package]]
 name = "accesskit_consumer"
 version = "0.38.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d10a236f96f87d70732e44520046785431ef01d5bcd6b041317bfadd2f88245"
+source = "git+https://github.com/bpellin/accesskit.git?rev=c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3#c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3"
 dependencies = [
  "accesskit",
  "hashbrown 0.16.1",
@@ -54,8 +51,7 @@ dependencies = [
 [[package]]
 name = "accesskit_ios"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "750c4e9f6ce888dfe8a10c0f1b5ceb646a7854fd46579d74919219d1bb314083"
+source = "git+https://github.com/bpellin/accesskit.git?rev=c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3#c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -68,8 +64,7 @@ dependencies = [
 [[package]]
 name = "accesskit_macos"
 version = "0.26.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce02dc63b43f0c9296af9ac946312a2dc8814427d7a64d2d600971dac55b6076"
+source = "git+https://github.com/bpellin/accesskit.git?rev=c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3#c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -82,8 +77,7 @@ dependencies = [
 [[package]]
 name = "accesskit_unix"
 version = "0.22.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03e156ed3802e35eefe894ef2671bc6c889303d8a7e110b5e1b48f504b91362f"
+source = "git+https://github.com/bpellin/accesskit.git?rev=c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3#c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3"
 dependencies = [
  "accesskit",
  "accesskit_atspi_common",
@@ -100,8 +94,7 @@ dependencies = [
 [[package]]
 name = "accesskit_windows"
 version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "106c2b961215864d1c2e703ee63269c25c4e80a577ffb2c1017b9c17dcdf83a1"
+source = "git+https://github.com/bpellin/accesskit.git?rev=c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3#c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -114,8 +107,7 @@ dependencies = [
 [[package]]
 name = "accesskit_winit"
 version = "0.33.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5b41e63a69f36d9f1f41e70464c7e5f72eee485ef26aab19f0b4f86e6c0a84c"
+source = "git+https://github.com/bpellin/accesskit.git?rev=c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3#c52b3b2bb8785410ecf86eac5d7f448b1b19a4d3"
 dependencies = [
  "accesskit",
  "accesskit_ios",
@@ -1659,8 +1651,7 @@ dependencies = [
 [[package]]
 name = "gilrs"
 version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "902fb00d3f6398e635be22e5c837b303c501835cca7ac11a47bba138f7aafdd8"
+source = "git+https://gitlab.com/bpellin/gilrs.git?rev=00d9a8c723d10cdd3a460597f1171112515b9699#00d9a8c723d10cdd3a460597f1171112515b9699"
 dependencies = [
  "fnv",
  "gilrs-core",

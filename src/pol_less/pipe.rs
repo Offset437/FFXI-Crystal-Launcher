@@ -302,6 +302,7 @@ impl LoaderPipe {
     }
     pub(crate) fn listen_for_commands(&mut self, wake: Option<crate::session_worker::CommandWake>) {
         self.command_wake = wake;
+        self.command_wake_pending = false;
     }
     /// A command writer's wake interrupts reads: the supervisor need not poll for commands.
     pub(crate) fn has_command_wake(&self) -> bool {
@@ -581,9 +582,11 @@ mod sys {
                     };
                 }
                 let notified = wake.is_some() && waited == WAIT_OBJECT_0 + 1;
-                if notified { self.command_wake_pending = true; }
+                let wake_failed = wake.is_some() && waited == WAIT_FAILED;
+                if wake_failed { self.command_wake = None; }
+                if notified || wake_failed { self.command_wake_pending = true; }
                 let stop = match check() {
-                    _ if notified => Some(AcceptError::Check("Native command ready.".into())),
+                    _ if notified || wake_failed => Some(AcceptError::Check("Command wait interrupted.".into())),
                     _ if waited == WAIT_FAILED => Some(AcceptError::Io(io::Error::last_os_error())),
                     Err(message) => Some(AcceptError::Check(message)),
                     Ok(()) if deadline.is_some_and(|end| Instant::now() >= end) => Some(AcceptError::TimedOut),

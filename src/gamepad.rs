@@ -109,6 +109,15 @@ impl Default for State {
 impl State {
     pub(crate) fn controller_pad(&self) -> Option<&Pad> { self.pad() }
     pub(crate) fn capturing(&self) -> bool { self.capture.is_some() }
+    pub(crate) fn suspend(&mut self) {
+        self.pads.clear();
+        self.selected = None;
+        self.prev = Input::default();
+        self.capture = None;
+        if self.notice.as_ref().is_some_and(|n| n.kind == NoticeKind::Capture) {
+            self.notice = None;
+        }
+    }
     /// Synthetic input for the controller highlight and binding chips.
     fn preview() -> Self {
         let kind = std::env::var("XI_PREVIEW_PAD").unwrap_or_else(|_| "xbox".into());
@@ -908,6 +917,25 @@ mod tests {
             assert_eq!(state.retail.edit.sin[slot], expected);
         }
         assert_ne!(state.retail.edit, state.retail.saved);
+    }
+
+    #[test]
+    fn suspending_monitoring_discards_capture_and_reconnects_with_fresh_input() {
+        let mut state = ps5_state(false);
+        let _ = update(&mut state, Msg::Capture(Row::Single(6)));
+        let mut pads = state.pads.clone();
+        pads[0].input.buttons = Btn::Start.bit();
+        state.suspend();
+        assert!(!state.capturing() && state.controller_pad().is_none());
+        let _ = update(&mut state, Msg::Pads(pads));
+        let mut nav = crate::controller_nav::State::default();
+        assert!(!nav.poll(state.controller_pad(), true, std::time::Instant::now()));
+        assert!(nav.take_pending().is_empty());
+        press(&mut state, 0);
+        assert!(!nav.poll(state.controller_pad(), true, std::time::Instant::now()));
+        press(&mut state, Btn::Start.bit());
+        assert!(nav.poll(state.controller_pad(), true, std::time::Instant::now()));
+        assert_eq!(nav.take_pending(), [crate::controller_nav::Command::Play]);
     }
 
     #[test]

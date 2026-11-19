@@ -401,6 +401,12 @@ export component SystemTab inherits VerticalLayout {
             note-1: SettingsView.strings.tray-note;
             toggled(on) => { SettingsView.set-tray(on); }
         }
+        SwitchNotes {
+            text: SettingsView.strings.reduce-background-label;
+            on: SettingsView.system.reduce-background;
+            note-1: SettingsView.strings.reduce-background-note;
+            toggled(on) => { SettingsView.set-reduce-background(on); }
+        }
     }
 
     // Launch tools.

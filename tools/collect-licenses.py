@@ -13,7 +13,8 @@ def dependencies(manifest, target, offline):
         command.append('--offline')
     graph = json.loads(subprocess.check_output(command, cwd=manifest.parent))
     nodes = {node['id']: node for node in graph['resolve']['nodes']}
-    pending = [graph['resolve']['root']]
+    root_id = graph['resolve']['root']
+    pending = [root_id]
     selected = set()
     while pending:
         package = pending.pop()
@@ -23,6 +24,7 @@ def dependencies(manifest, target, offline):
         for dependency in nodes[package]['deps']:
             if any(kind['kind'] != 'dev' for kind in dependency['dep_kinds']):
                 pending.append(dependency['pkg'])
+    selected.remove(root_id)
     return [package for package in graph['packages'] if package['id'] in selected]
 
 
@@ -39,13 +41,35 @@ def license_files(package):
                 candidates.add(path)
             elif path.is_dir():
                 candidates.update(file for file in path.rglob('*') if file.is_file())
-    if not candidates and directory.is_relative_to(root):
-        candidates.add(root / 'LICENSE')
     revision_file = directory / '.cargo_vcs_info.json'
     revision = json.loads(revision_file.read_text())['git']['sha1'] if revision_file.exists() else None
     fallback = root / 'licenses/cargo' / (revision or f"{package['name']}-{package['version']}")
     if not candidates and fallback.is_dir():
         candidates.update(file for file in fallback.iterdir() if file.is_file())
+    source = package.get('source') or ''
+    if source.startswith('git+https://gitlab.com/bpellin/gilrs.git?'):
+        # The Git checkout keeps Gilrs's license texts at its workspace root.
+        for name in ('LICENSE-APACHE', 'LICENSE-MIT'):
+            license_path = directory.parent / name
+            if license_path.is_file():
+                candidates.add(license_path)
+    if package['name'] == 'gilrs':
+        mappings_license = directory / 'SDL_GameControllerDB' / 'LICENSE'
+        if mappings_license.is_file():
+            candidates.add(mappings_license)
+    if not candidates and source.startswith('git+https://github.com/bpellin/accesskit.git?'):
+        # AccessKit's Git workspace keeps the licenses for its member crates at the root.
+        for parent in directory.parents:
+            apache = parent / 'LICENSE-APACHE'
+            mit = parent / 'LICENSE-MIT'
+            if apache.is_file() and mit.is_file():
+                candidates.add(apache)
+                if package.get('license') == 'MIT OR Apache-2.0':
+                    candidates.add(mit)
+                    chromium = parent / 'LICENSE.chromium'
+                    if chromium.is_file():
+                        candidates.add(chromium)
+                break
     return sorted(candidates)
 
 
@@ -59,9 +83,7 @@ def main():
     for manifest, target in [(root / 'Cargo.toml', 'x86_64-pc-windows-msvc'),
                              (root / 'crystal-loader/Cargo.toml', 'i686-pc-windows-msvc')]:
         for package in dependencies(manifest, target, args.offline):
-            # Crystal's own packages are covered by the root LICENSE.
-            if not Path(package['manifest_path']).is_relative_to(root):
-                packages[package['id']] = package
+            packages[package['id']] = package
     texts = {}
     entries = []
     missing = []

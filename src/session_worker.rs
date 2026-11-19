@@ -109,6 +109,8 @@ struct ParkRequest {
     config: Config,
     account: Account,
     plan: Plan,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    reduce_background_usage: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1182,7 +1184,9 @@ fn serve(mut request: Request, login: Box<Login<'_>>, emit: &mut dyn FnMut(&Even
 /// What a park worker drives: `pol_less::park::Parked`, or a fake in tests.
 pub(crate) trait ParkHost {
     fn info(&self) -> crate::pol_less::park::ParkedInfo;
-    fn watch(&mut self, wait: Duration) -> Option<String>;
+    fn listen_for_frames(&mut self, wake: Option<CommandWake>);
+    fn frame_notifications(&self) -> bool;
+    fn watch(&mut self, wait: Option<Duration>) -> Option<String>;
     fn kill(self);
     #[allow(clippy::too_many_arguments)]
     fn play(self, config: &Config, plan: &Plan, account: Account, otp: Zeroizing<String>, clicked: Instant,
@@ -1191,7 +1195,9 @@ pub(crate) trait ParkHost {
 }
 impl ParkHost for crate::pol_less::park::Parked {
     fn info(&self) -> crate::pol_less::park::ParkedInfo { self.info }
-    fn watch(&mut self, wait: Duration) -> Option<String> { crate::pol_less::park::Parked::watch(self, wait) }
+    fn listen_for_frames(&mut self, wake: Option<CommandWake>) { self.listen_for_frames(wake); }
+    fn frame_notifications(&self) -> bool { self.frame_notifications() }
+    fn watch(&mut self, wait: Option<Duration>) -> Option<String> { self.watch(wait) }
     fn kill(self) { crate::pol_less::park::Parked::kill(self) }
     fn play(self, config: &Config, plan: &Plan, account: Account, otp: Zeroizing<String>, clicked: Instant,
         progress: &mut dyn FnMut(&str), cold: Box<dyn FnOnce(Account, Zeroizing<String>, &mut dyn FnMut(&str)) -> Result<LaunchResult, String> + '_>)
@@ -1205,15 +1211,14 @@ static PARK_CLOSED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn run_park() -> i32 {
     private_std_handles();
-    run_park_with(io::stdin(), |config, plan, account, closed| {
-        crate::pol_less::park::park(config, plan, account, closed, &mut |_| {})
+    run_park_with(io::stdin(), |config, plan, account, savings, closed| {
+        crate::pol_less::park::park(config, plan, account, savings, closed, &mut |_| {})
     }, emit, |config, account, otp, via, clicked, progress| {
         backend::login_with_progress(config, account, otp, via, clicked, progress)
     }, &PARK_CLOSED)
 }
 
-/// After a host parks, how often the worker looks for frame 2 and at the host: a Play's
-/// credentials leave within this of the window's staggered write (07a parity condition 3).
+/// When frame notifications are disabled or unavailable, look for frame 2 this often.
 const FRAME_POLL: Duration = Duration::from_millis(20);
 
 /// Frame 1, park, `Parked`; then frame 2 (the Play) or EOF, watching the host meanwhile.
@@ -1224,7 +1229,7 @@ const FRAME_POLL: Duration = Duration::from_millis(20);
 /// today's worker (`serve`), the parked host signing in.
 fn run_park_with<H: ParkHost>(
     mut input: impl Read + Send + 'static,
-    park: impl FnOnce(&Config, &Plan, &Account, &'static AtomicBool) -> Result<H, String>,
+    park: impl FnOnce(&Config, &Plan, &Account, bool, &'static AtomicBool) -> Result<H, String>,
     mut emit: impl FnMut(&Event),
     cold: impl Fn(&Config, Account, String, Option<Plan>, Instant, &mut dyn FnMut(&str)) -> Result<LaunchResult, String>,
     closed: &'static AtomicBool,
@@ -1233,18 +1238,22 @@ fn run_park_with<H: ParkHost>(
         Ok(request) => request,
         Err(error) => { emit(&Event::ParkFailed(error)); return 1; }
     };
+    let wake = parking.reduce_background_usage.then(CommandWake::anonymous).and_then(Result::ok);
+    let reader_wake = wake.clone();
     let (sender, frames) = std::sync::mpsc::channel();
     let reader = std::thread::Builder::new().name("park-frame".into()).spawn(move || {
         let frame = read_frame::<Request>(&mut input).ok();
         if frame.is_none() { closed.store(true, Ordering::Release); }
         let _ = sender.send(frame);
+        if let Some(wake) = reader_wake { wake.wake(); }
     });
     if reader.is_err() { emit(&Event::ParkFailed(t("Could not start Crystal's background session worker.").into())); return 1; }
-    let mut host = match park(&parking.config, &parking.plan, &parking.account, closed) {
+    let mut host = match park(&parking.config, &parking.plan, &parking.account, parking.reduce_background_usage, closed) {
         Ok(host) => host,
         Err(error) => { emit(&Event::ParkFailed(error)); return 1; }
     };
     let info = host.info();
+    host.listen_for_frames(wake);
     emit(&Event::Parked { loader_pid: info.loader_pid, tool_pid: info.tool_pid, polcore_ms: info.polcore_ms, hello_ms: info.hello_ms });
     // A host parked for a while gives its untouched pages back (worker and loader; priority
     // stays normal, so a Play's warm start is not slowed).
@@ -1262,12 +1271,16 @@ fn run_park_with<H: ParkHost>(
             Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => { host.kill(); return 0; }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
-        if let Some(why) = host.watch(FRAME_POLL) {
+        let wait = if !host.frame_notifications() { Some(FRAME_POLL) }
+            else if !trimmed { Some(crate::footprint::IDLE_AFTER.saturating_sub(parked.elapsed())) }
+            else { None };
+        if let Some(why) = host.watch(wait) {
             emit(&Event::ParkFailed(why));
             host.kill();
             return 1;
         }
     };
+    host.listen_for_frames(None);
     // The Play must be for the account, tool and profile this host was parked for.
     let same = backend::account_key(&request.account) == backend::account_key(&parking.account)
         && request.via.as_ref().is_some_and(|plan| crate::pol_less::park::ParkKey::for_plan(&request.account, plan)
@@ -1309,7 +1322,7 @@ pub(crate) struct ParkWorker {
     events: std::sync::mpsc::Receiver<Event>,
     worker: Identity,
     ended: bool,
-    /// It reported `Parked`: its host is up and reads frame 2 within FRAME_POLL.
+    /// It reported `Parked`: its host is up and ready for frame 2.
     parked: bool,
     /// The host it reported parked, by a SYNCHRONIZE handle opened at that report, so a close
     /// can wait for that pol.exe itself (`wait_exit`). None when it can't be opened (an
@@ -1318,29 +1331,29 @@ pub(crate) struct ParkWorker {
 }
 
 /// Start a park worker for `account` and `plan`; frame 1 carries no password and no OTP.
-pub(crate) fn spawn_park(config: &Config, account: &Account, plan: &Plan) -> Result<ParkWorker, String> {
+pub(crate) fn spawn_park(config: &Config, account: &Account, plan: &Plan, reduce_background_usage: bool) -> Result<ParkWorker, String> {
     let mut command = session_worker_command()?;
     command.arg(crate::pol_less::park::PARK_ARG);
-    spawn_park_command(command, config, account, plan)
+    spawn_park_command(command, config, account, plan, reduce_background_usage)
 }
 
 /// Frame 1: no password, no OTP; the plan's per-Play fields are not used before frame 2.
-fn park_frame(config: &Config, account: &Account, plan: &Plan) -> Result<Zeroizing<Vec<u8>>, String> {
+fn park_frame(config: &Config, account: &Account, plan: &Plan, reduce_background_usage: bool) -> Result<Zeroizing<Vec<u8>>, String> {
     let account = account.without_secrets();
     let mut plan = plan.clone();
     plan.trigger = Default::default();
-    Ok(Zeroizing::new(serde_json::to_vec(&ParkRequest { config: config.clone(), account, plan })
+    Ok(Zeroizing::new(serde_json::to_vec(&ParkRequest { config: config.clone(), account, plan, reduce_background_usage })
         .map_err(|_| t("Could not prepare the session request."))?))
 }
 
 /// A park worker running `command` instead of Crystal (window tests).
 #[cfg(test)]
 pub(crate) fn spawn_test_park(command: Command, config: &Config, account: &Account, plan: &Plan) -> Result<ParkWorker, String> {
-    spawn_park_command(command, config, account, plan)
+    spawn_park_command(command, config, account, plan, false)
 }
 
-fn spawn_park_command(mut command: Command, config: &Config, account: &Account, plan: &Plan) -> Result<ParkWorker, String> {
-    let bytes = park_frame(config, account, plan)?;
+fn spawn_park_command(mut command: Command, config: &Config, account: &Account, plan: &Plan, reduce_background_usage: bool) -> Result<ParkWorker, String> {
+    let bytes = park_frame(config, account, plan, reduce_background_usage)?;
     let mut child = spawn_hidden(&mut command).map_err(|_| t("Could not start Crystal's background session worker."))?;
     let started = (|| -> Result<(Identity, std::process::ChildStdin, std::process::ChildStdout), String> {
         let worker = identity(child.id()).ok_or(t("Could not identify Crystal's background session worker."))?;
@@ -1419,7 +1432,7 @@ impl ParkWorker {
     /// Adopt this parked worker for a Play or Connect (07d §1.5): frame 2 with the credentials
     /// and the click, then its progress exactly like `launch_command`. `Err(otp)`: the worker
     /// is gone or would not take the frame, so nothing was delivered; launch cold instead.
-    /// Frame 2 goes only once the host has parked (a parked host reads it within FRAME_POLL),
+    /// Frame 2 goes only once the host has parked,
     /// and only at its slot in `deliveries`: the stagger spaces the credentials themselves,
     /// not writes a still-parking worker would sit on (07a parity condition 3).
     pub(crate) fn play(mut self, config: &Config, account: Account, otp: String, via: Plan, clicked: Instant,
@@ -1492,6 +1505,12 @@ impl ParkWorker {
 }
 
 
+static STATUS_MODE: wake::StatusMode = wake::StatusMode::new();
+
+pub(crate) fn use_status_notifications(on: bool) {
+    STATUS_MODE.set(on);
+}
+
 /// Holds only weak handles: a monitor whose `alive` nobody holds any more (a later Play on
 /// the same retained session tracks it again) stops instead of polling until the session ends.
 fn monitor(
@@ -1500,34 +1519,74 @@ fn monitor(
     alive: std::sync::Weak<AtomicBool>,
     (game_running, connection_lost): (std::sync::Weak<AtomicBool>, std::sync::Weak<AtomicBool>),
     outcome: std::sync::Weak<Mutex<Option<ExitReport>>>,
+    mode: &wake::StatusMode,
 ) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{Foundation::WAIT_TIMEOUT, System::Threading::WaitForSingleObject};
+
+    const POLL_MS: u32 = 250;
+    // Bound the lifetime of monitors whose owner dropped its last strong reference, and
+    // recheck the files occasionally even on filesystems that accept a watch but miss a change.
+    const SWEEP_MS: u32 = 30_000;
+    let directory = path.parent().expect("a session record has a parent");
+    let control = mode.listen().ok();
+    let mut process = None;
+    let mut directory_watch = None;
+    let mut using_notifications = false;
     let mut previous_friends = None;
     loop {
         // `alive` is what every holder watches; the others may be dropped earlier.
         let Some(alive) = alive.upgrade() else { return };
+        let notifications = mode.enabled();
+        if notifications != using_notifications {
+            using_notifications = notifications;
+            process = if notifications && control.is_some() {
+                open_identity(worker.pid).filter(|(_, found)| *found == worker).map(|(process, _)| process)
+            } else {
+                None
+            };
+            directory_watch = process.as_ref().and_then(|_| wake::StatusWatch::open(directory));
+        }
         let (game_running, outcome) = (game_running.upgrade(), outcome.upgrade());
-        let modified = path.parent().and_then(|d| fs::metadata(d.join("friends.json")).ok()).and_then(|m| m.modified().ok());
-        if modified != previous_friends {
-            if let Some(snapshot) = path.parent().and_then(|d| read_friend_cache(d, worker)) {
-                if let (Some(game), Some(running)) = (snapshot.game_running, &game_running) { running.store(game, Ordering::Release); }
-                if let Some(lost) = connection_lost.upgrade() { lost.store(snapshot.connection_lost, Ordering::Release); }
+        let modified = fs::metadata(directory.join("friends.json")).ok().and_then(|m| m.modified().ok());
+        let mut changed = false;
+        if modified != previous_friends || directory_watch.is_some() {
+            if let Some(snapshot) = read_friend_cache(directory, worker) {
+                if let (Some(game), Some(running)) = (snapshot.game_running, &game_running) {
+                    changed = running.swap(game, Ordering::AcqRel) != game;
+                }
+                if let Some(lost) = connection_lost.upgrade() { changed |= lost.swap(snapshot.connection_lost, Ordering::AcqRel) != snapshot.connection_lost; }
                 previous_friends = modified;
             }
         }
+        // Check the process first, then read its record, so an exit racing this pass
+        // still has a chance to supply the final report it published before exit.
+        let running = process.as_ref().map_or_else(|| identity(worker.pid) == Some(worker),
+            |process| unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } == WAIT_TIMEOUT);
         let report = match read_record(&path).filter(|r| r.worker == worker).map(|record| record.state) {
             Some(Event::Finished(report)) => Some(report),
             Some(Event::Failed(_)) => Some(Some(ExitReport::other(Some(1)))),
-            _ if identity(worker.pid) != Some(worker) => Some(Some(ExitReport::worker_ended())),
+            _ if !running => Some(Some(ExitReport::worker_ended())),
             _ => None,
         };
         if let Some(report) = report {
             if let Some(Ok(mut slot)) = outcome.as_ref().map(|outcome| outcome.lock()) { *slot = report; }
-            alive.store(false, Ordering::Release);
             if let Some(running) = &game_running { running.store(false, Ordering::Release); }
+            alive.store(false, Ordering::Release);
+            if notifications { crate::tick_gate::notify_session_change(); }
             return;
         }
+        if notifications && changed { crate::tick_gate::notify_session_change(); }
         drop((alive, game_running, outcome));
-        std::thread::sleep(Duration::from_millis(250));
+        if let (Some(watch), Some(process), Some(control)) = (&directory_watch, &process, &control) {
+            if watch.wait(process, control, SWEEP_MS) { continue; }
+            directory_watch = None;
+        }
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        let waited = control.as_ref().map(|wake| unsafe { WaitForSingleObject(wake.raw(), POLL_MS) });
+        if !matches!(waited, Some(WAIT_OBJECT_0 | WAIT_TIMEOUT)) {
+            std::thread::sleep(Duration::from_millis(POLL_MS.into()));
+        }
     }
 }
 
@@ -1541,7 +1600,7 @@ fn track(path: PathBuf, worker: Identity, started: Started) -> Result<LaunchResu
     let game = (Arc::downgrade(&game_running), Arc::downgrade(&connection_lost));
     std::thread::Builder::new()
         .name("session-status".into())
-        .spawn(move || monitor(path, worker, tracked, game, ended))
+        .spawn(move || monitor(path, worker, tracked, game, ended, &STATUS_MODE))
         .map_err(|_| t("Could not watch the background session."))?;
     Ok(LaunchResult {
         pid: started.pid,
@@ -2917,12 +2976,19 @@ mod tests {
     use crate::pol_less::park::{Note, ParkedInfo, Worker};
 
     /// A parked host stand-in: records kills and the Play, and ends its session when told.
-    struct FakeHost { root: PathBuf, dies: bool }
+    struct FakeHost { root: PathBuf, dies: bool, wake: Option<CommandWake> }
     impl ParkHost for FakeHost {
         fn info(&self) -> ParkedInfo { ParkedInfo { loader_pid: 4242, tool_pid: Some(4343), polcore_ms: Some(400), hello_ms: 1900 } }
-        fn watch(&mut self, wait: Duration) -> Option<String> {
+        fn listen_for_frames(&mut self, wake: Option<CommandWake>) { self.wake = wake; }
+        fn frame_notifications(&self) -> bool { self.wake.is_some() }
+        fn watch(&mut self, wait: Option<Duration>) -> Option<String> {
             if self.dies { return Some("The parked game host ended.".into()); }
-            std::thread::sleep(wait.min(Duration::from_millis(20)));
+            if let Some(wake) = &self.wake {
+                use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+                unsafe { WaitForSingleObject(wake.raw(), wait.map_or(INFINITE, |wait| wait.as_millis() as u32)); }
+            } else {
+                std::thread::sleep(wait.unwrap_or(FRAME_POLL));
+            }
             None
         }
         fn kill(self) { fs::write(self.root.join("killed"), []).unwrap(); }
@@ -2946,7 +3012,9 @@ mod tests {
     struct LostHost;
     impl ParkHost for LostHost {
         fn info(&self) -> ParkedInfo { ParkedInfo { loader_pid: 4242, tool_pid: None, polcore_ms: None, hello_ms: 0 } }
-        fn watch(&mut self, wait: Duration) -> Option<String> { std::thread::sleep(wait.min(Duration::from_millis(20))); None }
+        fn listen_for_frames(&mut self, _: Option<CommandWake>) {}
+        fn frame_notifications(&self) -> bool { false }
+        fn watch(&mut self, wait: Option<Duration>) -> Option<String> { std::thread::sleep(wait.unwrap_or(FRAME_POLL)); None }
         fn kill(self) {}
         fn play(self, _: &Config, _: &Plan, account: Account, otp: Zeroizing<String>, _: Instant,
             progress: &mut dyn FnMut(&str), cold: Box<dyn FnOnce(Account, Zeroizing<String>, &mut dyn FnMut(&str)) -> Result<LaunchResult, String> + '_>)
@@ -2961,10 +3029,10 @@ mod tests {
     fn a_failed_cold_fallback_is_recorded_once() {
         let fixture = Fixture::new();
         let config = config(&fixture.0);
-        let mut bytes = frame(&ParkRequest { config: config.clone(), account: account(), plan: park_plan() });
+        let mut bytes = frame(&ParkRequest { config: config.clone(), account: account(), plan: park_plan(), reduce_background_usage: false });
         bytes.extend(frame(&play_request(&config, account(), crate::launch_timing::LaunchTrigger::ParkedPlay)));
         let history = config.history_path();
-        let code = run_park_with(Feed { bytes, at: 0, hold: None }, |_, _, _, _| Ok(LostHost), |_| {}, |config, account, _, _, _, _| {
+        let code = run_park_with(Feed { bytes, at: 0, hold: None }, |_, _, _, _, _| Ok(LostHost), |_| {}, |config, account, _, _, _, _| {
             crate::launch_log::append_history(&config.history_path(), &account.label, "fixture cold refused", None);
             Err("fixture cold refused".into())
         }, closed_flag());
@@ -3012,10 +3080,11 @@ mod tests {
         plan.trigger = crate::launch_timing::LaunchTrigger::ParkedPlay;
         let mut account = account();
         account.totp_key = "JBSWY3DPEHPK3PXP".into();
-        let bytes = park_frame(&config(&fixture.0), &account, &plan).unwrap();
+        let bytes = park_frame(&config(&fixture.0), &account, &plan, true).unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(!text.contains("fixture-password-never-on-disk") && !text.contains("\"otp\"") && !text.contains("JBSWY3DPEHPK3PXP"), "{text}");
         let request: ParkRequest = serde_json::from_slice(&bytes).unwrap();
+        assert!(request.reduce_background_usage);
         assert_eq!((request.account.pol_id.as_str(), request.plan.trigger), ("fixture", crate::launch_timing::LaunchTrigger::Play));
     }
 
@@ -3025,9 +3094,9 @@ mod tests {
     fn a_park_worker_reports_parked_then_closes_on_eof_or_host_loss() {
         let fixture = Fixture::new();
         let config = config(&fixture.0);
-        let first = frame(&ParkRequest { config: config.clone(), account: account(), plan: park_plan() });
+        let first = frame(&ParkRequest { config: config.clone(), account: account(), plan: park_plan(), reduce_background_usage: false });
         let mut events = Vec::new();
-        let code = run_park_with(Feed { bytes: first.clone(), at: 0, hold: None }, |_, _, _, _| Ok(FakeHost { root: fixture.0.clone(), dies: false }),
+        let code = run_park_with(Feed { bytes: first.clone(), at: 0, hold: None }, |_, _, _, _, _| Ok(FakeHost { root: fixture.0.clone(), dies: false, wake: None }),
             |event| events.push(event.clone()), |_, _, _, _, _, _| panic!("no Play"), closed_flag());
         assert_eq!(code, 0);
         assert!(matches!(events.as_slice(), [Event::Parked { loader_pid: 4242, tool_pid: Some(4343), polcore_ms: Some(400), hello_ms: 1900 }]), "{events:?}");
@@ -3035,21 +3104,21 @@ mod tests {
         fs::remove_file(fixture.0.join("killed")).unwrap();
         let (release, hold) = std::sync::mpsc::channel::<()>();
         let mut events = Vec::new();
-        let code = run_park_with(Feed { bytes: first.clone(), at: 0, hold: Some(hold) }, |_, _, _, _| Ok(FakeHost { root: fixture.0.clone(), dies: true }),
+        let code = run_park_with(Feed { bytes: first.clone(), at: 0, hold: Some(hold) }, |_, _, _, _, _| Ok(FakeHost { root: fixture.0.clone(), dies: true, wake: None }),
             |event| events.push(event.clone()), |_, _, _, _, _, _| panic!("no Play"), closed_flag());
         drop(release);
         assert_eq!(code, 1);
         assert!(matches!(events.as_slice(), [Event::Parked { .. }, Event::ParkFailed(why)] if why.contains("ended")), "{events:?}");
         assert!(fixture.0.join("killed").exists());
         let mut events = Vec::new();
-        assert_eq!(run_park_with(Feed { bytes: first.clone(), at: 0, hold: None }, |_, _, _, _| Err::<FakeHost, _>(crate::pol_less::park::UNSUPPORTED.into()),
+        assert_eq!(run_park_with(Feed { bytes: first.clone(), at: 0, hold: None }, |_, _, _, _, _| Err::<FakeHost, _>(crate::pol_less::park::UNSUPPORTED.into()),
             |event| events.push(event.clone()), |_, _, _, _, _, _| panic!("no Play"), closed_flag()), 1);
         assert!(matches!(events.as_slice(), [Event::ParkFailed(why)] if why == crate::pol_less::park::UNSUPPORTED), "{events:?}");
         // Finding: stdin ending while the park is still starting reaches the park itself, so it
         // can stop Windower before its loader (no orphaned Windower.exe rewriting settings.xml).
         let mut events = Vec::new();
         let saw = std::cell::Cell::new(false);
-        assert_eq!(run_park_with(Feed { bytes: first, at: 0, hold: None }, |_, _, _, closed| {
+        assert_eq!(run_park_with(Feed { bytes: first, at: 0, hold: None }, |_, _, _, _, closed| {
             let until = Instant::now() + Duration::from_secs(5);
             while !closed.load(Ordering::Acquire) && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
             saw.set(closed.load(Ordering::Acquire));
@@ -3066,10 +3135,10 @@ mod tests {
         let fixture = Fixture::new();
         let config = config(&fixture.0);
         fs::write(fixture.0.join("stop"), []).unwrap();
-        let mut bytes = frame(&ParkRequest { config: config.clone(), account: account(), plan: park_plan() });
+        let mut bytes = frame(&ParkRequest { config: config.clone(), account: account(), plan: park_plan(), reduce_background_usage: false });
         bytes.extend(frame(&play_request(&config, account(), LaunchTrigger::ParkedPlay)));
         let mut events = Vec::new();
-        let code = run_park_with(Feed { bytes, at: 0, hold: None }, |_, _, _, _| Ok(FakeHost { root: fixture.0.clone(), dies: false }),
+        let code = run_park_with(Feed { bytes, at: 0, hold: None }, |_, _, _, _, _| Ok(FakeHost { root: fixture.0.clone(), dies: false, wake: None }),
             |event| events.push(event.clone()), |_, _, _, _, _, _| panic!("the parked host was alive"), closed_flag());
         assert_eq!(code, 0);
         assert_eq!(fs::read_to_string(fixture.0.join("credentials")).unwrap(), "parked Play 123456");
@@ -3079,10 +3148,10 @@ mod tests {
         // Another account: never the parked host.
         let mut other = account();
         other.pol_id = "other".into();
-        let mut bytes = frame(&ParkRequest { config: config.clone(), account: account(), plan: park_plan() });
+        let mut bytes = frame(&ParkRequest { config: config.clone(), account: account(), plan: park_plan(), reduce_background_usage: false });
         bytes.extend(frame(&play_request(&config, other, LaunchTrigger::ParkedPlay)));
         let cold = std::cell::Cell::new(false);
-        let code = run_park_with(Feed { bytes, at: 0, hold: None }, |_, _, _, _| Ok(FakeHost { root: fixture.0.clone(), dies: false }),
+        let code = run_park_with(Feed { bytes, at: 0, hold: None }, |_, _, _, _, _| Ok(FakeHost { root: fixture.0.clone(), dies: false, wake: None }),
             |_| {}, |_, account, otp, _, _, _| { cold.set(account.pol_id == "other" && otp == "123456"); Err("fixture cold".into()) }, closed_flag());
         assert_eq!(code, 1);
         assert!(cold.get() && fixture.0.join("killed").exists());
@@ -3092,7 +3161,7 @@ mod tests {
     #[ignore = "executed only in a fixture subprocess"]
     fn park_worker_fixture() {
         let root = PathBuf::from(std::env::var_os("CRYSTAL_SESSION_FIXTURE").unwrap());
-        let code = run_park_with(io::stdin(), |_, _, _, closed| {
+        let code = run_park_with(io::stdin(), |_, _, _, _, closed| {
             // `hold-park`: a park still starting (Windower's turn, hello, polcore) until
             // `release-park`, or until the window closes it.
             if root.join("hold-park").exists() {
@@ -3105,7 +3174,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
-            Ok(FakeHost { root: root.clone(), dies: false })
+            Ok(FakeHost { root: root.clone(), dies: false, wake: None })
         }, emit, |_, _, _, _, _, _| Err("fixture: no cold launch".into()), &PARK_CLOSED);
         std::process::exit(code);
     }
@@ -3118,10 +3187,16 @@ mod tests {
     /// gone hands the OTP back for a cold Play.
     #[test]
     fn the_window_adopts_closes_or_falls_back_from_a_park_worker() {
+        for notifications in [false, true] {
+            adopt_close_or_fall_back(notifications);
+        }
+    }
+
+    fn adopt_close_or_fall_back(notifications: bool) {
         let fixture = Fixture::new();
         let config = config(&fixture.0);
         let parked = |worker: &mut ParkWorker| until(|| matches!(worker.poll(), Some(Note::Parked(ParkedInfo { loader_pid: 4242, .. }))));
-        let mut worker = spawn_park_command(child_command("session_worker::tests::park_worker_fixture", &fixture.0), &config, &account(), &park_plan()).unwrap();
+        let mut worker = spawn_park_command(child_command("session_worker::tests::park_worker_fixture", &fixture.0), &config, &account(), &park_plan(), notifications).unwrap();
         parked(&mut worker);
         let mut via = park_plan();
         via.trigger = crate::launch_timing::LaunchTrigger::ParkedPlay;
@@ -3133,12 +3208,12 @@ mod tests {
         assert!(!fixture.0.join("killed").exists(), "a host that got credentials is never killed");
         fs::remove_file(fixture.0.join("stop")).unwrap();
         // Closed before Play: the worker kills its host and exits.
-        let mut worker = spawn_park_command(child_command("session_worker::tests::park_worker_fixture", &fixture.0), &config, &account(), &park_plan()).unwrap();
+        let mut worker = spawn_park_command(child_command("session_worker::tests::park_worker_fixture", &fixture.0), &config, &account(), &park_plan(), notifications).unwrap();
         parked(&mut worker);
         crate::pol_less::park::close_workers(vec![worker]);
         assert!(fixture.0.join("killed").exists());
         // Gone: the OTP comes back, nothing was delivered.
-        let mut worker = spawn_park_command(child_command("session_worker::tests::park_worker_fixture", &fixture.0), &config, &account(), &park_plan()).unwrap();
+        let mut worker = spawn_park_command(child_command("session_worker::tests::park_worker_fixture", &fixture.0), &config, &account(), &park_plan(), notifications).unwrap();
         worker.terminate();
         assert_eq!(worker.play(&config, account(), "654321".into(), park_plan(), Instant::now(), &Mutex::new(None), |_| panic!("no progress")).err().as_deref(), Some("654321"));
     }
@@ -3151,7 +3226,7 @@ mod tests {
         let fixture = Fixture::new();
         let config = config(&fixture.0);
         fs::write(fixture.0.join("hold-park"), []).unwrap();
-        let worker = spawn_park_command(child_command("session_worker::tests::park_worker_fixture", &fixture.0), &config, &account(), &park_plan()).unwrap();
+        let worker = spawn_park_command(child_command("session_worker::tests::park_worker_fixture", &fixture.0), &config, &account(), &park_plan(), false).unwrap();
         let deliveries = Arc::new(Mutex::new(None));
         let mut via = park_plan();
         via.trigger = crate::launch_timing::LaunchTrigger::ParkedPlay;
@@ -3173,7 +3248,7 @@ mod tests {
         fs::remove_file(fixture.0.join("stop")).unwrap();
         for file in ["release-park", "parking", "credentials"] { let _ = fs::remove_file(fixture.0.join(file)); }
         // Closed while still parking: no terminate; the worker aborts its own park and exits.
-        let worker = spawn_park_command(child_command("session_worker::tests::park_worker_fixture", &fixture.0), &config, &account(), &park_plan()).unwrap();
+        let worker = spawn_park_command(child_command("session_worker::tests::park_worker_fixture", &fixture.0), &config, &account(), &park_plan(), false).unwrap();
         until(|| fixture.0.join("parking").exists());
         assert!(!worker.parked());
         crate::pol_less::park::close_workers(vec![worker]);
@@ -3203,6 +3278,67 @@ mod tests {
         request_native_control(&config, &account, NativeControl::SignOut).unwrap();
         until(|| !launch.alive.load(Ordering::Acquire));
         assert!(find(&config, &account).is_none());
+    }
+
+    #[test]
+    fn session_monitor_follows_status_replacements_and_switches_back_to_polling() {
+        let fixture = Fixture::new();
+        let config = config(&fixture.0);
+        let account = account();
+        let directory = config.account_directory(&account);
+        save_live_record_for_test(&config, &account);
+        let path = record_path(&config, &account);
+        let worker = identity(std::process::id()).unwrap();
+        let mode = wake::StatusMode::new();
+        mode.set(true);
+        let alive = Arc::new(AtomicBool::new(true));
+        let game = Arc::new(AtomicBool::new(false));
+        let outcome = Arc::new(Mutex::new(None));
+        let (tracked, running, ended) = (Arc::downgrade(&alive), Arc::downgrade(&game), Arc::downgrade(&outcome));
+        let mode = Arc::new(mode);
+        let monitor = {
+            let mode = mode.clone();
+            let path = path.clone();
+            std::thread::spawn(move || monitor(path, worker, tracked, (running, std::sync::Weak::new()), ended, &mode))
+        };
+        publish_friends(&directory, &crate::friends::Snapshot { game_running: Some(true), ..Default::default() }).unwrap();
+        until(|| game.load(Ordering::Acquire));
+        mode.set(false);
+        publish_friends(&directory, &crate::friends::Snapshot { game_running: Some(false), ..Default::default() }).unwrap();
+        until(|| !game.load(Ordering::Acquire));
+        mode.set(true);
+        update_record(&path, worker, |record| record.state = Event::Finished(Some(ExitReport::other(Some(23))))).unwrap();
+        until(|| !alive.load(Ordering::Acquire));
+        monitor.join().unwrap();
+        assert_eq!(*outcome.lock().unwrap(), Some(ExitReport::other(Some(23))));
+    }
+
+    #[test]
+    fn session_monitor_wakes_when_the_verified_worker_exits_without_a_status_write() {
+        let fixture = Fixture::new();
+        let config = config(&fixture.0);
+        let account = account();
+        let mut child = spawn_hidden(&mut child_command("session_worker::tests::worker_fixture", &fixture.0)).unwrap();
+        // This fixture is waiting for its initial stdin frame. Give it a live record,
+        // then close stdin so it exits before writing any status of its own.
+        let worker = identity(child.id()).unwrap();
+        let path = record_path(&config, &account);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        save_record(&path, &Record { worker, state: Event::Progress("fixture".into()), social_only: true,
+            authenticated: false, native_batch: false, otp_used: None, launch_choice: None, launch_tool: None }).unwrap();
+        let mode = wake::StatusMode::new();
+        mode.set(true);
+        let alive = Arc::new(AtomicBool::new(true));
+        let outcome = Arc::new(Mutex::new(None));
+        let (tracked, ended) = (Arc::downgrade(&alive), Arc::downgrade(&outcome));
+        let monitor = std::thread::spawn(move || monitor(path, worker, tracked, Default::default(), ended, &mode));
+        // Leave the monitor in its wait, so the process is the only source of a wake.
+        std::thread::sleep(Duration::from_millis(100));
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        until(|| !alive.load(Ordering::Acquire));
+        monitor.join().unwrap();
+        assert_eq!(*outcome.lock().unwrap(), Some(ExitReport::worker_ended()));
     }
 
     #[test]
@@ -3594,7 +3730,7 @@ mod tests {
         let (weak_alive, weak_game, weak_outcome) = (Arc::downgrade(&alive), Arc::downgrade(&game), Arc::downgrade(&outcome));
         drop((alive, game, outcome));
         let path = fixture.0.join("session.json");
-        let monitor = std::thread::spawn(move || monitor(path, worker, weak_alive, (weak_game, std::sync::Weak::new()), weak_outcome));
+        let monitor = std::thread::spawn(move || monitor(path, worker, weak_alive, (weak_game, std::sync::Weak::new()), weak_outcome, &wake::StatusMode::new()));
         until(|| monitor.is_finished());
     }
 

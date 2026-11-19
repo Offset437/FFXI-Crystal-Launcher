@@ -2,9 +2,9 @@
 //! (with it on, no account name or ID, friend, character, mail subject or message is readable
 //! in any text the window holds, on any page; with it off the same texts read normally).
 use super::sync::headless;
-use super::MainWindow;
+use super::{window_size_for_work_area, MainWindow, WorkArea};
 use crate::i18n::{t, tf, Lang};
-use crate::{friends::Pane, operation, services, App, MaintenanceKind, Message, Page};
+use crate::{friends::Pane, operation, services, App, MaintenanceKind, Message, Page, DEFAULT_WINDOW_SIZE, SMALL_WINDOW_SIZE};
 use i_slint_core::item_tree::ItemRc;
 use i_slint_core::items::{ComplexText, SimpleText, TextInput};
 use i_slint_core::window::WindowInner;
@@ -12,6 +12,48 @@ use slint::platform::software_renderer::MinimalSoftwareWindow;
 use slint::ComponentHandle;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::RECT;
+
+fn work_area(width: i32, height: i32, scale: f64) -> WorkArea {
+    WorkArea { rect: RECT { left: 16, top: 40, right: 16 + width, bottom: 40 + height }, scale }
+}
+
+#[test]
+fn startup_window_keeps_preferred_size_when_it_fits() {
+    for area in [work_area(1920, 1040, 1.0), work_area(1440, 900, 1.0)] {
+        assert_eq!(window_size_for_work_area(Some(&area)), DEFAULT_WINDOW_SIZE);
+    }
+}
+
+#[test]
+fn startup_window_uses_preview_small_dimensions_on_the_deck() {
+    let area = work_area(1280, 760, 1.0);
+    let size = window_size_for_work_area(Some(&area));
+    assert_eq!(size, SMALL_WINDOW_SIZE);
+    assert_eq!(area.centred(size), slint::PhysicalPosition::new(206, 95));
+}
+
+#[test]
+fn startup_window_uses_small_size_when_either_dimension_is_too_short_at_fractional_dpi() {
+    let exact_fit = work_area(1800, 1125, 1.25);
+    assert_eq!(window_size_for_work_area(Some(&exact_fit)), DEFAULT_WINDOW_SIZE);
+    for area in [work_area(1799, 1125, 1.25), work_area(1800, 1124, 1.25)] {
+        assert_eq!(window_size_for_work_area(Some(&area)), SMALL_WINDOW_SIZE);
+    }
+}
+
+#[test]
+fn startup_window_aligns_to_the_work_area_when_the_small_size_overflows() {
+    let area = work_area(800, 600, 1.0);
+    let size = window_size_for_work_area(Some(&area));
+    assert_eq!(size, SMALL_WINDOW_SIZE);
+    assert_eq!(area.centred(size), slint::PhysicalPosition::new(16, 40));
+}
+
+#[test]
+fn startup_window_keeps_preferred_size_when_work_area_is_unknown() {
+    assert_eq!(window_size_for_work_area(None), DEFAULT_WINDOW_SIZE);
+}
 
 #[path = "pick_tests.rs"]
 mod pick_tests;
