@@ -64,6 +64,8 @@ mod windower_plugin_settings;
 mod reshade_input;
 #[cfg(target_arch = "x86")]
 mod addon_files;
+#[cfg(all(target_arch = "x86", feature = "asset-pool-1gib"))]
+mod asset_pool;
 
 use std::time::Duration;
 
@@ -227,6 +229,8 @@ const GAME_THREAD_STACK: usize = 4 << 20;
 
 /// The whole loader. Returns the process exit code.
 pub fn run() -> i32 {
+    #[cfg(all(target_arch = "x86", feature = "asset-pool-1gib"))]
+    asset_pool::publish_status(false);
     let entry = startup_timing::Entry::capture();
     let log_started = startup_timing::Stamp::capture();
     let log_path = log::init();

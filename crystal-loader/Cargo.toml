@@ -9,6 +9,7 @@ description = "32-bit FFXI game host using the installed PlayOnline core for ret
 [features]
 # The default build steps polcore at the Viewer's 20 ms frame (pol-spec 07b decision 2).
 default = []
+asset-pool-1gib = []
 
 # Own workspace root: this crate never joins the launcher build.
 [workspace]
@@ -39,6 +40,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_Environment",
     # Process-only thread lists for Windower Hook startup (windower_threads.rs).
     "Win32_System_Diagnostics_ProcessSnapshotting",
     "Win32_System_Kernel",

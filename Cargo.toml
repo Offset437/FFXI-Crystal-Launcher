@@ -23,6 +23,7 @@ default = ["software"]
 skia = ["slint/renderer-skia"]
 femtovg = ["slint/renderer-femtovg"]
 software = ["slint/renderer-software"]
+asset-pool-1gib = []
 
 [dependencies]
 imagecrate = { package = "image", version = "=0.25.8", default-features = false, features = ["jpeg", "png", "gif", "webp"] }

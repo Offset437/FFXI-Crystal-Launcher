@@ -383,6 +383,12 @@ fn create_from_dll_with_outer(clsid: &GUID, iid: &GUID, outer: *mut c_void, dll:
             return Err(format!("{what}: CreateInstance failed (hr={hr:#010x})"));
         }
     }
+
+   #[cfg(all(target_arch = "x86", feature = "asset-pool-1gib"))]
+   if what == "GameMain" {
+       crate::asset_pool::arm(m as usize)
+           .map_err(|error| format!("1 GiB asset pool: {error}"))?;
+   }
     log!("{what}: created from {}", dll.display());
     Ok(Com(p))
 }
@@ -796,10 +802,14 @@ fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], session: &mut crate
     log!("stage: calling FFXiEntry::GameStart");
     let mut message: *mut c_void = std::ptr::null_mut();
     // SAFETY: IFFXiEntry::GameStart(this, IUnknown* pol, IUnknown** msg); blocks for the session.
+    #[cfg(all(target_arch = "x86", feature = "asset-pool-1gib"))]
+    let pool_verifier = crate::asset_pool::Verifier::start()?;
     let hr = unsafe {
         let start: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> HRESULT = ffxi.method(VT_GAME_START);
         start(ffxi.0, polcore.0, &mut message)
     };
+    #[cfg(all(target_arch = "x86", feature = "asset-pool-1gib"))]
+    drop(pool_verifier);
     drop(awake);
     log!("stage: GameStart returned hr={hr:#010x}");
     // Stop all input before game callbacks/interfaces can be detached or freed.

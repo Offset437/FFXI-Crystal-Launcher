@@ -3,7 +3,7 @@
 param(
     [string]$OutputPath,
     [string]$LoaderTargetDir,
-    [string]$LoaderFeatures,
+    [string]$LoaderFeatures = "asset-pool-1gib",
     [string]$LauncherFeatures,
     [string]$InstallerCompiler,
     [switch]$Offline
